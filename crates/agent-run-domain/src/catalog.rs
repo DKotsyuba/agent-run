@@ -904,10 +904,6 @@ impl<'de> Deserialize<'de> for PhysicalQuotaKey {
 pub use crate::legacy_provider::{
     DecodedLegacyRequest, LegacyRuntime, decode_legacy_request, legacy_runtime,
 };
-pub use crate::quota_snapshot::{
-    NormalizedQuotaSnapshot, QuotaModelObservation, QuotaPoolObservation, QuotaWindow,
-};
-
 /// The immutable launch authority frozen at admission, before any attempt.
 ///
 /// Everything a launch must not change across retries lives here: provider,
@@ -1106,6 +1102,63 @@ pub struct QuotaCandidate {
     pub quota_known: bool,
 }
 
+/// A bounded, nonsecret reference to one external quota evaluation.
+///
+/// The source revision belongs to quota, never to Run's local capacity revision.
+/// This reference cannot authenticate the source; only trusted ranking may set it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaDecision {
+    /// Lowercase hexadecimal source incarnation (32 characters).
+    pub source_epoch: String,
+    /// Optional nonnegative revision in that source incarnation.
+    pub revision: Option<i64>,
+    /// Lowercase hexadecimal quota configuration digest (64 characters).
+    pub config_revision: String,
+    /// Unix seconds when the source state was evaluated.
+    pub evaluated_at: f64,
+    /// Exclusive earliest finite state validity among all authoritative model
+    /// classes used for ranking, including exhausted classes omitted from candidates.
+    pub valid_until: Option<f64>,
+    /// Whether authoritative state influenced selection, including a no-reset
+    /// exhaustion latch. False permits audit only and requires no deadline.
+    pub requires_clock_fence: bool,
+}
+
+impl QuotaDecision {
+    /// Rejects malformed references and authoritative decisions outside their
+    /// wall-clock interval. No deadline means only rollback protection, never a
+    /// cache permit. Invalid references and clock rollback require discarding
+    /// the snapshot; finite expiry may be re-evaluated. Rollback takes precedence
+    /// over expiry. The typed refusals contain no source values.
+    pub fn check_admission(&self, at: f64) -> Result<()> {
+        let hex = |value: &str, length| {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let valid = hex(&self.source_epoch, 32)
+            && hex(&self.config_revision, 64)
+            && self.revision.is_none_or(|revision| revision >= 0)
+            && self.evaluated_at.is_finite()
+            && self.evaluated_at >= 0.0
+            && self
+                .valid_until
+                .is_none_or(|until| until.is_finite() && until >= 0.0)
+            && (self.requires_clock_fence || self.valid_until.is_none());
+        if !valid {
+            return Err(QuotaAdmissionError::QuotaDecisionInvalid.into());
+        }
+        if self.requires_clock_fence && (!at.is_finite() || at < self.evaluated_at) {
+            return Err(QuotaAdmissionError::QuotaClockRollback.into());
+        }
+        if self.requires_clock_fence && self.valid_until.is_some_and(|until| at >= until) {
+            return Err(QuotaAdmissionError::QuotaDecisionStale.into());
+        }
+        Ok(())
+    }
+}
+
 /// The immutable, ordered candidate set quota hands to transactional admission.
 ///
 /// Produced read-only by the quota side from physical capacity data; it never
@@ -1124,12 +1177,37 @@ pub struct QuotaCandidateSet {
     pub candidates: Vec<QuotaCandidate>,
     /// The committed capacity revision this ordering is based on.
     pub capacity_revision: i64,
+    /// Optional external evaluation checked independently after the local
+    /// revision fence. Absent preserves trusted legacy/test admission behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_decision: Option<QuotaDecision>,
 }
 
 impl QuotaCandidateSet {
+    /// Checks the optional reference and requires clock fencing whenever a
+    /// retained candidate uses known quota. Producers must also fence excluded
+    /// exhausted classes, which cannot be reconstructed from this set. Missing
+    /// references retain the trusted legacy contract; contradictions invalidate
+    /// the snapshot and must not be retried as ordinary finite expiry.
+    pub fn check_quota_decision(&self, at: f64) -> Result<()> {
+        if let Some(decision) = &self.quota_decision {
+            if !decision.requires_clock_fence
+                && self
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.quota_known)
+            {
+                return Err(QuotaAdmissionError::QuotaDecisionInvalid.into());
+            }
+            decision.check_admission(at)?;
+        }
+        Ok(())
+    }
+
     /// Validates nonblank model, distinct accounts, host-bound physical key
     /// sets that are nonempty exactly for known-capacity candidates, and the
-    /// pinned account's membership.
+    /// pinned account's membership. The optional external reference is checked
+    /// separately by [`Self::check_quota_decision`] after the local fence.
     pub fn validate(&self) -> Result<()> {
         nonblank("model", &self.model)?;
         let mut seen = std::collections::BTreeSet::new();
@@ -1195,6 +1273,15 @@ impl BindingCooldownReason {
 /// fact. None of them may masquerade as another.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuotaAdmissionError {
+    /// External quota evidence reached its finite validity boundary. Re-evaluate
+    /// or refetch; this is not local capacity revision contention.
+    QuotaDecisionStale,
+    /// The wall clock is invalid or precedes the source evaluation. Discard the
+    /// snapshot permanently for this operation, even if the clock recovers.
+    QuotaClockRollback,
+    /// External decision metadata is malformed or contradicts candidate state.
+    /// Discard the snapshot; rechecking time cannot make this evidence usable.
+    QuotaDecisionInvalid,
     /// The committed capacity revision moved before admission; quota must
     /// recompute outside the transaction and resubmit.
     SelectionStale {
@@ -1247,6 +1334,9 @@ impl QuotaAdmissionError {
     /// Returns the stable machine-readable kind name.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::QuotaDecisionStale => "quota_decision_stale",
+            Self::QuotaClockRollback => "quota_clock_rollback",
+            Self::QuotaDecisionInvalid => "quota_decision_invalid",
             Self::SelectionStale { .. } => "selection_stale",
             Self::SelectionBusy { .. } => "selection_busy",
             Self::NoEligibleAccount { .. } => "no_eligible_account",
@@ -1260,6 +1350,9 @@ impl fmt::Display for QuotaAdmissionError {
     /// Writes the kind plus the discriminating fields.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::QuotaDecisionStale => formatter.write_str("quota_decision_stale"),
+            Self::QuotaClockRollback => formatter.write_str("quota_clock_rollback"),
+            Self::QuotaDecisionInvalid => formatter.write_str("quota_decision_invalid"),
             Self::SelectionStale {
                 committed_capacity_revision,
                 current_capacity_revision,

@@ -22,6 +22,84 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
 }
+
+/// Exact Linux process incarnation. These facts are correlation evidence, not
+/// a credential; an unavailable or changing procfs observation is not death.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelIncarnation {
+    pub boot_id: String,
+    pub pid_namespace_inode: u64,
+    pub uid: u32,
+    pub pid: u32,
+    pub start_ticks: u64,
+}
+
+/// Inspect the owned leader twice, requiring the same live generation and
+/// local PID namespace throughout. Never inspect the process environment.
+#[cfg(target_os = "linux")]
+pub fn kernel_incarnation(leader: &Identity) -> std::io::Result<KernelIncarnation> {
+    use std::os::unix::fs::MetadataExt;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kernel identity unavailable",
+        )
+    };
+    let read = || -> std::io::Result<KernelIncarnation> {
+        let observed = inspect(leader.pid)?;
+        if observed.zombie || observed.token != leader.token {
+            return Err(invalid());
+        }
+        let (boot, ticks) = observed
+            .token
+            .strip_prefix("linux:")
+            .and_then(|s| s.rsplit_once(':'))
+            .ok_or_else(invalid)?;
+        let parsed = uuid::Uuid::parse_str(boot).map_err(|_| invalid())?;
+        if parsed.to_string() != boot {
+            return Err(invalid());
+        }
+        let start_ticks = ticks
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(invalid)?;
+        let local_ns = std::fs::metadata("/proc/self/ns/pid")?.ino();
+        let target_ns = std::fs::metadata(format!("/proc/{}/ns/pid", leader.pid))?.ino();
+        if target_ns == 0 || target_ns != local_ns {
+            return Err(invalid());
+        }
+        let status = std::fs::read_to_string(format!("/proc/{}/status", leader.pid))?;
+        let mut lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let uids = lines
+            .next()
+            .ok_or_else(invalid)?
+            .split_ascii_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| invalid())?;
+        if lines.next().is_some() || uids.len() != 4 {
+            return Err(invalid());
+        }
+        // SAFETY: geteuid has no preconditions.
+        if uids[1] != unsafe { libc::geteuid() } {
+            return Err(invalid());
+        }
+        Ok(KernelIncarnation {
+            boot_id: boot.into(),
+            pid_namespace_inode: target_ns,
+            uid: uids[1],
+            pid: leader.pid.try_into().map_err(|_| invalid())?,
+            start_ticks,
+        })
+    };
+    let before = read()?;
+    if read()? != before {
+        return Err(invalid());
+    }
+    Ok(before)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
@@ -62,6 +140,96 @@ pub fn executable(pid: i32) -> std::io::Result<std::path::PathBuf> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Require a filesystem whose Linux executable write exclusion protects the loaded inode.
+///
+/// Resolve the *open file's* mount ID via fdinfo, then its filesystem type in
+/// this process's mountinfo. This avoids path-prefix/bind-mount ambiguity and
+/// needs no unsafe statfs call or new dependency. Hidden/detached mounts and
+/// unknown types fail closed. Overlay is deliberately unsupported: its visible
+/// type alone does not establish the upper filesystem's write exclusion.
+/// The caller must open /proc/PID/exe and also verify inode, digest, mode and
+/// incarnation. No wall clock or file timestamp contributes authority.
+#[cfg(target_os = "linux")]
+pub fn executable_write_excluded(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(executable_mount_allowed(&info, &mounts))
+}
+
+#[cfg(target_os = "linux")]
+fn executable_mount_allowed(info: &str, mounts: &str) -> bool {
+    let mut ids = info.lines().filter_map(|line| line.strip_prefix("mnt_id:"));
+    let Some(id) = ids.next().and_then(|s| s.trim().parse::<u64>().ok()) else {
+        return false;
+    };
+    if ids.next().is_some() {
+        return false;
+    }
+    let mut matching = mounts.lines().filter(|line| {
+        line.split_ascii_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(id)
+    });
+    let Some(line) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    let kind = line
+        .split_once(" - ")
+        .and_then(|(_, tail)| tail.split_ascii_whitespace().next());
+    // Names are the kernel mountinfo equivalents of statfs f_type magic values.
+    let magic = match kind {
+        Some("ext2" | "ext3" | "ext4") => 0xef53,
+        Some("xfs") => 0x58465342,
+        Some("btrfs") => 0x9123683e,
+        Some("tmpfs") => 0x01021994,
+        _ => return false,
+    };
+    executable_fs_magic_allowed(magic)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_fs_magic_allowed(magic: u64) -> bool {
+    matches!(magic, 0xef53 | 0x58465342 | 0x9123683e | 0x01021994)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod executable_mount_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_filesystems_fail_closed() {
+        for magic in [0xef53, 0x58465342, 0x9123683e, 0x01021994] {
+            assert!(executable_fs_magic_allowed(magic));
+        }
+        for magic in [0, 0x794c7630, 0x6969, u64::MAX] {
+            assert!(!executable_fs_magic_allowed(magic));
+        }
+        for kind in ["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs"] {
+            let mounts = format!("42 1 0:1 / / rw - {kind} source rw\n");
+            assert!(executable_mount_allowed("mnt_id:\t42\n", &mounts));
+        }
+        for (info, mounts) in [
+            ("mnt_id: 42", "42 1 0:1 / / rw - overlay source rw"),
+            ("mnt_id: 42", "42 1 0:1 / / rw - nfs source rw"),
+            ("mnt_id: 42", "43 1 0:1 / / rw - ext4 source rw"),
+            ("mnt_id: 42\nmnt_id: 42", "42 1 0:1 / / rw - ext4 source rw"),
+            (
+                "mnt_id: 42",
+                "42 1 0:1 / / rw - ext4 source rw\n42 1 0:1 / / rw - tmpfs source rw",
+            ),
+            ("mnt_id: invalid", ""),
+            ("", ""),
+        ] {
+            assert!(!executable_mount_allowed(info, mounts));
+        }
     }
 }
 
@@ -1020,6 +1188,20 @@ impl OwnedProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_kernel_incarnation_rejects_a_reused_leader() {
+        let mut leader = inspect(std::process::id() as i32).unwrap();
+        let facts = kernel_incarnation(&leader).unwrap();
+        assert_eq!(facts.pid, std::process::id());
+        assert_eq!(
+            leader.token,
+            format!("linux:{}:{}", facts.boot_id, facts.start_ticks)
+        );
+        leader.token.push('0');
+        assert!(kernel_incarnation(&leader).is_err());
+    }
 
     /// Procfs init and wildcard-like names never enter a process snapshot.
     #[test]

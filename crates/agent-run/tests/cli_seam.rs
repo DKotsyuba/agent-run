@@ -86,18 +86,15 @@ impl CliService for FakeService {
     fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(async { Ok(json!([])) })
     }
-    fn limits(&self) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn limits(&self) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
-    fn capacity_order(
-        &self,
-        _query: agent_run_domain::CapacityOrderQuery,
-    ) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
     /// Returns empty text for this fixture's guide query without catalog I/O.
-    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
-        Ok(Value::String(String::new()))
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(Value::String(String::new())) })
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
         Ok(json!({}))
@@ -135,6 +132,332 @@ fn dependencies(
                 ..agent_run::doctor::Report::default()
             })
         }),
+    }
+}
+
+/// CLI forwards a strict batch spec and returns the exact structured receipt.
+#[tokio::test]
+async fn batch_cli_forwards_receipt_and_refuses_duplicate_job_keys() {
+    let temp = tempdir().unwrap();
+    let spec = temp.path().join("batch.json");
+    let input = json!({"request_id":"batch-cli","jobs":[{"provider":"p","model":"m","profile":"code","task":"one","workdir":temp.path()}]});
+    fs::write(&spec, serde_json::to_vec(&input).unwrap()).unwrap();
+    let receipt = json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"batch-cli","jobs":[{"index":0,"agent_id":AGENT_ID,"sequence":1,"execution_ref":format!("ex1_{}", "a".repeat(64))}]}});
+    let broker = Arc::new(FakeBroker::new(vec![receipt.clone()]));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let path = spec.to_str().unwrap();
+    agent_run::cli::run_with(
+        parse(&["start-batch", "--spec", path]),
+        dependencies(
+            Arc::new(FakeService::new(vec![], false)),
+            broker.clone(),
+            output.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    {
+        let calls = broker.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "start_batch");
+        assert_eq!(calls[0].1["request_id"], "batch-cli");
+        assert_eq!(calls[0].1["jobs"][0]["task"], "one");
+    }
+    assert_eq!(output.lock().unwrap().as_slice(), &[receipt]);
+
+    let escaped_path = serde_json::to_string(temp.path().to_str().unwrap()).unwrap();
+    fs::write(&spec, format!(r#"{{"request_id":"b","jobs":[{{"provider":"p","model":"m","profile":"code","task":"one","workdir":{escaped_path},"required_mcp":{{"x":[],"x":[]}}}}]}}"#)).unwrap();
+    let result = agent_run::cli::run_with(
+        parse(&["start-batch", "--spec", path]),
+        dependencies(
+            Arc::new(FakeService::new(vec![], false)),
+            broker.clone(),
+            output,
+        ),
+    )
+    .await;
+    assert!(matches!(result, Err(agent_run::Error::Validation(_))));
+    assert_eq!(broker.calls.lock().unwrap().len(), 1);
+}
+
+/// A malformed batch incarnation cannot be presented as a successful admission.
+#[tokio::test]
+async fn batch_cli_rejects_missing_or_malformed_execution_ref_as_unknown() {
+    let temp = tempdir().unwrap();
+    let spec = temp.path().join("batch.json");
+    fs::write(
+        &spec,
+        serde_json::to_vec(&json!({"request_id":"batch-cli","jobs":[
+            {"provider":"p","model":"m","profile":"code","task":"one","workdir":temp.path()}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    for reference in [None, Some("ex1_invalid")] {
+        let mut job = json!({"index":0,"agent_id":AGENT_ID,"sequence":1});
+        if let Some(reference) = reference {
+            job["execution_ref"] = json!(reference);
+        }
+        let receipt = json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"batch-cli","jobs":[job]}});
+        let broker = Arc::new(FakeBroker::new(vec![receipt]));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let result = agent_run::cli::run_with(
+            parse(&["start-batch", "--spec", spec.to_str().unwrap()]),
+            dependencies(
+                Arc::new(FakeService::new(vec![], false)),
+                broker,
+                output.clone(),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(agent_run::Error::BatchOutcomeUnknown { .. })
+        ));
+        assert!(output.lock().unwrap().is_empty());
+    }
+}
+
+/// One CLI command uses the shared pin wire for release and list actions.
+#[tokio::test]
+async fn history_pins_cli_uses_exact_release_key_and_list_page() {
+    let pin = "pin_550e8400e29b41d4a716446655440000";
+    let first = json!({"pin_id":pin,"status":"released","already_released":false});
+    let second = json!({"pin_id":pin,"status":"released","already_released":true});
+    let page = json!({"pins":[{"pin_id":pin,"agent_id":AGENT_ID,"status":"released"}],"next_after_pin_id":null});
+    let broker = Arc::new(FakeBroker::new(vec![
+        first.clone(),
+        second.clone(),
+        page.clone(),
+    ]));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    for args in [
+        vec!["history-pins", "release", "--pin-id", pin],
+        vec!["history-pins", "release", "--pin-id", pin],
+        vec!["history-pins", "list", "--status", "released"],
+    ] {
+        agent_run::cli::run_with(
+            parse(&args),
+            dependencies(
+                Arc::new(FakeService::new(vec![], false)),
+                broker.clone(),
+                output.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(output.lock().unwrap().as_slice(), &[first, second, page]);
+    let calls = broker.calls.lock().unwrap();
+    assert!(calls.iter().all(|(method, _)| method == "history_pins"));
+    assert_eq!(calls[0].1, json!({"action":"release","pin_id":pin}));
+    assert_eq!(calls[1].1, calls[0].1);
+    assert_eq!(
+        calls[2].1,
+        json!({"action":"list","status":"released","limit":100,"after_pin_id":null})
+    );
+}
+
+/// CLI forwards one strict status request and refuses an unrelated result.
+#[tokio::test]
+async fn status_cli_forwards_exact_request_and_rejects_malformed_result() {
+    let temp = tempdir().unwrap();
+    let spec = temp.path().join("status.json");
+    let input = json!({"version":1,"targets":[{"agent_id":AGENT_ID,"sequence":1}]});
+    fs::write(&spec, serde_json::to_vec(&input).unwrap()).unwrap();
+    let output_value = json!({"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","observed_at":1.0,"items":[{
+        "selector":{"agent_id":AGENT_ID,"sequence":1},"canonical_agent_id":null,"match":"missing","pin_id":null,"pin_state":"missing",
+        "selected":null,"retained_latest":null,"coverage":"unknown","restart_resume":"unknown","lineage_terminal":null,
+        "terminal_outcome":null,"success_commit":"unknown","cleanup":{"scope":"lineage","state":"unknown"}}]});
+    let mut malformed = output_value.clone();
+    malformed["items"] = json!([]);
+    let broker = Arc::new(FakeBroker::new(vec![output_value.clone(), malformed]));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    for pass in 0..2 {
+        let result = agent_run::cli::run_with(
+            parse(&["status", "--spec", spec.to_str().unwrap()]),
+            dependencies(
+                Arc::new(FakeService::new(vec![], false)),
+                broker.clone(),
+                output.clone(),
+            ),
+        )
+        .await;
+        if pass == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(output.lock().unwrap().as_slice(), &[output_value]);
+    let calls = broker.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(method, _)| method == "status"));
+    assert_eq!(calls[0].1["targets"][0]["agent_id"], AGENT_ID);
+}
+
+/// CLI preserves the exact lookup intent and rejects a malformed missing result.
+#[tokio::test]
+async fn batch_receipt_cli_uses_scoped_intent_and_strict_result() {
+    let temp = tempdir().unwrap();
+    let spec = temp.path().join("batch.json");
+    let input = json!({"request_id":"lookup","expected_store_id":"store_0123456789abcdef0123456789abcdef",
+        "jobs":[{"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"}]});
+    fs::write(&spec, serde_json::to_vec(&input).unwrap()).unwrap();
+    let found = json!({"found":true,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"lookup","jobs":[{
+        "index":0,"agent_id":AGENT_ID,"sequence":1,"execution_ref":format!("ex1_{}","a".repeat(64))}]}});
+    let broker = Arc::new(FakeBroker::new(vec![
+        json!({"found":false}),
+        found.clone(),
+        json!({"found":false,"receipt":null}),
+    ]));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    for pass in 0..3 {
+        let result = agent_run::cli::run_with(
+            parse(&["batch-receipt", "--spec", spec.to_str().unwrap()]),
+            dependencies(
+                Arc::new(FakeService::new(vec![], false)),
+                broker.clone(),
+                output.clone(),
+            ),
+        )
+        .await;
+        if pass < 2 {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        &[json!({"found":false}), found]
+    );
+    let calls = broker.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert!(
+        calls
+            .iter()
+            .all(|(method, params)| method == "batch_receipt"
+                && params["expected_store_id"] == input["expected_store_id"])
+    );
+}
+
+/// CLI submits and recovers the exact ordered prerequisites without allowing
+/// duplicate JSON keys or a mismatched receipt to reach the output sink.
+#[tokio::test]
+async fn batch_cli_preconditions_preserve_order_and_strict_fields() {
+    let temp = tempdir().unwrap();
+    let spec = temp.path().join("batch-preconditions.json");
+    let conditions = json!([
+        {"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":format!("ex1_{}","a".repeat(64)),"pin_id":"pin_550e8400e29b41d4a716446655440000"},
+        {"agent_id":"ag-20260826-120001-0123456789","sequence":2,"execution_ref":format!("ex1_{}","b".repeat(64)),"pin_id":"pin_550e8400e29b41d4a716446655440001"}
+    ]);
+    let input = json!({"request_id":"precondition-cli","expected_store_id":"store_0123456789abcdef0123456789abcdef",
+        "preconditions":conditions.clone(),"jobs":[{"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"}]});
+    let receipt = json!({"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"precondition-cli",
+        "preconditions":conditions,"jobs":[{"index":0,"agent_id":"ag-20260826-120002-0123456789","sequence":1,"execution_ref":format!("ex1_{}","c".repeat(64))}]});
+    fs::write(&spec, input.to_string()).unwrap();
+    let good = json!({"replayed":false,"receipt":receipt.clone()});
+    let mut wrong = good.clone();
+    wrong["receipt"]["preconditions"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    let broker = Arc::new(FakeBroker::new(vec![
+        good.clone(),
+        wrong,
+        json!({"found":true,"receipt":receipt}),
+    ]));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(FakeService::new(vec![], false));
+    for (cmd, succeeds) in [
+        ("start-batch", true),
+        ("start-batch", false),
+        ("batch-receipt", true),
+    ] {
+        let result = agent_run::cli::run_with(
+            parse(&[cmd, "--spec", spec.to_str().unwrap()]),
+            dependencies(service.clone(), broker.clone(), output.clone()),
+        )
+        .await;
+        assert_eq!(result.is_ok(), succeeds, "{cmd}");
+        if !succeeds {
+            assert_eq!(
+                result.unwrap_err().machine_code().as_str(),
+                "BatchOutcomeUnknown"
+            );
+        }
+    }
+    assert_eq!(output.lock().unwrap()[0], good);
+    assert_eq!(
+        output.lock().unwrap()[1]["receipt"]["preconditions"],
+        input["preconditions"]
+    );
+    assert!(
+        broker
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, params)| params["preconditions"] == input["preconditions"])
+    );
+
+    for bad in [
+        input
+            .to_string()
+            .replace("\"sequence\":1", "\"sequence\":1,\"sequence\":2"),
+        input.to_string().replace(
+            "\"preconditions\":[",
+            "\"preconditions\":[],\"preconditions\":[",
+        ),
+        {
+            let mut value = input.clone();
+            value["preconditions"] = Value::Null;
+            value.to_string()
+        },
+        {
+            let mut value = input.clone();
+            value["preconditions"] = json!([]);
+            value.to_string()
+        },
+        {
+            let mut value = input.clone();
+            value.as_object_mut().unwrap().remove("expected_store_id");
+            value.to_string()
+        },
+        {
+            let mut value = input.clone();
+            let condition = value["preconditions"][0].clone();
+            value["preconditions"][0] = json!([
+                condition["agent_id"],
+                condition["sequence"],
+                condition["execution_ref"],
+                condition["pin_id"]
+            ]);
+            value.to_string()
+        },
+        {
+            let mut value = input.clone();
+            value["jobs"][0] = json!(["p", "m", "review", "fixture", "/missing"]);
+            value.to_string()
+        },
+        json!(["key", [], false, null, null]).to_string(),
+    ] {
+        fs::write(&spec, bad).unwrap();
+        for command in ["start-batch", "batch-receipt"] {
+            let never_called = Arc::new(FakeBroker::new(vec![]));
+            let result = agent_run::cli::run_with(
+                parse(&[command, "--spec", spec.to_str().unwrap()]),
+                dependencies(
+                    service.clone(),
+                    never_called.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                ),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(never_called.calls.lock().unwrap().is_empty());
+        }
     }
 }
 
@@ -1428,18 +1751,15 @@ impl CliService for PausingService {
     fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(async { Ok(json!([])) })
     }
-    fn limits(&self) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn limits(&self) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
-    fn capacity_order(
-        &self,
-        _query: agent_run_domain::CapacityOrderQuery,
-    ) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
     /// Returns empty text for this fixture's guide query without catalog I/O.
-    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
-        Ok(Value::String(String::new()))
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(Value::String(String::new())) })
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
         Ok(json!({}))
@@ -1705,18 +2025,15 @@ impl CliService for FollowService {
     fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(async { Ok(json!([])) })
     }
-    fn limits(&self) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn limits(&self) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
-    fn capacity_order(
-        &self,
-        _query: agent_run_domain::CapacityOrderQuery,
-    ) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
     /// Returns empty text for this fixture's guide query without catalog I/O.
-    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
-        Ok(Value::String(String::new()))
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(Value::String(String::new())) })
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
         Ok(json!({}))

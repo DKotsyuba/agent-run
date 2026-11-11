@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "result": {
+    "schema_version": 1,
+    "source_epoch": "00000000000000000000000000000000",
+    "revision": 1,
+    "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "evaluated_at": 10000.0,
+    "coverage": {
+      "state": "partial",
+      "unobserved": [],
+      "last_collection": {
+        "observed_at": 10000.0,
+        "ok": false,
+        "error": null,
+        "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sources": [{"account":"acct-test","provider":"codex","source":"fixture-source","status":"failed","windows":0,"issues":["collector_timeout"]}]
+      }
+    },
+    "accounts": [{
+      "account":"acct-test",
+      "models":[{
+        "provider":"codex", "model":"model-a", "native_model":"model-a", "state":"unknown",
+        "quota_score":null, "limiting_window":null, "remaining_percent":null, "burn_percent_per_hour":null,
+        "reset_at":null, "risk":"unknown", "evidence":"missing", "newest_observed_at":null,
+        "exhausted_until":null, "pools":[]
+      }],
+      "windows":[], "latches":[], "advice":[], "advice_key":"e3b0c44298fc1c149afbf4c8996fb924"
+    }]
+  }
+}

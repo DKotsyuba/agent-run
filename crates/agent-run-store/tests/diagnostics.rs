@@ -10,6 +10,8 @@ fn python_test_snapshots_fixture_is_read_only_and_bounded() {
     ));
     let snapshot = diagnostic_snapshot(&fixture, 1_759_000_100.0, 256).unwrap();
     assert!(!snapshot.agents.is_empty());
-    assert!(!snapshot.capacity.is_empty());
     assert_eq!(snapshot.agents[0]["status"], "running");
+    let bounded = diagnostic_snapshot(&fixture, 1_759_000_100.0, 1).unwrap();
+    assert_eq!(bounded.agents.len(), 1);
+    assert_eq!(bounded.agents[0], snapshot.agents[0]);
 }

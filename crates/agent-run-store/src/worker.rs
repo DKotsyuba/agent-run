@@ -138,7 +138,7 @@ impl Store<'_> {
         proof: &agent_run_domain::worker::WorkerCatalogProof,
         at: f64,
     ) -> Result<()> {
-        if !agent_run_domain::worker::known_pool_catalog(proof.version, &proof.digest) {
+        if !agent_run_domain::worker::known_worker_catalog(proof.version, &proof.digest) {
             return Err(Error::Unsupported(
                 "worker pool catalog is not supported".into(),
             ));

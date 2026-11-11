@@ -242,6 +242,67 @@ fn is_resume_ack(frame: &Value, session: &str, input_id: &str) -> bool {
         && frame.get("session_id").and_then(Value::as_str) == Some(session)
 }
 
+/// A late replay cannot turn a deadline-unknown owner effect into acceptance.
+fn is_owner_v2_ack(
+    frame: &Value,
+    session: &str,
+    input_id: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    tokio::time::Instant::now() < deadline && is_resume_ack(frame, session, input_id)
+}
+
+/// After a native write, failure to journal its turn is uncertain, never unsent.
+pub(crate) async fn owner_v2_after_write(
+    process: &mut Process,
+    store: &mut Persist,
+    id: &AgentId,
+    call: agent_run_adapters::native_owner_v2::Call,
+    input: String,
+    token: String,
+) -> Result<(agent_run_adapters::native_owner_v2::Call, String, String)> {
+    if let Err(error) = process
+        .observing(store.worker_turn(id, false, crate::domain::now()))
+        .await
+    {
+        let reply = crate::native_owner::finish_v2(
+            process,
+            store,
+            &call.request,
+            &token,
+            "unknown",
+            None,
+            None,
+            Some("native_uncertain"),
+        )
+        .await;
+        call.answer(reply);
+        return Err(error);
+    }
+    Ok((call, input, token))
+}
+
+/// Persist deadline uncertainty before answering the original owner call.
+pub(crate) async fn owner_v2_expire(
+    process: &mut Process,
+    store: &mut Persist,
+    call: agent_run_adapters::native_owner_v2::Call,
+    token: &str,
+) {
+    let reply = crate::native_owner::finish_v2(
+        process,
+        store,
+        &call.request,
+        token,
+        "unknown",
+        None,
+        None,
+        Some("native_uncertain"),
+    )
+    .await;
+    call.answer(reply);
+}
+
 /// Selection evidence for one terminal frame, independent of answer contents.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResultScope {
@@ -575,12 +636,297 @@ pub async fn run(
     logical_record: &Record,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
+    run_inner(process, store, record, logical_record, initial_input, None).await
+}
+
+/// Managed entry point after the selector pins the Pool/worker executables.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn run_managed(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    initial_input: Option<&str>,
+    selection: &agent_run_adapters::managed_role::Selection,
+    config_digest: &str,
+    launch_args: &[String],
+    catalogs: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    catalog_sha256: &str,
+) -> Result<EngineResult> {
+    run_inner(
+        process,
+        store,
+        record,
+        logical_record,
+        initial_input,
+        Some((
+            selection,
+            config_digest,
+            launch_args,
+            catalogs,
+            catalog_sha256,
+        )),
+    )
+    .await
+}
+
+/// Await the first native init after initial input but before qualification or
+/// owner handoff. Claude Code 2.1.311 first acknowledges the identified input
+/// with `command_lifecycle` frames, `queued` then `started`; only those, for
+/// exactly this input and session, may precede `system/init`. They carry no
+/// tool or authority and the main loop ignores them. Any other frame or
+/// mismatch closes stdin and refuses the managed run.
+async fn managed_initial_inventory(
+    process: &mut Process,
+    allowed: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    expected_session: &str,
+    input_id: &str,
+) -> Result<Event> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut acknowledgements = ["queued", "started"].into_iter().peekable();
+    loop {
+        let event = tokio::time::timeout_at(deadline, process.next()).await;
+        match event {
+            Ok(Event::Json(frame)) => {
+                if frame.get("session_id").and_then(Value::as_str) != Some(expected_session) {
+                    process.input.take();
+                    return Err(invalid("native managed session did not verify"));
+                }
+                if frame.get("type").and_then(Value::as_str) == Some("command_lifecycle")
+                    && frame.get("command_uuid").and_then(Value::as_str) == Some(input_id)
+                    && acknowledgements
+                        .next_if(|state| frame.get("state").and_then(Value::as_str) == Some(state))
+                        .is_some()
+                {
+                    continue;
+                }
+                if let Err(error) =
+                    agent_run_adapters::managed_role::verify_claude_inventory(&frame, allowed)
+                {
+                    process.input.take();
+                    return Err(error);
+                }
+                return Ok(Event::Json(frame));
+            }
+            Ok(Event::OwnershipFailure(error)) => {
+                process.input.take();
+                return Err(error);
+            }
+            _ => {
+                process.input.take();
+                return Err(invalid("native managed inventory did not verify"));
+            }
+        }
+    }
+}
+
+/// Pin the exact no-tool controls and the native session selected at exec.
+/// Returns the native session and the verified deny argument.
+fn managed_claude_session(
+    args: &[String],
+    selection: &agent_run_adapters::managed_role::Selection,
+    catalogs: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> Result<(String, String)> {
+    let invalid_args = || invalid("native managed launch controls did not verify");
+    let value = |flag: &str| -> Result<&str> {
+        let mut matches = args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.as_str() == flag);
+        let (index, _) = matches.next().ok_or_else(invalid_args)?;
+        if matches.next().is_some() || args.iter().any(|arg| arg.starts_with(&format!("{flag}="))) {
+            return Err(invalid_args());
+        }
+        args.get(index + 1)
+            .map(String::as_str)
+            .ok_or_else(invalid_args)
+    };
+    let expected = agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory)?;
+    for flag in ["--tools", "--allowedTools"] {
+        let index = expected
+            .iter()
+            .position(|arg| arg == flag)
+            .ok_or_else(invalid_args)?;
+        if value(flag)? != expected[index + 1] {
+            return Err(invalid_args());
+        }
+    }
+    let denied =
+        agent_run_adapters::managed_role::claude_disallowed_tools(&selection.inventory, catalogs)?;
+    if value("--disallowedTools")? != denied {
+        return Err(invalid_args());
+    }
+    if !value("--setting-sources")?.is_empty()
+        || !std::path::Path::new(value("--mcp-config")?).is_absolute()
+        || [
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-chrome",
+        ]
+        .iter()
+        .any(|flag| args.iter().filter(|arg| arg.as_str() == *flag).count() != 1)
+        || args.iter().any(|arg| {
+            matches!(arg.as_str(), "--bare" | "--safe-mode" | "--plugin-dir")
+                || arg.starts_with("--plugin-dir=")
+                || arg.starts_with("--bare=")
+                || arg.starts_with("--safe-mode=")
+                || arg.starts_with("--resume=")
+                || arg.starts_with("--session-id=")
+                || arg.starts_with("--strict-mcp-config=")
+                || arg.starts_with("--disable-slash-commands=")
+                || arg.starts_with("--no-chrome=")
+        })
+    {
+        return Err(invalid_args());
+    }
+    let selected = match (
+        args.iter().any(|arg| arg == "--session-id"),
+        args.iter().any(|arg| arg == "--resume"),
+    ) {
+        (true, false) => value("--session-id")?,
+        (false, true) => value("--resume")?,
+        _ => return Err(invalid_args()),
+    };
+    let session = if std::path::Path::new(selected).is_absolute() {
+        std::path::Path::new(selected)
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .ok_or_else(invalid_args)?
+    } else {
+        selected
+    };
+    agent_run_domain::attempt_binding::validate_id(session)?;
+    Ok((session.to_owned(), denied))
+}
+
+/// Bare control frames do not submit a model prompt or alter native hooks.
+async fn managed_claude_control(
+    process: &mut Process,
+    subtype: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let frame = json!({"type":"control_request","request_id":id,"request":{"subtype":subtype}});
+    let result = async {
+        process.text(&format!("{frame}\n")).await?;
+        match process.next().await {
+            Event::Json(reply)
+                if reply.get("type").and_then(Value::as_str) == Some("control_response")
+                    && reply.pointer("/response/subtype").and_then(Value::as_str)
+                        == Some("success")
+                    && reply
+                        .pointer("/response/request_id")
+                        .and_then(Value::as_str)
+                        == Some(id.as_str())
+                    && reply
+                        .pointer("/response/response")
+                        .is_some_and(Value::is_object) =>
+            {
+                Ok(reply)
+            }
+            Event::OwnershipFailure(error) => Err(error),
+            _ => Err(invalid("native managed control response did not verify")),
+        }
+    };
+    match tokio::time::timeout_at(deadline, result).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(error)) => {
+            process.input.take();
+            Err(error)
+        }
+        Err(_) => {
+            process.input.take();
+            Err(invalid("native managed control response timed out"))
+        }
+    }
+}
+
+/// Claude Code 2.1.311 connects MCP servers asynchronously: an `mcp_status`
+/// sent right after `initialize` reports them `pending`. Repeat the bare
+/// control within the same setup deadline until no server is pending, and
+/// return that reply for the caller's single exact verification.
+async fn managed_claude_status_settled(
+    process: &mut Process,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    loop {
+        let status = managed_claude_control(process, "mcp_status", deadline).await?;
+        let pending = status
+            .pointer("/response/response/mcpServers")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| servers.iter().any(|s| s["status"] == "pending"));
+        if !pending {
+            return Ok(status);
+        }
+        if tokio::time::Instant::now() + Duration::from_millis(250) >= deadline {
+            process.input.take();
+            return Err(invalid("native managed MCP servers did not connect"));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+type ManagedClaudeInputs<'a> = (
+    &'a agent_run_adapters::managed_role::Selection,
+    &'a str,
+    &'a [String],
+    &'a std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    &'a str,
+);
+
+async fn run_inner(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    initial_input: Option<&str>,
+    managed: Option<ManagedClaudeInputs<'_>>,
+) -> Result<EngineResult> {
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
         || record.identity != logical_record.identity
     {
         return Err(invalid("native input and logical authority do not match"));
     }
+    let managed_preflight = if let Some((
+        selection,
+        config_digest,
+        args,
+        catalogs,
+        catalog_sha256,
+    )) = managed
+    {
+        let preflight = async {
+            if initial_input.is_none() { return Err(invalid("native managed input unavailable")); }
+            let (expected_session, disallowed) = managed_claude_session(args,selection,catalogs)?;
+            if record.resume_of_runtime_session_id.as_ref().is_some_and(|id| id != &expected_session) {
+                return Err(invalid("native managed session did not verify"));
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let initialize = managed_claude_control(process,"initialize",deadline).await?;
+            let status = managed_claude_status_settled(process,deadline).await?;
+            let reported = agent_run_adapters::managed_role::verify_claude_control_inventory(&initialize,&status,&selection.inventory,catalogs,catalog_sha256,&disallowed)?;
+            let evidence = json!({
+                "initialize_sha256":agent_run_domain::canonical::sha256_hex(&initialize,true),
+                "mcp_status_sha256":agent_run_domain::canonical::sha256_hex(&status,true),
+                "agents_sha256":agent_run_domain::canonical::sha256_hex(&initialize["response"]["response"]["agents"],true),
+                "native_tools":"empty",
+                "mcp_catalog_sha256":catalog_sha256,
+                "mcp_status_tools":reported,
+            });
+            Ok::<_,crate::Error>((selection,config_digest,expected_session,evidence))
+        }.await;
+        match preflight {
+            Ok(value) => Some(value),
+            Err(error) => {
+                process.input.take();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let mut managed_init = None;
     let mut inputs = ResultInputs::default();
     let mut initial_input_id = None;
     if let Some(input) = initial_input {
@@ -629,11 +975,49 @@ pub async fn run(
             inputs.sent(id, true);
         } else {
             // Historical text fixtures remain one-shot; they provide no correlation.
+            if managed_preflight.is_some() {
+                process.input.take();
+                return Err(invalid("native managed input is malformed"));
+            }
             inputs.unframed_initial = true;
             process.text(input).await?;
         }
     } else {
         process.input.take();
+    }
+    if let Some((selection, config_digest, expected_session, mut evidence)) = managed_preflight {
+        let Some(input_id) = initial_input_id.as_deref() else {
+            process.input.take();
+            return Err(invalid("native managed input unavailable"));
+        };
+        let event =
+            managed_initial_inventory(process, &selection.inventory, &expected_session, input_id)
+                .await?;
+        let Event::Json(frame) = &event else {
+            unreachable!("managed inventory is JSON")
+        };
+        evidence["system_init_sha256"] =
+            json!(agent_run_domain::canonical::sha256_hex(frame, true));
+        let inventory_digest = agent_run_domain::canonical::sha256_hex(&evidence, true);
+        // Names only: which accepted shape each server's raw list had.
+        process
+            .observing(store.event(
+                &record.id,
+                "managed_native_drift_v1",
+                &json!({"harness":"claude-code","mcp_catalog_sha256":evidence["mcp_catalog_sha256"],"mcp_status_tools":evidence["mcp_status_tools"]}),
+            ))
+            .await?;
+        crate::managed_qualification::record(
+            process,
+            store,
+            record,
+            selection,
+            "claude-code",
+            config_digest.to_owned(),
+            inventory_digest,
+        )
+        .await?;
+        managed_init = Some(event);
     }
     process
         .observing(store.event(
@@ -663,12 +1047,24 @@ pub async fn run(
     let mut message_id: Option<String> = None;
     let mut fallback_messages: u64 = 0;
     let mut native_owner = process.native_owner.take();
+    let mut native_owner_v2 = process.native_owner_v2.take();
     let mut native_calls = agent_run_adapters::native_owner::Calls::default();
     let mut native_pending: Option<(agent_run_adapters::native_owner::Call, String)> = None;
+    let mut native_pending_v2: Option<(agent_run_adapters::native_owner_v2::Call, String, String)> =
+        None;
     let mut native_idle = false;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if native_pending_v2
+            .as_ref()
+            .is_some_and(|(call, _, _)| tokio::time::Instant::now() >= call.deadline)
+        {
+            let (call, _, token) = native_pending_v2.take().expect("checked pending input");
+            owner_v2_expire(process, store, call, &token).await;
+            native_owner_v2.take();
+            return Err(invalid("native owner input acknowledgement is uncertain"));
+        }
         if native_pending
             .as_ref()
             .is_some_and(|(call, _)| tokio::time::Instant::now() >= call.deadline)
@@ -701,27 +1097,52 @@ pub async fn run(
                 }
             }
         }
-        let event = tokio::select! {
-            biased;
-            call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
-                use agent_run_adapters::native_owner::Reply;
-                let id=call.request.call_id.clone();
-                if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
-                let refusal=crate::native_owner::refusal(process,store,logical_record,&call,session.as_deref(),native_idle && native_pending.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
-                if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
-                let input_id=uuid::Uuid::new_v4().to_string();
-                if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
-                    let reply=Reply::unknown(&id);native_calls.finish(reply.clone());call.answer(reply);native_owner.take();
-                    return Err(invalid("native owner input write is uncertain"));
+        let event = if managed_init.is_some() {
+            managed_init.take()
+        } else {
+            tokio::select! {
+                biased;
+                call = agent_run_adapters::native_owner_v2::Owner::receive(&mut native_owner_v2) => {
+                    if call.stale {let reply=crate::native_owner::stale_v2(process,store,logical_record,&call.request,session.as_deref()).await;call.answer(reply);continue;}
+                    let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.transport,session.as_deref(),native_idle && native_pending.is_none() && native_pending_v2.is_none(),closing_at.is_some()).await;
+                    let token = match prepared {
+                        crate::native_owner::PreparedV2::Reply(reply) => {call.answer(reply);continue;}
+                        crate::native_owner::PreparedV2::Invoke(token) => token,
+                    };
+                    let input_id=uuid::Uuid::new_v4().to_string();
+                    if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
+                        let reply=crate::native_owner::finish_v2(process,store,&call.request,&token,"unknown",None,None,Some("native_uncertain")).await;
+                        call.answer(reply);native_owner_v2.take();
+                        return Err(invalid("native owner input write is uncertain"));
+                    }
+                    inputs.sent(input_id.clone(),false);
+                    native_idle=false;
+                    match owner_v2_after_write(process,store,&record.id,call,input_id,token).await {
+                        Ok(pending) => native_pending_v2=Some(pending),
+                        Err(error) => {native_owner_v2.take();return Err(error);}
+                    }
+                    continue;
                 }
-                inputs.sent(input_id.clone(),false);
-                native_idle=false;
-                process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
-                native_pending=Some((call,input_id));
-                continue;
+                call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
+                    use agent_run_adapters::native_owner::Reply;
+                    let id=call.request.call_id.clone();
+                    if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
+                    let refusal=crate::native_owner::refusal(process,store,logical_record,&call,session.as_deref(),native_idle && native_pending.is_none() && native_pending_v2.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
+                    if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
+                    let input_id=uuid::Uuid::new_v4().to_string();
+                    if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
+                        let reply=Reply::unknown(&id);native_calls.finish(reply.clone());call.answer(reply);native_owner.take();
+                        return Err(invalid("native owner input write is uncertain"));
+                    }
+                    inputs.sent(input_id.clone(),false);
+                    native_idle=false;
+                    process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
+                    native_pending=Some((call,input_id));
+                    continue;
+                }
+                event = process.next() => Some(event),
+                _ = tick.tick() => None,
             }
-            event = process.next() => Some(event),
-            _ = tick.tick() => None,
         };
         // Journal rows wait at most one flush age while frames keep arriving and
         // are written at once when the engine goes quiet.
@@ -1333,6 +1754,30 @@ pub async fn run(
                 }
             }
             Some("user") => {
+                if native_pending_v2.as_ref().is_some_and(|(call, input, _)| {
+                    is_owner_v2_ack(&v, &call.request.thread_id, input, call.deadline)
+                }) {
+                    let (call, input, token) = native_pending_v2
+                        .take()
+                        .expect("checked native replay ownership");
+                    let reply = crate::native_owner::finish_v2(
+                        process,
+                        store,
+                        &call.request,
+                        &token,
+                        "accepted",
+                        Some("claude_input"),
+                        Some(&input),
+                        None,
+                    )
+                    .await;
+                    let unknown = reply.state == "unknown";
+                    call.answer(reply);
+                    if unknown {
+                        native_owner_v2.take();
+                        return Err(invalid("native owner input outcome is uncertain"));
+                    }
+                }
                 if native_pending.as_ref().is_some_and(|(call, input)| {
                     tokio::time::Instant::now() < call.deadline
                         && v.get("isReplay").and_then(Value::as_bool) == Some(true)
@@ -1573,6 +2018,595 @@ mod tests {
     use super::{native_result_metadata, result_failure_kind, result_text, runtime_result_usage};
     use serde_json::json;
 
+    /// Controls precede the task; the native init arrives after it as a tripwire.
+    #[tokio::test]
+    async fn managed_claude_controls_precede_input_and_init_tripwire() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let allowed = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
+        // Claude 2.1.311 acknowledges the identified input before init; only
+        // this input's ordered queued/started frames may precede it.
+        for (tool, lifecycle, accepted) in [
+            ("mcp__pool__pool_get", "", true),
+            ("mcp__pool__pool_get", "input:queued,input:started", true),
+            ("mcp__pool__pool_get", "input:started", false),
+            ("mcp__pool__pool_get", "foreign:queued", false),
+            ("mcp__pool__pool_get", "input:started,input:queued", false),
+            ("mcp__pool__pool_get", "input:queued,input:queued", false),
+            ("mcp__pool__pool_get", "input:completed", false),
+            ("Bash", "", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = format!(
+                r#"import json,sys
+for expected in ['initialize','mcp_status']:
+    request=json.loads(sys.stdin.readline())
+    assert request['request']=={{'subtype':expected}}
+    body={{'commands':[],'agents':[{{'name':'Explore'}}]}} if expected=='initialize' else {{'mcpServers':[{{'name':'pool','status':'connected'}}]}}
+    print(json.dumps({{'type':'control_response','response':{{'subtype':'success','request_id':request['request_id'],'response':body}}}}),flush=True)
+assert json.loads(sys.stdin.readline())['type']=='user'
+open('received','w').write('input')
+for item in [x for x in '{lifecycle}'.split(',') if x]:
+    command,state=item.split(':')
+    print(json.dumps({{'type':'command_lifecycle','command_uuid':command,'state':state,'session_id':'session'}}),flush=True)
+print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tools':['{tool}']}}),flush=True)
+"#
+            );
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/usr/bin/python3".into(),
+                args: vec!["-u".into(), "-c".into(), script],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let init = super::managed_claude_control(&mut process, "initialize", deadline)
+                .await
+                .unwrap();
+            let status = super::managed_claude_control(&mut process, "mcp_status", deadline)
+                .await
+                .unwrap();
+            let catalogs = allowed.clone();
+            agent_run_adapters::managed_role::verify_claude_control_inventory(
+                &init,
+                &status,
+                &allowed,
+                &catalogs,
+                &agent_run_adapters::managed_role::claude_catalog_digest(&catalogs).unwrap(),
+                &agent_run_adapters::managed_role::claude_disallowed_tools(&allowed, &catalogs)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!dir.path().join("received").exists());
+            process
+                .text("{\"type\":\"user\",\"uuid\":\"input\"}\n")
+                .await
+                .unwrap();
+            let result =
+                super::managed_initial_inventory(&mut process, &allowed, "session", "input").await;
+            assert_eq!(result.is_ok(), accepted, "{tool} {lifecycle}");
+            assert!(dir.path().join("received").exists());
+            if !accepted {
+                assert!(process.input.is_none());
+            }
+            process.input.take();
+            assert_eq!(process.reap().await, Some(0));
+        }
+    }
+
+    /// Live probe of the real managed Claude launch (see `managed_live_probe`):
+    /// Run's argv shape for the frozen role, the real Pool catalog discovery and
+    /// deny check, then exactly the runner's pre-input preflight and the
+    /// `system/init` tripwire against the installed harness. The one user frame
+    /// cannot leave the host: `ANTHROPIC_BASE_URL` is a refused loopback port.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live harness probe; requires AGENT_RUN_LIVE_MANAGED_PROBE"]
+    async fn live_managed_claude_qualifies_before_model_input() {
+        use agent_run_adapters::managed_role as managed;
+        use std::collections::BTreeMap;
+        let Some(live) = crate::managed_live_probe::load("claude") else {
+            return;
+        };
+        let (launch_dir, scratch) = (live.path("launch_dir"), live.path("scratch"));
+        let launch: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(launch_dir.join("provider-launch.json")).unwrap(),
+        )
+        .unwrap();
+        let model = launch["native_model"].as_str().unwrap().to_owned();
+        // Run's generated MCP config and settings; only the worker command is
+        // replaced by the build under test.
+        let mut mcp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(launch_dir.join("mcp/mcp-config.json")).unwrap())
+                .unwrap();
+        mcp["mcpServers"][agent_run_domain::worker::SERVER_NAME]["command"] =
+            live.section["worker"].clone();
+        for dir in ["mcp", "config", "work"] {
+            std::fs::create_dir_all(scratch.join(dir)).unwrap();
+        }
+        std::fs::write(
+            scratch.join("mcp/mcp-config.json"),
+            serde_json::to_vec(&mcp).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            launch_dir.join("settings.json"),
+            scratch.join("settings.json"),
+        )
+        .unwrap();
+        // The managed shape of `provider::claude_args`.
+        let mut args: Vec<String> = [
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--replay-user-messages",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            &model,
+            "--permission-mode",
+            "default",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--settings",
+            scratch.join("settings.json").to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        args.extend(
+            managed::claude_tool_arguments(&live.selection.inventory)
+                .unwrap()
+                .into_iter()
+                .filter(|arg| arg != "--strict-mcp-config"),
+        );
+        args.extend([
+            "--mcp-config".into(),
+            scratch.join("mcp/mcp-config.json").to_string_lossy().into(),
+        ]);
+        if let Some(effort) = &live.request.effort {
+            args.extend(["--effort".into(), effort.clone()]);
+        }
+        args.extend([
+            "--append-system-prompt".into(),
+            live.role.prompt.clone(),
+            "--session-id".into(),
+            uuid::Uuid::new_v4().to_string(),
+        ]);
+        let mut environment = BTreeMap::from([
+            ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
+            ("HOME".into(), scratch.to_string_lossy().into()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                scratch.join("config").to_string_lossy().into(),
+            ),
+            ("ANTHROPIC_BASE_URL".into(), "http://127.0.0.1:9".into()),
+            (
+                "ANTHROPIC_API_KEY".into(),
+                "live-probe-no-model-call".into(),
+            ),
+            ("DISABLE_TELEMETRY".into(), "1".into()),
+            ("DISABLE_AUTOUPDATER".into(), "1".into()),
+            (
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
+                "1".into(),
+            ),
+        ]);
+        environment.extend(live.worker_environment());
+        let harness = live.identity.authority.harness;
+        let mut plan = agent_run_adapters::provider::ProviderLaunchPlan {
+            launch: agent_run_adapters::LaunchPlan {
+                binary: live.config.harnesses[&harness].binary.clone(),
+                args,
+                cwd: scratch.join("work"),
+                environment,
+                initial_input: None,
+            },
+            native_model: model.clone(),
+            role: live.role.clone(),
+            runtime: agent_run_adapters::provider::runtime(&live.config, harness, &model).unwrap(),
+            profile: agent_run_adapters::provider::profile(&live.role),
+        };
+        // The supervisor's discovery and deny check.
+        let catalogs = agent_run_adapters::mcp_catalog::apply_claude_tool_filters(
+            &mut plan,
+            |_| -> agent_run_adapters::io::PersistFuture { Box::pin(async { Ok(()) }) },
+        )
+        .await
+        .unwrap();
+        let expected = managed::claude_disallowed_tools(&live.selection.inventory, &catalogs);
+        let deny = plan
+            .launch
+            .args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .map(|index| plan.launch.args[index + 1].clone());
+        let catalog_sha256 = managed::claude_catalog_digest(&catalogs).unwrap();
+        // The runner's preflight, in order.
+        let mut process = agent_run_adapters::io::Process::spawn(&plan.launch).unwrap();
+        let session = super::managed_claude_session(&plan.launch.args, &live.selection, &catalogs);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let initialize = super::managed_claude_control(&mut process, "initialize", deadline).await;
+        let status = super::managed_claude_status_settled(&mut process, deadline).await;
+        let reported = match (&initialize, &status, &session) {
+            (Ok(initialize), Ok(status), Ok((_, disallowed))) => {
+                Some(managed::verify_claude_control_inventory(
+                    initialize,
+                    status,
+                    &live.selection.inventory,
+                    &catalogs,
+                    &catalog_sha256,
+                    disallowed,
+                ))
+            }
+            _ => None,
+        };
+        let mut init = None;
+        if let (Some(Ok(_)), Ok((session, _))) = (&reported, &session) {
+            let input = json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":[{"type":"text","text":"live probe"}]}});
+            process.text(&format!("{input}\n")).await.unwrap();
+            init = Some(
+                super::managed_initial_inventory(
+                    &mut process,
+                    &live.selection.inventory,
+                    session,
+                    input["uuid"].as_str().unwrap(),
+                )
+                .await,
+            );
+        }
+        process.input.take();
+        let _ = process
+            .owner
+            .cleanup(std::time::Duration::from_secs(2))
+            .await;
+        process.reap().await;
+        fn error<T>(result: &Result<T, crate::Error>) -> Option<String> {
+            result.as_ref().err().map(|e| e.to_string())
+        }
+        let init_frame = init.as_ref().and_then(|result| match result {
+            Ok(super::Event::Json(frame)) => Some(frame.clone()),
+            _ => None,
+        });
+        live.write_evidence(&json!({
+            "harness": "claude-code",
+            "agent_id": live.section["agent_id"],
+            "selection_inventory": live.selection.inventory,
+            "role_digest": live.selection.role_digest,
+            "discovered_catalogs": catalogs,
+            "catalog_sha256": catalog_sha256,
+            "argv": plan.launch.args,
+            "deny_argument_matches_supervisor": expected.as_ref().ok() == deny.as_ref(),
+            "session": error(&session),
+            "initialize": initialize.as_ref().ok(),
+            "initialize_error": error(&initialize),
+            "mcp_status": status.as_ref().ok(),
+            "mcp_status_error": error(&status),
+            "control_inventory": reported.as_ref().map(|r| r.as_ref().ok().cloned()),
+            "control_inventory_error": reported.as_ref().and_then(|r| r.as_ref().err().map(|e| e.to_string())),
+            "system_init": init_frame,
+            "system_init_error": init.as_ref().and_then(|r| r.as_ref().err().map(|e| e.to_string())),
+        }));
+        assert_eq!(expected.ok(), deny, "supervisor deny check");
+        session.unwrap();
+        initialize.unwrap();
+        status.unwrap();
+        reported.expect("control inventory verified").unwrap();
+        init.expect("system/init tripwire reached").unwrap();
+    }
+
+    /// The real Claude 2.1.311 frames after an identified input (captured by
+    /// the live probe) pass the tripwire; another input's frames do not.
+    #[tokio::test]
+    async fn managed_claude_tripwire_accepts_real_input_acknowledgements() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let lifecycle: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/managed-native/claude-2.1.311-input-lifecycle.json"
+        ))
+        .unwrap();
+        let init: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/managed-native/claude-2.1.311-system-init.json"
+        ))
+        .unwrap();
+        let mut allowed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for tool in init["tools"].as_array().unwrap() {
+            let (server, name) = tool
+                .as_str()
+                .unwrap()
+                .strip_prefix("mcp__")
+                .unwrap()
+                .split_once("__")
+                .unwrap();
+            allowed
+                .entry(server.into())
+                .or_default()
+                .insert(name.into());
+        }
+        let session = init["session_id"].as_str().unwrap();
+        let input = lifecycle[0]["command_uuid"].as_str().unwrap();
+        for (input_id, accepted) in [(input, true), ("another-input", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let lines: Vec<String> = lifecycle
+                .iter()
+                .chain([&init])
+                .map(|frame| frame.to_string())
+                .collect();
+            std::fs::write(dir.path().join("frames"), lines.join("\n") + "\n").unwrap();
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/bin/sh".into(),
+                args: vec!["-c".into(), "read line; cat frames; read line".into()],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            process.text("{\"type\":\"user\"}\n").await.unwrap();
+            let result =
+                super::managed_initial_inventory(&mut process, &allowed, session, input_id).await;
+            assert_eq!(result.is_ok(), accepted);
+            process.input.take();
+            process.reap().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_claude_rejects_unsolicited_or_mismatched_control_before_input() {
+        use std::collections::BTreeMap;
+        for frame in [
+            r#"{"type":"control_request","request_id":"foreign","request":{"subtype":"permission"}}"#,
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"wrong","response":{}}}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = format!(
+                "read line; printf '%s\\n' '{}'; if read line; then touch sent; fi",
+                frame
+            );
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            assert!(
+                super::managed_claude_control(&mut process, "initialize", deadline)
+                    .await
+                    .is_err()
+            );
+            assert!(process.input.is_none());
+            assert_eq!(process.reap().await, Some(0));
+            assert!(!dir.path().join("sent").exists());
+        }
+    }
+
+    #[test]
+    fn managed_claude_argv_pins_session_and_no_native_tools() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let selection = agent_run_adapters::managed_role::Selection {
+            host_id: "host".into(),
+            role_digest: "a".repeat(64),
+            inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+            codex: None,
+        };
+        let mut args =
+            agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory).unwrap();
+        let catalogs = BTreeMap::from([(
+            "pool".into(),
+            BTreeSet::from(["pool_get".into(), "pool_start_batch".into()]),
+        )]);
+        let denied = agent_run_adapters::managed_role::claude_disallowed_tools(
+            &selection.inventory,
+            &catalogs,
+        )
+        .unwrap();
+        let index = args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .unwrap()
+            + 1;
+        args[index] = denied.clone();
+        args.extend([
+            "--setting-sources".into(),
+            "".into(),
+            "--mcp-config".into(),
+            "/fixture".into(),
+            "--session-id".into(),
+            "native-session".into(),
+        ]);
+        assert_eq!(
+            super::managed_claude_session(&args, &selection, &catalogs).unwrap(),
+            ("native-session".to_owned(), denied)
+        );
+        let mut unsafe_args = args.clone();
+        unsafe_args.push("--tools=Bash".into());
+        assert!(super::managed_claude_session(&unsafe_args, &selection, &catalogs).is_err());
+        unsafe_args = args.clone();
+        unsafe_args.push("--bare".into());
+        assert!(super::managed_claude_session(&unsafe_args, &selection, &catalogs).is_err());
+        unsafe_args = args.clone();
+        unsafe_args[index] = agent_run_adapters::managed_role::CLAUDE_DISALLOWED_TOOLS.into();
+        assert!(super::managed_claude_session(&unsafe_args, &selection, &catalogs).is_err());
+    }
+
+    /// Exercise the actual managed runner and writer against a fake CLI that
+    /// emits init only after user input. No external provider is contacted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_claude_runner_qualifies_only_after_control_and_init_tripwire() {
+        use agent_run_domain::{attempt_binding::Incarnation, domain::AgentId};
+        use std::collections::{BTreeMap, BTreeSet};
+        for mode in [
+            "ok",
+            "pending",
+            "lifecycle",
+            "bad-lifecycle",
+            "catalog",
+            "bad-status",
+            "bad-init",
+            "bad-extra",
+            "bad-digest",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().canonicalize().unwrap();
+            let script = r#"import json,sys,time
+mode=sys.argv[1]
+names=['initialize']+['mcp_status']*(3 if mode=='pending' else 1)
+for index,name in enumerate(names):
+    req=json.loads(sys.stdin.readline())
+    status='failed' if mode=='bad-status' else 'pending' if index<len(names)-1 else 'connected'
+    body={'commands':[],'agents':[{'name':'Explore'}]} if name=='initialize' else {'mcpServers':[{'name':'pool','status':status}]}
+    if name=='mcp_status' and mode in ('catalog','bad-extra','bad-digest'):
+        tools=['pool_get','pool_start_batch']+(['pool_start_agent'] if mode=='bad-extra' else [])
+        body['mcpServers'][0]['tools']=[{'name':tool} for tool in tools]
+    print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':req['request_id'],'response':body}}),flush=True)
+line=sys.stdin.readline()
+if line:
+    open('model-input','w').write('received')
+    if mode in ('lifecycle','bad-lifecycle'):
+        command=json.loads(line)['uuid'] if mode=='lifecycle' else 'foreign'
+        for state in ['queued','started']:
+            print(json.dumps({'type':'command_lifecycle','command_uuid':command,'state':state,'session_id':'native'}),flush=True)
+    tool='Bash' if mode=='bad-init' else 'mcp__pool__pool_get'
+    print(json.dumps({'type':'system','subtype':'init','session_id':'native','tools':[tool]}),flush=True)
+    print(json.dumps({'type':'result','subtype':'error_during_execution','is_error':True,'session_id':'native','result':'synthetic'}),flush=True)
+    time.sleep(1)
+"#;
+            let selection = agent_run_adapters::managed_role::Selection {
+                host_id: "host".into(),
+                role_digest: "b".repeat(64),
+                inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+                codex: None,
+            };
+            // As discovered from a real Pool: the deny complement is not empty.
+            let catalogs = BTreeMap::from([(
+                "pool".into(),
+                BTreeSet::from(["pool_get".into(), "pool_start_batch".into()]),
+            )]);
+            let digest = if mode == "bad-digest" {
+                "0".repeat(64)
+            } else {
+                agent_run_adapters::managed_role::claude_catalog_digest(&catalogs).unwrap()
+            };
+            let mut args: Vec<String> = vec!["-u".into(), "-c".into(), script.into(), mode.into()];
+            args.extend(
+                agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory)
+                    .unwrap(),
+            );
+            let deny = args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .unwrap()
+                + 1;
+            args[deny] = agent_run_adapters::managed_role::claude_disallowed_tools(
+                &selection.inventory,
+                &catalogs,
+            )
+            .unwrap();
+            args.extend([
+                "--setting-sources".into(),
+                "".into(),
+                "--mcp-config".into(),
+                "/fixture".into(),
+                "--session-id".into(),
+                "native".into(),
+            ]);
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/usr/bin/python3".into(),
+                args: args.clone(),
+                cwd: root.clone(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let leader = process.owner.leader.as_ref().unwrap().clone();
+            let kernel = agent_run_platform::process::kernel_incarnation(&leader).unwrap();
+            let incarnation = Incarnation {
+                host_id: "host".into(),
+                boot_id: kernel.boot_id,
+                pid_namespace_inode: kernel.pid_namespace_inode,
+                uid: kernel.uid,
+                pid: kernel.pid,
+                start_ticks: kernel.start_ticks,
+            };
+            let mut db = agent_run_store::fixture::initialize(&root).unwrap();
+            let id = AgentId::new();
+            let attempt = format!("{}:1", id.as_str());
+            let launch = uuid::Uuid::new_v4().to_string();
+            let request:crate::domain::StartRequest = serde_json::from_value(json!({"runtime":"fixture","model":"model","profile":"managed","task":"task","workdir":root,"explicit_finish":true})).unwrap();
+            let identity = json!({"provider_identity_version":2,"provider_config":{"managed_attempt_binding":{"enabled":true,"role_name":"managed","host_id":"host"}},"authority":{"profile":"managed","harness":"claude-code","role_payload":{"config_revision":"b".repeat(64)}}});
+            db.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,sequence,identity_json) VALUES(?,'fixture','model','managed','task','task',?,?,'running',1,'cfg',?,1,?)",rusqlite::params![id.as_str(),root.to_string_lossy(),serde_json::to_string(&request).unwrap(),id.as_str(),identity.to_string()]).unwrap();
+            db.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active,process_identity,process_birth_time) VALUES(?,?,1,'running','{}',1,'spawning',1,?,?)",rusqlite::params![attempt,id.as_str(),leader.token,leader.birth]).unwrap();
+            db.conn.execute("INSERT INTO worker_capabilities(attempt_id,token_sha256,created_at) VALUES(?,?,1)",rusqlite::params![attempt,"f".repeat(64)]).unwrap();
+            db.conn.execute("INSERT INTO worker_lifecycle(attempt_id,phase,transition_at) VALUES(?,'running',1)",[&attempt]).unwrap();
+            db.conn.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) VALUES(?,?,1,?,?,'bound',?,?,?,?,?)",rusqlite::params![attempt,id.as_str(),attempt,launch,incarnation.boot_id,incarnation.pid_namespace_inode,incarnation.uid,incarnation.pid,incarnation.start_ticks]).unwrap();
+            let record = db.get(&id).unwrap();
+            let prep = crate::writer_test_harness::prepare_supervisor(&mut db, &id);
+            drop(db);
+            let writer = crate::writer_test_harness::Harness::start(&root);
+            let mut persist = writer.supervisor(&root, prep, &id).await;
+            let input = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"task"}]}}).to_string();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                super::run_managed(
+                    &mut process,
+                    &mut persist,
+                    &record,
+                    &record,
+                    Some(&input),
+                    &selection,
+                    &"c".repeat(64),
+                    &args,
+                    &catalogs,
+                    &digest,
+                ),
+            )
+            .await
+            .unwrap();
+            let accepted = matches!(mode, "ok" | "pending" | "lifecycle" | "catalog");
+            assert_eq!(result.is_ok(), accepted, "{mode}");
+            assert_eq!(
+                root.join("model-input").exists(),
+                accepted || matches!(mode, "bad-init" | "bad-lifecycle"),
+                "{mode}"
+            );
+            let drift: Option<String> = persist
+                .conn
+                .query_row(
+                    "SELECT data_json FROM events WHERE agent_id=? AND kind='managed_native_drift_v1'",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )
+                .ok();
+            assert_eq!(
+                drift.map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap()["mcp_status_tools"]["pool"].clone()),
+                accepted.then(|| json!(if mode == "catalog" { "catalog" } else { "omitted" })),
+                "{mode}"
+            );
+            let qualified: bool = persist
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attempt_role_qualifications WHERE attempt_id=?)",
+                    [&attempt],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(qualified, accepted, "{mode}");
+            if !accepted {
+                assert!(process.input.is_none());
+            }
+            let _ = process
+                .owner
+                .cleanup(std::time::Duration::from_secs(2))
+                .await;
+            process.reap().await;
+        }
+    }
+
     /// A resume is acknowledged only by the matching native session and input.
     #[test]
     fn resume_ack_requires_matching_native_replay() {
@@ -1583,6 +2617,44 @@ mod tests {
         let mut missing = frame;
         missing["isReplay"] = json!(false);
         assert!(!super::is_resume_ack(&missing, "session", "input"));
+    }
+
+    #[test]
+    fn claude_owner_v2_requires_exact_replay_session_uuid_and_deadline() {
+        let now = tokio::time::Instant::now();
+        let frame = json!({"type":"user","isReplay":true,"uuid":"input","session_id":"session"});
+        assert!(super::is_owner_v2_ack(
+            &frame,
+            "session",
+            "input",
+            now + std::time::Duration::from_secs(1)
+        ));
+        assert!(!super::is_owner_v2_ack(
+            &frame,
+            "other",
+            "input",
+            now + std::time::Duration::from_secs(1)
+        ));
+        assert!(!super::is_owner_v2_ack(
+            &frame,
+            "session",
+            "other",
+            now + std::time::Duration::from_secs(1)
+        ));
+        assert!(!super::is_owner_v2_ack(
+            &frame,
+            "session",
+            "input",
+            now - std::time::Duration::from_millis(1)
+        ));
+        let mut no_replay = frame;
+        no_replay["isReplay"] = json!(false);
+        assert!(!super::is_owner_v2_ack(
+            &no_replay,
+            "session",
+            "input",
+            now + std::time::Duration::from_secs(1)
+        ));
     }
 
     /// Runner replays retain task/steering authority and reject unknown or repeated results.

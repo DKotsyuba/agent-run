@@ -48,16 +48,16 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has 100 active rows with stable, unique wire ids and
+/// The inventory has 126 active rows with stable, unique wire ids and
 /// unique snake-case names, and rows 6, 49 and 79 are internal-only.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 100);
+    assert_eq!(all.len(), 126);
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(
             kind.wire_id() as usize,
-            (1..=105)
+            (1..=131)
                 .filter(|id| ![54, 55, 58, 103, 104].contains(id))
                 .nth(index)
                 .unwrap()
@@ -65,12 +65,24 @@ fn inventory_is_closed_with_stable_unique_ids() {
         assert_eq!(OpKindRef::from_wire_id(kind.wire_id()), Some(*kind));
     }
     assert_eq!(OpKindRef::from_wire_id(0), None);
-    assert_eq!(OpKindRef::from_wire_id(106), None);
+    assert_eq!(
+        OpKindRef::from_wire_id(129),
+        Some(OpKindRef::PrepareManagedEnrollment)
+    );
+    assert_eq!(
+        OpKindRef::from_wire_id(130),
+        Some(OpKindRef::AbortManagedEnrollment)
+    );
+    assert_eq!(
+        OpKindRef::from_wire_id(131),
+        Some(OpKindRef::AdmitManagedEnrollment)
+    );
+    assert_eq!(OpKindRef::from_wire_id(132), None);
     for retired in [54, 55, 58, 103, 104] {
         assert_eq!(OpKindRef::from_wire_id(retired), None);
     }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 100);
+    assert_eq!(names.len(), 126);
     assert!(
         names
             .iter()
@@ -82,7 +94,7 @@ fn inventory_is_closed_with_stable_unique_ids() {
         .map(|kind| kind.wire_id())
         .collect();
     assert_eq!(internal, vec![6, 49, 79]);
-    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 49);
+    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 54);
 }
 
 /// The static matrix confines worker rows to Worker, broker rows to Broker
@@ -135,11 +147,73 @@ fn authority_matrix_confines_roles() {
         birth: 3.0,
         token: "t".into(),
     };
+    assert!(OpKindRef::QualifyAttemptRole.permits(&supervisor));
+    assert!(!OpKindRef::QualifyAttemptRole.permits(&worker));
+    assert!(!OpKindRef::QualifyAttemptRole.permits(&cli));
+    assert!(!OpKindRef::QualifyAttemptRole.permits(&WriteAuthority::Broker));
+    for kind in [
+        OpKindRef::ReserveOwnerEffect,
+        OpKindRef::InvokeOwnerEffect,
+        OpKindRef::FinishOwnerEffect,
+    ] {
+        assert!(kind.permits(&supervisor));
+        assert!(!kind.permits(&worker));
+        assert!(!kind.permits(&cli));
+        assert!(!kind.permits(&WriteAuthority::Broker));
+    }
+    for kind in [
+        OpKindRef::BeginAttemptAdmission,
+        OpKindRef::AdmitAttempt,
+        OpKindRef::AbortAttemptAdmission,
+        OpKindRef::SettleAttemptAdmission,
+        OpKindRef::FenceAttemptNamespace,
+        OpKindRef::ObserveAttemptPoolSeal,
+        OpKindRef::InvokeAttemptRetirement,
+        OpKindRef::CompleteAttemptRetirement,
+        OpKindRef::BeginAttemptCurrent,
+        OpKindRef::RecordAttemptIngress,
+        OpKindRef::PrepareAttemptRetirement,
+        OpKindRef::AbortOwnerEffect,
+    ] {
+        assert!(kind.permits(&WriteAuthority::Broker));
+        assert!(!kind.is_remote());
+        assert!(!kind.permits(&worker));
+        assert!(!kind.permits(&supervisor));
+        assert!(!kind.permits(&cli));
+    }
     for role in [&worker, &collector, &supervisor] {
         assert!(!OpKindRef::ClaimDelivery.permits(role));
         assert!(!OpKindRef::CompleteDelivery.permits(role));
         assert!(!OpKindRef::PrepareBridgeDelivery.permits(role));
     }
+    let executor = WriteAuthority::ServiceExec {
+        generation: "fixture".into(),
+        capability_sha256: "a".repeat(64),
+        pid: 2,
+        birth: 3.0,
+        token: "t".into(),
+        root_pid: 1,
+        root_birth: 2.0,
+        root_token: "root".into(),
+    };
+    for kind in [OpKindRef::AcquireLineageHold, OpKindRef::ReleaseLineageHold] {
+        assert!(!kind.is_remote());
+        assert!(!kind.scoped());
+        assert!(agent_run_store::ops::implemented(kind));
+        assert!(kind.permits(&WriteAuthority::Broker));
+        for role in [&cli, &worker, &collector, &supervisor, &executor] {
+            assert!(!kind.permits(role));
+        }
+        assert_eq!(kind.wire_max(), 0);
+        assert_eq!(
+            WriteEnvelope::from_wire(kind.wire_id(), b"{}")
+                .unwrap_err()
+                .code,
+            RejectCode::ProtocolUnsupported
+        );
+    }
+    assert_eq!(OpKindRef::AcquireLineageHold.decoded_max(), 16 * 1024);
+    assert_eq!(OpKindRef::ReleaseLineageHold.decoded_max(), 1024);
     assert!(OpKindRef::PruneCapacitySamples.permits(&collector));
     assert!(!OpKindRef::ClaimCommand.permits(&WriteAuthority::Broker));
     assert_eq!(OpKindRef::HealthTick.wire_id(), 93);

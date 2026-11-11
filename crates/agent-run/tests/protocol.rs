@@ -13,12 +13,12 @@ fn service() -> Service {
         "/nonexistent-agent-run-protocol-fixture",
     ))
 }
-/// Pins the shared eighteen-entry discovery projection while compatibility
+/// Pins the shared twenty-four-entry discovery projection while compatibility
 /// calls retain their schemas in the same domain-owned registry.
 #[test]
-fn packaged_table_has_exactly_the_shared_eighteen_tools() {
+fn packaged_table_has_exactly_the_shared_twenty_four_tools() {
     let tools = dispatch::tools();
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 24);
     let names: std::collections::BTreeSet<_> =
         tools.iter().map(|v| v["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -46,7 +46,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     )
     .await
     .unwrap();
-    assert_eq!(response["result"].as_array().unwrap().len(), 18);
+    assert_eq!(response["result"].as_array().unwrap().len(), 24);
 }
 /// Mirrors `test_api_socket.py::test_unknown_method_and_validation_error`.
 #[tokio::test]
@@ -201,12 +201,13 @@ fn list_query_bounds_reject_nonfinite_or_negative_waits() {
     );
 }
 
-/// Mirrors `test_dispatch.py::test_removed_tools_are_rejected`.
+/// Retired tools stay hidden; `status` is the new versioned observation tool.
 #[test]
 fn retired_tools_are_not_advertised_by_dispatch() {
-    for name in ["fast", "status", "list_orchestrators", "summary", "chain"] {
+    for name in ["fast", "list_orchestrators", "summary", "chain"] {
         assert!(!dispatch::is_tool(name), "retired tool {name} is public");
     }
+    assert!(dispatch::is_tool("status"));
 }
 
 /// Mirrors `test_dispatch.py::test_start_accepts_account`.

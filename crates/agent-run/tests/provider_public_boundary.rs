@@ -15,6 +15,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn fixture_temp_base() -> std::ffi::OsString {
+    std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| std::env::temp_dir().into_os_string())
+}
+
+#[test]
+fn fixture_temp_base_falls_back_to_tmpdir() {
+    const CHILD: &str = "RUN_FIXTURE_TMPDIR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(fixture_temp_base(), std::env::var_os("TMPDIR").unwrap());
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fixture_temp_base_falls_back_to_tmpdir"])
+        .env_clear()
+        .env("TMPDIR", dir.path())
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
 /// One disposable schema-2 home with one Claude Messages provider bound to
 /// one fake environment reference, and its real resident broker.
 struct Broker {
@@ -24,6 +46,159 @@ struct Broker {
     home: PathBuf,
     /// The broker child, terminated on drop.
     child: Child,
+}
+
+/// One private fixture Quota endpoint. Each connection returns a current v2
+/// snapshot for the sole synthetic account and is counted before replying.
+struct FakeQuota {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeQuota {
+    /// Starts either known 60% or authoritative exhaustion over a real UDS.
+    fn start(exhausted: bool) -> Self {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+        let root = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = tempfile::Builder::new()
+            .prefix("qa-public-")
+            .tempdir_in(root)
+            .unwrap();
+        let path = directory.path().join("quota.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                if stream.read_to_end(&mut request).await.is_err() {
+                    continue;
+                }
+                let request: Value = match serde_json::from_slice(&request) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                if request["version"] != 1
+                    || request["method"] != "snapshot"
+                    || request["accounts"] != json!([])
+                {
+                    continue;
+                }
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut bytes = serde_json::to_vec(&quota_response(exhausted)).unwrap();
+                bytes.push(b'\n');
+                let _ = stream.write_all(&bytes).await;
+            }
+        });
+        Self {
+            _directory: directory,
+            path,
+            task,
+            requests,
+        }
+    }
+
+    /// Configures only the fixture home; the broker refreshes its config digest.
+    fn configure(&self, broker: &Broker) {
+        let path = broker.home.join("config.toml");
+        let mut config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let capacity = config
+            .as_table_mut()
+            .unwrap()
+            .entry("capacity")
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        capacity.as_table_mut().unwrap().insert(
+            "quota".into(),
+            toml::Value::Table(
+                [(
+                    "socket".into(),
+                    toml::Value::String(self.path.to_string_lossy().into_owned()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    }
+
+    /// Confirms the application reached this fixture rather than local history.
+    fn assert_requested(&self, minimum: usize) {
+        assert!(self.requests.load(std::sync::atomic::Ordering::Relaxed) >= minimum);
+    }
+}
+
+impl Drop for FakeQuota {
+    /// Stops this fixture's listener on both success and panic.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Adapts checked-in synthetic Quota facts to this fixture's exact model and
+/// current clock; the supplied score and states are source facts, not Run math.
+fn quota_response(exhausted: bool) -> Value {
+    const KNOWN: &str =
+        include_str!("../../agent-run-core/tests/fixtures/quota-client-v1/snapshot-v2.json");
+    const EXHAUSTED: &str = include_str!(
+        "../../agent-run-core/tests/fixtures/quota-client-v1/exhausted-snapshot-v2.json"
+    );
+    let mut value: Value = serde_json::from_str(
+        &if exhausted { EXHAUSTED } else { KNOWN }.replace("acct-test", "acct-work"),
+    )
+    .unwrap();
+    let at = agent_run_core::domain::now();
+    let until = at + 600.0;
+    let reset = at + 3600.0;
+    value["result"]["evaluated_at"] = json!(at);
+    value["result"]["coverage"]["last_collection"]["observed_at"] = json!(at);
+    value["result"]["coverage"]["last_collection"]["sources"][0]["provider"] = json!("glm-user");
+    let account = &mut value["result"]["accounts"][0];
+    let model = &mut account["models"][0];
+    model["provider"] = json!("glm-user");
+    model["model"] = json!("fixture");
+    model["native_model"] = json!("fixture");
+    model["state_validity"] = json!({"kind":"until","at":until});
+    model["newest_observed_at"] = json!(at);
+    model["reset_at"] = json!(reset);
+    if exhausted {
+        model["exhausted_until"] = json!(reset);
+    } else {
+        model["quota_score"] = json!(1.2);
+        model["remaining_percent"] = json!(60.0);
+    }
+    let window = &mut account["windows"][0];
+    window["runtime"] = json!("glm-user");
+    window["models"] = json!(["fixture"]);
+    window["observed_at"] = json!(at);
+    window["valid_until"] = json!(until);
+    window["last_reset_at"] = json!(reset);
+    window["forecast"]["observed_at"] = json!(at);
+    window["forecast"]["reset_at"] = json!(reset);
+    window["evaluation"]["reset_at"] = json!(reset);
+    if !exhausted {
+        window["last_remaining_percent"] = json!(60.0);
+        window["forecast"]["remaining_percent"] = json!(60.0);
+        window["forecast"]["sustainable_percent_per_hour"] = json!(60.0);
+        window["evaluation"]["remaining_percent"] = json!(60.0);
+    }
+    if exhausted {
+        account["latches"][0]["models"] = json!(["fixture"]);
+        account["latches"][0]["observed_at"] = json!(at);
+        account["latches"][0]["reset_at"] = json!(reset);
+    }
+    account["advice"][0]["reset_at"] = json!(reset);
+    if !exhausted {
+        account["advice"][0]["remaining_percent"] = json!(60.0);
+    }
+    value
 }
 
 impl Broker {
@@ -45,7 +220,7 @@ impl Broker {
     /// Starts an isolated synthetic broker with a fixture-only active limit;
     /// production configuration, credentials and running jobs are untouched.
     fn start_with_limit(environment: &[(&str, &str)], active_limit: usize) -> Self {
-        let base = std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into());
+        let base = fixture_temp_base();
         let temp = tempfile::Builder::new()
             .prefix("ar-pb-")
             .tempdir_in(base)
@@ -1178,27 +1353,22 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     assert_eq!(active, 0);
 }
 
-/// Authoritative quota exhaustion (a durable native latch on the model's
-/// lane, written through the same store API the supervisor uses) and a
-/// disabled sole account are refused with their exact allowlisted public
-/// codes through the real broker's ranking on every transport.
-#[tokio::test]
+/// Authoritative Quota exhaustion and a disabled sole account are refused with
+/// their exact public codes through real CLI, MCP and socket dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_codes_survive_every_public_transport() {
+    let quota = FakeQuota::start(true);
     let broker = Broker::start();
-    let now = agent_run_domain::domain::now();
-    agent_run_store::fixture::open(&broker.home)
-        .unwrap()
-        .latch_native_exhaustion(
-            &"acct-work".parse().unwrap(),
-            "glm-user",
-            "fixture",
-            "5h",
-            "native-signal",
-            &std::collections::BTreeSet::from(["fixture".to_owned()]),
-            now,
-            Some(now + 3600.0),
-        )
+    quota.configure(&broker);
+    let view = BrokerClient::new(broker.home.join("api.sock"))
+        .call("models", Some(json!({})))
+        .await
         .unwrap();
+    assert_eq!(
+        view["providers"][0]["models"][0]["quota"]["status"],
+        "exhausted"
+    );
+    assert_eq!(view["quota_coverage"]["incomplete"], false);
     broker.assert_refused("quota_exhausted").await;
 
     assert!(
@@ -1207,6 +1377,7 @@ async fn admission_codes_survive_every_public_transport() {
             .success()
     );
     broker.assert_refused("no_eligible_account").await;
+    quota.assert_requested(4);
 }
 
 /// A static credential/connection mismatch returns a typed refusal through
@@ -1292,20 +1463,20 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
     assert_eq!(malformed.public().kind, "ValidationError");
 }
 
-/// One isolated broker and real raw MCP exchanges prove eighteen advertised
+/// One isolated broker and real raw MCP exchanges prove the advertised
 /// tools, filtered guidance, typed errors, diagnostic privacy/numbers, and
 /// unchanged structured CLI/socket compatibility aliases without provider turns.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
+    let quota = FakeQuota::start(false);
     let broker = Broker::start();
+    quota.configure(&broker);
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let store = agent_run_store::fixture::open(&broker.home).unwrap();
-    let at = agent_run_core::domain::now();
-    store.conn.execute(
-        "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key)
-         VALUES('glm-user','fixture','5h',NULL,'fixture',60,?1,?2,?3,'null','acct-work','acct-work::fixture')",
-        rusqlite::params![at + 3600.0, at, at + 600.0],
-    ).unwrap();
+    let initial = client.call("limits", Some(json!({}))).await.unwrap();
+    assert_eq!(initial["items"][0]["remaining_percent"], 60.0);
+    assert_eq!(initial["coverage"]["incomplete"], false);
+    assert!(initial["coverage"]["evaluated_at"].is_number());
     let discovery = mcp_request(&broker.home, "2026-07-28", "tools/list", json!({})).await;
     let legacy_discovery = mcp_request(&broker.home, "2025-06-18", "tools/list", json!({})).await;
     assert_eq!(
@@ -1313,12 +1484,12 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         discovery["result"]["tools"]
     );
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18, "{discovery}");
+    assert_eq!(tools.len(), 24, "{discovery}");
     for name in ["models", "capacity_order"] {
         assert!(!tools.iter().any(|tool| tool["name"] == name));
     }
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
-    assert_eq!(socket_tools.as_array().unwrap().len(), 18);
+    assert_eq!(socket_tools.as_array().unwrap().len(), 24);
     let filtered_cli = cli(
         &broker.home,
         &[
@@ -1407,6 +1578,7 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
         .unwrap();
     assert_eq!(agents, 0, "read-only smoke must not launch provider turns");
+    quota.assert_requested(3);
 }
 
 /// The delegation guide is one plain-text result on every public transport:

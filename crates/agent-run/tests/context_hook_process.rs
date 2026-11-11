@@ -109,7 +109,10 @@ fn preserved(output: &Output, agent: &str) {
     let text = value["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("prepared context must survive");
-    assert!(text.contains("Runtime priorities"), "{text}");
+    assert!(
+        text.contains("migrate configuration to schema_version 2"),
+        "{text}"
+    );
     assert!(text.contains(agent), "{text}");
     assert!(text.chars().count() <= 2500);
     assert!(
@@ -165,7 +168,7 @@ async fn no_writer_retains_context_and_recovery_restores_deduplication() {
             .unwrap();
         assert!(text.contains(&unbound));
         assert!(
-            !text.contains("Runtime priorities"),
+            !text.contains("migrate configuration to schema_version 2"),
             "unchanged priority must stay deduplicated"
         );
         broker.stop().await;
@@ -498,7 +501,7 @@ fn terminal(home: &Path) -> String {
 /// custody is deliberately asserted separately from native receiver acceptance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_failure_does_not_break_binding_or_result_delivery_for_either_client() {
-    use bridge_sdk::bridge_protocol::{Destination, Host, NativeAddress};
+    use bridge_sdk::bridge_protocol::{Destination, HarnessName, Host, NativeAddress};
     for (transport, host) in [
         ("codex_queue", Host::Codex),
         ("claude_uds", Host::ClaudeCode),
@@ -508,7 +511,7 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
         let receiver = bridge::start(home.path(), false);
         let context = hook(home.path(), "context", transport, prompt()).await;
         assert_eq!(context.status.code(), Some(0));
-        assert!(serde_json::from_slice::<Value>(&context.stdout).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Runtime priorities"));
+        assert!(serde_json::from_slice::<Value>(&context.stdout).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("migrate configuration to schema_version 2"));
         let broker = test_broker::TestBroker::start(home.path()).await;
         let payload = json!({"hook_event_name":"PostToolUse", "session_id":"context-probe", "tool_response":{"agent_id":id}});
         for _ in 0..2 {
@@ -535,7 +538,7 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
                 panic!("native address expected")
             };
             let address = NativeAddress::parse(address).unwrap();
-            assert_eq!(address.harness, host);
+            assert_eq!(address.harness, HarnessName::from(host));
             assert_eq!(address.session, "context-probe");
         }
         assert_eq!(
@@ -566,16 +569,16 @@ async fn native_context_result_delivery_probe() {
     )
     .unwrap();
     assert_eq!(address.host, config.host_id);
-    let transport = match address.harness {
-        Host::Codex => {
+    let transport = match address.harness.host() {
+        Some(Host::Codex) => {
             assert_eq!(config.codex_store.as_ref(), Some(&address.store));
             "codex_queue"
         }
-        Host::ClaudeCode => {
+        Some(Host::ClaudeCode) => {
             assert_eq!(config.claude_store.as_ref(), Some(&address.store));
             "claude_uds"
         }
-        Host::OpenCode => panic!("this native control supports only Codex and Claude Code"),
+        _ => panic!("this native control supports only Codex and Claude Code"),
     };
     let home = home().await.keep();
     println!("native probe sender retained at {}", home.display());

@@ -1,8 +1,8 @@
 //! Read-only public provider catalog and provider capacity order (schema 2).
 //!
-//! Both reads combine one validated immutable config revision with one
-//! committed quota/registry read. They never collect quota, probe a harness,
-//! reserve capacity, consume reset credits, write samples, or start agents.
+//! Projection combines one validated immutable config revision with one
+//! committed local read and caller-supplied Quota standings. It never collects
+//! quota, probes a harness, reserves capacity, writes samples or starts agents.
 //! The orchestrator alone chooses provider, model, effort and profile; these
 //! views report configured facts, declared recommendation prose, canonical
 //! role grants, and cached quota standing — no automatic choice or score of
@@ -11,12 +11,12 @@
 use crate::{Result, capacity::provider_ranking, error::invalid};
 use agent_run_config::{policy, profiles, provider_config::ProviderConfig, role_plan};
 use agent_run_domain::{
-    CapacityOrderQuery, ModelsQuery, ProviderStartRequest,
+    ModelsQuery, ProviderStartRequest,
     catalog::{ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderModel},
 };
 use agent_run_store::Store;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::Path};
+use std::path::Path;
 
 /// Loads the canonical role `name` exactly as provider admission does, using
 /// a catalog-only request for `provider`/`model` (no task is admitted).
@@ -93,12 +93,12 @@ fn connection(connection: &ProviderConnection) -> Value {
 }
 
 /// Resolves the catalog against the committed account registry.
-fn resolve(config: &ProviderConfig, store: &Store) -> Result<ProviderCatalog> {
+pub(super) fn resolve(config: &ProviderConfig, store: &Store) -> Result<ProviderCatalog> {
     config.resolve_catalog(store.list_accounts()?)
 }
 
 /// Validates `model` against the catalog: it must be offered somewhere.
-fn check_model(catalog: &ProviderCatalog, model: Option<&str>) -> Result<()> {
+pub(super) fn check_model(catalog: &ProviderCatalog, model: Option<&str>) -> Result<()> {
     if let Some(model) = model
         && !catalog
             .providers()
@@ -110,57 +110,22 @@ fn check_model(catalog: &ProviderCatalog, model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The public provider catalog (`models`) for one config revision.
-///
-/// `revision` is the exact-byte SHA-256 of the cached, immutable `config`;
-/// role files are read once and digested into `roles_sha256`. Every mutable
-/// fact — registry status, samples, exhaustion latches, and the advertised
-/// `capacity_revision` — comes from ONE committed read transaction, so a
-/// registry or quota change between reads can never be mixed into one
-/// result. `ranked_at` is the advice clock the standing was evaluated at,
-/// not a sample age; each offering's `quota` carries `status`,
-/// `best_priority`, `evidence` (`fresh`/`stale`/`missing`),
-/// `newest_observed_at` (sample age), and `exhausted_until`. Providers are
-/// ranked over exactly the offerings the filters retain (see
-/// [`provider_ranking::provider_order_filtered_at`]), so a removed offering
-/// never lends its score. Filters are exact (see [`ModelsQuery`]); unknown
-/// provider/profile/model values are validation errors.
-pub fn models(
+/// Projects the existing catalog shape with one caller-supplied provider order.
+pub(super) fn models_from_store(
+    store: &Store,
     home: &Path,
     config: &ProviderConfig,
     revision: &str,
     query: &ModelsQuery,
+    at: f64,
+    order: impl FnOnce(
+        &Store,
+        &ProviderCatalog,
+        &dyn Fn(&ProviderDefinition, &ProviderModel) -> bool,
+        f64,
+    ) -> Result<provider_ranking::ProviderCapacityOrder>,
 ) -> Result<Value> {
-    models_between(home, config, revision, query, &mut || {})
-}
-
-/// [`models`] with a hook between the registry read and the quota read of
-/// its one transaction (feature `test-fixtures`): a test seam proving a
-/// concurrent registry or quota commit there cannot mix into the result.
-#[cfg(feature = "test-fixtures")]
-pub fn models_observed(
-    home: &Path,
-    config: &ProviderConfig,
-    revision: &str,
-    query: &ModelsQuery,
-    between_reads: &mut dyn FnMut(),
-) -> Result<Value> {
-    models_between(home, config, revision, query, between_reads)
-}
-
-/// Shared body of [`models`]; `between_reads` runs after the registry read
-/// and before the quota read, inside the same read transaction.
-fn models_between(
-    home: &Path,
-    config: &ProviderConfig,
-    revision: &str,
-    query: &ModelsQuery,
-    between_reads: &mut dyn FnMut(),
-) -> Result<Value> {
-    let store = Store::open(home)?;
-    // One committed read: registry, samples, latches and revision together.
-    let _read = store.conn.unchecked_transaction()?;
-    let catalog = resolve(config, &store)?;
+    let catalog = resolve(config, store)?;
     if let Some(provider) = &query.provider
         && catalog.provider(&provider.parse()?).is_none()
     {
@@ -209,7 +174,6 @@ fn models_between(
             Err(_) => profiles_out.push(json!({"name": name, "canonical": false})),
         }
     }
-    between_reads();
     let keep = |definition: &ProviderDefinition, offering: &ProviderModel| {
         query
             .provider
@@ -224,13 +188,7 @@ fn models_between(
                     .iter()
                     .all(|role| admissible(config, definition, offering, role)))
     };
-    let order = provider_ranking::provider_order_filtered_at(
-        &store,
-        &catalog,
-        &BTreeSet::new(),
-        &keep,
-        crate::domain::now(),
-    )?;
+    let order = order(store, &catalog, &keep, at)?;
     let mut providers = Vec::new();
     for entry in &order.providers {
         let definition = catalog
@@ -293,53 +251,12 @@ fn quota(standing: &provider_ranking::ProviderModelOrder) -> Value {
     })
 }
 
-/// The public provider-only capacity order for one config revision.
-///
-/// Providers, never provider/account pairs, in descending score with each
-/// offered model's own standing (as in [`models`]); with `query.model` only
-/// providers offering that model appear, ranked by that model. Registry and
-/// quota facts and the advertised `capacity_revision` come from one
-/// committed read; `ranked_at` is the advice clock.
-pub fn order(
-    home: &Path,
-    config: &ProviderConfig,
-    revision: &str,
-    query: &CapacityOrderQuery,
-) -> Result<Value> {
-    let store = Store::open(home)?;
-    let _read = store.conn.unchecked_transaction()?;
-    order_from_store(&store, config, revision, query)
-}
-
-/// Ranks providers from the caller's committed read snapshot and validated
-/// config revision. Opens no connection or transaction; the caller owns SQL
-/// limits. Model validation and storage errors retain the public order contract.
-pub(crate) fn order_from_store(
-    store: &Store,
-    config: &ProviderConfig,
-    revision: &str,
-    query: &CapacityOrderQuery,
-) -> Result<Value> {
-    let catalog = resolve(config, store)?;
-    check_model(&catalog, query.model.as_deref())?;
-    let order = provider_ranking::provider_order_filtered_at(
-        store,
-        &catalog,
-        &BTreeSet::new(),
-        &|_, offering| {
-            query
-                .model
-                .as_deref()
-                .is_none_or(|wanted| wanted == offering.id)
-        },
-        crate::domain::now(),
-    )?;
-    Ok(order_value(&order, revision))
-}
-
 /// Serializes existing provider ranking without changing its compatibility
 /// shape, numerical priorities or account-free provider/model identities.
-fn order_value(order: &provider_ranking::ProviderCapacityOrder, revision: &str) -> Value {
+pub(super) fn order_value(
+    order: &provider_ranking::ProviderCapacityOrder,
+    revision: &str,
+) -> Value {
     let providers: Vec<Value> = order
         .providers
         .iter()
@@ -363,48 +280,4 @@ fn order_value(order: &provider_ranking::ProviderCapacityOrder, revision: &str) 
         "ranked_at": order.observed_at,
         "providers": providers,
     })
-}
-
-/// Returns quota windows plus provider/model ranking from one committed read,
-/// active configuration revision and advice clock. It reuses the admission
-/// ranker, including all windows/latches; no collectors or engines are started.
-pub fn diagnostics(home: &Path, config: &ProviderConfig, revision: &str) -> Result<Value> {
-    diagnostics_between(home, config, revision, &mut || {})
-}
-
-/// Fixture seam proving a concurrent quota commit cannot split diagnostic
-/// windows and ranking. The callback runs after registry snapshot acquisition.
-#[cfg(feature = "test-fixtures")]
-pub fn diagnostics_observed(
-    home: &Path,
-    config: &ProviderConfig,
-    revision: &str,
-    between_reads: &mut dyn FnMut(),
-) -> Result<Value> {
-    diagnostics_between(home, config, revision, between_reads)
-}
-
-/// Owns the shared read transaction and invokes the optional fixture seam
-/// before projecting quota windows and scores at the exact same advice clock.
-fn diagnostics_between(
-    home: &Path,
-    config: &ProviderConfig,
-    revision: &str,
-    between_reads: &mut dyn FnMut(),
-) -> Result<Value> {
-    let store = Store::open(home)?;
-    let _read = store.conn.unchecked_transaction()?;
-    let catalog = resolve(config, &store)?;
-    between_reads();
-    let at = crate::domain::now();
-    let order = provider_ranking::provider_order_filtered_at(
-        &store,
-        &catalog,
-        &BTreeSet::new(),
-        &|_, _| true,
-        at,
-    )?;
-    let mut value = crate::capacity::limits_from_store(&store, at)?;
-    value["ranking"] = order_value(&order, revision);
-    Ok(value)
 }

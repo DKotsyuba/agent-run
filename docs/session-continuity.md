@@ -49,13 +49,13 @@ These are the durable, checkable conditions of the legacy resume path
   `auth.json` from the account credential home into the generated home.
   Native thread history belongs to that generated home, not to the login
   credential home.
-- Claude labelled login, execution, and quota collection share one
+- Claude labelled login and execution share one
   `CLAUDE_CONFIG_DIR`, chosen by `materialize::claude_account_config`:
   `<app-home>/accounts/claude/<label>/claude-config`, unless only a login
   from an earlier release exists at
   `<configured-runtime-home>@<label>/claude-config`, which is then used in
-  place. If both directories exist the label is ambiguous and login, runs,
-  and quota collection fail instead of choosing one. For an ordered switch,
+  place. If both directories exist the label is ambiguous and login and runs
+  fail instead of choosing one. For an ordered switch,
   authentication uses this account directory while `--resume` names the
   previously sealed transcript by absolute path.
 

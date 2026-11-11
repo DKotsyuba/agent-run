@@ -213,7 +213,7 @@ async fn busy_release_finishes_original_call_without_replay() {
     blocker
         .execute_batch("CREATE TABLE items(id INTEGER); BEGIN IMMEDIATE")
         .unwrap();
-    let connection = Connection::open(&path).unwrap();
+    let mut connection = Connection::open(&path).unwrap();
     connection.busy_handler(Some(signal_busy)).unwrap();
     let db = Database::from_connection(connection, Limits::default(), None).unwrap();
     let (signal_tx, signal_rx) = mpsc::channel();

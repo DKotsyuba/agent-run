@@ -13,7 +13,7 @@ use agent_run_domain::integration::{
 use bridge_sdk::{
     ClientError,
     bridge_protocol::{
-        ErrorClass, Host, NativeAddress, RecipientResolution, ResolveRecipientParams,
+        ErrorClass, HarnessName, Host, NativeAddress, RecipientResolution, ResolveRecipientParams,
     },
 };
 use rusqlite::OptionalExtension;
@@ -284,7 +284,7 @@ impl Service {
                                 && result.sampled_at_ms <= i64::MAX as u64
                                 && NativeAddress::parse(&address).is_ok_and(|parsed| {
                                     parsed.host == bridge.host_id
-                                        && parsed.harness == host
+                                        && parsed.harness == HarnessName::from(host)
                                         && Some(&parsed.session) == before.native.session.as_ref()
                                         && parsed.canonical() == address
                                 }) =>
@@ -398,15 +398,28 @@ mod tests {
             request.validate().unwrap();
             let prepared =
                 crate::service::prepare_provider(&config, &revision, &catalog, request).unwrap();
-            let candidates = crate::capacity::provider_ranking::provider_candidates(
+            let at = crate::domain::now();
+            let raw = include_str!("../tests/fixtures/quota-client-v1/unknown-snapshot-v2.json")
+                .replace("acct-test", "test-account");
+            let mut response: Value = serde_json::from_str(&raw).unwrap();
+            response["result"]["evaluated_at"] = json!(at);
+            response["result"]["accounts"][0]["models"][0]["provider"] = json!("p");
+            response["result"]["accounts"][0]["models"][0]["model"] = json!("model");
+            response["result"]["accounts"][0]["models"][0]["native_model"] = json!("model");
+            let quota: crate::quota_client::Snapshot =
+                serde_json::from_value(response["result"].clone()).unwrap();
+            let candidates = crate::capacity::quota_adapter::candidates_at(
                 &store,
                 &catalog,
                 &prepared.request.provider,
                 &prepared.request.model,
                 None,
                 &Default::default(),
+                Some(&quota),
+                at,
             )
-            .unwrap();
+            .unwrap()
+            .candidates;
             let admitted = store
                 .admit_provider(
                     &prepared.request,

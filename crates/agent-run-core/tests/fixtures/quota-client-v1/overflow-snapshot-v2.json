@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "result": {
+    "schema_version": 2,
+    "source_epoch": "00000000000000000000000000000000",
+    "revision": 7,
+    "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "evaluated_at": 1e-305,
+    "coverage": {"state":"unknown", "unobserved":[], "last_collection":null},
+    "accounts": [{
+      "account":"acct-bad",
+      "models":[{
+        "provider":"codex", "model":"a", "native_model":"a", "state":"unknown",
+        "state_validity":{"kind":"unknown"}, "quota_score":null, "limiting_window":null,
+        "remaining_percent":null, "burn_percent_per_hour":null, "reset_at":null,
+        "risk":"unknown", "evidence":"stale", "newest_observed_at":1e-305,
+        "exhausted_until":null, "pools":["acct-bad::a"]
+      }],
+      "windows":[{
+        "runtime":"codex", "lane":"a", "pool":"acct-bad::a", "source":"fixture",
+        "window":"hour", "target":"acct-bad", "models":["a"], "observed_at":1e-305,
+        "valid_until":1000.0, "last_remaining_percent":80.0, "last_reset_at":2e-305,
+        "forecast":{
+          "key":{"runtime":"acct-bad","lane":"a","window":"hour","target":null,"source":"fixture"},
+          "known":true, "remaining_percent":80.0, "reset_at":2e-305, "observed_at":1e-305,
+          "warmup":false, "burn_percent_per_hour":null, "sustainable_percent_per_hour":null,
+          "risk":"low", "burn_span_seconds":1e-305
+        },
+        "evaluation":null
+      }],
+      "latches":[],
+      "advice":[{
+        "key":{"runtime":"acct-bad","lane":"a","window":"hour","target":null,"source":"fixture"},
+        "known":true, "remaining_percent":80.0, "reset_at":2e-305, "warmup":false,
+        "risk":"low", "recommendations":[]
+      }],
+      "advice_key":"f52db427aff23ec59c9a4e18d3f7b83f"
+    }]
+  }
+}

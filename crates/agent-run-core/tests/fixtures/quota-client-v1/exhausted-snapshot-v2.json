@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "result": {
+    "schema_version": 2,
+    "source_epoch": "00000000000000000000000000000000",
+    "revision": 3,
+    "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "evaluated_at": 10001.0,
+    "coverage": {
+      "state": "complete",
+      "unobserved": [],
+      "last_collection": {
+        "observed_at": 10001.0,
+        "ok": true,
+        "error": null,
+        "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sources": [{"account":"acct-test","provider":"codex","source":"fixture-source","status":"collected","windows":1,"issues":[]}]
+      }
+    },
+    "accounts": [{
+      "account":"acct-test",
+      "models":[{
+        "provider":"codex", "model":"model-a", "native_model":"model-a", "state":"exhausted",
+        "state_validity":{"kind":"until","at":20000.0},
+        "quota_score":null, "limiting_window":{"pool":"acct-test::primary","source":"fixture-source","window":"five_hour"},
+        "remaining_percent":0.0, "burn_percent_per_hour":288000.0, "reset_at":20000.0, "risk":"high",
+        "evidence":"fresh", "newest_observed_at":10001.0, "exhausted_until":20000.0, "pools":["acct-test::primary"]
+      }],
+      "windows":[{
+        "runtime":"codex", "lane":"primary", "pool":"acct-test::primary", "source":"fixture-source",
+        "window":"five_hour", "target":"acct-test", "models":["model-a"], "observed_at":10001.0,
+        "valid_until":10901.0, "last_remaining_percent":0.0, "last_reset_at":20000.0,
+        "forecast":{
+          "key":{"runtime":"acct-test","lane":"primary","window":"five_hour","target":null,"source":"fixture-source"},
+          "known":true, "remaining_percent":0.0, "reset_at":20000.0, "observed_at":10001.0,
+          "warmup":false, "burn_percent_per_hour":288000.0, "sustainable_percent_per_hour":0.0,
+          "risk":"high", "burn_span_seconds":1.0
+        },
+        "evaluation":{
+          "key":{"runtime":"acct-test","lane":"primary","window":"five_hour","target":null,"source":"fixture-source"},
+          "remaining_percent":0.0, "burn_percent_per_hour":288000.0, "burn_span_seconds":1.0,
+          "reset_at":20000.0, "projected_percent":null, "slack":-1.0,
+          "marker":"thin_evidence", "risk":"high"
+        }
+      }],
+      "latches":[{"lane":"primary","pool":"acct-test::primary","source":"fixture-source","window":"five_hour",
+        "observed_at":10001.0,"reset_at":20000.0,"models":["model-a"],"active":true}],
+      "advice":[{
+        "key":{"runtime":"acct-test","lane":"primary","window":"five_hour","target":null,"source":"fixture-source"},
+        "known":true, "remaining_percent":0.0, "reset_at":20000.0, "warmup":false, "risk":"high",
+        "recommendations":["acct-test/primary five_hour source=fixture-source is near exhaustion; avoid starting new primary work before reset."]
+      }],
+      "advice_key":"24ab79806b5c1832b5aae5f5fbc72c1d"
+    }]
+  }
+}

@@ -3,6 +3,12 @@
 #[cfg(test)]
 extern crate self as agent_run_core;
 pub mod agent_identity;
+mod attempt_binding;
+mod attempt_transport;
+/// Private authenticated attempt receipt and protocol transport.
+pub mod attempt_wire;
+/// Read-only lookup of permanently admitted batch receipts.
+pub mod batch_receipt;
 /// In-process producer lanes of the resident broker.
 pub mod broker_writer;
 pub mod capacity;
@@ -22,7 +28,14 @@ pub mod hooks;
 pub mod housekeeping;
 mod integration;
 pub mod lifecycle;
+/// Generic writer-backed lineage holds and read-only recovery.
+pub mod lineage_holds;
 pub mod logging;
+/// Setup for the ignored live probes of the real managed launch path, which
+/// exist on Linux only; elsewhere nothing uses it.
+#[cfg(all(test, target_os = "linux"))]
+mod managed_live_probe;
+mod managed_qualification;
 pub mod managed_services;
 /// Single-instance storage of Codex's unindexed native metadata caches.
 pub mod native_cache;
@@ -35,6 +48,8 @@ pub mod observation;
 pub mod opencode;
 /// Persistence facade of processes other than the resident broker.
 pub mod persist;
+/// Authenticated, read-only snapshots from the independent quota service.
+pub mod quota_client;
 /// Authenticated workdir-confined report writes for restricted research.
 mod research_reports;
 /// Native cache lifecycle glue shared by the supervisor and operator surfaces.
@@ -44,6 +59,8 @@ pub mod runtime_storage;
 pub mod service;
 /// Planned restart coordination using the normal worker lifecycle.
 pub mod service_restart;
+/// Snapshot-scoped operator status and its optional redacted selected view.
+pub mod status;
 /// Client lanes of the private writer socket.
 pub mod storage_client;
 /// Reference-aware collection of the shared managed-asset store.

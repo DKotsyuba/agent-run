@@ -14,7 +14,7 @@
     "tool_timeout_seconds": null,
     "transport": "stdio"
   },
-  "product_version": "0.30.0",
+  "product_version": "0.31.0",
   "protocol_versions": [
     "2024-11-05",
     "2025-03-26",
@@ -25,7 +25,7 @@
   "schema_version": 1,
   "sdk": {
     "name": "rmcp",
-    "version": "3.4.0"
+    "version": "3.9.0"
   },
   "worker": {
     "args": [

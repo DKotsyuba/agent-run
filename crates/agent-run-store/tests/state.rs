@@ -18,15 +18,16 @@ use std::{
 /// Initialization/reopen retain the current inventory, including schema26
 /// enrollment, schema27 independent incident evidence and the schema30 writer
 /// receipt, producer and authority tables, schema31 Bridge intention ownership,
-/// schema33 binding cooldowns, schema35 restart state, plus durable WAL and
-/// private-mode safety settings.
+/// schema33 binding cooldowns, schema35 restart state, schema36 batch receipts
+/// and history pins, schema37 lineage holds and schema38 launch journal,
+/// plus WAL and private modes.
 #[test]
 fn schema_initialization_and_reopen() {
     let h = common::Home::new();
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 45);
+    assert_eq!(a["tables"], 60);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     for name in [
@@ -41,6 +42,21 @@ fn schema_initialization_and_reopen() {
         "service_restart_agents",
         "service_restart_recipients",
         "service_restart_notices",
+        "start_batch_receipts",
+        "history_pins",
+        "store_identity",
+        "lineage_holds",
+        "lineage_hold_targets",
+        "attempt_launches",
+        "attempt_admissions",
+        "attempt_pending_checks",
+        "attempt_pending_current",
+        "attempt_role_qualifications",
+        "owner_effects",
+        "attempt_current_receipts",
+        "attempt_namespace_retirements",
+        "managed_enrollments",
+        "managed_enrollment_members",
     ] {
         assert!(
             store

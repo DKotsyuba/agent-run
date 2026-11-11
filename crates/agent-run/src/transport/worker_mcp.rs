@@ -45,6 +45,9 @@ pub struct WorkerProxy {
     research: bool,
     /// Native completion catalog selected by frozen supervisor admission.
     explicit_finish: bool,
+    /// Supervisor-selected managed role: with explicit finish, the surface is
+    /// exactly `health_reply` and `finish`.
+    managed: bool,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -62,10 +65,16 @@ fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
 impl WorkerProxy {
     /// Returns the role-bound embedded surface. Research adds only the report
     /// writer; legacy ordinary workers retain their exact five-tool inventory.
-    /// Explicit mode adds only finish, with no additional role authority.
+    /// Explicit mode adds only finish, with no additional role authority. A
+    /// managed role serves only the completion tools.
     fn tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
         if self.explicit_finish {
-            return agent_run_domain::worker::finish_tools_json(self.research)
+            let catalog = if self.managed {
+                agent_run_domain::worker::managed_tools_json()
+            } else {
+                agent_run_domain::worker::finish_tools_json(self.research)
+            };
+            return catalog
                 .into_iter()
                 .map(|tool| {
                     serde_json::from_value(tool).map_err(|_| {
@@ -104,7 +113,9 @@ impl WorkerProxy {
             } else {
                 agent_run_domain::worker::POOL_CATALOG_VERSION
             },
-            digest: if self.explicit_finish {
+            digest: if self.explicit_finish && self.managed {
+                agent_run_domain::worker::managed_catalog_digest()
+            } else if self.explicit_finish {
                 agent_run_domain::worker::finish_catalog_digest(self.research)
             } else if self.research {
                 agent_run_domain::worker::research_catalog_digest()
@@ -489,7 +500,14 @@ pub async fn serve_from_env() -> Result<()> {
             .is_ok_and(|value| value == "1"),
         explicit_finish: std::env::var(agent_run_domain::worker::FINISH_ENV)
             .is_ok_and(|value| value == "1"),
+        managed: std::env::var(agent_run_domain::worker::MANAGED_ENV)
+            .is_ok_and(|value| value == "1"),
     };
+    // The managed surface exists only in explicit, non-research mode; any
+    // other combination is a supervisor contract error, never a wider catalog.
+    if proxy.managed && (!proxy.explicit_finish || proxy.research) {
+        return Err(invalid("invalid managed worker context"));
+    }
     proxy.register_catalog().await;
     let service = proxy
         .serve((
@@ -547,6 +565,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            managed: false,
         };
         let ordinary = proxy.tools().unwrap();
         assert_eq!(ordinary.len(), 5);
@@ -571,6 +590,54 @@ mod tests {
         for name in ["start", "resume", "Bash", "exec_command", "write_file"] {
             assert!(proxy.get_tool(name).is_none(), "{name}");
         }
+        // A managed role serves exactly the completion tools.
+        proxy.research = false;
+        proxy.managed = true;
+        let managed: Vec<_> = proxy
+            .tools()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(managed, agent_run_domain::worker::MANAGED_TOOLS);
+        for name in [
+            "pool_post",
+            "pool_read",
+            "notify_orchestrator",
+            "save_report",
+        ] {
+            assert!(proxy.get_tool(name).is_none(), "{name}");
+        }
+    }
+
+    /// The managed proof names the managed catalog, which the broker accepts
+    /// as a worker catalog but never as a pool-capable one.
+    #[tokio::test]
+    async fn managed_catalog_proof_is_completion_only() {
+        let broker = Arc::new(Broker::default());
+        let proxy = WorkerProxy {
+            broker: broker.clone(),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
+            explicit_finish: true,
+            managed: true,
+        };
+        proxy.register_catalog().await;
+        let calls = broker.0.lock().unwrap();
+        assert_eq!(calls[0].0, agent_run_domain::worker::CATALOG_METHOD);
+        let digest = calls[0].1["digest"].as_str().unwrap();
+        assert_eq!(digest, agent_run_domain::worker::managed_catalog_digest());
+        assert!(agent_run_domain::worker::known_worker_catalog(
+            calls[0].1["version"].as_u64().unwrap() as u32,
+            digest
+        ));
+        assert!(!agent_run_domain::worker::known_pool_catalog(
+            agent_run_domain::worker::FINISH_CATALOG_VERSION,
+            digest
+        ));
     }
 
     /// Every private pool write keeps its own strict input and durable receipt.
@@ -587,6 +654,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            managed: false,
         };
         for (tool, input) in [
             (
@@ -693,6 +761,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            managed: false,
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -718,6 +787,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            managed: false,
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -786,6 +856,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            managed: false,
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

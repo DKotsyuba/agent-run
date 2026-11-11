@@ -30,11 +30,12 @@ uuid.workspace = true
 
 [features]
 # Exposes deterministic test seams (never enabled in production builds).
-test-fixtures = ["agent-run-store/test-fixtures"]
+test-fixtures = ["agent-run-store/test-fixtures", "agent-run-adapters/test-fixtures"]
 
 [dev-dependencies]
 # Fenced raw store access for test fixtures; never part of a production build.
 agent-run-store = { path = "../agent-run-store", features = ["test-fixtures"] }
+agent-run-adapters = { path = "../agent-run-adapters", features = ["test-fixtures"] }
 tempfile.workspace = true
 toml.workspace = true
 

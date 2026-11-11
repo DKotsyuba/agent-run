@@ -587,12 +587,38 @@ fn retain_cleanup_evidence(
     candidate.map(|_| ())
 }
 
+/// A contract rejection's reason when it is one of Run's static phrases:
+/// ASCII letters, spaces and `/ - , ( )` only, short words, bounded length,
+/// and `/`/`-` only inside a word. Text that could carry configured or native
+/// content (digits, underscores, quotes, paths, long tokens, other bytes) is
+/// withheld, never echoed.
+fn static_reason(message: &str) -> Option<&str> {
+    let joined = |word: &str| {
+        !word.starts_with(['/', '-'])
+            && !word.ends_with(['/', '-'])
+            && word.split(['/', '-']).all(|part| part.len() <= 24)
+    };
+    (!message.trim().is_empty()
+        && message.len() <= 160
+        && message.bytes().all(|b| {
+            b.is_ascii_alphabetic() || matches!(b, b' ' | b'/' | b'-' | b',' | b'(' | b')')
+        })
+        && message.split(' ').all(joined))
+    .then_some(message)
+}
+
 /// Returns closed, content-free categories for an execution error. Original
 /// messages, SQL text, paths, JSON contents and credential/environment values
-/// never enter diagnostics. Native numeric errno/SQLite codes remain nullable.
+/// never enter diagnostics; a validation or unsupported error adds only its
+/// [`static_reason`]. Native numeric errno/SQLite codes remain nullable.
 pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
+        Error::Validation(message) | Error::Unsupported(message) => {
+            if let Some(reason) = static_reason(message) {
+                data["reason"] = json!(reason);
+            }
+        }
         Error::OwnershipCheckpoint { stage, source } => {
             data = execution_error_metadata(source);
             data["stage"] = json!(stage);
@@ -1107,6 +1133,7 @@ pub fn native_publication_root(
         adapters::provider::LaunchOptions {
             fast: request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
+            managed_builds: None,
         },
         shared.as_ref(),
     )?;
@@ -1223,6 +1250,7 @@ pub async fn relocate_retained_home_on<B: crate::runtime_storage::LayoutBackend>
         adapters::provider::LaunchOptions {
             fast: row.request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
+            managed_builds: None,
         },
         None,
     ) {
@@ -1459,6 +1487,54 @@ fn system_private_home(route: &crate::system_launch::SystemRoute) -> Result<Path
     Ok(route.private_home.clone())
 }
 
+/// Delivery transport is not agent identity: every new launch (fresh start,
+/// resume or account switch) pins the current validated Bridge route and
+/// build, while an already running launch keeps the pin its owner-v2 endpoint
+/// captured at spawn. A system route has no readable per-user configuration
+/// and keeps its root-approved admission transport.
+fn launch_bridge_transport(
+    home: &Path,
+    frozen: &agent_run_config::provider_config::ProviderConfig,
+    system_route: bool,
+) -> Result<agent_run_config::provider_config::ManagedAttemptTransport> {
+    let unavailable = || invalid("managed owner transport unavailable");
+    let current;
+    let config = if system_route {
+        frozen
+    } else {
+        current = agent_run_config::provider_config::ProviderConfig::load(home)
+            .map_err(|_| unavailable())?
+            .0;
+        &current
+    };
+    config
+        .managed_attempt_binding
+        .as_ref()
+        .and_then(|settings| settings.transport.clone())
+        .ok_or_else(unavailable)
+}
+
+/// Managed role selection for every new launch (fresh start, resume or account
+/// switch) verifies the Pool frontend and Bridge hook against the builds pinned
+/// by the current validated configuration, while the frozen snapshot keeps the
+/// role and its declarations. Ordinary roles and system routes use the frozen
+/// snapshot unchanged.
+fn launch_managed_config(
+    home: &Path,
+    frozen: &agent_run_config::provider_config::ProviderConfig,
+    system_route: bool,
+    harness: HarnessId,
+    role: &agent_run_config::role_plan::ResolvedRolePlan,
+) -> Result<agent_run_config::provider_config::ProviderConfig> {
+    if system_route || !adapters::managed_role::selects(frozen, role) {
+        return Ok(frozen.clone());
+    }
+    let current = agent_run_config::provider_config::ProviderConfig::load(home)
+        .map_err(|_| invalid("managed role changed since admission"))?
+        .0;
+    adapters::managed_role::launch_build_pins(frozen, &current, harness)
+}
+
 /// Runs an admitted provider attempt through fenced process ownership and the terminal outbox.
 /// After the durable outcome, logs only public execution identity and numeric
 /// per-stage completion durations; logging never changes that outcome.
@@ -1524,6 +1600,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &runtime_home,
             identity.runtime_home.is_some(),
         )?;
+        // Role semantics stay frozen; component build pins come from the
+        // current configuration at this launch, like the Bridge transport.
+        // Planning and the later selection both use this one read.
+        let managed_config = launch_managed_config(
+            home,
+            &config,
+            identity.system_route.is_some(),
+            identity.authority.harness,
+            &ResolvedRolePlan::from_payload(&identity.authority.role_payload)?,
+        )?;
         if identity.runtime_home.is_none() {
             let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
             let (_, digest) = adapters::provider::materialize_selected(
@@ -1568,6 +1654,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 adapters::provider::LaunchOptions {
                     fast: row.request.fast,
                     output_schema: identity.provider_request.output_schema.as_ref(),
+                    managed_builds: Some(&managed_config),
                 },
                 None,
             )?;
@@ -1689,9 +1776,22 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             adapters::provider::LaunchOptions {
                 fast: row.request.fast,
                 output_schema: identity.provider_request.output_schema.as_ref(),
+                managed_builds: Some(&managed_config),
             },
             Some(&shared_assets),
         )?;
+        let managed_selection = adapters::managed_role::select(
+            &managed_config,
+            identity.authority.harness,
+            &planned.role,
+            row.request.explicit_finish,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        if managed_selection.is_some() {
+            return Err(Error::Unsupported(
+                "managed attempt binding requires Linux".into(),
+            ));
+        }
         // Codex keeps its original managed profile and its own native
         // sandbox: the shared store must stay provably outside every root that
         // profile can write and outside the temporary directories the native
@@ -1730,6 +1830,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             planned.launch.environment.insert(
                 agent_run_domain::worker::FINISH_ENV.into(),
                 if row.request.explicit_finish {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            );
+            // The selected managed role's worker surface is exactly its
+            // qualified allowlist: `health_reply` and `finish`.
+            planned.launch.environment.insert(
+                agent_run_domain::worker::MANAGED_ENV.into(),
+                if managed_selection.is_some() {
                     "1"
                 } else {
                     "0"
@@ -1823,6 +1934,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         }
         let service_gate = crate::managed_services::wait_for_gate(home, id).await;
         service_gate?;
+        let mut managed_claude_catalog = None;
         if identity.authority.harness == HarnessId::ClaudeCode && !store.cancel_pending(id)? {
             // Discovery children are owned by this attempt: each snapshot is one
             // journal event submitted through the same ordered lane, so the
@@ -1835,7 +1947,28 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 adapters::mcp_catalog::apply_claude_tool_filters(&mut planned, move |snapshot| {
                     discovery_ownership(&producer, &ownership_agent, &ownership_attempt, snapshot)
                 });
-            discovery.await?;
+            let catalogs = discovery.await?;
+            if let Some(selection) = &managed_selection {
+                let expected = adapters::managed_role::claude_disallowed_tools(
+                    &selection.inventory,
+                    &catalogs,
+                )?;
+                let positions: Vec<_> = planned
+                    .launch
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, arg)| (arg == "--disallowedTools").then_some(index + 1))
+                    .collect();
+                if positions.len() != 1 || planned.launch.args.get(positions[0]) != Some(&expected)
+                {
+                    return Err(invalid("managed Claude deny controls did not verify"));
+                }
+                // The same deterministic function is used again by the native
+                // runner before its first control frame or model input.
+                planned.launch.args[positions[0]] = expected;
+                managed_claude_catalog = Some(catalogs);
+            }
         }
         let owner_supported = matches!(
             planned.runtime.kind()?,
@@ -1849,6 +1982,57 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &planned.profile,
             owner_supported,
         );
+        // A selected managed launch always gets its own v2 address at exec.
+        // Missing local IPC settings fail before the journal's spawn claim.
+        // The Bridge route/build is pinned from the current configuration at
+        // this launch, not from the frozen identity snapshot.
+        let managed_owner_v2 = if managed_selection.is_some() {
+            let transport = launch_bridge_transport(
+                home,
+                &identity.provider_config,
+                identity.system_route.is_some(),
+            )?;
+            let setting = |name: &str| -> Result<std::path::PathBuf> {
+                planned
+                    .launch
+                    .environment
+                    .get(name)
+                    .filter(|value| !value.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| invalid("managed owner transport unavailable"))
+            };
+            let channel = setting(adapters::native_owner::SETTINGS[0])?;
+            if channel != transport.bridge_socket
+                || channel.canonicalize().ok().as_ref() != Some(&transport.bridge_socket)
+            {
+                return Err(invalid(
+                    "managed owner channel differs from pinned Bridge route",
+                ));
+            }
+            Some(adapters::native_owner_v2::Config {
+                channel,
+                directory: setting(adapters::native_owner::SETTINGS[1])?,
+                transport,
+            })
+        } else {
+            None
+        };
+        // Journal before the spawning claim and inject only the generated
+        // launch correlation. Legacy/OpenCode are not qualified managed paths.
+        #[cfg(target_os = "linux")]
+        let launch_journaled = matches!(
+            identity.authority.harness,
+            HarnessId::Codex | HarnessId::ClaudeCode
+        );
+        #[cfg(not(target_os = "linux"))]
+        let launch_journaled = false;
+        if launch_journaled {
+            let launch = store.prepare_attempt_launch(id, &attempt_id).await?;
+            planned
+                .launch
+                .environment
+                .insert("AGENT_RUN_LAUNCH_ID".into(), launch);
+        }
         if row.request.explicit_finish && planned.role.worker_mcp {
             // Before the spawn claim, give the broker this attempt's final
             // launch secrets: it refuses every first finish intent that
@@ -1915,7 +2099,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         }
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
-        let spawned = if identity.authority.harness == HarnessId::OpenCode {
+        let spawned = if managed_selection.is_some() {
+            Process::spawn_managed(&planned.launch, managed_owner_v2)
+        } else if identity.authority.harness == HarnessId::OpenCode {
             Process::spawn_lease(&planned.launch)
         } else {
             Process::spawn(&planned.launch)
@@ -1939,6 +2125,24 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .leader
                 .clone()
                 .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
+            #[cfg(target_os = "linux")]
+            let incarnation = if launch_journaled {
+                // Ordinary execution retains its existing ownership evidence
+                // when a full managed incarnation cannot be established.
+                #[cfg(feature = "test-fixtures")]
+                let unavailable = home.join("fixture-unavailable-incarnation").exists();
+                #[cfg(not(feature = "test-fixtures"))]
+                let unavailable = false;
+                if unavailable {
+                    None
+                } else {
+                    agent_run_platform::process::kernel_incarnation(&leader).ok()
+                }
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let incarnation = None;
             process
                 .observing(async {
                     fixture_hold(home, "provider-process").await;
@@ -1952,7 +2156,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                             })
                             .filter(|evidence| evidence.validate().is_ok());
                     store
-                        .provider_process(id, &attempt_id, &leader, integration)
+                        .provider_process(id, &attempt_id, &leader, integration, incarnation)
                         .await
                 })
                 .await?;
@@ -2001,25 +2205,102 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .await
             } else if identity.authority.harness == HarnessId::Codex {
                 native_row.request.model = planned.native_model.clone();
-                crate::codex::run(
-                    &mut process,
-                    store,
-                    &native_row,
-                    &row,
-                    &planned.runtime,
-                    &planned.profile,
-                    &runtime_home,
-                )
-                .await
+                if let Some(selection) = &managed_selection {
+                    let bytes = std::fs::read(runtime_home.join("config.toml"))?;
+                    if bytes.len() > 1024 * 1024 {
+                        return Err(invalid("managed config unavailable"));
+                    }
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|_| invalid("managed config unavailable"))?;
+                    let native: toml::Value =
+                        toml::from_str(text).map_err(|_| invalid("managed config unavailable"))?;
+                    let native = serde_json::to_value(native)?;
+                    let hooks = native
+                        .get("hooks")
+                        .ok_or_else(|| invalid("managed hooks unavailable"))?;
+                    let managed = crate::codex::ManagedCodexRole {
+                        pre_tool_use: &hooks["PreToolUse"],
+                        permission_request: &hooks["PermissionRequest"],
+                        hook_state: &hooks["state"],
+                        inventory: &selection.inventory,
+                        selection,
+                        code_mode: adapters::managed_role::codex_config_code_mode(&native)?,
+                    };
+                    crate::codex::run_managed(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        &planned.runtime,
+                        &planned.profile,
+                        &runtime_home,
+                        &managed,
+                    )
+                    .await
+                } else {
+                    crate::codex::run(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        &planned.runtime,
+                        &planned.profile,
+                        &runtime_home,
+                    )
+                    .await
+                }
             } else {
-                crate::stream::run(
-                    &mut process,
-                    store,
-                    &native_row,
-                    &row,
-                    planned.launch.initial_input.as_deref(),
-                )
-                .await
+                if let Some(selection) = &managed_selection {
+                    let catalogs = managed_claude_catalog
+                        .as_ref()
+                        .ok_or_else(|| invalid("managed Claude catalog unavailable"))?;
+                    let disallowed = adapters::managed_role::claude_disallowed_tools(
+                        &selection.inventory,
+                        catalogs,
+                    )?;
+                    let expected_mcp = runtime_home.join("mcp/mcp-config.json");
+                    let mcp_args: Vec<_> = planned
+                        .launch
+                        .args
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--mcp-config")
+                        .map(|pair| std::path::Path::new(&pair[1]))
+                        .collect();
+                    if mcp_args != [expected_mcp.as_path()] {
+                        return Err(invalid("managed MCP configuration path did not verify"));
+                    }
+                    let settings = std::fs::read(runtime_home.join("settings.json"))?;
+                    if settings.len() > 1024 * 1024 {
+                        return Err(invalid("managed config unavailable"));
+                    }
+                    let catalog_sha256 = adapters::managed_role::claude_catalog_digest(catalogs)?;
+                    let config_digest = agent_run_domain::canonical::sha256_hex(
+                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args,"disallowed_tools":disallowed,"mcp_catalog_sha256":catalog_sha256}),
+                        true,
+                    );
+                    crate::stream::run_managed(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        planned.launch.initial_input.as_deref(),
+                        selection,
+                        &config_digest,
+                        &planned.launch.args,
+                        catalogs,
+                        &catalog_sha256,
+                    )
+                    .await
+                } else {
+                    crate::stream::run(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        planned.launch.initial_input.as_deref(),
+                    )
+                    .await
+                }
             }
         };
         let execution = execution.await;
@@ -2128,23 +2409,6 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             data["account"] = json!(account);
             data["provider"] = json!(identity.authority.provider);
             data["model"] = json!(identity.authority.model);
-            if let Some((lane, window)) = latch_mapping(&identity, failure) {
-                let reset = data["resets_at"].as_f64();
-                store
-                    .latch_native_exhaustion(ops::LatchNativeExhaustion {
-                        execution: id.clone(),
-                        account: account.clone(),
-                        runtime: identity.authority.provider.as_str().to_owned(),
-                        lane: lane.clone(),
-                        window: window.clone(),
-                        source: "native-quota-exhaustion".to_owned(),
-                        models: governed_lanes(&identity, &account),
-                        observed_at: domain::now(),
-                        reset_at: reset,
-                    })
-                    .await?;
-                data["latched"] = json!({"lane":lane,"window":window});
-            }
             store.event(id, "native_failure", &data).await?;
             state["native_failure"] = data;
         }
@@ -2342,15 +2606,38 @@ async fn failover(
                 .collect()
         })
         .unwrap_or_default();
-    for _ in 0..=crate::service::PROVIDER_STALE_RETRIES {
-        let candidates = crate::capacity::provider_ranking::provider_candidates(
-            store,
-            &frozen,
-            &authority.provider,
-            &authority.model,
-            None,
-            &hard,
-        )
+    let mut submission = 0;
+    let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
+    loop {
+        let snapshot = decisions
+            .read(identity.provider_config.capacity.quota.as_ref())
+            .await;
+        let ranked_home = home.to_path_buf();
+        let ranked_catalog = frozen.clone();
+        let ranked_provider = authority.provider.clone();
+        let ranked_model = authority.model.clone();
+        let ranked_hard = hard.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            let local = agent_run_store::writer::StoreReader::open_with(
+                &ranked_home,
+                crate::service::READ_ALLOWANCE,
+            )?;
+            Ok::<_, Error>(
+                crate::capacity::quota_adapter::candidates_at(
+                    &local,
+                    &ranked_catalog,
+                    &ranked_provider,
+                    &ranked_model,
+                    None,
+                    &ranked_hard,
+                    snapshot.as_deref(),
+                    domain::now(),
+                )?
+                .candidates,
+            )
+        })
+        .await
+        .map_err(|_| "no_eligible_account".to_owned())?
         .map_err(|_| "no_eligible_account".to_owned())?;
         let catalog = serde_json::to_value(&frozen).map_err(|error| error.to_string())?;
         let allocation = store
@@ -2367,7 +2654,22 @@ async fn failover(
             }
             Err(Error::QuotaAdmission(
                 agent_run_domain::catalog::QuotaAdmissionError::SelectionStale { .. },
-            )) => continue,
+            )) if submission < crate::service::PROVIDER_STALE_RETRIES => {
+                submission += 1;
+                decisions.require_fresh();
+            }
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::SelectionStale { .. },
+            )) => return Err("selection_busy".into()),
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::QuotaClockRollback
+                | agent_run_domain::catalog::QuotaAdmissionError::QuotaDecisionInvalid,
+            )) if decisions
+                .retry_invalidated(&mut submission, crate::service::PROVIDER_STALE_RETRIES) => {}
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::QuotaDecisionStale,
+            )) if decisions
+                .retry_expired(&mut submission, crate::service::PROVIDER_STALE_RETRIES) => {}
             Err(Error::QuotaAdmission(
                 agent_run_domain::catalog::QuotaAdmissionError::NoEligibleAccount { .. },
             )) => return Err("no_eligible_account".into()),
@@ -2377,7 +2679,6 @@ async fn failover(
             Err(error) => return Err(error.to_string().into()),
         }
     }
-    Err("selection_busy".into())
 }
 
 /// Test-only controlled failure injection: `AGENT_RUN_INJECT_QUOTA=<n>` makes
@@ -2563,75 +2864,6 @@ fn history_root(
             }),
     }
 }
-/// The exact physical pool of an authoritative exhaustion, when the
-/// provider's own collector mapping establishes it: a Claude Code provider
-/// whose limits come from the first-party `anthropic_usage` collector maps
-/// `five_hour` to `primary`/`five_hour` and `seven_day` to
-/// `secondary`/`seven_day` (both over every bound model, as that collector
-/// records them). Model-scoped weekly windows, overage, Codex's windowless
-/// `usageLimitExceeded` and every other provider stay unmapped: they only
-/// exclude the account for this run.
-fn latch_mapping(
-    identity: &ProviderLaunchIdentity,
-    failure: &adapters::native_failure::NativeFailure,
-) -> Option<(String, String)> {
-    let adapters::native_failure::NativeFailure::QuotaExhausted {
-        window: Some(window),
-        ..
-    } = failure
-    else {
-        return None;
-    };
-    let provider = identity
-        .provider_config
-        .providers
-        .get(&identity.authority.provider)?;
-    if provider.limits_source != agent_run_domain::LimitsSource::Exec {
-        return None;
-    }
-    let pool = provider
-        .collector
-        .as_ref()?
-        .exhaustion_windows
-        .get(window)?;
-    Some((pool.clone(), window.clone()))
-}
-
-/// The model lanes (native alias, else id) an explicitly configured native exhaustion pool
-/// of `account` governs for this provider: every provider model the
-/// account's bindings admit, exactly as that collector builds its unit.
-fn governed_lanes(
-    identity: &ProviderLaunchIdentity,
-    account: &agent_run_domain::catalog::AccountId,
-) -> std::collections::BTreeSet<String> {
-    let Some(provider) = identity
-        .provider_config
-        .providers
-        .get(&identity.authority.provider)
-    else {
-        return Default::default();
-    };
-    provider
-        .bindings
-        .iter()
-        .filter(|binding| &binding.account == account)
-        .flat_map(|binding| {
-            provider.models.iter().filter(move |model| {
-                binding
-                    .models
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(&model.id))
-            })
-        })
-        .map(|model| {
-            model
-                .native_model
-                .clone()
-                .unwrap_or_else(|| model.id.clone())
-        })
-        .collect()
-}
-
 /// Completes one refused handoff only after proving its attempt never spawned.
 async fn finish_blocked_handoff(
     store: &mut Persist,
@@ -3011,6 +3243,42 @@ mod tests {
         }
         let data = execution_error_metadata(&errors[1]);
         assert_eq!(data["sqlite_code"], "DatabaseBusy");
+        // A static contract reason is kept for operators; anything that could
+        // carry configured or native content is withheld.
+        let error = Error::Validation("native managed MCP status did not verify".into());
+        assert_eq!(
+            execution_error_metadata(&error)["reason"],
+            "native managed MCP status did not verify"
+        );
+        assert!(
+            failed_result(&error)
+                .outcome
+                .failure_text
+                .unwrap()
+                .contains("native managed MCP status did not verify")
+        );
+        assert_eq!(
+            execution_error_metadata(&Error::Validation(
+                "Codex effective readable/writable roots differ from admitted grant".into()
+            ))["reason"],
+            "Codex effective readable/writable roots differ from admitted grant"
+        );
+        for withheld in [
+            "writable root /home/user/work does not resolve",
+            "token abc123 rejected",
+            "value \"quoted\" rejected",
+            "key sk-ant-api03-abcdefghijklmnopqrstuvwxyz rejected",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "",
+        ] {
+            let data = execution_error_metadata(&Error::Validation(withheld.into()));
+            assert!(data.get("reason").is_none(), "{withheld}");
+        }
+        assert!(
+            execution_error_metadata(&Error::Runtime("plain words".into()))
+                .get("reason")
+                .is_none()
+        );
         assert_eq!(data["sqlite_extended_code"], 5);
         assert_eq!(
             execution_error_metadata(&errors[0])["io_kind"],
@@ -3174,5 +3442,220 @@ mod writer_identity_diagnostic_tests {
         assert_eq!(metadata["wait_ms"], 30000);
         assert_eq!(metadata["attempts"], 2);
         assert_eq!(error.public().message, "state persistence operation failed");
+    }
+}
+
+#[cfg(test)]
+mod launch_bridge_transport_tests {
+    use super::*;
+
+    fn config(bridge: char) -> String {
+        format!(
+            r#"schema_version=2
+[managed_attempt_binding]
+enabled=true
+role_name='managed'
+pool_server='pool'
+pool_executable_sha256='{frontend}'
+bridge_hook_sha256='{hook}'
+host_id='host'
+pool_resident_executable='/opt/pool-resident'
+pool_resident_sha256='{resident}'
+[managed_attempt_binding.transport]
+run_route={{component_store_id='store_0123456789abcdef0123456789abcdef',route_id='run',worker_uid=1000}}
+pool_route={{component_store_id='pool-store',route_id='pool',worker_uid=1000}}
+bridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid=1000}}
+producer='pool'
+pool_socket='/opt/pool.sock'
+bridge_socket='/opt/bridge.sock'
+bridge_executable='/opt/bridge-daemon'
+bridge_executable_sha256='{bridge}'
+bridge_reader_credential_file='/opt/reader'
+bridge_reader_credential_sha256='{credential}'
+"#,
+            frontend = "a".repeat(64),
+            hook = "c".repeat(64),
+            resident = "b".repeat(64),
+            bridge = bridge.to_string().repeat(64),
+            credential = "e".repeat(64),
+        )
+    }
+
+    /// A frozen snapshot names build D; after an in-place Bridge upgrade to F
+    /// every new launch (fresh start or resume) pins F. System routes keep
+    /// their root-approved admission transport; a missing one fails closed.
+    #[test]
+    fn new_launch_pins_current_bridge_build_not_frozen_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let frozen =
+            agent_run_config::provider_config::ProviderConfig::parse(&config('d'), home.path())
+                .unwrap();
+        std::fs::write(home.path().join("config.toml"), config('f')).unwrap();
+        let launch = launch_bridge_transport(home.path(), &frozen, false).unwrap();
+        assert_eq!(launch.bridge_executable_sha256, "f".repeat(64));
+        let system = launch_bridge_transport(home.path(), &frozen, true).unwrap();
+        assert_eq!(system.bridge_executable_sha256, "d".repeat(64));
+        std::fs::write(
+            home.path().join("config.toml"),
+            config('f')
+                .split("[managed_attempt_binding.transport]")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(launch_bridge_transport(home.path(), &frozen, false).is_err());
+    }
+
+    fn managed_config(root: &Path, hook_sha256: &str, role: &str, tools: &str) -> String {
+        format!(
+            r#"schema_version=2
+[harnesses.codex]
+binary='/usr/bin/true'
+home='{root}/codex'
+[harnesses.claude-code]
+binary='/usr/bin/true'
+home='{root}/claude'
+hooks=[{{event='PreToolUse',command=['{root}/bridge-hook'],matcher='mcp__pool__.*'}}]
+[mcp.pool]
+transport='stdio'
+command='{root}/pool-frontend'
+args=['mcp','--config','{root}/pool.toml']
+approval_mode='approve'
+allowed_tools=[{tools}]
+[providers.mock]
+harness='claude-code'
+connection={{kind='custom',endpoint='https://gateway.example/api',protocol='messages'}}
+auth_family='anthropic'
+limits_source='none'
+[[providers.mock.models]]
+id='fixture'
+[[providers.mock.bindings]]
+label='work'
+account='acct-work'
+[managed_attempt_binding]
+enabled=true
+role_name='{role}'
+pool_server='pool'
+pool_executable_sha256='{frontend}'
+bridge_hook_sha256='{hook_sha256}'
+host_id='host'
+"#,
+            root = root.display(),
+            frontend = agent_run_platform::fs::sha256(b"pool-frontend\n"),
+        )
+    }
+
+    fn install(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        // Atomic replacement, as a real upgrade installs a new inode.
+        let staged = path.with_extension("new");
+        std::fs::write(&staged, bytes).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(staged, path).unwrap();
+    }
+
+    /// Start under Bridge hook build A, upgrade to B and update the pin, then
+    /// resume: role selection verifies B from the current configuration while
+    /// the frozen role and its digest are unchanged. A changed role semantic
+    /// in the current configuration is refused rather than adopted.
+    #[test]
+    fn resumed_launch_selects_frozen_role_with_current_component_builds() {
+        use agent_run_config::role_plan::{McpSelectionSource, ResolvedMcp, ResolvedRolePlan};
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let (build_a, build_b) = (b"bridge-hook-A\n", b"bridge-hook-B\n");
+        let (sha_a, sha_b) = (
+            agent_run_platform::fs::sha256(build_a),
+            agent_run_platform::fs::sha256(build_b),
+        );
+        install(&root.join("bridge-hook"), build_a);
+        install(&root.join("pool-frontend"), b"pool-frontend\n");
+        let frozen = agent_run_config::provider_config::ProviderConfig::parse(
+            &managed_config(&root, &sha_a, "managed", "'pool_get'"),
+            &root,
+        )
+        .unwrap();
+        let role = ResolvedRolePlan {
+            role_name: "managed".into(),
+            role_revision: "1".into(),
+            prompt: "managed".into(),
+            write: false,
+            network: false,
+            allow_external_read_roots: false,
+            read_roots: vec![],
+            skills: vec![],
+            mcp: vec![ResolvedMcp {
+                id: "pool".into(),
+                transport: "stdio".into(),
+                command: root.join("pool-frontend").to_string_lossy().into_owned(),
+                args: vec![
+                    "mcp".into(),
+                    "--config".into(),
+                    root.join("pool.toml").to_string_lossy().into_owned(),
+                ],
+                env_from: vec![],
+                approval_mode: "approve".into(),
+                allowed_tools: Some(vec!["pool_get".into()]),
+                selection: McpSelectionSource::Profile,
+            }],
+            worker_mcp: true,
+            required_constraints: Default::default(),
+            auth_mode: "native".into(),
+            auth_reference: None,
+            config_revision: "b".repeat(64),
+        };
+        let select = |config: &agent_run_config::provider_config::ProviderConfig| {
+            adapters::managed_role::select(config, HarnessId::ClaudeCode, &role, true)
+        };
+        std::fs::write(
+            root.join("config.toml"),
+            managed_config(&root, &sha_a, "managed", "'pool_get'"),
+        )
+        .unwrap();
+        let launch =
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).unwrap();
+        let initial = select(&launch).unwrap().unwrap();
+        // In-place upgrade: the hook binary is replaced and the pin follows.
+        install(&root.join("bridge-hook"), build_b);
+        std::fs::write(
+            root.join("config.toml"),
+            managed_config(&root, &sha_b, "managed", "'pool_get'"),
+        )
+        .unwrap();
+        assert!(select(&frozen).is_err());
+        let launch =
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).unwrap();
+        let settings = launch.managed_attempt_binding.as_ref().unwrap();
+        assert_eq!(settings.bridge_hook_sha256, sha_b);
+        let resumed = select(&launch).unwrap().unwrap();
+        assert_eq!(resumed.role_digest, role.config_revision);
+        assert_eq!(resumed.role_digest, initial.role_digest);
+        assert_eq!(resumed.inventory, initial.inventory);
+        // A system route keeps its admission snapshot and so the A pin.
+        let system =
+            launch_managed_config(&root, &frozen, true, HarnessId::ClaudeCode, &role).unwrap();
+        assert!(select(&system).is_err());
+        // Changed role semantics are refused, never adopted on resume.
+        for changed in [
+            managed_config(&root, &sha_b, "managed", "'pool_get','pool_post'"),
+            managed_config(&root, &sha_b, "other", "'pool_get'"),
+            managed_config(&root, &sha_b, "managed", "'pool_get'")
+                .replace("matcher='mcp__pool__.*'", "matcher='mcp__pool__pool_get'"),
+        ] {
+            std::fs::write(root.join("config.toml"), changed).unwrap();
+            assert!(
+                launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).is_err()
+            );
+        }
+        // An ordinary role never reads the current configuration.
+        std::fs::remove_file(root.join("config.toml")).unwrap();
+        let mut ordinary = role.clone();
+        ordinary.role_name = "ordinary".into();
+        assert!(
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &ordinary).is_ok()
+        );
+        assert!(
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).is_err()
+        );
     }
 }

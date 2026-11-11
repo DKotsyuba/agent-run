@@ -2,7 +2,7 @@
 
 use crate::{
     Store,
-    provider_admission::{AdmissionInputs, admit_in_tx},
+    provider_admission::{AdmissionInputs, admit_in_tx, check_quota_decision},
 };
 use agent_run_domain::{
     Error, Result,
@@ -134,7 +134,8 @@ impl Store<'_> {
     /// per-member admission once per member in slot order against the same
     /// transaction, so caps, account reservations and physical keys see the
     /// earlier members, and a failure of any member rolls back every row. The
-    /// quota capacity revision advances once. Nothing is launched.
+    /// quota capacity revision advances once. Every new member's quota clock
+    /// fence is rechecked before the shared commit. Nothing is launched.
     pub fn admit_pool(&mut self, input: PoolAdmissionInput<'_>) -> Result<PoolAdmission> {
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if let Some(found) = replay_pool(
@@ -255,6 +256,11 @@ impl Store<'_> {
             Store::advance_quota_capacity_revision(&tx)?;
         }
         let members = members_of(&tx, input.pool_id.as_str())?;
+        for member in &input.members {
+            if let PoolAdmissionSource::New(inputs) = &member.source {
+                check_quota_decision(inputs.candidates)?;
+            }
+        }
         tx.commit()?;
         Ok(PoolAdmission {
             pool_id: input.pool_id.clone(),

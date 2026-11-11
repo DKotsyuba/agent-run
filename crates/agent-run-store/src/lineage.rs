@@ -26,11 +26,12 @@ fn group_is_gone(pgid: i32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Loads and proves a terminal parent can safely supply exactly one resume child.
+/// Proves an unheld terminal parent can safely supply exactly one resume child.
 pub(crate) fn resume_parent(
     tx: &rusqlite::Connection,
     parent_id: &AgentId,
 ) -> Result<ResumeLineage> {
+    crate::lineage_holds::require_unheld(tx, parent_id)?;
     let parent = tx.query_row(
         "SELECT * FROM agents WHERE id=?",
         [parent_id.as_str()],

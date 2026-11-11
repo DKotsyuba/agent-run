@@ -419,6 +419,16 @@ impl Grant {
             permission_profile: profile,
         })
     }
+    /// The grant of a thread started with no native environment
+    /// (`environments: []`), as the managed role requires. Like research, it
+    /// then has no runtime workspace roots: codex-cli 0.167.0 echoes
+    /// `runtimeWorkspaceRoots: []` and exposes no filesystem, shell or patch
+    /// tool, so requesting the workdir root would be both ineffective and an
+    /// echo mismatch. cwd, sandbox, approval and network stay as admitted.
+    pub fn without_environments(mut self) -> Self {
+        self.roots.clear();
+        self
+    }
     /// Builds thread-start/resume fields from the already admitted grant.
     /// Named and built-in profiles replace legacy sandbox fields; only the
     /// existing unnamed network path retains its native network override.
@@ -772,6 +782,106 @@ pub async fn run(
     role: &Profile,
     home: &Path,
 ) -> Result<EngineResult> {
+    run_inner(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        None,
+    )
+    .await
+}
+
+/// Pinned values supplied by the explicitly enabled managed-role selector.
+/// The values themselves are not proof of trusted executable provenance.
+#[allow(dead_code)]
+pub(crate) struct ManagedCodexRole<'a> {
+    pub pre_tool_use: &'a Value,
+    pub permission_request: &'a Value,
+    pub hook_state: &'a Value,
+    pub inventory: &'a BTreeMap<String, BTreeSet<String>>,
+    pub selection: &'a agent_run_adapters::managed_role::Selection,
+    /// Whether the launch's generated configuration enables the Code Mode
+    /// host; it then requires the selection's verified host.
+    pub code_mode: bool,
+}
+
+async fn verify_live_managed_config(
+    process: &mut Process,
+    cwd: &Path,
+    managed: &ManagedCodexRole<'_>,
+) -> Result<(String, Value)> {
+    let codex = managed
+        .selection
+        .codex
+        .as_ref()
+        .ok_or_else(|| invalid("managed Codex selection unavailable"))?;
+    if managed.code_mode && codex.code_mode_host.is_none() {
+        return Err(invalid("managed Codex code-mode host is not pinned"));
+    }
+    agent_run_adapters::managed_role::verify_codex_pre_tool_use(managed.pre_tool_use, codex)?;
+    let config = process
+        .rpc("config/read", json!({"cwd":cwd}), Duration::from_secs(30))
+        .await?;
+    let mut accepted = agent_run_adapters::managed_role::verify_managed_config(
+        &config,
+        managed.pre_tool_use,
+        managed.permission_request,
+        managed.hook_state,
+        managed.code_mode,
+    )?;
+    // Codex's own name for the Pool server's tools, which the Bridge hook
+    // matcher selects, and the verified host model code runs in.
+    accepted["pool_tool_prefix"] = json!(format!("mcp__{}__", codex.pool_namespace));
+    accepted["code_mode_host"] = json!(codex.code_mode_host.as_ref().filter(|_| managed.code_mode));
+    // The accepted native drift is bound into the qualification digest
+    // beside the whole reply, and journaled by name so drift stays visible.
+    let digest = agent_run_domain::canonical::sha256_hex(
+        &json!({"config_sha256":agent_run_domain::canonical::sha256_hex(&config, true),"accepted":accepted}),
+        true,
+    );
+    Ok((digest, accepted))
+}
+
+/// Managed Codex entry point, selected only after trusted component checks.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn run_managed(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    managed: &ManagedCodexRole<'_>,
+) -> Result<EngineResult> {
+    run_inner(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        Some(managed),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    managed: Option<&ManagedCodexRole<'_>>,
+) -> Result<EngineResult> {
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
         || record.identity != logical_record.identity
@@ -779,7 +889,26 @@ pub async fn run(
         return Err(invalid("native input and logical authority do not match"));
     }
     agent_run_adapters::validate_role(runtime, role)?;
+    if managed.is_some()
+        && (!role.skills.is_empty() || !runtime.plugins.is_empty() || role.research_tools_only())
+    {
+        return Err(invalid("native managed role assets did not verify"));
+    }
     initialize(process).await?;
+    let mut managed_config_digest = if let Some(managed) = managed {
+        let (digest, accepted) =
+            verify_live_managed_config(process, &record.request.workdir, managed).await?;
+        process
+            .observing(store.event(
+                &record.id,
+                "managed_native_drift_v1",
+                &json!({"harness":"codex","config":accepted}),
+            ))
+            .await?;
+        Some(digest)
+    } else {
+        None
+    };
     if role.research_tools_only() {
         let config = process
             .rpc(
@@ -811,7 +940,34 @@ pub async fn run(
     {
         return Err(invalid("effort is not offered by selected account/model"));
     }
-    let grant = Grant::new(runtime, &record.request, role, home)?;
+    if let Some(managed) = managed {
+        // Codex recorded its catalog while listing models. A model that needs
+        // Code Mode is refused here, before any thread, unless the pinned host
+        // is enabled; the mode is bound into the qualification digest.
+        let tool_mode =
+            agent_run_adapters::managed_role::codex_model_tool_mode(home, &record.request.model);
+        agent_run_adapters::managed_role::verify_codex_tool_mode(
+            tool_mode.as_deref(),
+            managed.code_mode,
+        )?;
+        process
+            .observing(store.event(
+                &record.id,
+                "managed_native_tool_mode_v1",
+                &json!({"harness":"codex","tool_mode":tool_mode,"code_mode":managed.code_mode}),
+            ))
+            .await?;
+        managed_config_digest = managed_config_digest.map(|digest| {
+            agent_run_domain::canonical::sha256_hex(
+                &json!({"config":digest,"tool_mode":tool_mode}),
+                true,
+            )
+        });
+    }
+    let mut grant = Grant::new(runtime, &record.request, role, home)?;
+    if managed.is_some() {
+        grant = grant.without_environments();
+    }
     let mut params = grant.request();
     if record.request.explicit_finish {
         // Runtime turn semantics belong above task/user text. Preserve the
@@ -840,6 +996,9 @@ pub async fn run(
         // Hosted web and the attempt-bound worker MCP remain available.
         params["environments"] = json!([]);
     }
+    if managed.is_some() {
+        agent_run_adapters::managed_role::codex_thread_parameters(&mut params)?;
+    }
     let method = if let Some(s) = &record.resume_of_runtime_session_id {
         params["threadId"] = json!(s);
         "thread/resume"
@@ -864,8 +1023,23 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
-    if record.request.explicit_finish {
+    if record.request.explicit_finish && managed.is_none() {
         finish_inventory_ready(process, &tid, role.research_tools_only()).await?;
+    }
+    if let Some(managed) = managed {
+        let inventory = managed_inventory_settled(process, &tid).await?;
+        agent_run_adapters::managed_role::verify_inventory(&inventory, managed.inventory)?;
+        let inventory_digest = agent_run_domain::canonical::sha256_hex(&inventory, true);
+        crate::managed_qualification::record(
+            process,
+            store,
+            record,
+            managed.selection,
+            "codex",
+            managed_config_digest.ok_or_else(|| invalid("managed config unavailable"))?,
+            inventory_digest,
+        )
+        .await?;
     }
     if role.research_tools_only() {
         let status = process
@@ -989,6 +1163,7 @@ pub async fn run(
     let mut final_answer: Option<String> = None;
     let mut usage = None;
     let mut native_owner = process.native_owner.take();
+    let mut native_owner_v2 = process.native_owner_v2.take();
     let mut native_calls = agent_run_adapters::native_owner::Calls::default();
     let mut idle = false;
     let mut closing_at: Option<tokio::time::Instant> = None;
@@ -1033,6 +1208,28 @@ pub async fn run(
         }
         let event = tokio::select! {
             biased;
+            call = agent_run_adapters::native_owner_v2::Owner::receive(&mut native_owner_v2) => {
+                use agent_run_adapters::io::RpcDisposition;
+                if call.stale {let reply=crate::native_owner::stale_v2(process,store,logical_record,&call.request,Some(&tid)).await;call.answer(reply);continue;}
+                let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.transport,Some(&tid),idle,closing_at.is_some()).await;
+                let token = match prepared {
+                    crate::native_owner::PreparedV2::Reply(reply) => {call.answer(reply);continue;}
+                    crate::native_owner::PreparedV2::Invoke(token) => token,
+                };
+                let old_turn=turn_id.clone();
+                let exchange=turn_input(process,&mut session,&tid,&mut turn_id,&mut idle,&call.request.text,record.request.effort.as_deref(),call.deadline).await;
+                let (state,protocol,native_id,reason)=match exchange {
+                    Ok(RpcDisposition::Replied(_)) if tokio::time::Instant::now()<call.deadline && turn_id!=old_turn && agent_run_adapters::native_owner::valid_id(&turn_id)=> ("accepted",Some("codex_turn"),Some(turn_id.as_str()),None),
+                    Ok(RpcDisposition::Rejected{..}|RpcDisposition::UnsentPressure)=>("known_unsent",None,None,Some("unavailable")),
+                    _=>("unknown",None,None,Some("native_uncertain")),
+                };
+                let reply=crate::native_owner::finish_v2(process,store,&call.request,&token,state,protocol,native_id,reason).await;
+                let accepted=reply.state=="accepted";let unknown=reply.state=="unknown";
+                call.answer(reply);
+                if unknown {native_owner_v2.take();return Err(invalid("native owner input outcome is uncertain"));}
+                if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
+                continue;
+            }
             call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
                 use agent_run_adapters::{native_owner::Reply,io::RpcDisposition};
                 let id=call.request.call_id.clone();
@@ -1565,6 +1762,22 @@ pub async fn run(
                 .await?;
             continue;
         }
+        // A worker finish result can arrive after its turn already completed
+        // (the session is idle, or the item names an earlier turn of this
+        // thread). It is still this attempt's observed receipt: the accepted
+        // finish digest binds it. Dropping it would leave the accepted finish
+        // unobserved, so closing would never begin.
+        if record.request.explicit_finish
+            && method == "item/completed"
+            && (idle || event_turn.is_some_and(|id| id != turn_id))
+            && let Some(item) = p.get("item").filter(|item| worker_finish_item(item))
+        {
+            let text = item
+                .pointer("/result/content")
+                .map(Value::to_string)
+                .unwrap_or_default();
+            crate::worker_finish::receipt(process, store, record, &text).await?;
+        }
         if event_turn.is_some_and(|id| id != turn_id) {
             record_native_event(process, store, &record.id, method, p).await?;
             continue;
@@ -1776,12 +1989,7 @@ pub async fn run(
                             .map(str::to_owned)
                     })
                     .unwrap_or_default();
-                    if item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
-                        && item.get("server").and_then(Value::as_str)
-                            == Some(agent_run_domain::worker::SERVER_NAME)
-                        && item.get("tool").and_then(Value::as_str) == Some("finish")
-                        && tool_error(item).is_none_or(|(error, _)| !error)
-                    {
+                    if worker_finish_item(item) {
                         crate::worker_finish::receipt(process, store, record, &text).await?;
                     }
                     process
@@ -1995,6 +2203,36 @@ async fn finish_inventory_ready(process: &mut Process, thread: &str, research: b
                 return Err(invalid("native finish tool catalog differs from admission"));
             }
             return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// codex-cli 0.167.0 starts thread MCP servers asynchronously after
+/// thread/start. Re-read the native status until every server is connected or
+/// one has failed, within the same 30-second setup allowance, and return that
+/// reply for the caller's single exact verification. Nothing is accepted here.
+async fn managed_inventory_settled(process: &mut Process, thread: &str) -> Result<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(invalid("native managed inventory did not become ready"));
+        }
+        let status = process
+            .rpc(
+                "mcpServerStatus/list",
+                json!({"threadId":thread,"limit":1000}),
+                left,
+            )
+            .await?;
+        let settled = status["data"].as_array().is_none_or(|servers| {
+            !servers.is_empty()
+                && (servers.iter().all(|s| s["runtimeStatus"] == "connected")
+                    || servers.iter().any(|s| s["runtimeStatus"] == "failed"))
+        });
+        if settled {
+            return Ok(status);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2573,6 +2811,14 @@ async fn native_job_completion(
     Ok(())
 }
 
+/// A completed, not explicitly failed call of this attempt's worker finish tool.
+fn worker_finish_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
+        && item.get("server").and_then(Value::as_str) == Some(agent_run_domain::worker::SERVER_NAME)
+        && item.get("tool").and_then(Value::as_str) == Some("finish")
+        && tool_error(item).is_none_or(|(error, _)| !error)
+}
+
 /// Returns explicit error evidence for a completed native command or MCP item.
 /// Command exitCode applies only to commandExecution; a failed command status
 /// is authoritative, while completion without an exit remains unknown. MCP
@@ -2715,6 +2961,312 @@ async fn turn_steer(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn managed_codex_config_read_refuses_native_override() {
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let pre = json!([{"matcher":"mcp__agent_pool__.*","hooks":[{"type":"command","command":"/fixture/bridge"}]}]);
+        let permission = json!([{"hooks":[{"type":"command","command":"/fixture/run"}]}]);
+        let state = json!({"pre":{"trusted_hash":"a"},"permission":{"trusted_hash":"b"}});
+        let layer = json!({"name":{"type":"user","file":"/home/config.toml","profile":null}});
+        let origins = json!({"features.hooks":layer,"tools.experimental_request_user_input.enabled":layer,"tools.update_plan.enabled":layer});
+        let inventory = BTreeMap::new();
+        let selection = |host: bool| agent_run_adapters::managed_role::Selection {
+            host_id: "host".into(),
+            role_digest: "a".repeat(64),
+            inventory: BTreeMap::new(),
+            codex: Some(agent_run_adapters::managed_role::CodexSelection {
+                pool_server: "agent-pool".into(),
+                pool_namespace: "agent_pool".into(),
+                code_mode_host: host.then(|| "/fixture/codex-code-mode-host".into()),
+            }),
+        };
+        let hyphenated = json!([{"matcher":"mcp__agent-pool__.*","hooks":pre[0]["hooks"]}]);
+        // (written code mode, pinned host, PreToolUse, widened, accepted)
+        for (code_mode, host, pinned, widened, accepted) in [
+            (false, false, &pre, false, true),
+            (false, false, &pre, true, false),
+            (true, true, &pre, false, true),
+            (true, true, &pre, true, false),
+            (true, false, &pre, false, false),
+            (false, true, &pre, false, true),
+            (false, false, &hyphenated, false, false),
+        ] {
+            let selection = selection(host);
+            let role = super::ManagedCodexRole {
+                pre_tool_use: pinned,
+                permission_request: &permission,
+                hook_state: &state,
+                inventory: &inventory,
+                selection: &selection,
+                code_mode,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = agent_run_adapters::managed_role::codex_settings(code_mode);
+            config["hooks"] =
+                json!({"PreToolUse":pinned,"PermissionRequest":permission,"state":state});
+            if widened {
+                config["features"]["shell_tool"] = json!(true);
+            }
+            let reply = json!({"id":1,"result":{"config":config,"origins":origins}}).to_string();
+            let script = format!("IFS= read -r request\nprintf '%s\\n' '{}'", reply);
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let result = super::verify_live_managed_config(&mut process, dir.path(), &role).await;
+            assert_eq!(result.is_ok(), accepted, "{code_mode} {host} {widened}");
+            if let Ok((_, accepted)) = result {
+                assert_eq!(accepted["pool_tool_prefix"], "mcp__agent_pool__");
+                assert_eq!(accepted["code_mode"], code_mode);
+                assert_eq!(accepted["code_mode_host"].is_string(), code_mode);
+            }
+            process.input.take();
+            let _ = process
+                .owner
+                .cleanup(std::time::Duration::from_secs(2))
+                .await;
+            process.reap().await;
+        }
+    }
+
+    /// Live probe of the real managed Codex launch (see `managed_live_probe`):
+    /// the attempt's native home materialized afresh by this build for its
+    /// frozen role and request under the launch configuration (scratch home
+    /// and workdir, credential link removed, the worker command set to the
+    /// build under test, the provider pointed at a refused loopback port),
+    /// then exactly the runner's steps up to qualification: initialize, live
+    /// `config/read` verification, the model list and tool-mode admission,
+    /// the admitted grant and thread/start parameters, `Grant::verify` and the
+    /// exact MCP inventory. No turn is ever started.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live harness probe; requires AGENT_RUN_LIVE_MANAGED_PROBE"]
+    async fn live_managed_codex_qualifies_before_any_turn() {
+        use serde_json::{Value, json};
+        use std::{collections::BTreeMap, time::Duration};
+        let Some(live) = crate::managed_live_probe::load("codex") else {
+            return;
+        };
+        let scratch = live.path("scratch");
+        let (home, work, app_home) = (
+            scratch.join("codex-home"),
+            scratch.join("work"),
+            scratch.join("app-home"),
+        );
+        for dir in [&home, &work, &app_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        live.materialize(&home, &work, &app_home);
+        let launch: Value =
+            serde_json::from_slice(&std::fs::read(home.join("provider-launch.json")).unwrap())
+                .unwrap();
+        let model = launch["native_model"].as_str().unwrap().to_owned();
+        // No credential: the account link is removed before Codex starts.
+        let _ = std::fs::remove_file(home.join("auth.json"));
+        let mut native: toml::Table =
+            toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        let worker = native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]
+            .as_table_mut()
+            .unwrap();
+        worker.insert(
+            "command".into(),
+            toml::Value::String(live.section["worker"].as_str().unwrap().into()),
+        );
+        native.insert(
+            "openai_base_url".into(),
+            toml::Value::String("http://127.0.0.1:9/v1".into()),
+        );
+        let text = toml::to_string(&native).unwrap();
+        std::fs::write(home.join("config.toml"), &text).unwrap();
+        if let Some(cache) = live.section["models_cache"].as_str() {
+            std::fs::copy(cache, home.join("models_cache.json")).unwrap();
+        }
+        // The supervisor's pinned hook declarations, read from that file.
+        let pinned = serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap();
+        let hooks = &pinned["hooks"];
+        let mut environment = BTreeMap::from([
+            ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
+            ("HOME".into(), home.to_string_lossy().into()),
+            ("CODEX_HOME".into(), home.to_string_lossy().into()),
+        ]);
+        environment.extend(live.worker_environment());
+        let harness = live.identity.authority.harness;
+        let plan = agent_run_adapters::LaunchPlan {
+            binary: live.config.harnesses[&harness].binary.clone(),
+            args: vec!["app-server".into()],
+            cwd: work.clone(),
+            environment,
+            initial_input: None,
+        };
+        let runtime = agent_run_adapters::provider::runtime(&live.config, harness, &model).unwrap();
+        let profile = agent_run_adapters::provider::profile(&live.role);
+        let mut request = live.request.clone();
+        request.model = model.clone();
+        request.workdir = work.clone();
+        let code_mode = agent_run_adapters::managed_role::codex_config_code_mode(&pinned).unwrap();
+        let managed = super::ManagedCodexRole {
+            pre_tool_use: &hooks["PreToolUse"],
+            permission_request: &hooks["PermissionRequest"],
+            hook_state: &hooks["state"],
+            inventory: &live.selection.inventory,
+            selection: &live.selection,
+            code_mode,
+        };
+        let mut process = super::Process::spawn(&plan).unwrap();
+        let mut evidence = json!({"harness":"codex","agent_id":live.section["agent_id"],
+            "selection_inventory":live.selection.inventory,"role_digest":live.selection.role_digest,
+            "codex_selection":format!("{:?}", live.selection.codex),"code_mode":code_mode,
+            "generated_config":text});
+        let outcome: crate::Result<()> = async {
+            super::initialize(&mut process).await?;
+            let config = super::verify_live_managed_config(&mut process, &work, &managed).await;
+            evidence["config_read_accepted"] = json!(config.as_ref().ok().map(|(_, v)| v));
+            evidence["config_read_error"] = json!(config.as_ref().err().map(|e| e.to_string()));
+            config?;
+            let raw = process
+                .rpc("config/read", json!({"cwd":work}), Duration::from_secs(30))
+                .await?;
+            evidence["config_read"] = raw;
+            let roster = super::models(&mut process).await?;
+            evidence["model_listed"] =
+                json!(roster.iter().any(|entry| entry.get("id") == Some(&json!(model))));
+            let tool_mode = agent_run_adapters::managed_role::codex_model_tool_mode(&home, &model);
+            evidence["tool_mode"] = json!(tool_mode);
+            let admitted = agent_run_adapters::managed_role::verify_codex_tool_mode(
+                tool_mode.as_deref(),
+                code_mode,
+            );
+            evidence["tool_mode_error"] = json!(admitted.as_ref().err().map(|e| e.to_string()));
+            admitted?;
+            let grant = super::Grant::new(&runtime, &request, &profile, &home)?.without_environments();
+            let mut params = grant.request();
+            let configured = process
+                .rpc("config/read", json!({"cwd":work}), Duration::from_secs(30))
+                .await?;
+            params["developerInstructions"] =
+                json!(super::finish_developer_instructions(&configured)?);
+            agent_run_adapters::managed_role::codex_thread_parameters(&mut params)?;
+            let mut shown = params.clone();
+            shown["developerInstructions"] = json!("<Run explicit-finish contract>");
+            evidence["thread_start_params"] = shown;
+            let thread = process
+                .rpc("thread/start", params, Duration::from_secs(30))
+                .await?;
+            let mut echo = thread.clone();
+            if let Some(thread) = echo.get_mut("thread") {
+                *thread = json!({"id":thread["id"],"environments":thread["environments"],"status":thread["status"]});
+            }
+            evidence["thread_start_echo"] = echo;
+            let verified = grant.verify(&thread);
+            evidence["grant_verify_error"] = json!(verified.as_ref().err().map(|e| e.to_string()));
+            verified?;
+            let tid = thread
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| crate::error::invalid("thread start did not return an id"))?
+                .to_owned();
+            let inventory = super::managed_inventory_settled(&mut process, &tid).await?;
+            evidence["mcp_server_status"] = inventory.clone();
+            let checked =
+                agent_run_adapters::managed_role::verify_inventory(&inventory, managed.inventory);
+            evidence["inventory_error"] = json!(checked.as_ref().err().map(|e| e.to_string()));
+            checked
+        }
+        .await;
+        evidence["outcome_error"] = json!(outcome.as_ref().err().map(|e| e.to_string()));
+        evidence["turn_started"] = json!(false);
+        process.input.take();
+        let _ = process.owner.cleanup(Duration::from_secs(2)).await;
+        process.reap().await;
+        live.write_evidence(&evidence);
+        outcome.unwrap();
+    }
+
+    /// A managed status still reporting a starting server is read again; the
+    /// settled reply is returned unverified, and a failed server ends the wait.
+    #[tokio::test]
+    async fn managed_codex_inventory_waits_for_starting_servers() {
+        use std::collections::BTreeMap;
+        let script = r#"import json,sys
+statuses=sys.argv[1].split(',')
+for status in statuses:
+    request=json.loads(sys.stdin.readline())
+    assert request['method']=='mcpServerStatus/list' and request['params']['threadId']=='thread'
+    print(json.dumps({'id':request['id'],'result':{'data':[{'name':'pool','runtimeStatus':status,'tools':{}}],'nextCursor':None}}),flush=True)
+"#;
+        for (statuses, last) in [
+            ("starting,starting,connected", "connected"),
+            ("starting,failed", "failed"),
+            ("connected", "connected"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/usr/bin/python3".into(),
+                args: vec!["-u".into(), "-c".into(), script.into(), statuses.into()],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let status = super::managed_inventory_settled(&mut process, "thread")
+                .await
+                .unwrap();
+            assert_eq!(status["data"][0]["runtimeStatus"], last, "{statuses}");
+            process.input.take();
+            assert_eq!(process.reap().await, Some(0));
+        }
+    }
+
+    /// A managed thread has no native environment and so no runtime roots:
+    /// the request asks for none and codex-cli 0.167.0's echo verifies.
+    #[test]
+    fn managed_grant_requests_and_verifies_no_runtime_roots() {
+        use serde_json::json;
+        let grant = super::Grant {
+            model: "gpt-6-luna".into(),
+            cwd: "/work".into(),
+            roots: vec!["/work".into()],
+            writable_roots: vec![],
+            sandbox: "read-only".into(),
+            approval_policy: "never".into(),
+            reviewer: None,
+            network_access: false,
+            permission_profile: Some(":read-only".into()),
+        };
+        // codex-cli 0.167.0's real reply to Run's managed thread/start.
+        let captured: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/managed-native/codex-0.167.0-thread-start.json"
+        ))
+        .unwrap();
+        let mut echo = captured["result"].clone();
+        echo["cwd"] = json!("/work");
+        assert!(grant.verify(&echo).is_err());
+        let managed = grant.without_environments();
+        let mut params = managed.request();
+        agent_run_adapters::managed_role::codex_thread_parameters(&mut params).unwrap();
+        for key in [
+            "runtimeWorkspaceRoots",
+            "permissions",
+            "approvalPolicy",
+            "environments",
+        ] {
+            assert_eq!(params[key], captured["params"][key], "{key}");
+        }
+        managed.verify(&echo).unwrap();
+        let mut widened = echo.clone();
+        widened["runtimeWorkspaceRoots"] = json!(["/work"]);
+        assert!(managed.verify(&widened).is_err());
+        widened = echo;
+        widened["sandbox"] =
+            json!({"type":"workspaceWrite","writableRoots":["/tmp"],"networkAccess":false});
+        assert!(managed.verify(&widened).is_err());
+    }
+
     /// The shared output budget never splits UTF-8 and reports omitted data.
     #[test]
     fn command_delta_shared_budget_marks_truncation() {

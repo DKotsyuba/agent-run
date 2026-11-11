@@ -1,5 +1,6 @@
 //! Rust MCP stdio compatibility proxy; durable execution stays in the broker.
 use crate::{Error, Result, cli::CliBroker, dispatch, domain::OrchestratorRef};
+use agent_run_domain::observation::MAX_RPC_ID_BYTES;
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
@@ -18,7 +19,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Match the Python broker and MCP stdin ceiling before the SDK allocates a frame.
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = agent_run_domain::observation::SOCKET_MAX_FRAME_BYTES;
 
 /// Preserve Python's stable, operator-actionable broker-unavailable wording.
 const BROKER_UNAVAILABLE: &str =
@@ -45,8 +46,6 @@ fn restart_refusal(tool: &str, error: &Error) -> Option<CallToolResult> {
 
 /// JSON-RPC string IDs must fit this encoded budget (including JSON quotes),
 /// leaving the presenter's 4 KiB envelope reserve ample room for the SDK wrapper.
-const MAX_RPC_ID_BYTES: usize = 1024;
-
 /// Checks echoed IDs before SDK allocation and preserves strict start decoding.
 /// The SDK's generic JSON object would erase duplicate required_mcp keys, so an
 /// invalid typed start is converted to an explicitly invalid argument object and
@@ -82,6 +81,31 @@ fn validate_frame_id(frame: &mut Vec<u8>) -> std::io::Result<()> {
         match value["params"]["name"].as_str() {
             Some("start") => {
                 serde_json::from_slice::<Frame<agent_run_domain::ProviderStartRequest>>(frame)
+                    .map(|frame| frame.params.arguments)
+                    .is_ok()
+            }
+            Some("start_batch") => {
+                serde_json::from_slice::<Frame<agent_run_domain::batch::StartBatchRequest>>(frame)
+                    .map(|frame| frame.params.arguments)
+                    .is_ok()
+            }
+            Some("batch_receipt") => {
+                serde_json::from_slice::<Frame<agent_run_domain::batch::StartBatchRequest>>(frame)
+                    .map(|frame| frame.params.arguments)
+                    .is_ok()
+            }
+            Some("transcript_exact") => serde_json::from_slice::<
+                Frame<agent_run_domain::transcript_exact::TranscriptExactRequest>,
+            >(frame)
+            .map(|frame| frame.params.arguments)
+            .is_ok(),
+            Some("initial_task") => serde_json::from_slice::<
+                Frame<agent_run_domain::initial_task::InitialTaskRequest>,
+            >(frame)
+            .map(|frame| frame.params.arguments)
+            .is_ok(),
+            Some("status") => {
+                serde_json::from_slice::<Frame<agent_run_domain::status::StatusRequest>>(frame)
                     .map(|frame| frame.params.arguments)
                     .is_ok()
             }
@@ -385,6 +409,80 @@ impl ServerHandler for Proxy {
         .await
         {
             Ok(mut value) => {
+                if request.name == "batch_receipt"
+                    && !crate::transport::socket::valid_batch_receipt_response(&value, &arguments)
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "invalid batch receipt lookup response",
+                    )
+                    .into());
+                }
+                if request.name == "transcript_exact"
+                    && !crate::transport::socket::valid_transcript_exact_response(
+                        &value, &arguments,
+                    )
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "invalid exact transcript response",
+                    )
+                    .into());
+                }
+                if request.name == "initial_task"
+                    && !crate::transport::socket::valid_initial_task_response(&value, &arguments)
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "invalid initial task response",
+                    )
+                    .into());
+                }
+                if request.name == "status"
+                    && !crate::transport::socket::valid_status_response(&value, &arguments)
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "invalid status response",
+                    )
+                    .into());
+                }
+                if request.name == "capabilities"
+                    && arguments.get("include_store_id") == Some(&json!(true))
+                    && !value
+                        .get("store_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.parse::<agent_run_domain::StoreId>().is_ok())
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "invalid capabilities store identity",
+                    )
+                    .into());
+                }
+                if request.name == "history_pins"
+                    && !crate::transport::socket::valid_history_pin_response(&value, &arguments)
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "history pin result is invalid; reconcile release by pin_id",
+                    )
+                    .into());
+                }
+                if request.name == "start_batch"
+                    && !crate::transport::socket::valid_batch_response(&value, &arguments)
+                {
+                    let error = Error::BatchOutcomeUnknown {
+                        source: Box::new(crate::error::invalid("invalid batch receipt")),
+                    };
+                    return Ok(super::mcp_text::failure_result(
+                        "start_batch",
+                        &error,
+                        request_id.as_deref(),
+                        None,
+                    )
+                    .into());
+                }
                 if request.name == "answer"
                     && crate::transport::mcp_text::answer_needs_metadata(&value)
                     && let Ok(selection) =
@@ -413,7 +511,9 @@ impl ServerHandler for Proxy {
             Err(error) => {
                 if let Some(refusal) = restart_refusal(request.name.as_ref(), &error) {
                     refusal
-                } else if matches!(error, Error::BrokerUnavailable) && request.name != "resume" {
+                } else if matches!(error, Error::BrokerUnavailable)
+                    && !matches!(request.name.as_ref(), "resume" | "start_batch")
+                {
                     crate::transport::mcp_text::error_result(
                         "BrokerUnavailable",
                         BROKER_UNAVAILABLE,
@@ -692,6 +792,93 @@ mod tests {
         }
     }
 
+    /// The MCP handler treats a damaged execution reference as an unknown outcome.
+    #[tokio::test]
+    async fn batch_mcp_rejects_malformed_execution_ref() {
+        struct Broker;
+        impl CliBroker for Broker {
+            fn call<'a>(&'a self, method: &'a str, params: serde_json::Value) -> CliFuture<'a> {
+                assert_eq!(method, "start_batch");
+                Box::pin(async move {
+                    let request_id = params["request_id"].as_str().unwrap();
+                    let mut job =
+                        json!({"index":0,"agent_id":"ag-20260826-120000-0123456789","sequence":1});
+                    if request_id == "bad" {
+                        job["execution_ref"] = json!("ex1_bad");
+                    }
+                    if request_id == "valid" {
+                        job["execution_ref"] = json!(format!("ex1_{}", "a".repeat(64)));
+                    }
+                    Ok(
+                        json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":request_id,"jobs":[job]}}),
+                    )
+                })
+            }
+        }
+        let (mut input, input_reader) = tokio::io::duplex(8192);
+        let (output_writer, output) = tokio::io::duplex(8192);
+        let server = tokio::spawn(super::serve_io(
+            std::path::PathBuf::from("/unused-mcp-fixture"),
+            None,
+            Arc::new(Broker),
+            input_reader,
+            output_writer,
+        ));
+        let mut output = tokio::io::BufReader::new(output);
+        let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}});
+        input
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut output, &mut line)
+            .await
+            .unwrap();
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        for (id, key) in ["missing", "bad", "valid"].into_iter().enumerate() {
+            let request = json!({"jsonrpc":"2.0","id":id + 2,"method":"tools/call","params":{
+            "name":"start_batch","arguments":{"request_id":key,"jobs":[{
+                "provider":"p","model":"m","profile":"review","task":"t","workdir":"/unused"
+            }]}}});
+            input
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::io::AsyncBufReadExt::read_line(&mut output, &mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if key == "valid" {
+                assert_eq!(reply["result"]["isError"], false);
+                assert_eq!(
+                    reply["result"]["structuredContent"]["receipt"]["jobs"][0]["execution_ref"],
+                    format!("ex1_{}", "a".repeat(64))
+                );
+            } else {
+                assert_eq!(reply["result"]["isError"], true);
+                assert_eq!(
+                    reply["result"]["structuredContent"]["code"],
+                    "BatchOutcomeUnknown"
+                );
+            }
+        }
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     use super::{BoundedReader, MAX_FRAME_BYTES};
     /// Original duplicate server keys must become invalid SDK arguments, never
     /// the lossy last-value-wins map. The request correlation remains intact.
@@ -711,6 +898,84 @@ mod tests {
             )
             .is_err()
         );
+        let mut status = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"status","arguments":{"version":1,"targets":[{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"sequence":2}]}}}"#.to_vec();
+        super::validate_frame_id(&mut status).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(
+            value["params"]["arguments"],
+            json!({"invalid_start_frame":true})
+        );
+        let mut batch = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"start_batch","arguments":{"request_id":"b","jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}]}}}"#.to_vec();
+        super::validate_frame_id(&mut batch).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&batch).unwrap();
+        assert_eq!(
+            value["params"]["arguments"],
+            json!({"invalid_start_frame":true})
+        );
+        let mut receipt = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"batch_receipt","arguments":{"request_id":"b","expected_store_id":"store_0123456789abcdef0123456789abcdef","jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}]}}}"#.to_vec();
+        super::validate_frame_id(&mut receipt).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(
+            value["params"]["arguments"],
+            json!({"invalid_start_frame":true})
+        );
+        let mut unknown = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"batch_receipt","arguments":{"request_id":"b","expected_store_id":"store_0123456789abcdef0123456789abcdef","jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","unexpected":true}]}}}"#.to_vec();
+        super::validate_frame_id(&mut unknown).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&unknown).unwrap();
+        assert_eq!(
+            value["params"]["arguments"],
+            json!({"invalid_start_frame":true})
+        );
+    }
+    /// The SDK must not erase duplicate prerequisite fields before validation.
+    #[test]
+    fn batch_precondition_duplicate_mcp_keys_cannot_reach_admission() {
+        for name in ["start_batch", "batch_receipt"] {
+            let base = format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"{name}","arguments":{{"request_id":"b","expected_store_id":"store_0123456789abcdef0123456789abcdef","jobs":[{{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/missing"}}],"preconditions":[{{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":"ex1_{}","pin_id":"pin_550e8400e29b41d4a716446655440000"}}]}}}}}}"#,
+                "a".repeat(64)
+            );
+            for bad in [
+                base.replace("\"sequence\":1", "\"sequence\":1,\"sequence\":2"),
+                base.replace(
+                    "\"preconditions\":[",
+                    "\"preconditions\":[],\"preconditions\":[",
+                ),
+            ] {
+                let mut frame = bad.into_bytes();
+                super::validate_frame_id(&mut frame).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(value["id"], 7);
+                assert_eq!(
+                    value["params"]["arguments"],
+                    json!({"invalid_start_frame":true})
+                );
+            }
+            for field in ["preconditions", "jobs", "arguments"] {
+                let mut value: serde_json::Value = serde_json::from_str(&base).unwrap();
+                let arguments = &mut value["params"]["arguments"];
+                match field {
+                    "preconditions" => {
+                        let selector = arguments["preconditions"][0].clone();
+                        arguments["preconditions"][0] = json!([
+                            selector["agent_id"],
+                            selector["sequence"],
+                            selector["execution_ref"],
+                            selector["pin_id"]
+                        ]);
+                    }
+                    "jobs" => arguments["jobs"][0] = json!(["p", "m", "review", "t", "/missing"]),
+                    _ => *arguments = json!(["b", [], false, null, null]),
+                }
+                let mut frame = serde_json::to_vec(&value).unwrap();
+                super::validate_frame_id(&mut frame).unwrap();
+                let rejected: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(
+                    rejected["params"]["arguments"],
+                    json!({"invalid_start_frame":true})
+                );
+            }
+        }
     }
     use crate::cli::{CliBroker, CliFuture};
     use serde_json::json;
@@ -852,6 +1117,21 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&result.content).unwrap()[0]["text"],
             "agent-run error AgentRunError: \"controlled broker failure\"\n"
+        );
+    }
+    /// Duplicate continuation fields must fail before generic JSON map decoding.
+    #[test]
+    fn transcript_exact_duplicate_cursor_rejected() {
+        let params = format!(
+            r#"{{"version":1,"expected_store_id":"store_00000000000000000000000000000000","selector":{{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":"ex1_{}","pin_id":"pin_00000000000040008000000000000000"}},"cursor":"0","cursor":"1","offset":0}}"#,
+            "0".repeat(64)
+        );
+        let mut frame = format!(r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"transcript_exact","arguments":{params}}}}}"#).into_bytes();
+        super::validate_frame_id(&mut frame).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            value["params"]["arguments"],
+            json!({"invalid_start_frame":true})
         );
     }
 }

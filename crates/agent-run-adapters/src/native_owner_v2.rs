@@ -1,0 +1,884 @@
+//! Separate per-launch managed owner-v2 transport. It never writes native stdin.
+use crate::native_owner::{self, FRAME_BYTES, OWNER_BUDGET};
+use agent_run_domain::{
+    Result,
+    error::invalid,
+    owner_v2::{ReplyV2, RequestV2, decode_request, invalid_request_echo},
+};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+    time::{Instant, timeout_at},
+};
+
+/// V2 address injected only into a selected managed harness at exec.
+pub const LOCATOR: &str = "BRIDGE_NATIVE_OWNER_SOCKET_V2";
+/// Refusal for a live Bridge whose build differs from this launch's pin.
+const STALE_BUILD: &str = "owner v2 Bridge build differs from launch pin";
+/// Longest wait for the owner lane to record a stale-build refusal.
+const STALE_RECORD_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bridge channel/build pinned at this launch and private per-launch parent directory.
+#[derive(Clone)]
+pub struct Config {
+    pub channel: PathBuf,
+    pub directory: PathBuf,
+    /// Current validated Run transport at spawn: Bridge socket, executable,
+    /// build and routes. It never changes for the life of this launch.
+    pub transport: agent_run_config::provider_config::ManagedAttemptTransport,
+}
+/// One authenticated handoff, owned by the existing native writer lane.
+pub struct Call {
+    pub request: RequestV2,
+    pub deadline: Instant,
+    /// This launch's pinned transport; its Bridge socket is the endpoint's
+    /// checked local trust anchor, never from request JSON.
+    pub transport: agent_run_config::provider_config::ManagedAttemptTransport,
+    /// The live configured Bridge passed every proof except this launch's
+    /// build pin. The owner records only a durable `known_unsent` with reason
+    /// `attempt_mismatch` and never writes native input.
+    pub stale: bool,
+    reply: oneshot::Sender<ReplyV2>,
+}
+impl Call {
+    pub fn answer(self, reply: ReplyV2) {
+        let _ = self.reply.send(reply);
+    }
+    /// Construct a synthetic owner call without a real Bridge process.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture(
+        request: RequestV2,
+        deadline: Instant,
+        transport: agent_run_config::provider_config::ManagedAttemptTransport,
+    ) -> (Self, oneshot::Receiver<ReplyV2>) {
+        let (reply, receiver) = oneshot::channel();
+        (
+            Self {
+                request,
+                deadline,
+                transport,
+                stale: false,
+                reply,
+            },
+            receiver,
+        )
+    }
+}
+/// Construct a response with the current dispatch correlation and immutable effect identity.
+pub fn reply(
+    request: &RequestV2,
+    state: &str,
+    protocol: Option<&str>,
+    native_id: Option<&str>,
+    reason: Option<&str>,
+) -> ReplyV2 {
+    ReplyV2 {
+        version: 2,
+        call_id: request.call_id.clone(),
+        effect_id: request.outbox_intent.effect_id.clone(),
+        effect_digest: request.effect_digest.clone(),
+        state: state.into(),
+        protocol: protocol.map(str::to_owned),
+        native_id: native_id.map(str::to_owned),
+        reason: reason.map(str::to_owned),
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// A peer that passes every proof except the launch build digest is refused
+/// with the distinct stale-build error after all other checks complete.
+fn verify_build(identity: &agent_run_platform::process::Identity, config: &Config) -> Result<()> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let fail = || invalid("owner v2 peer unavailable");
+    let bridge_executable = &config.transport.bridge_executable;
+    let bridge_sha256 = &config.transport.bridge_executable_sha256;
+    if !agent_run_config::provider_config::loader_preload_safe()
+        || !bridge_executable.is_absolute()
+        || agent_run_config::provider_config::forbidden_interpreter(bridge_executable)
+        || bridge_executable.canonicalize().map_err(|_| fail())? != *bridge_executable
+        || bridge_sha256.len() != 64
+        || !bridge_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(fail());
+    }
+    let before = agent_run_platform::process::kernel_incarnation(identity).map_err(|_| fail())?;
+    let peer_safe = || -> Result<()> {
+        let mut environment = Vec::new();
+        std::fs::File::open(format!("/proc/{}/environ", identity.pid))
+            .map_err(|_| fail())?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut environment)
+            .map_err(|_| fail())?;
+        if environment.len() > 1024 * 1024
+            || (!environment.is_empty() && environment.last() != Some(&0))
+            || environment
+                .split(|byte| *byte == 0)
+                .any(|entry| entry.starts_with(b"LD_"))
+        {
+            return Err(fail());
+        }
+        let mut status = Vec::new();
+        std::fs::File::open(format!("/proc/{}/status", identity.pid))
+            .map_err(|_| fail())?
+            .take(65537)
+            .read_to_end(&mut status)
+            .map_err(|_| fail())?;
+        let text = std::str::from_utf8(&status).map_err(|_| fail())?;
+        let mut tracers = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("TracerPid:"));
+        if status.len() > 65536
+            || !matches!((tracers.next(), tracers.next()), (Some(value), None) if value.trim() == "0")
+        {
+            return Err(fail());
+        }
+        Ok(())
+    };
+    peer_safe()?;
+    let path = agent_run_platform::process::executable(identity.pid).map_err(|_| fail())?;
+    if path != *bridge_executable {
+        return Err(fail());
+    }
+    let mut file =
+        std::fs::File::open(format!("/proc/{}/exe", identity.pid)).map_err(|_| fail())?;
+    let metadata = file.metadata().map_err(|_| fail())?;
+    let loaded = std::fs::metadata(&path).map_err(|_| fail())?;
+    // SAFETY: geteuid has no arguments or side effects.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || !(metadata.uid() == uid || metadata.uid() == 0)
+        || metadata.mode() & 0o022 != 0
+        || before.uid != uid
+        || metadata.dev() != loaded.dev()
+        || metadata.ino() != loaded.ino()
+        || metadata.len() > 128 * 1024 * 1024
+    {
+        return Err(fail());
+    }
+    if !agent_run_platform::process::executable_write_excluded(&file).map_err(|_| fail())? {
+        return Err(fail());
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(128 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| fail())?;
+    let after = std::fs::metadata(&path).map_err(|_| fail())?;
+    let loaded_after =
+        std::fs::metadata(format!("/proc/{}/exe", identity.pid)).map_err(|_| fail())?;
+    if bytes.starts_with(b"#!")
+        || agent_run_config::provider_config::forbidden_interpreter_build(
+            &path,
+            bridge_sha256,
+            metadata.len(),
+        )
+        || metadata.dev() != after.dev()
+        || metadata.ino() != after.ino()
+        || metadata.len() != after.len()
+        || metadata.mtime() != after.mtime()
+        || metadata.mtime_nsec() != after.mtime_nsec()
+        || metadata.ctime() != after.ctime()
+        || metadata.ctime_nsec() != after.ctime_nsec()
+        || metadata.dev() != loaded_after.dev()
+        || metadata.ino() != loaded_after.ino()
+    {
+        return Err(fail());
+    }
+    let stale = agent_run_platform::fs::sha256(&bytes) != *bridge_sha256;
+    if agent_run_platform::process::executable(identity.pid).map_err(|_| fail())? != path
+        || agent_run_platform::process::kernel_incarnation(identity).map_err(|_| fail())? != before
+    {
+        return Err(fail());
+    }
+    peer_safe()?;
+    if !agent_run_config::provider_config::loader_preload_safe() {
+        return Err(fail());
+    }
+    if stale {
+        return Err(invalid(STALE_BUILD));
+    }
+    Ok(())
+}
+fn stale_build(error: &agent_run_domain::Error) -> bool {
+    matches!(error, agent_run_domain::Error::Validation(message) if message == STALE_BUILD)
+}
+#[cfg(not(target_os = "linux"))]
+fn verify_build(_: &agent_run_platform::process::Identity, _: &Config) -> Result<()> {
+    Err(agent_run_domain::Error::Unsupported(
+        "owner v2 requires Linux".into(),
+    ))
+}
+async fn authenticate(
+    stream: &UnixStream,
+    trust: &native_owner::Trust,
+    config: &Config,
+    deadline: Instant,
+) -> Result<()> {
+    trust.verify(stream, deadline).await?;
+    let identity = native_owner::peer(stream)?;
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || verify_build(&identity, &config))
+        .await
+        .map_err(|_| invalid("owner v2 peer unavailable"))??;
+    trust.verify(stream, deadline).await
+}
+
+/// Per-launch listener. Qualification readiness begins false and is enabled only
+/// after the supervisor's exact-launch qualification commit succeeds.
+pub struct Owner {
+    incoming: mpsc::Receiver<Call>,
+    transport: JoinHandle<()>,
+    ready: Arc<AtomicBool>,
+    directory: PathBuf,
+    socket: PathBuf,
+    identity: ((u64, u64), (u64, u64)),
+    pinned: agent_run_config::provider_config::ManagedAttemptTransport,
+}
+impl Owner {
+    /// Create the distinct v2 endpoint; caller has already selected managed role.
+    pub fn prepare(
+        environment: &mut std::collections::BTreeMap<String, String>,
+        config: Config,
+    ) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        environment.remove(LOCATOR);
+        environment.remove(native_owner::LOCATOR);
+        for name in native_owner::SETTINGS
+            .into_iter()
+            .chain(native_owner::RETIRED_SETTINGS)
+        {
+            environment.remove(name);
+        }
+        if config.channel != config.transport.bridge_socket
+            || config.channel.canonicalize().ok().as_ref() != Some(&config.transport.bridge_socket)
+        {
+            return Err(invalid("owner v2 channel differs from pinned Bridge route"));
+        }
+        native_owner::protected(&config.channel, true)?;
+        native_owner::protected(&config.directory, false)?;
+        let root = std::fs::symlink_metadata(&config.directory)?;
+        if !root.is_dir() || root.mode() & 0o777 != 0o700 {
+            return Err(invalid("owner v2 directory unavailable"));
+        }
+        let directory = config
+            .directory
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let socket = directory.join("v2.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&directory);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) =
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        {
+            drop(listener);
+            let _ = std::fs::remove_file(&socket);
+            let _ = std::fs::remove_dir(&directory);
+            return Err(error.into());
+        }
+        let d = std::fs::symlink_metadata(&directory)?;
+        let s = std::fs::symlink_metadata(&socket)?;
+        let identity = ((d.dev(), d.ino()), (s.dev(), s.ino()));
+        let trust = native_owner::Trust {
+            channel: config.channel.clone(),
+        };
+        let pinned = config.transport.clone();
+        let (send, incoming) = mpsc::channel(1);
+        let ready = Arc::new(AtomicBool::new(false));
+        let current = ready.clone();
+        let transport = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let deadline = Instant::now() + OWNER_BUDGET;
+                let input = async {
+                    // The live configured Bridge running another build than
+                    // this launch's pin gets only a definitive typed refusal.
+                    let stale = match authenticate(&stream, &trust, &config, deadline).await {
+                        Ok(()) => false,
+                        Err(error) if stale_build(&error) => true,
+                        Err(error) => return Err(error),
+                    };
+                    let length = stream.read_u32_le().await? as usize;
+                    if length == 0 || length > FRAME_BYTES {
+                        return Err(invalid("owner v2 frame unavailable"));
+                    }
+                    let mut bytes = vec![0; length];
+                    stream.read_exact(&mut bytes).await?;
+                    let request = match decode_request(&bytes) {
+                        Ok(request) => Ok(request),
+                        Err(_) => {
+                            let (call_id, effect_id, effect_digest) = invalid_request_echo(&bytes)
+                                .ok_or_else(|| invalid("owner v2 frame unavailable"))?;
+                            Err(ReplyV2 {
+                                version: 2,
+                                call_id,
+                                effect_id,
+                                effect_digest,
+                                state: "known_unsent".into(),
+                                protocol: None,
+                                native_id: None,
+                                reason: Some(
+                                    if stale {
+                                        "attempt_mismatch"
+                                    } else {
+                                        "invalid_request"
+                                    }
+                                    .into(),
+                                ),
+                            })
+                        }
+                    };
+                    match authenticate(&stream, &trust, &config, deadline).await {
+                        Ok(()) if !stale => {}
+                        Err(error) if stale && stale_build(&error) => {}
+                        Err(error) => return Err(error),
+                        Ok(()) => return Err(invalid("owner v2 peer unavailable")),
+                    }
+                    Ok::<_, agent_run_domain::Error>((request, stale))
+                };
+                let Ok(Ok((request, stale))) = timeout_at(deadline, input).await else {
+                    continue;
+                };
+                let result = match request {
+                    Err(refusal) => refusal,
+                    Ok(request) => {
+                        // A stale build never gets native input. A qualified
+                        // owner records the typed refusal durably; any lane
+                        // failure still answers it, since nothing was written.
+                        let mismatch = reply(
+                            &request,
+                            "known_unsent",
+                            None,
+                            None,
+                            Some("attempt_mismatch"),
+                        );
+                        if !current.load(Ordering::Acquire) {
+                            if stale {
+                                mismatch
+                            } else {
+                                reply(
+                                    &request,
+                                    "known_unsent",
+                                    None,
+                                    None,
+                                    Some("qualification_pending"),
+                                )
+                            }
+                        } else {
+                            let (fallback, unsent) = if stale {
+                                (mismatch.clone(), mismatch)
+                            } else {
+                                (
+                                    reply(
+                                        &request,
+                                        "unknown",
+                                        None,
+                                        None,
+                                        Some("native_uncertain"),
+                                    ),
+                                    reply(
+                                        &request,
+                                        "known_unsent",
+                                        None,
+                                        None,
+                                        Some("unavailable"),
+                                    ),
+                                )
+                            };
+                            // Recording a stale refusal must not delay its
+                            // typed answer behind a busy native lane.
+                            let wait = if stale {
+                                deadline.min(Instant::now() + STALE_RECORD_BUDGET)
+                            } else {
+                                deadline
+                            };
+                            let (response, receive) = oneshot::channel();
+                            let call = Call {
+                                request,
+                                deadline,
+                                transport: config.transport.clone(),
+                                stale,
+                                reply: response,
+                            };
+                            if !matches!(timeout_at(wait, send.send(call)).await, Ok(Ok(()))) {
+                                unsent
+                            } else {
+                                match timeout_at(wait, receive).await {
+                                    Ok(Ok(result)) => result,
+                                    _ => fallback,
+                                }
+                            }
+                        }
+                    }
+                };
+                if let Ok(bytes) = serde_json::to_vec(&result) {
+                    let _ = timeout_at(deadline, async {
+                        stream.write_u32_le(bytes.len() as u32).await?;
+                        stream.write_all(&bytes).await?;
+                        stream.flush().await
+                    })
+                    .await;
+                }
+            }
+        });
+        environment.insert(LOCATOR.into(), socket.to_string_lossy().into_owned());
+        Ok(Self {
+            incoming,
+            transport,
+            ready,
+            directory,
+            socket,
+            identity,
+            pinned,
+        })
+    }
+    /// The Run transport pinned when this launch was spawned.
+    pub fn transport(&self) -> &agent_run_config::provider_config::ManagedAttemptTransport {
+        &self.pinned
+    }
+    /// Called only after exact native role qualification is durable.
+    pub fn enable(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+    /// Receive one call; absent endpoint remains pending without polling.
+    pub async fn receive(owner: &mut Option<Self>) -> Call {
+        if let Some(owner) = owner
+            && let Some(call) = owner.incoming.recv().await
+        {
+            return call;
+        }
+        std::future::pending().await
+    }
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        self.transport.abort();
+        if std::fs::symlink_metadata(&self.directory)
+            .is_ok_and(|m| (m.dev(), m.ino()) == self.identity.0)
+        {
+            if std::fs::symlink_metadata(&self.socket)
+                .is_ok_and(|m| (m.dev(), m.ino()) == self.identity.1)
+            {
+                let _ = std::fs::remove_file(&self.socket);
+            }
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::{
+        LaunchPlan,
+        io::{Event, Process},
+    };
+    use agent_run_domain::{
+        attempt_binding::{Actor, AttemptRef, Binding, Incarnation, Route},
+        domain::AgentId,
+        owner_v2::{OutboxIntent, RequestV2, outbox_digest},
+    };
+    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+
+    #[test]
+    fn fake_bridge_process() {
+        use std::io::{Read, Write};
+        let Some(root) = std::env::var_os("RUN_R3_BRIDGE_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let channel = root.join("bridge.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&channel).unwrap();
+        std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(root.join("ready"), b"ready").unwrap();
+        fn wait_file(path: &Path) {
+            let start = std::time::Instant::now();
+            while !path.exists() {
+                assert!(start.elapsed() < Duration::from_secs(20));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        wait_file(&root.join("locator"));
+        let socket = std::fs::read_to_string(root.join("locator")).unwrap();
+        let input = std::fs::read(root.join("request")).unwrap();
+        let phases = if root.join("single").exists() { 1 } else { 3 };
+        for phase in 1..=phases {
+            if phase == 2 {
+                wait_file(&root.join("qualified"));
+            }
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            let input = if phase == 3 {
+                std::fs::read(root.join("invalid-request")).unwrap()
+            } else {
+                input.clone()
+            };
+            stream
+                .write_all(&(input.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&input).unwrap();
+            let mut length = [0u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            std::fs::write(root.join(format!("result-{phase}")), bytes).unwrap();
+        }
+    }
+
+    fn pinned_transport(
+        channel: PathBuf,
+        bridge_executable: PathBuf,
+        bridge_executable_sha256: String,
+    ) -> agent_run_config::provider_config::ManagedAttemptTransport {
+        let route = |id: &str| Route {
+            component_store_id: id.into(),
+            route_id: id.into(),
+            worker_uid: 1000,
+        };
+        agent_run_config::provider_config::ManagedAttemptTransport {
+            run_route: route("run"),
+            pool_route: route("pool"),
+            bridge_route: route("bridge"),
+            producer: "pool".into(),
+            pool_socket: "/opt/pool.sock".into(),
+            bridge_socket: channel,
+            bridge_executable,
+            bridge_executable_sha256,
+            bridge_reader_credential_file: "/opt/reader".into(),
+            bridge_reader_credential_sha256: "e".repeat(64),
+        }
+    }
+
+    async fn wait_file(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_build_rejects_hash_replacement_permissions_and_loader_environment() {
+        let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        for preload in [false, true] {
+            let root = tempfile::Builder::new()
+                .prefix("r3-build-")
+                .tempdir_in(&base)
+                .unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = root.path().join("fixture-bridge");
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let digest = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
+            // A newly installed Bridge may start in the same wall second.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let mut command = tokio::process::Command::new(&executable);
+            command
+                .args([
+                    "--exact",
+                    "native_owner_v2::tests::fake_bridge_process",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("RUN_R3_BRIDGE_ROOT", root.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            if preload {
+                command.env("LD_PRELOAD", "/nonexistent/synthetic.so");
+            }
+            let mut child = command.spawn().unwrap();
+            wait_file(&root.path().join("ready")).await;
+            let identity =
+                agent_run_platform::process::inspect(child.id().unwrap() as i32).unwrap();
+            let config = Config {
+                channel: root.path().join("bridge.sock"),
+                directory: root.path().into(),
+                transport: pinned_transport(
+                    root.path().join("bridge.sock"),
+                    executable.clone(),
+                    digest,
+                ),
+            };
+            assert_eq!(verify_build(&identity, &config).is_ok(), !preload);
+            if !preload {
+                // Changing ctime after exec is harmless with unchanged mode/inode/build.
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                assert!(verify_build(&identity, &config).is_ok());
+                // Only an otherwise proven live build with another digest is stale.
+                let mut wrong = config.clone();
+                wrong.transport.bridge_executable_sha256 = "0".repeat(64);
+                assert!(stale_build(&verify_build(&identity, &wrong).unwrap_err()));
+                wrong = config.clone();
+                wrong.transport.bridge_executable = "/usr/bin/python3".into();
+                assert!(!stale_build(&verify_build(&identity, &wrong).unwrap_err()));
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o770))
+                    .unwrap();
+                assert!(!stale_build(&verify_build(&identity, &config).unwrap_err()));
+                std::fs::rename(&executable, root.path().join("old-build")).unwrap();
+                std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                assert!(verify_build(&identity, &config).is_err());
+            }
+            child.kill().await.unwrap();
+            let _ = child.wait().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_launch_advertises_v2_before_qualification_but_never_handoffs() {
+        launch_handoff(false).await;
+    }
+
+    /// A launch pinned to an older Bridge build refuses the live upgraded
+    /// Bridge with a definitive typed reply; its owner lane sees only a
+    /// stale-marked call to record, never a native handoff.
+    #[tokio::test]
+    async fn stale_launch_build_pin_refuses_live_bridge_with_attempt_mismatch() {
+        launch_handoff(true).await;
+    }
+
+    async fn launch_handoff(stale: bool) {
+        let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = tempfile::Builder::new()
+            .prefix("r3-owner-")
+            .tempdir_in(base)
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = root.path().join("fixture-bridge");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let digest = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut bridge = tokio::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "native_owner_v2::tests::fake_bridge_process",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("RUN_R3_BRIDGE_ROOT", root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        wait_file(&root.path().join("ready")).await;
+        let id = AgentId::new();
+        let store: agent_run_domain::StoreId =
+            "store_0123456789abcdef0123456789abcdef".parse().unwrap();
+        let route = |component: &str, name: &str| Route {
+            component_store_id: component.into(),
+            route_id: name.into(),
+            worker_uid: 1000,
+        };
+        let bridge_route = route("01234567-89ab-4cde-8fab-0123456789ab", "bridge");
+        let outbox = OutboxIntent {
+            effect_id: "effect".into(),
+            producer_scope: "scope".into(),
+            event_key: "event".into(),
+            payload_sha256: agent_run_platform::fs::sha256(b"text"),
+            payload_length: 4,
+            target_binding: Binding {
+                pool_store_id: "pool".into(),
+                pool_id: "pool".into(),
+                member_id: "member".into(),
+                binding_generation: 1,
+                attempt: AttemptRef {
+                    run_store_id: store.clone(),
+                    lineage_root_id: id.clone(),
+                    execution_id: id,
+                    sequence: 1,
+                    attempt_id: "attempt".into(),
+                    launch_id: "01234567-89ab-4cde-8fab-0123456789ab".into(),
+                },
+                actor: Actor {
+                    address: "host/codex/native".into(),
+                    role: "root".into(),
+                    native_id: "native".into(),
+                    epoch: 1,
+                },
+                run_route: route(&store.to_string(), "run"),
+                bridge_route: bridge_route.clone(),
+            },
+            expected_incarnation: Incarnation {
+                host_id: "host".into(),
+                boot_id: "01234567-89ab-4cde-8fab-0123456789ab".into(),
+                pid_namespace_inode: 2,
+                uid: 1000,
+                pid: 42,
+                start_ticks: 7,
+            },
+            bridge_route,
+            mode: "message".into(),
+            retention: "keep_all".into(),
+        };
+        let request = RequestV2 {
+            version: 2,
+            thread_id: "native".into(),
+            call_id: "call".into(),
+            effect_digest: outbox_digest(&outbox).unwrap(),
+            outbox_intent: outbox,
+            text: "text".into(),
+            wake_only: true,
+        };
+        std::fs::write(
+            root.path().join("request"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["text"] = serde_json::json!("tampered");
+        std::fs::write(
+            root.path().join("invalid-request"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        let plan = LaunchPlan {
+            binary:"/bin/sh".into(),
+            args:vec!["-c".into(),"printf '{\"v1\":\"%s\",\"v2\":\"%s\"}\\n' \"${BRIDGE_NATIVE_OWNER_SOCKET-unset}\" \"${BRIDGE_NATIVE_OWNER_SOCKET_V2-unset}\"; read stop".into()],
+            cwd:root.path().into(),environment:BTreeMap::from([("BRIDGE_NATIVE_OWNER_SOCKET".into(),"forged".into())]),initial_input:None,
+        };
+        let mut untrusted = BTreeMap::new();
+        let mismatched = Config {
+            channel: root.path().join("bridge.sock"),
+            directory: root.path().into(),
+            transport: pinned_transport(
+                root.path().join("other.sock"),
+                executable.clone(),
+                digest.clone(),
+            ),
+        };
+        assert!(Owner::prepare(&mut untrusted, mismatched).is_err());
+        assert!(!untrusted.contains_key(LOCATOR));
+        let mut process = Process::spawn_managed(
+            &plan,
+            Some(Config {
+                channel: root.path().join("bridge.sock"),
+                directory: root.path().into(),
+                transport: pinned_transport(
+                    root.path().join("bridge.sock"),
+                    executable,
+                    if stale { "0".repeat(64) } else { digest },
+                ),
+            }),
+        )
+        .unwrap();
+        let Event::Json(environment) = tokio::time::timeout(Duration::from_secs(5), process.next())
+            .await
+            .unwrap()
+        else {
+            panic!("harness environment missing")
+        };
+        assert_eq!(environment["v1"], "unset");
+        let socket = environment["v2"].as_str().unwrap();
+        assert!(socket.ends_with("/v2.sock"));
+        if stale {
+            std::fs::write(root.path().join("single"), b"1").unwrap();
+            // Qualification does not lend an old launch the new build's authority.
+            process.native_owner_v2.as_ref().unwrap().enable();
+        }
+        std::fs::write(root.path().join("locator"), socket).unwrap();
+        if stale {
+            // The qualified owner gets only a stale-marked call to record the
+            // typed refusal; a lost lane reply still answers it typed.
+            let call = tokio::time::timeout(
+                Duration::from_secs(15),
+                Owner::receive(&mut process.native_owner_v2),
+            )
+            .await
+            .unwrap();
+            assert!(call.stale);
+            assert_eq!(call.request.effect_digest, request.effect_digest);
+            drop(call);
+        }
+        wait_file(&root.path().join("result-1")).await;
+        let first: ReplyV2 =
+            serde_json::from_slice(&std::fs::read(root.path().join("result-1")).unwrap()).unwrap();
+        assert_eq!(first.state, "known_unsent");
+        assert_eq!(first.call_id, request.call_id);
+        assert_eq!(first.effect_id, request.outbox_intent.effect_id);
+        assert_eq!(first.effect_digest, request.effect_digest);
+        if stale {
+            assert_eq!(first.reason.as_deref(), Some("attempt_mismatch"));
+            assert!(bridge.wait().await.unwrap().success());
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(30),
+                    Owner::receive(&mut process.native_owner_v2)
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                process
+                    .owner
+                    .cleanup(Duration::from_secs(2))
+                    .await
+                    .unwrap()
+                    .confirmed
+            );
+            process.reap().await;
+            return;
+        }
+        assert_eq!(first.reason.as_deref(), Some("qualification_pending"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                Owner::receive(&mut process.native_owner_v2)
+            )
+            .await
+            .is_err()
+        );
+        process.native_owner_v2.as_ref().unwrap().enable();
+        std::fs::write(root.path().join("qualified"), b"ok").unwrap();
+        let call = tokio::time::timeout(
+            Duration::from_secs(15),
+            Owner::receive(&mut process.native_owner_v2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.request.effect_digest, request.effect_digest);
+        let response = reply(&call.request, "known_unsent", None, None, Some("not_idle"));
+        call.answer(response);
+        assert!(bridge.wait().await.unwrap().success());
+        let second: ReplyV2 =
+            serde_json::from_slice(&std::fs::read(root.path().join("result-2")).unwrap()).unwrap();
+        assert_eq!(second.reason.as_deref(), Some("not_idle"));
+        let invalid: ReplyV2 =
+            serde_json::from_slice(&std::fs::read(root.path().join("result-3")).unwrap()).unwrap();
+        assert_eq!(invalid.state, "known_unsent");
+        assert_eq!(invalid.reason.as_deref(), Some("invalid_request"));
+        assert_eq!(invalid.call_id, request.call_id);
+        assert_eq!(invalid.effect_id, request.outbox_intent.effect_id);
+        assert!(
+            process
+                .owner
+                .cleanup(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .confirmed
+        );
+        process.reap().await;
+    }
+}

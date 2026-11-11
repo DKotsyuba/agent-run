@@ -56,7 +56,7 @@ qualified_hosts = []
 [release]
 enabled = true
 workflow = "release.yml"
-# agent-run's richer sealed-directory bundle (bin/, collectors/, services/,
+# agent-run's richer sealed-directory bundle (bin/, services/, systemd/,
 # metadata.json, SHA256SUMS, COMPLETE) rather than the template's
 # single-binary-v1 profile.
 delivery_profile = "agent-run-archive-v1"

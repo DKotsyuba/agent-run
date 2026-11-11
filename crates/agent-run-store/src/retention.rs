@@ -45,6 +45,7 @@ const SCANNED_CANDIDATES: usize = 256;
 const POOL_AGENT_EXPIRED: &str = "(x.status IN ('succeeded','failed','timed_out','cancelled','lost') \
      AND x.finished_at IS NOT NULL \
      AND (x.finished_at < ?1 OR COALESCE(NULLIF(x.root_agent_id,''),x.id) IN (SELECT root FROM retention_roots)) \
+     AND NOT EXISTS (SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(x.root_agent_id,''),x.id) AND hp.released=0) \
      AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=x.id \
           AND (t.ownership_active=1 OR t.cleanup_proof_json IS NULL OR t.phase!='cleanup_complete')) \
      AND NOT EXISTS (SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
@@ -78,6 +79,7 @@ fn agent_eligible(at: &str) -> String {
          AND (a.finished_at < ?1 \
               OR (a.finished_at IS NOT NULL \
                   AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots))) \
+         AND NOT EXISTS (SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) AND hp.released=0) \
          AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1) \
          AND NOT EXISTS (SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
            WHERE rs.finished_at IS NULL AND (ra.agent_id=a.id OR ra.resumed_execution_id=a.id)) \
@@ -421,7 +423,7 @@ impl Store<'_> {
     /// because a live service may hold a shared-tree file or working directory
     /// open directly. The progress handler is cleared
     /// on either outcome. OS I/O is not preempted.
-    pub fn storage_protection_snapshot(&self) -> Result<StorageProtection> {
+    pub fn storage_protection_snapshot(&mut self) -> Result<StorageProtection> {
         let deadline = Instant::now() + Duration::from_secs(2);
         self.conn
             .progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
@@ -582,6 +584,7 @@ impl Store<'_> {
                   AND (a.finished_at < ?1
                        OR (a.finished_at IS NOT NULL
                            AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots)))
+                  AND NOT EXISTS (SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) AND hp.released=0)
                   AND NOT EXISTS (SELECT 1 FROM pool_members m
                                   WHERE m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id)))
              OR EXISTS(SELECT 1 FROM pools p WHERE {releasable})
@@ -943,7 +946,7 @@ impl Store<'_> {
     /// Schema 19 prepares incremental mode during offline migration. This method
     /// never replaces the database file or changes schema/auto-vacuum mode.
     /// Callback setup/cleanup errors propagate; cleanup is attempted even if vacuum fails.
-    pub fn vacuum_history(&self) -> Result<bool> {
+    pub fn vacuum_history(&mut self) -> Result<bool> {
         let active: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE status IN ('created','starting','running','cancelling'))
              OR EXISTS(SELECT 1 FROM workflow_runs WHERE status IN ('created','running'))

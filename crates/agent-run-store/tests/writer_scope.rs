@@ -1,7 +1,6 @@
 //! In-transaction authority scope on disposable private homes: process
 //! owners resolve their execution or generation from durable rows, attempt
-//! payloads must name the supervisor's pinned owned attempt, a native latch
-//! must name that attempt's selected account, rows acting on the current
+//! payloads must name the supervisor's pinned owned attempt, rows acting on the current
 //! owned attempt derive it and enforce the pin, process owner kinds are
 //! confined per authority, and recorded process identities (bootstrap
 //! leaders included) and authority births must equal the authenticated
@@ -20,8 +19,8 @@ use agent_run_platform::process::{Identity, OwnershipSnapshot};
 use agent_run_store::{
     ops::{
         AttemptTarget, BootstrapServiceProcess, ClaimServiceProcessIdentity, EnqueueNativeWake,
-        FinishAttempt, LatchNativeExhaustion, ObserveWorkerFinishReceipt, ProviderSpawning,
-        RecordSupervisorOwner, RememberProcesses, RemoteOp, WorkerTurn, WriteEnvelope,
+        FinishAttempt, ObserveWorkerFinishReceipt, ProviderSpawning, RecordSupervisorOwner,
+        RememberProcesses, RemoteOp, WorkerTurn, WriteEnvelope,
     },
     writer::{StoreWriter, WriterLease},
 };
@@ -340,42 +339,6 @@ fn attempt_payloads_must_name_the_pinned_attempt() {
     assert!(replayed.replayed);
     assert_eq!(replayed.commit_seq, original.commit_seq);
     in_scope(&f.apply(&repinned, finish(format!("{a}:2"))));
-}
-
-/// A native latch must name the account selected by the pinned owned
-/// attempt; a cross-account latch is refused before any mutation.
-#[test]
-fn native_latch_must_name_the_pinned_attempt_account() {
-    let mut f = Fixture::new();
-    let a = f.execution();
-    let sup = f.bind(&a, Some(format!("{a}:1")));
-    let latch = |account: &str| {
-        RemoteOp::from(LatchNativeExhaustion {
-            execution: a.clone(),
-            account: account.parse().unwrap(),
-            runtime: "claude".into(),
-            lane: "default".into(),
-            window: "five_hour".into(),
-            source: "native".into(),
-            models: ["model".to_owned()].into(),
-            observed_at: 1.0,
-            reset_at: None,
-        })
-    };
-    refused(f.apply(&sup, latch("acct-2")), RejectCode::Unauthorized);
-    let unpinned_other = supervisor(&a, Some(format!("{a}:2")), 1.0);
-    refused(
-        f.apply(&unpinned_other, latch("acct-2")),
-        RejectCode::Unauthorized,
-    );
-    assert_eq!(
-        f.count(
-            "SELECT COUNT(*) FROM quota_exhaustion WHERE account_id=?",
-            "acct-2"
-        ),
-        0
-    );
-    in_scope(&f.apply(&sup, latch("acct-1")));
 }
 
 /// A recorded supervisor identity must equal the authenticated principal's

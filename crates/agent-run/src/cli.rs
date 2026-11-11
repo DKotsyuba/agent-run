@@ -1,6 +1,6 @@
 //! Operator CLI. Starts and resumes always go through the resident broker.
 use crate::{
-    Error, Result, capacity,
+    Error, Result,
     config::{Adapter, Config},
     domain::{AgentId, OrchestratorRef},
     error::invalid,
@@ -127,12 +127,12 @@ pub trait CliService: Send + Sync {
     /// Return the configured model roster or schema-2 provider catalog.
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
     /// Return the configured capacity limits.
-    fn limits(&self) -> Result<Value>;
+    fn limits(&self) -> CliFuture<'_>;
     /// Return the ordered capacity view, optionally for one exact model.
-    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value>;
+    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_>;
     /// Returns account-free guide text for the exact catalog filters; omitted
     /// filters retain default guidance, and invalid names preserve typed errors.
-    fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> Result<Value>;
+    fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> CliFuture<'_>;
     /// Return delivery status for one exact execution.
     fn delivery_status(&self, id: &AgentId) -> Result<Value>;
     /// Cancel one completion-delivery attempt.
@@ -201,15 +201,15 @@ impl CliService for Service {
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(Service::models(self, query))
     }
-    fn limits(&self) -> Result<Value> {
-        Service::limits(self)
+    fn limits(&self) -> CliFuture<'_> {
+        Box::pin(Service::limits(self))
     }
-    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
-        Service::capacity_order(self, query)
+    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
+        Box::pin(Service::capacity_order(self, query))
     }
     /// Forwards the CLI's exact optional filters to the shared guide service.
-    fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
-        Service::delegation_guide_filtered(self, query)
+    fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
+        Box::pin(Service::delegation_guide_filtered(self, query))
     }
     fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         Service::delivery_status(self, id)
@@ -332,6 +332,41 @@ pub enum Command {
         json: bool,
     },
     Start(Start),
+    /// Atomically admit independent jobs from one JSON request (`-` reads stdin).
+    StartBatch {
+        /// JSON file or `-`: request_id and ordered jobs.
+        #[arg(long)]
+        spec: String,
+    },
+    /// Look up the permanent receipt for an exact scoped batch intent.
+    BatchReceipt {
+        /// JSON file or `-`: the original batch intent with expected_store_id.
+        #[arg(long)]
+        spec: String,
+    },
+    /// Read exact status selectors from one JSON request (`-` reads stdin).
+    Status {
+        /// JSON file or `-`: version, targets and optional view/fence.
+        #[arg(long)]
+        spec: String,
+    },
+    /// Export one exact pinned transcript fragment from JSON (`-` reads stdin).
+    TranscriptExact {
+        /// JSON file or `-`: store, selector and bounded continuation.
+        #[arg(long)]
+        spec: String,
+    },
+    /// Read one page of a root execution's exact initial task from JSON (`-` reads stdin).
+    InitialTask {
+        /// JSON file or `-`: mode, store, root agent, fences and page.
+        #[arg(long)]
+        spec: String,
+    },
+    /// List or release durable lineage history pins.
+    HistoryPins {
+        #[command(subcommand)]
+        command: HistoryPinsCommand,
+    },
     Resume(Resume),
     /// Start a cooperative pool from one JSON request (`-` reads stdin).
     StartPool {
@@ -410,7 +445,14 @@ pub enum Command {
         text: bool,
     },
     /// Report the resident broker's versioned read schemas and transport limits.
-    Capabilities,
+    Capabilities {
+        /// Explicitly read the current database identity.
+        #[arg(long)]
+        include_store_id: bool,
+        /// Detect the `initial_task` read method, its modes and bounds.
+        #[arg(long)]
+        include_initial_task: bool,
+    },
     /// Read an exact verified artifact chunk fenced to the current execution.
     AnswerChunk {
         /// Stable logical agent identity.
@@ -586,6 +628,35 @@ pub enum Command {
         /// Repeated configured MCP namespaces eligible for the narrow allow decision.
         #[arg(long = "allow-mcp", required = true)]
         allow_mcp: Vec<String>,
+    },
+}
+
+/// Operator actions for durable history pins.
+#[derive(Subcommand, Debug)]
+pub enum HistoryPinsCommand {
+    /// List pins in exclusive key order.
+    List {
+        /// Current pin state to list.
+        #[arg(long, default_value = "all", value_parser = ["all", "active", "released"])]
+        status: String,
+        /// Maximum page size, at most 1000.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Exclude this key and all earlier keys.
+        #[arg(long)]
+        after_pin_id: Option<String>,
+        /// Refuse a database different from the recorded store identity.
+        #[arg(long)]
+        expected_store_id: Option<String>,
+    },
+    /// Release one exact pin idempotently.
+    Release {
+        /// Canonical pin identifier from a batch receipt.
+        #[arg(long)]
+        pin_id: String,
+        /// Refuse a database different from the recorded store identity.
+        #[arg(long)]
+        expected_store_id: Option<String>,
     },
 }
 
@@ -971,7 +1042,6 @@ pub enum Api {
         stderr_log: Option<PathBuf>,
     },
 }
-/// Capacity worker commands retained from the Python operator surface.
 /// Configuration migration commands (see `crate::migrate`).
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
@@ -1035,25 +1105,11 @@ pub enum StorageCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum Capacity {
-    Collect {
-        #[arg(long, required = true)]
-        once: bool,
-    },
     /// Capacity order; schema 2 lists providers, optionally for one model.
     Order {
         /// Exact provider-visible model id.
         #[arg(long)]
         model: Option<String>,
-    },
-    Launchd {
-        #[arg(long)]
-        binary: PathBuf,
-        #[arg(long, default_value = "com.pluto.agent-run.capacity")]
-        label: String,
-        #[arg(long, default_value = "/dev/null")]
-        stdout_log: PathBuf,
-        #[arg(long)]
-        stderr_log: Option<PathBuf>,
     },
 }
 /// Completion-delivery commands retained from the Python operator surface.
@@ -1280,7 +1336,23 @@ fn operator_config(
 )> {
     match agent_run_config::provider_config::ProviderConfig::load(home) {
         Ok((v2, _)) => Ok((v2.shared(), Some(v2))),
-        Err(_) => Ok((Config::load(home)?, None)),
+        Err(v2_error) => {
+            let bytes = fs::Dir::open(home)?.read(Path::new("config.toml"), 1024 * 1024)?;
+            let is_v2 = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("schema_version")
+                        .and_then(toml::Value::as_integer)
+                })
+                == Some(2);
+            if is_v2 {
+                Err(v2_error)
+            } else {
+                Ok((Config::load(home)?, None))
+            }
+        }
     }
 }
 pub fn doc(topic: &str) -> Result<&'static str> {
@@ -1300,7 +1372,7 @@ fn xml(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
-/// Renders the Python-compatible launchd document and its machine-readable metadata.
+/// Renders a launchd document and its machine-readable metadata for supported jobs.
 pub fn launchd(
     home: &Path,
     binary: PathBuf,
@@ -1313,7 +1385,6 @@ pub fn launchd(
     let binary = absolute(&binary)?;
     let args = match kind {
         "api" => vec!["api", "serve"],
-        "capacity" => vec!["capacity", "collect", "--once"],
         "delivery" => vec!["delivery", "dispatch"],
         _ => return Err(invalid("unknown launchd job")),
     };
@@ -1732,6 +1803,12 @@ fn client_command(command: &Command) -> bool {
     matches!(
         command,
         Command::Start(_)
+            | Command::StartBatch { .. }
+            | Command::BatchReceipt { .. }
+            | Command::Status { .. }
+            | Command::TranscriptExact { .. }
+            | Command::InitialTask { .. }
+            | Command::HistoryPins { .. }
             | Command::Restart(_)
             | Command::Resume(_)
             | Command::StartPool { .. }
@@ -1739,7 +1816,7 @@ fn client_command(command: &Command) -> bool {
             | Command::PoolReplace { .. }
             | Command::Pool { .. }
             | Command::Pools { .. }
-            | Command::Capabilities
+            | Command::Capabilities { .. }
             | Command::AnswerChunk { .. }
             | Command::Doc { .. }
             | Command::Mcp
@@ -2437,6 +2514,130 @@ async fn run_client_command(
             let result = broker.call("resume", arguments).await?;
             (output)(&admission_output(&result)?)?;
         }
+        Command::StartBatch { spec } => {
+            let text = if spec == "-" {
+                read_stdin(1024 * 1024)?
+            } else {
+                read_input(Path::new(&spec), 1024 * 1024)?
+            };
+            let mut request: agent_run_domain::batch::StartBatchRequest =
+                serde_json::from_str(&text).map_err(|_| invalid("invalid batch spec"))?;
+            request.validate_intent()?;
+            let params = serde_json::to_value(request)?;
+            let result = broker.call("start_batch", params.clone()).await?;
+            if !transport::socket::valid_batch_response(&result, &params) {
+                return Err(Error::BatchOutcomeUnknown {
+                    source: Box::new(invalid("invalid batch receipt")),
+                });
+            }
+            (output)(&result)?;
+        }
+        Command::BatchReceipt { spec } => {
+            let text = if spec == "-" {
+                read_stdin(1024 * 1024)?
+            } else {
+                read_input(Path::new(&spec), 1024 * 1024)?
+            };
+            let mut request: agent_run_domain::batch::StartBatchRequest =
+                serde_json::from_str(&text).map_err(|_| invalid("invalid batch receipt spec"))?;
+            request.validate_receipt_lookup()?;
+            let params = serde_json::to_value(request)?;
+            let result = broker.call("batch_receipt", params.clone()).await?;
+            if !transport::socket::valid_batch_receipt_response(&result, &params) {
+                return Err(Error::Runtime(
+                    "invalid batch receipt lookup response".into(),
+                ));
+            }
+            (output)(&result)?;
+        }
+        Command::Status { spec } => {
+            let text = if spec == "-" {
+                read_stdin(1024 * 1024)?
+            } else {
+                read_input(Path::new(&spec), 1024 * 1024)?
+            };
+            let request: agent_run_domain::status::StatusRequest =
+                serde_json::from_str(&text).map_err(|_| invalid("invalid status spec"))?;
+            request.validate()?;
+            let params = serde_json::to_value(request)?;
+            let result = broker.call("status", params.clone()).await?;
+            if !transport::socket::valid_status_response(&result, &params) {
+                return Err(Error::Runtime("invalid status response".into()));
+            }
+            (output)(&result)?;
+        }
+        Command::TranscriptExact { spec } => {
+            let text = if spec == "-" {
+                read_stdin(1024 * 1024)?
+            } else {
+                read_input(Path::new(&spec), 1024 * 1024)?
+            };
+            let request: agent_run_domain::transcript_exact::TranscriptExactRequest =
+                serde_json::from_str(&text)
+                    .map_err(|_| invalid("invalid exact transcript spec"))?;
+            request.validate()?;
+            let params = serde_json::to_value(request)?;
+            let result = broker.call("transcript_exact", params.clone()).await?;
+            if !transport::socket::valid_transcript_exact_response(&result, &params) {
+                return Err(Error::Runtime("invalid exact transcript response".into()));
+            }
+            (output)(&result)?;
+        }
+        Command::InitialTask { spec } => {
+            let text = if spec == "-" {
+                read_stdin(1024 * 1024)?
+            } else {
+                read_input(Path::new(&spec), 1024 * 1024)?
+            };
+            let request: agent_run_domain::initial_task::InitialTaskRequest =
+                serde_json::from_str(&text).map_err(|_| invalid("invalid initial task spec"))?;
+            request.validate()?;
+            let params = serde_json::to_value(request)?;
+            let result = broker.call("initial_task", params.clone()).await?;
+            if !transport::socket::valid_initial_task_response(&result, &params) {
+                return Err(Error::Runtime("invalid initial task response".into()));
+            }
+            (output)(&result)?;
+        }
+        Command::HistoryPins { command } => {
+            let (mut params, expected_store_id) = match command {
+                HistoryPinsCommand::List {
+                    status,
+                    limit,
+                    after_pin_id,
+                    expected_store_id,
+                } => (
+                    json!({
+                        "action":"list", "status":status, "limit":limit, "after_pin_id":after_pin_id
+                    }),
+                    expected_store_id,
+                ),
+                HistoryPinsCommand::Release {
+                    pin_id,
+                    expected_store_id,
+                } => (
+                    json!({"action":"release", "pin_id":pin_id}),
+                    expected_store_id,
+                ),
+            };
+            if let Some(id) = expected_store_id {
+                params["expected_store_id"] = json!(id);
+            }
+            let request: agent_run_domain::batch::HistoryPinsRequest =
+                serde_json::from_value(params.clone())
+                    .map_err(|_| invalid("invalid history pin request"))?;
+            if matches!(request, agent_run_domain::batch::HistoryPinsRequest::List { limit, .. } if !(1..=1000).contains(&limit))
+            {
+                return Err(invalid("history pin limit must be 1..=1000"));
+            }
+            let result = broker.call("history_pins", params.clone()).await?;
+            if !transport::socket::valid_history_pin_response(&result, &params) {
+                return Err(Error::Runtime(
+                    "history pin result is invalid; reconcile release by pin_id".into(),
+                ));
+            }
+            (output)(&result)?;
+        }
         Command::StartPool { spec, session } => {
             let mut request = spec_json(&spec)?;
             if let Some(reference) = session.resolve()? {
@@ -2510,8 +2711,37 @@ async fn run_client_command(
                 (output)(&result)?;
             }
         }
-        Command::Capabilities => {
-            (output)(&broker.call("capabilities", json!({})).await?)?;
+        Command::Capabilities {
+            include_store_id,
+            include_initial_task,
+        } => {
+            let mut params = json!({});
+            if include_store_id {
+                params["include_store_id"] = json!(true);
+            }
+            if include_initial_task {
+                params["include_initial_task"] = json!(true);
+            }
+            let result = broker.call("capabilities", params).await?;
+            if include_store_id
+                && !result
+                    .get("store_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.parse::<agent_run_domain::StoreId>().is_ok())
+            {
+                return Err(Error::Runtime("invalid capabilities store identity".into()));
+            }
+            if include_initial_task
+                && serde_json::from_value::<agent_run_domain::initial_task::InitialTaskCapability>(
+                    result.get("initial_task").cloned().unwrap_or(Value::Null),
+                )
+                .is_err()
+            {
+                return Err(Error::Runtime(
+                    "invalid initial task capability response".into(),
+                ));
+            }
+            (output)(&result)?;
         }
         Command::AnswerChunk {
             agent_id,
@@ -2878,7 +3108,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 })
                 .await?,
         )?,
-        Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
+        Command::Limits => (dependencies.output)(&dependencies.service.limits().await?)?,
         Command::DelegationGuide {
             provider,
             profile,
@@ -2891,7 +3121,8 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     provider,
                     profile,
                     model,
-                })?;
+                })
+                .await?;
             let text = value
                 .as_str()
                 .ok_or_else(|| invalid("delegation guide must be text"))?;
@@ -2963,27 +3194,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             Capacity::Order { model } => (dependencies.output)(
                 &dependencies
                     .service
-                    .capacity_order(agent_run_domain::CapacityOrderQuery { model })?,
+                    .capacity_order(agent_run_domain::CapacityOrderQuery { model })
+                    .await?,
             )?,
-            Capacity::Launchd {
-                binary,
-                label,
-                stdout_log,
-                stderr_log,
-            } => emit(&crate::launchd::render(
-                &home,
-                binary,
-                "capacity",
-                operator_config(&home)?.0.capacity.collect_interval_seconds,
-                &label,
-                stdout_log,
-                stderr_log.unwrap_or_else(|| home.join("capacity-worker.err.log")),
-            )?)?,
-            Capacity::Collect { once: _ } => {
-                let result = capacity::collect(&home).await?;
-                (dependencies.output)(&result)?;
-                return Ok(if result["ok"] == true { 0 } else { 2 });
-            }
         },
         Command::Delivery { command } => match command {
             Delivery::Status { agent_id, run_id } => {
@@ -3203,6 +3416,26 @@ mod login_selection_tests {
     use super::provider_login_target;
     use agent_run_config::provider_config::ProviderConfig;
     use agent_run_domain::catalog::{AccountRecord, AccountStatus};
+
+    #[test]
+    fn operator_config_preserves_schema_two_validation_error() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),format!("schema_version=2\n[managed_attempt_binding]\nenabled=true\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\npool_resident_sha256='{}'\n","a".repeat(64),"b".repeat(64),"b".repeat(64))).unwrap();
+        let error = super::operator_config(home.path()).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("managed component identity is ambiguous"),
+            "{error}"
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            "schema_version=1\n[runtimes.invalid]\nadapter='bogus'\n",
+        )
+        .unwrap();
+        let error = super::operator_config(home.path()).err().unwrap();
+        assert!(error.to_string().contains("invalid config"), "{error}");
+    }
 
     /// Forward only the host identity and restart receipt from a blocked start.
     #[test]

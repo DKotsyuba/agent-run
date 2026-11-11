@@ -31,13 +31,13 @@ fn account_runtime_retains_live_and_configured_runs() {
         fs::private_dir(&run).unwrap();
         std::fs::write(run.join("data"), "fixture").unwrap();
     }
-    let store = home.store();
+    let mut store = home.store();
     retained(&store, live, "{}");
     let alias = home.path.join("configured-alias");
     std::os::unix::fs::symlink(base.join("runs").join(configured), &alias).unwrap();
     let protected = [alias.join("not-yet-created")];
     for _ in 0..4 {
-        agent_run_core::housekeeping::sweep_account_runtime(&base, NOW, &store, &protected)
+        agent_run_core::housekeeping::sweep_account_runtime(&base, NOW, &mut store, &protected)
             .unwrap();
     }
     assert!(!base.join("runs").join(orphan).exists());
@@ -52,7 +52,7 @@ fn account_runtime_retains_live_and_configured_runs() {
         agent_run_core::housekeeping::sweep_account_runtime(
             &uncertain,
             NOW,
-            &store,
+            &mut store,
             &["relative-and-untrusted".into()]
         )
         .is_err()

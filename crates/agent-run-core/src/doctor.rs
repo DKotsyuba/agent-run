@@ -200,6 +200,15 @@ fn check(name: &str, status: CheckStatus, detail: &str, remediation: &str) -> Ch
     }
 }
 
+/// Warn while at least 90% of the permanent owner-effect ledger is used.
+fn owner_effect_capacity_status(used: u64, limit: u64) -> CheckStatus {
+    if limit == 0 || limit.saturating_sub(used) <= limit / 10 {
+        CheckStatus::Warning
+    } else {
+        CheckStatus::Ok
+    }
+}
+
 /// Represents unavailable release evidence without inventing a version or seal.
 fn unobserved_release(name: &str) -> ReleaseSummary {
     ReleaseSummary {
@@ -528,6 +537,12 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         findings: Vec::new(),
         ..Report::default()
     };
+    report.diagnostics.checks.push(check(
+        "quota",
+        CheckStatus::NotChecked,
+        "Agent Run does not check quota status",
+        "run agent-quota limits to inspect quotas and agent-quota doctor to check service availability",
+    ));
     let executing = std::env::current_exe().ok().and_then(|binary| {
         let bin = binary.parent()?;
         (bin.file_name()? == "bin" && bin.parent()?.join("COMPLETE").exists())
@@ -616,8 +631,46 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         "read-only state snapshot obtained",
         "none",
     ));
+    match state::writer::StoreReader::open_with(&report.home, Duration::from_millis(100))
+        .and_then(|reader| reader.attempt_capacity_headroom())
+    {
+        Ok(headroom) => report.diagnostics.checks.push(check(
+            "attempt_binding_headroom",
+            owner_effect_capacity_status(headroom.owner_effects_used,headroom.owner_effects_limit),
+            &format!(
+                "active currentness remaining {} of {}; admission keys remaining {} of {}; retirements remaining {} of {}; qualifications remaining {} of {}; owner effects remaining {} of {}; prepared enrollments remaining {} of {}; terminal enrollments {}",
+                headroom
+                    .active_current_limit
+                    .saturating_sub(headroom.active_current_used),
+                headroom.active_current_limit,
+                headroom
+                    .admission_keys_limit
+                    .saturating_sub(headroom.admission_keys_used),
+                headroom.admission_keys_limit,
+                headroom.retirements_limit.saturating_sub(headroom.retirements_used),
+                headroom.retirements_limit,
+                headroom.qualifications_limit.saturating_sub(headroom.qualifications_used),
+                headroom.qualifications_limit,
+                headroom.owner_effects_limit.saturating_sub(headroom.owner_effects_used),
+                headroom.owner_effects_limit,
+                headroom
+                    .enrollments_prepared_limit
+                    .saturating_sub(headroom.enrollments_prepared_used),
+                headroom.enrollments_prepared_limit,
+                headroom.enrollments_terminal
+            ),
+            "retire fully settled namespaces before permanent-key compaction is available",
+        )),
+        Err(_) => report.diagnostics.checks.push(check(
+            "attempt_binding_headroom",
+            CheckStatus::NotChecked,
+            "attempt binding headroom unavailable",
+            "inspect the state store read-only",
+        )),
+    }
     if let Some(config) = &provider_config {
         provider_bindings(config, &report.home, &mut report.findings);
+        managed_codex_code_mode(config, &mut report.findings);
         managed_services(
             config,
             &report.home,
@@ -625,12 +678,6 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
             &mut report.findings,
         );
     }
-    capacity(
-        &config,
-        &snapshot.capacity,
-        report.checked_at,
-        &mut report.findings,
-    );
     supervisors(&snapshot.agents, &mut report.findings);
     terminal_attempt_ownership(&report.home, &mut report.findings);
     match state::incidents::read_summary(&report.home.join("state.db")) {
@@ -767,6 +814,53 @@ fn managed_services(
             "services",
             "service state could not be read",
         );
+    }
+}
+
+/// Checks the managed Codex Code Mode host the harness would spawn against
+/// its pin. Without a pin, managed Codex models that require Code Mode are
+/// refused at launch, which is reported as a warning.
+fn managed_codex_code_mode(
+    config: &agent_run_config::provider_config::ProviderConfig,
+    findings: &mut Vec<Finding>,
+) {
+    let (Some(settings), Some(codex)) = (
+        config
+            .managed_attempt_binding
+            .as_ref()
+            .filter(|settings| settings.enabled),
+        config
+            .harnesses
+            .get(&agent_run_domain::catalog::HarnessId::Codex),
+    ) else {
+        return;
+    };
+    match &settings.codex_code_mode_host_sha256 {
+        None => add(
+            findings,
+            "managed_codex_code_mode_unpinned",
+            "warning",
+            "harness:codex",
+            "managed Codex members cannot use models that require Code Mode; pin the code-mode host",
+        ),
+        Some(digest) => {
+            match agent_run_adapters::managed_role::codex_code_mode_host(&codex.binary, digest) {
+                Ok(_) => add(
+                    findings,
+                    "managed_codex_code_mode_host",
+                    "info",
+                    "harness:codex",
+                    "the pinned Codex code-mode host verified",
+                ),
+                Err(_) => add(
+                    findings,
+                    "managed_codex_code_mode_host_invalid",
+                    "error",
+                    "harness:codex",
+                    "the Codex code-mode host is missing, unsafe or not the pinned build",
+                ),
+            }
+        }
     }
 }
 
@@ -1559,49 +1653,6 @@ fn keychain_present_with(name: &str, lookup: impl FnOnce(Option<&str>, &str) -> 
     fallback.is_some_and(|(account, service)| lookup(account, service))
 }
 
-/// Flags capacity samples whose validity window or age has expired.
-fn capacity(config: &Config, rows: &[Value], at: f64, findings: &mut Vec<Finding>) {
-    let stale_after = config.capacity.collect_interval_seconds.max(1) as f64 * 2.0;
-    let mut latest = BTreeSet::new();
-    for row in rows {
-        let identity = (
-            row.get("runtime").and_then(Value::as_str),
-            row.get("lane").and_then(Value::as_str),
-            row.get("window").and_then(Value::as_str),
-            row.get("target").and_then(Value::as_str),
-            row.get("source").and_then(Value::as_str),
-        );
-        if !latest.insert(identity) {
-            continue;
-        }
-        let stale = match row.get("valid_until").and_then(Value::as_f64) {
-            Some(valid_until) => valid_until < at,
-            None => row
-                .get("observed_at")
-                .and_then(Value::as_f64)
-                .is_some_and(|observed| at - observed > stale_after),
-        };
-        if stale {
-            let runtime = row
-                .get("runtime")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let detail = ["lane", "window", "target", "source"]
-                .iter()
-                .map(|key| row.get(*key).and_then(Value::as_str).unwrap_or("-"))
-                .collect::<Vec<_>>()
-                .join("/");
-            add(
-                findings,
-                "capacity_stale",
-                "warning",
-                &format!("capacity:{runtime}"),
-                detail,
-            );
-        }
-    }
-}
-
 /// Reports missing active supervisor PIDs and safely observes recorded PID births.
 ///
 /// A native identity observation is the only death proof accepted here.  When
@@ -1968,6 +2019,23 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_effect_headroom_warns_at_ninety_percent() {
+        use super::{CheckStatus, owner_effect_capacity_status};
+        assert_eq!(
+            owner_effect_capacity_status(89_999, 100_000),
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            owner_effect_capacity_status(90_000, 100_000),
+            CheckStatus::Warning
+        );
+        assert_eq!(
+            owner_effect_capacity_status(100_000, 100_000),
+            CheckStatus::Warning
+        );
+        assert_eq!(owner_effect_capacity_status(0, 0), CheckStatus::Warning);
+    }
     /// Only a validated Bridge path is a reference; malformed/relative/inline fields remain findings.
     #[test]
     fn bridge_token_file_reference_is_not_plaintext_secret() {
@@ -2246,6 +2314,55 @@ mod tests {
     }
 
     /// Cold services are normal, missing ownership is an error, and diagnostics never expose commands or write state.
+    #[cfg(unix)]
+    #[test]
+    fn managed_codex_code_mode_host_is_reported_against_its_pin() {
+        let home = tempfile::tempdir().unwrap();
+        let package = home.path().canonicalize().unwrap().join("package");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(package.join("codex-package.json"), "{}").unwrap();
+        std::fs::write(package.join("bin/codex"), b"\x7fELF codex").unwrap();
+        std::fs::write(package.join("bin/codex-code-mode-host"), b"\x7fELF host").unwrap();
+        let digest = agent_run_platform::fs::sha256(b"\x7fELF host");
+        let codes = |pin: Option<&str>| {
+            let pin = pin.map_or(String::new(), |pin| {
+                format!("codex_code_mode_host_sha256='{pin}'\n")
+            });
+            let config = agent_run_config::provider_config::ProviderConfig::parse(
+                &format!(
+                    "schema_version=2\n[managed_attempt_binding]\nenabled=true\nrole_name='managed'\npool_server='agent-pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\n{pin}[harnesses.codex]\nbinary='{}'\nhome='{root}/codex'\n[harnesses.claude-code]\nbinary='/bin/true'\nhome='{root}/claude'\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='gpt'\n[[providers.codex.bindings]]\nlabel='global'\naccount='acct'\n",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    package.join("bin/codex").display(),
+                    root = home.path().display(),
+                ),
+                home.path(),
+            )
+            .unwrap();
+            let mut findings = Vec::new();
+            managed_codex_code_mode(&config, &mut findings);
+            findings
+                .into_iter()
+                .map(|finding| (finding.code, finding.severity))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            codes(None),
+            [("managed_codex_code_mode_unpinned".into(), "warning".into())]
+        );
+        assert_eq!(
+            codes(Some(&digest)),
+            [("managed_codex_code_mode_host".into(), "info".into())]
+        );
+        assert_eq!(
+            codes(Some(&"0".repeat(64))),
+            [(
+                "managed_codex_code_mode_host_invalid".into(),
+                "error".into()
+            )]
+        );
+    }
+
     #[test]
     fn service_diagnostics_are_read_only_and_secret_safe() {
         let home = tempfile::tempdir().unwrap();
@@ -2327,6 +2444,13 @@ readiness={command="/bin/true"}
             findings[0]
                 .detail
                 .contains(&format!("expected v{}", crate::state::VERSION))
+        );
+        assert!(
+            report
+                .diagnostics
+                .checks
+                .iter()
+                .any(|check| { check.name == "quota" && check.status == CheckStatus::NotChecked })
         );
         assert!(!report.ok());
     }
@@ -2487,75 +2611,108 @@ readiness={command="/bin/true"}
         assert_eq!(findings[0].severity, "warning");
     }
 
-    /// Builds one capacity snapshot row shaped like Python's `_row`.
-    fn capacity_row(lane: &str, observed_at: f64, valid_until: Option<f64>) -> Value {
-        json!({
-            "runtime": "fixture",
-            "lane": lane,
-            "window": "5h",
-            "target": null,
-            "source": "omniroute",
-            "observed_at": observed_at,
-            "valid_until": valid_until,
-        })
-    }
+    /// Legacy quota rows never create current findings; unrelated checks stay read-only.
+    #[test]
+    fn doctor_ignores_legacy_quota_samples_and_reports_quota_not_checked() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "schema_version = 1\n[capacity]\ncollect_interval_seconds = 30\n",
+        )
+        .unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+        store.conn.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,observed_at,valid_until,payload_json) \
+             VALUES('codex','tokens','5h','legacy',1,2,'{}')",
+            [],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) \
+             VALUES('ag-20260101-000000-0000000001','fixture','model','','task','task',?,'{}','running',1,'fixture')",
+            [home.path().to_str().unwrap()],
+        ).unwrap();
+        let data_version: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
 
-    /// Returns the stale lanes for `rows`, mirroring Python's `_lanes`.
-    fn capacity_lanes(rows: &[Value]) -> Vec<String> {
-        let config: Config =
-            serde_json::from_value(json!({"schema_version": 1})).expect("default config");
-        let mut findings = Vec::new();
-        capacity(&config, rows, 1_000., &mut findings);
-        findings
+        let dependencies = Dependencies::new(Some(home.path().join("missing-canary")), Vec::new);
+        let report = run_with(home.path(), &dependencies).unwrap();
+
+        let headroom = report
+            .diagnostics
+            .checks
             .iter()
-            .map(|finding| {
-                finding
-                    .detail
-                    .split('/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
-            .collect()
-    }
-
-    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_a_sample_still_within_its_validity_is_never_stale`.
-    #[test]
-    fn python_doctor_sample_within_its_validity_is_never_stale() {
-        assert!(capacity_lanes(&[capacity_row("fresh", 100., Some(2_000.))]).is_empty());
-    }
-
-    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_an_expired_sample_is_stale_even_when_recently_observed`.
-    #[test]
-    fn python_doctor_expired_sample_is_stale_even_when_recently_observed() {
-        assert_eq!(
-            capacity_lanes(&[capacity_row("expired", 999., Some(500.))]),
-            ["expired"]
-        );
-    }
-
-    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_a_sample_without_validity_keeps_the_age_bound`.
-    #[test]
-    fn python_doctor_sample_without_validity_keeps_the_age_bound() {
-        assert_eq!(
-            capacity_lanes(&[
-                capacity_row("aged", 100., None),
-                capacity_row("recent", 900., None),
-            ]),
-            ["aged"]
-        );
-    }
-
-    /// Keeps only the newest row for each capacity identity before staleness checks.
-    /// Mirrors `tests/test_capacity_diagnostics.py::CapacityDiagnosticTests::test_frequent_healthy_samples_do_not_hide_stale_identity`.
-    #[test]
-    fn capacity_staleness_deduplicates_identity_before_reporting() {
+            .find(|check| check.name == "attempt_binding_headroom")
+            .unwrap();
+        assert_eq!(headroom.status, CheckStatus::Ok);
         assert!(
-            capacity_lanes(&[
-                capacity_row("same", 900., Some(2_000.)),
-                capacity_row("same", 100., Some(500.)),
-            ])
-            .is_empty()
+            headroom
+                .detail
+                .contains("active currentness remaining 100000 of 100000")
+        );
+        assert!(
+            headroom
+                .detail
+                .contains("retirements remaining 100000 of 100000")
+        );
+        assert!(
+            headroom
+                .detail
+                .contains("qualifications remaining 100000 of 100000")
+        );
+        assert!(
+            headroom
+                .detail
+                .contains("owner effects remaining 100000 of 100000")
+        );
+        assert!(!headroom.detail.contains("private-task-sentinel"));
+
+        let quota = report
+            .diagnostics
+            .checks
+            .iter()
+            .find(|check| check.name == "quota")
+            .unwrap();
+        assert_eq!(quota.status, CheckStatus::NotChecked);
+        assert_eq!(
+            serde_json::to_value(quota).unwrap()["status"],
+            "not_checked"
+        );
+        assert!(quota.remediation.contains("agent-quota limits"));
+        assert!(quota.remediation.contains("agent-quota doctor"));
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "capacity_stale")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "dead_supervisor" && finding.severity == "error")
+        );
+        assert!(
+            report
+                .diagnostics
+                .checks
+                .iter()
+                .any(|check| check.name == "state" && check.status == CheckStatus::Ok)
+        );
+        assert!(!report.ok());
+        let after: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, data_version);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

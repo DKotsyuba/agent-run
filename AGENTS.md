@@ -13,8 +13,7 @@ evidence, process ownership, and secret safety are product requirements.
   the repository has not tested (see docs/family-standard.md).
 - Keep modules focused. Add tests for every behavior change.
 - Agent-task harnesses are created only through adapters and the supervisor.
-  Configured quota commands use the bounded external collector runner; shipped
-  collectors query metadata without starting model turns.
+  Agent Quota owns collection and forecasting; Run reads its bounded snapshots.
 - Preserve unrelated work and never weaken lifecycle assertions to hide flakes.
 - Release workflows build macOS Apple-silicon and Linux x86-64 artifacts on
   their native runners. Both platform checks gate publication; do not claim

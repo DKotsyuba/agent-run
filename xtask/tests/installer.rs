@@ -9,7 +9,7 @@ use std::{
     process::Command,
 };
 use tempfile::TempDir;
-use xtask::{installer, release};
+use xtask::{deploy, installer, release};
 
 /// Holds a sealed fixture, isolated state and a launcher directory containing spaces and quotes.
 struct Fixture {
@@ -728,6 +728,125 @@ fn foreign_tui_blocks_cutover_and_preserves_existing_release() {
     assert!(!fixture.prefix.join("releases/1.0.0").exists());
 }
 
+/// Builds a sealed future candidate containing only the exact compatibility shim.
+fn shim_candidate(fixture: &Fixture, version: &str) -> PathBuf {
+    release::build_with_installer(
+        &fixture.temporary.path().join("download"),
+        version,
+        &fixture.temporary.path().join("runtime"),
+        Path::new(env!("CARGO_BIN_EXE_xtask")),
+        Some(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/tui-compat.sh")),
+    )
+    .unwrap()
+}
+
+/// A managed old wrapper sees the shim on upgrade and the old TUI after rollback.
+#[test]
+fn shim_upgrade_preserves_wrapper_and_rollback() {
+    let fixture = Fixture::with_tui(true);
+    fixture.install().unwrap();
+    let launcher = fixture.bin.join("agent-run-tui");
+    let wrapper = fs::read(&launcher).unwrap();
+    let shim = shim_candidate(&fixture, "1.0.1");
+    installer::install(&shim, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1").unwrap();
+    assert_eq!(fs::read(&launcher).unwrap(), wrapper);
+    let output = Command::new(&launcher).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("moved to Agent Hub"));
+    deploy::rollback(&fixture.prefix, &fixture.home, false).unwrap();
+    assert!(Command::new(&launcher).output().unwrap().status.success());
+    assert_eq!(fs::read(&launcher).unwrap(), wrapper);
+}
+
+/// A sealed but nonexecutable shim cannot replace a working release.
+#[test]
+fn shim_nonexecutable_is_refused_before_cutover() {
+    let fixture = Fixture::with_tui(true);
+    fixture.install().unwrap();
+    let pointer = fs::read_link(fixture.prefix.join("current")).unwrap();
+    let launcher = fixture.bin.join("agent-run-tui");
+    let wrapper = fs::read(&launcher).unwrap();
+    let shim = shim_candidate(&fixture, "1.0.1");
+    fs::set_permissions(
+        shim.join("bin/agent-run-tui"),
+        fs::Permissions::from_mode(0o641),
+    )
+    .unwrap();
+    release::verify(&shim).unwrap();
+    let error = installer::install(&shim, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1")
+        .unwrap_err();
+    assert!(error.contains("must be executable"), "{error}");
+    assert_eq!(
+        fs::read_link(fixture.prefix.join("current")).unwrap(),
+        pointer
+    );
+    assert_eq!(fs::read(&launcher).unwrap(), wrapper);
+    assert!(!fixture.prefix.join("releases/1.0.1").exists());
+    assert!(Command::new(launcher).output().unwrap().status.success());
+}
+
+/// Shim installs preserve foreign launchers, omit fresh launchers, and retain seal checks.
+#[test]
+fn shim_preserves_foreign_and_enforces_immutable_seal() {
+    for foreign in ["missing", "file", "link"] {
+        let fixture = Fixture::new();
+        let shim = shim_candidate(&fixture, "1.0.1");
+        fs::create_dir(&fixture.bin).unwrap();
+        let launcher = fixture.bin.join("agent-run-tui");
+        if foreign == "file" {
+            fs::write(&launcher, "foreign").unwrap();
+        } else if foreign == "link" {
+            std::os::unix::fs::symlink("foreign-target", &launcher).unwrap();
+        }
+        installer::install(&shim, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1").unwrap();
+        installer::install(&shim, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1").unwrap();
+        if foreign == "missing" {
+            let different = release::build_with_installer(
+                &fixture.temporary.path().join("other-download"),
+                "1.0.1",
+                &fixture.temporary.path().join("runtime"),
+                Path::new(env!("CARGO_BIN_EXE_xtask")),
+                Some(&fixture.temporary.path().join("observer")),
+            )
+            .unwrap();
+            assert!(
+                installer::install(
+                    &different,
+                    &fixture.prefix,
+                    &fixture.home,
+                    &fixture.bin,
+                    "1.0.1"
+                )
+                .is_err()
+            );
+        }
+        match foreign {
+            "file" => assert_eq!(fs::read(&launcher).unwrap(), b"foreign"),
+            "link" => assert_eq!(
+                fs::read_link(&launcher).unwrap(),
+                Path::new("foreign-target")
+            ),
+            _ => assert!(!launcher.exists()),
+        }
+        fs::write(shim.join("bin/agent-run-tui"), "tampered").unwrap();
+        assert!(
+            installer::install(&shim, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1")
+                .is_err()
+        );
+        assert!(release::verify(&fixture.prefix.join("releases/1.0.1")).is_ok());
+        fs::remove_file(shim.join("bin/agent-run-tui")).unwrap();
+        std::os::unix::fs::symlink(
+            fixture.temporary.path().join("observer"),
+            shim.join("bin/agent-run-tui"),
+        )
+        .unwrap();
+        assert!(
+            installer::install(&shim, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1")
+                .is_err()
+        );
+    }
+}
+
 /// Reusing a sealed legacy version cannot silently omit a newly requested observer.
 #[test]
 fn adding_tui_to_an_existing_release_requires_a_new_version() {
@@ -786,6 +905,7 @@ fn unlisted_candidate_files_are_refused_without_changes() {
             let journal = fs::read(fixture.prefix.join("deploy.json")).ok();
             let launchers = fs::read_dir(&fixture.bin).map(|d| d.count()).unwrap_or(0);
             let extra = fixture.candidate.join(added);
+            fs::create_dir_all(extra.parent().unwrap()).unwrap();
             fs::write(&extra, "added after sealing").unwrap();
             executable(&extra, "#!/bin/sh\necho added\n");
             assert!(release::verify(&fixture.candidate).is_err(), "{added}");

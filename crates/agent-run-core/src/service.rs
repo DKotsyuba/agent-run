@@ -32,7 +32,7 @@ use agent_run_store::{
 
 /// Busy allowance of a broker-side read-only store job: reads never wait out a
 /// writer's long transaction on an executor thread.
-const READ_ALLOWANCE: Duration = Duration::from_millis(250);
+pub(crate) const READ_ALLOWANCE: Duration = Duration::from_millis(250);
 
 /// Most `selection_stale` recalculations after the initial selection in
 /// [`Service::admit_provider`]: four admission submissions in total.
@@ -645,8 +645,7 @@ impl Service {
         }
     }
 
-    /// Admits a strict provider request, choosing its account mechanically
-    /// from persisted quota evidence; nothing is spawned.
+    /// Admits a strict provider request using one fresh Quota snapshot and local policy.
     ///
     /// The orchestrator chooses provider, model, effort and profile; this
     /// only picks the account. Order of work:
@@ -656,11 +655,9 @@ impl Service {
     ///    quota read; a different request under that id is `Conflict`.
     /// 2. The current valid v2 config and account registry resolve the
     ///    launch authority once; that config revision is frozen into the row.
-    /// 3. Candidates come from
-    ///    [`crate::capacity::provider_ranking::provider_candidates`] outside
-    ///    every write transaction (the request's account label, if any, is a
-    ///    pin with no failover), then the store validates and commits.
-    /// 4. `selection_stale` recomputes from persisted facts and resubmits:
+    /// 3. Candidates combine Quota with local account state outside the write
+    ///    transaction; an account label pins without failover.
+    /// 4. `selection_stale` obtains a new snapshot and resubmits:
     ///    one initial selection plus at most [`PROVIDER_STALE_RETRIES`]
     ///    recalculations. If the last of those four submissions is also
     ///    stale, this returns `selection_busy` and nothing was admitted.
@@ -699,24 +696,21 @@ impl Service {
         request: ProviderStartRequest,
         before_admission: &mut (dyn FnMut(u32) -> Result<()> + Send),
     ) -> Result<Value> {
-        self.admit_provider_with(
-            request,
-            PROVIDER_STALE_RETRIES,
-            &mut |store, catalog, request, attempt| {
-                let pin = request.account.as_ref().map(|label| label.as_str());
-                let candidates = crate::capacity::provider_ranking::provider_candidates(
-                    store,
-                    catalog,
-                    &request.provider,
-                    &request.model,
-                    pin,
-                    &std::collections::BTreeSet::new(),
-                )?;
-                before_admission(attempt)?;
-                Ok(candidates)
-            },
-        )
+        self.admit_provider_with(request, PROVIDER_STALE_RETRIES, None, &mut |attempt, _| {
+            before_admission(attempt)
+        })
         .await
+    }
+
+    /// Test seam for a writer-side clock change after candidates are built.
+    #[cfg(feature = "test-fixtures")]
+    pub async fn admit_provider_decision_observed(
+        &self,
+        request: ProviderStartRequest,
+        before_admission: &mut (dyn FnMut(u32, &mut QuotaCandidateSet) -> Result<()> + Send),
+    ) -> Result<Value> {
+        self.admit_provider_with(request, PROVIDER_STALE_RETRIES, None, before_admission)
+            .await
     }
 
     /// Admits a strict provider request from trusted Rust quota candidates.
@@ -729,7 +723,7 @@ impl Service {
         request: ProviderStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
-        self.admit_provider_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+        self.admit_provider_with(request, 0, Some(candidates), &mut |_, _| Ok(()))
             .await
     }
 
@@ -738,22 +732,14 @@ impl Service {
     /// Validates/canonicalizes live paths when possible; a failed path check is
     /// enforced only for a new admission so exact retained intent can replay.
     ///
-    /// `produce` builds one candidate set from the committed store state for
-    /// the resolved catalog; it runs outside any write transaction and gets
-    /// the zero-based submission number. See [`Self::admit_provider`].
+    /// Trusted fixtures may supply a fixed set; ordinary calls obtain fresh Quota
+    /// before a bounded local read. The hook runs before each writer submission.
     async fn admit_provider_with(
         &self,
         mut request: ProviderStartRequest,
         stale_retries: u32,
-        produce: &mut (
-                 dyn FnMut(
-            &Store,
-            &agent_run_domain::catalog::ProviderCatalog,
-            &ProviderStartRequest,
-            u32,
-        ) -> Result<QuotaCandidateSet>
-                     + Send
-             ),
+        trusted: Option<QuotaCandidateSet>,
+        before_admission: &mut (dyn FnMut(u32, &mut QuotaCandidateSet) -> Result<()> + Send),
     ) -> Result<Value> {
         request.validate_intent()?;
         // Preserve canonical spelling for live paths, but an exact immutable
@@ -789,9 +775,37 @@ impl Service {
             pinned,
         } = prepared;
         let global_cap = config.core.max_active_agents;
+        let live_quota = trusted.is_none();
         let mut submission = 0;
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
         let admission = loop {
-            let candidates = produce(&Store::open(&self.home)?, &catalog, &request, submission)?;
+            let snapshot = if live_quota {
+                decisions.read(config.capacity.quota.as_ref()).await
+            } else {
+                None
+            };
+            let mut candidates = if let Some(candidates) = &trusted {
+                candidates.clone()
+            } else {
+                let catalog = catalog.clone();
+                let request = request.clone();
+                self.read(move |store| {
+                    let pin = request.account.as_ref().map(|label| label.as_str());
+                    Ok(crate::capacity::quota_adapter::candidates_at(
+                        store,
+                        &catalog,
+                        &request.provider,
+                        &request.model,
+                        pin,
+                        &std::collections::BTreeSet::new(),
+                        snapshot.as_deref(),
+                        now(),
+                    )?
+                    .candidates)
+                })
+                .await?
+            };
+            before_admission(submission, &mut candidates)?;
             #[cfg(feature = "test-fixtures")]
             if std::env::var_os("AGENT_RUN_FIXTURE_ALWAYS_STALE").is_some() {
                 self.lane("admission")?
@@ -819,6 +833,13 @@ impl Service {
                 )
                 .await
             {
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if live_quota && decisions.retry_invalidated(&mut submission, stale_retries) => {
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if live_quota && decisions.retry_expired(&mut submission, stale_retries) => {}
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if stale_retries > 0 && submission == stale_retries =>
                 {
@@ -828,6 +849,7 @@ impl Service {
                     if submission < stale_retries =>
                 {
                     submission += 1;
+                    decisions.require_fresh();
                 }
                 result => break result?,
             }
@@ -854,6 +876,512 @@ impl Service {
         };
         self.hand_off_provider(&mut result).await?;
         Ok(result)
+    }
+
+    /// Atomically admits independent provider jobs, retaining their replay receipt.
+    /// An exact replay uses no mutable config, paths, quota or supervisor launch.
+    pub async fn admit_batch(
+        &self,
+        request: agent_run_domain::batch::StartBatchRequest,
+    ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        self.admit_batch_ranked(request, &mut |_, _| Ok(())).await
+    }
+
+    /// Exercises a local revision race after each complete batch candidate read.
+    #[cfg(feature = "test-fixtures")]
+    pub async fn admit_batch_observed(
+        &self,
+        request: agent_run_domain::batch::StartBatchRequest,
+        before_admission: &mut (dyn FnMut(u32) -> Result<()> + Send),
+    ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        self.admit_batch_ranked(request, &mut |attempt, _| before_admission(attempt))
+            .await
+    }
+
+    /// Test seam for a writer-side clock change after all batch candidates are built.
+    #[cfg(feature = "test-fixtures")]
+    pub async fn admit_batch_decision_observed(
+        &self,
+        request: agent_run_domain::batch::StartBatchRequest,
+        before_admission: &mut (
+                 dyn FnMut(u32, &mut [agent_run_store::ops::BatchMemberSpec]) -> Result<()> + Send
+             ),
+    ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        self.admit_batch_ranked(request, before_admission).await
+    }
+
+    /// Shares replay-first batch admission and its optional deterministic race hook.
+    async fn admit_batch_ranked(
+        &self,
+        mut request: agent_run_domain::batch::StartBatchRequest,
+        before_admission: &mut (
+                 dyn FnMut(u32, &mut [agent_run_store::ops::BatchMemberSpec]) -> Result<()> + Send
+             ),
+    ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        request.validate_public_key()?;
+        request.validate_intent()?;
+        let fingerprint = request.fingerprint()?;
+        if let Some(replay) = Store::open(&self.home)?.replay_batch_scoped(
+            &request.request_id,
+            &fingerprint,
+            request.expected_store_id.as_ref(),
+        )? {
+            replay
+                .validate_for_request(&request)
+                .map_err(|_| Error::Integrity("invalid batch replay receipt".into()))?;
+            return Ok(replay);
+        }
+        request.validate_new_lookup_frame()?;
+        if let Some(restart_id) = agent_run_store::service_restart::active_service_restart(
+            &Store::open(&self.home)?.conn,
+        )? {
+            return Err(Error::Transition(
+                agent_run_store::service_restart::blocked_message(restart_id),
+            ));
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let mut prepared = Vec::with_capacity(request.jobs.len());
+        for mut job in request.jobs {
+            job.validate()?;
+            let mut job = prepare_provider(&config, &revision, &catalog, job)?;
+            self.bind_system_route(&mut job)?;
+            prepared.push(job);
+        }
+        let ids: Vec<_> = prepared.iter().map(|_| AgentId::new()).collect();
+        let mut submission = 0;
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
+        loop {
+            // One external snapshot serves every job in this attempt; never hold
+            // a local transaction while awaiting another service.
+            let snapshot = decisions.read(config.capacity.quota.as_ref()).await;
+            let requests: Vec<_> = prepared.iter().map(|job| job.request.clone()).collect();
+            let rank_catalog = catalog.clone();
+            let sets = self
+                .read(move |store| {
+                    let read = store.conn.unchecked_transaction()?;
+                    let decision_time = now();
+                    let mut sets = Vec::with_capacity(requests.len());
+                    for request in &requests {
+                        let pin = request.account.as_ref().map(|label| label.as_str());
+                        sets.push(
+                            crate::capacity::quota_adapter::candidates_at(
+                                store,
+                                &rank_catalog,
+                                &request.provider,
+                                &request.model,
+                                pin,
+                                &std::collections::BTreeSet::new(),
+                                snapshot.as_deref(),
+                                decision_time,
+                            )?
+                            .candidates,
+                        );
+                    }
+                    drop(read);
+                    Ok(sets)
+                })
+                .await?;
+            let mut jobs = Vec::with_capacity(prepared.len());
+            for ((id, job), candidates) in ids.iter().zip(&prepared).zip(&sets) {
+                jobs.push(agent_run_store::ops::BatchMemberSpec {
+                    id: id.clone(),
+                    inputs: AdmissionInputs {
+                        request: &job.request,
+                        effective: &job.effective,
+                        authority: &job.authority,
+                        candidates,
+                        identity: &job.identity,
+                        global_cap: config.core.max_active_agents,
+                        harness_cap: job.cap,
+                        pinned: job.pinned.as_ref(),
+                    }
+                    .into(),
+                });
+            }
+            before_admission(submission, &mut jobs)?;
+            let outcome = self
+                .lane("admission")?
+                .local(
+                    agent_run_store::ops::AdmitBatch {
+                        request_id: request.request_id.clone(),
+                        fingerprint: fingerprint.clone(),
+                        retain_history: request.retain_history,
+                        expected_store_id: request.expected_store_id.clone(),
+                        preconditions: request.preconditions.clone(),
+                        catalog: catalog.clone(),
+                        jobs,
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await;
+            match outcome {
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if decisions.retry_invalidated(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if decisions.retry_expired(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < PROVIDER_STALE_RETRIES =>
+                {
+                    submission += 1;
+                    decisions.require_fresh();
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
+                    return Err(QuotaAdmissionError::SelectionBusy {
+                        stale_retries: PROVIDER_STALE_RETRIES,
+                    }
+                    .into());
+                }
+                Err(error) if batch_admission_unknown(&error) => {
+                    return Err(Error::BatchOutcomeUnknown {
+                        source: Box::new(error),
+                    });
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Admit one private Pool enrollment through the same provider preparation,
+    /// quota snapshot and batch writer as ordinary starts.
+    pub(crate) async fn start_managed_enrollment(
+        &self,
+        grant: &crate::attempt_binding::PeerGrant,
+        request: agent_run_domain::enrollment::Start,
+        raw: Value,
+        fingerprint: String,
+    ) -> Result<agent_run_domain::enrollment::Receipt> {
+        use agent_run_domain::{batch::StartBatchRequest, enrollment::Key};
+        use agent_run_store::ops::{AdmitManagedEnrollment, PrepareManagedEnrollment};
+        let key = Key {
+            version: 1,
+            expected_store_id: request.expected_store_id.clone(),
+            pool_store_id: request.pool_store_id.clone(),
+            request_id: request.request_id.clone(),
+            fingerprint,
+        };
+        let route = self.managed_enrollment_grant(grant)?;
+        key.validate(&route.pool_route)?;
+        let lookup_key = key.clone();
+        let lookup_route = route.pool_route.clone();
+        if let Some(existing) = self
+            .read(move |store| store.managed_enrollment_lookup(&lookup_key, &lookup_route))
+            .await?
+        {
+            if existing
+                .grant
+                .as_ref()
+                .is_some_and(|original| original != &route)
+            {
+                return Err(invalid("enrollment transport changed"));
+            }
+            if let Some(receipt) = existing.receipt {
+                return Ok(receipt);
+            }
+            if existing.state == "aborted" {
+                return Err(invalid("enrollment aborted"));
+            }
+        }
+        self.attempt_enabled(grant)?;
+        let prepared_key = key.clone();
+        let prepared_route = route.clone();
+        let stage = self
+            .lane("admission")?
+            .local(
+                PrepareManagedEnrollment {
+                    key: prepared_key,
+                    grant: prepared_route,
+                    request: raw,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        if let Some(receipt) = stage.receipt {
+            return Ok(receipt);
+        }
+        if stage.state == "aborted" {
+            return Err(invalid("enrollment aborted"));
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let settings = config
+            .managed_attempt_binding
+            .as_ref()
+            .filter(|settings| settings.enabled)
+            .ok_or_else(|| Error::Unsupported("managed attempt binding disabled".into()))?;
+        if request
+            .jobs
+            .iter()
+            .any(|job| job.selector.role_name != settings.role_name)
+        {
+            return Err(invalid("enrollment role mismatch"));
+        }
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let mut jobs = Vec::with_capacity(request.jobs.len());
+        let mut role_digests = Vec::with_capacity(request.jobs.len());
+        let mut normalized = Vec::with_capacity(request.jobs.len());
+        for member in &request.jobs {
+            let mut spec: ProviderStartRequest = serde_json::from_value(member.spec.clone())
+                .map_err(|_| invalid("enrollment request invalid"))?;
+            spec.validate_intent()?;
+            normalized.push(spec.clone());
+            spec.validate()?;
+            let mut prepared = prepare_provider(&config, &revision, &catalog, spec)?;
+            let role = role_plan::ResolvedRolePlan::from_payload(&prepared.authority.role_payload)
+                .map_err(|_| invalid("enrollment role unqualified"))?;
+            let selected = adapters::managed_role::select(
+                &config,
+                prepared.authority.harness,
+                &role,
+                prepared.request.explicit_finish,
+            )
+            .map_err(|_| invalid("enrollment role unqualified"))?
+            .ok_or_else(|| invalid("enrollment role unqualified"))?;
+            if role.role_name != member.selector.role_name
+                || prepared.request.write
+                || prepared.effective.write
+            {
+                return Err(invalid("enrollment role mismatch"));
+            }
+            role_digests.push(selected.role_digest);
+            self.bind_system_route(&mut prepared)?;
+            jobs.push(prepared);
+        }
+        // Namespace the existing batch replay key by the authenticated Pool route.
+        let internal = format!(
+            "p3_{}",
+            agent_run_domain::canonical::sha256_hex(
+                &json!([route.pool_route, key.pool_store_id, key.request_id]),
+                true
+            )
+        );
+        let mut batch = StartBatchRequest {
+            request_id: internal,
+            jobs: normalized,
+            retain_history: true,
+            expected_store_id: Some(request.expected_store_id.clone()),
+            preconditions: (!request.preconditions.is_empty())
+                .then_some(request.preconditions.clone()),
+        };
+        batch.validate_intent()?;
+        batch.validate_new_lookup_frame()?;
+        let batch_fingerprint = batch.fingerprint()?;
+        let ids: Vec<_> = jobs.iter().map(|_| AgentId::new()).collect();
+        let mut submission = 0;
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
+        let outcome = loop {
+            let snapshot = decisions.read(config.capacity.quota.as_ref()).await;
+            let requests: Vec<_> = jobs.iter().map(|job| job.request.clone()).collect();
+            let rank_catalog = catalog.clone();
+            let sets = self
+                .read(move |store| {
+                    let read = store.conn.unchecked_transaction()?;
+                    let decision_time = now();
+                    let mut sets = Vec::with_capacity(requests.len());
+                    for request in &requests {
+                        let pin = request.account.as_ref().map(|label| label.as_str());
+                        sets.push(
+                            crate::capacity::quota_adapter::candidates_at(
+                                store,
+                                &rank_catalog,
+                                &request.provider,
+                                &request.model,
+                                pin,
+                                &std::collections::BTreeSet::new(),
+                                snapshot.as_deref(),
+                                decision_time,
+                            )?
+                            .candidates,
+                        );
+                    }
+                    drop(read);
+                    Ok(sets)
+                })
+                .await?;
+            let mut members = Vec::with_capacity(jobs.len());
+            for ((id, job), candidates) in ids.iter().zip(&jobs).zip(&sets) {
+                members.push(agent_run_store::ops::BatchMemberSpec {
+                    id: id.clone(),
+                    inputs: AdmissionInputs {
+                        request: &job.request,
+                        effective: &job.effective,
+                        authority: &job.authority,
+                        candidates,
+                        identity: &job.identity,
+                        global_cap: config.core.max_active_agents,
+                        harness_cap: job.cap,
+                        pinned: job.pinned.as_ref(),
+                    }
+                    .into(),
+                });
+            }
+            let attempt = self
+                .lane("admission")?
+                .local(
+                    AdmitManagedEnrollment {
+                        key: key.clone(),
+                        grant: route.clone(),
+                        config_revision: revision.clone(),
+                        role_digests: role_digests.clone(),
+                        batch: agent_run_store::ops::AdmitBatch {
+                            request_id: batch.request_id.clone(),
+                            fingerprint: batch_fingerprint.clone(),
+                            retain_history: true,
+                            expected_store_id: batch.expected_store_id.clone(),
+                            preconditions: batch.preconditions.clone(),
+                            catalog: catalog.clone(),
+                            jobs: members,
+                        },
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await;
+            match attempt {
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if decisions.retry_invalidated(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if decisions.retry_expired(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < PROVIDER_STALE_RETRIES =>
+                {
+                    submission += 1;
+                    decisions.require_fresh();
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
+                    return Err(QuotaAdmissionError::SelectionBusy {
+                        stale_retries: PROVIDER_STALE_RETRIES,
+                    }
+                    .into());
+                }
+                Err(error) if batch_admission_unknown(&error) => {
+                    return Err(Error::BatchOutcomeUnknown {
+                        source: Box::new(error),
+                    });
+                }
+                other => break other?,
+            }
+        };
+        if !outcome.replayed {
+            for job in &outcome.receipt.jobs {
+                self.hand_off_admitted(&job.execution_id).await;
+            }
+        }
+        Ok(outcome.receipt)
+    }
+
+    /// Admits a batch, then hands off only newly admitted jobs to supervisors.
+    /// The transport owns this future across client timeout; the receipt does
+    /// not promise that any process has started.
+    pub async fn start_batch(
+        &self,
+        request: agent_run_domain::batch::StartBatchRequest,
+    ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        let result = self.start_batch_owned(request).await;
+        if let Err(error) = &result
+            && let Some(logger) = logging::configured()
+        {
+            logger.log(
+                logging::Level::Warning,
+                &format!("batch_start_incomplete class={}", error.public().kind),
+            );
+        }
+        result
+    }
+
+    /// Owns admission and every post-commit handoff independently of a client wait.
+    async fn start_batch_owned(
+        &self,
+        request: agent_run_domain::batch::StartBatchRequest,
+    ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        let callers: Vec<_> = request
+            .jobs
+            .iter()
+            .filter_map(|job| job.orchestrator.clone())
+            .collect();
+        let result = match self.admit_batch(request).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.remember_blocked_batch(&error, callers).await?;
+                return Err(error);
+            }
+        };
+        if !result.replayed {
+            for job in &result.receipt.jobs {
+                self.hand_off_admitted(&job.agent_id).await;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Hand one newly admitted job to its supervisor. The complete handoff,
+    /// including synchronous launcher code, is isolated in its own task: a
+    /// panic or cancellation says nothing about whether a child was created,
+    /// so it is durably recorded as `supervisor_handoff_error` and the caller
+    /// continues with the next job.
+    async fn hand_off_admitted(&self, id: &AgentId) {
+        let service = self.clone();
+        let owned = id.clone();
+        let handoff = tokio::spawn(async move {
+            let mut single = json!({"created":true,"agent_id":owned});
+            service.hand_off_provider(&mut single).await
+        });
+        match handoff.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => batch_handoff_log(id, error.public().kind),
+            Err(error) => {
+                let reason = if error.is_panic() {
+                    "panic"
+                } else {
+                    "cancelled"
+                };
+                let recorded = match self.lane("admission") {
+                    Ok(lane) => {
+                        lane.event(
+                            id,
+                            "supervisor_handoff_error",
+                            json!({"kind":"RuntimeError","reason":reason}),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = recorded {
+                    batch_handoff_log(id, error.public().kind);
+                }
+                batch_handoff_log(id, "unknown");
+            }
+        }
+    }
+
+    /// Record each distinct explicitly bound caller refused by a restart fence.
+    async fn remember_blocked_batch(
+        &self,
+        error: &Error,
+        callers: Vec<OrchestratorRef>,
+    ) -> Result<()> {
+        if !matches!(error, Error::Transition(_)) {
+            return Ok(());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut failure = None;
+        for caller in callers {
+            let key = (
+                caller.canonical_transport()?,
+                caller.external_session_id.clone(),
+            );
+            if seen.insert(key)
+                && let Err(error) = self.remember_blocked_start(error, Some(caller)).await
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Launches the supervisor for a newly created provider admission only;
@@ -907,26 +1435,10 @@ impl Service {
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
-    /// Admits a whole cooperative pool atomically, choosing every account from
-    /// persisted quota evidence; nothing is spawned. See
-    /// `Self::admit_pool_with`.
+    /// Admits a whole cooperative pool using one Quota snapshot per attempt.
     pub async fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
-        self.admit_pool_with(
-            request,
-            PROVIDER_STALE_RETRIES,
-            &mut |store, catalog, member, _| {
-                let pin = member.account.as_ref().map(|label| label.as_str());
-                crate::capacity::provider_ranking::provider_candidates(
-                    store,
-                    catalog,
-                    &member.provider,
-                    &member.model,
-                    pin,
-                    &std::collections::BTreeSet::new(),
-                )
-            },
-        )
-        .await
+        self.admit_pool_with(request, PROVIDER_STALE_RETRIES, None)
+            .await
     }
 
     /// [`Self::admit_pool`] with one fixed trusted candidate set for every
@@ -937,8 +1449,7 @@ impl Service {
         request: PoolStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
-        self.admit_pool_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
-            .await
+        self.admit_pool_with(request, 0, Some(candidates)).await
     }
 
     /// Shared pool admission.
@@ -963,15 +1474,7 @@ impl Service {
         &self,
         mut request: PoolStartRequest,
         stale_retries: u32,
-        produce: &mut (
-                 dyn FnMut(
-            &Store,
-            &agent_run_domain::catalog::ProviderCatalog,
-            &ProviderStartRequest,
-            u32,
-        ) -> Result<QuotaCandidateSet>
-                     + Send
-             ),
+        trusted: Option<QuotaCandidateSet>,
     ) -> Result<Value> {
         request.validate()?;
         let request_value = serde_json::to_value(&request)?;
@@ -1027,6 +1530,7 @@ impl Service {
                     .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
+        drop(store);
         let mut binding = request.orchestrator.clone();
         for pin in existing.iter().flatten() {
             if let Some(reference) = &pin.orchestrator {
@@ -1097,18 +1601,58 @@ impl Service {
                 prepared.push(None);
             }
         }
+        let live_quota = trusted.is_none();
         let mut submission = 0;
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
         let admission = loop {
-            let mut sets = Vec::new();
-            let store = Store::open(&self.home)?;
-            for member in &prepared {
-                sets.push(
-                    member
-                        .as_ref()
-                        .map(|p| produce(&store, &catalog, &p.request, submission))
-                        .transpose()?,
-                );
-            }
+            let snapshot = if live_quota && prepared.iter().any(Option::is_some) {
+                decisions.read(config.capacity.quota.as_ref()).await
+            } else {
+                None
+            };
+            let sets = if let Some(candidates) = &trusted {
+                prepared
+                    .iter()
+                    .map(|member| member.as_ref().map(|_| candidates.clone()))
+                    .collect()
+            } else {
+                let requests: Vec<_> = prepared
+                    .iter()
+                    .map(|member| member.as_ref().map(|p| p.request.clone()))
+                    .collect();
+                let rank_catalog = catalog.clone();
+                self.read(move |store| {
+                    let read = store.conn.unchecked_transaction()?;
+                    let decision_time = now();
+                    let mut sets = Vec::with_capacity(requests.len());
+                    for request in &requests {
+                        sets.push(
+                            request
+                                .as_ref()
+                                .map(|request| {
+                                    let pin = request.account.as_ref().map(|label| label.as_str());
+                                    Ok::<_, Error>(
+                                        crate::capacity::quota_adapter::candidates_at(
+                                            store,
+                                            &rank_catalog,
+                                            &request.provider,
+                                            &request.model,
+                                            pin,
+                                            &std::collections::BTreeSet::new(),
+                                            snapshot.as_deref(),
+                                            decision_time,
+                                        )?
+                                        .candidates,
+                                    )
+                                })
+                                .transpose()?,
+                        );
+                    }
+                    drop(read);
+                    Ok(sets)
+                })
+                .await?
+            };
             let members: Vec<PoolMemberAdmission<'_>> = request
                 .members
                 .iter()
@@ -1168,7 +1712,6 @@ impl Service {
                     },
                 )
                 .collect();
-            drop(store);
             let outcome = self
                 .lane("pools")?
                 .local(
@@ -1187,6 +1730,13 @@ impl Service {
                 )
                 .await;
             match outcome {
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if live_quota && decisions.retry_invalidated(&mut submission, stale_retries) => {
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if live_quota && decisions.retry_expired(&mut submission, stale_retries) => {}
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if stale_retries > 0 && submission == stale_retries =>
                 {
@@ -1196,6 +1746,7 @@ impl Service {
                     if submission < stale_retries =>
                 {
                     submission += 1;
+                    decisions.require_fresh();
                 }
                 result => break result?,
             }
@@ -1284,22 +1835,8 @@ impl Service {
         &self,
         request: PoolReplace,
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
-        self.admit_replacement_with(
-            request,
-            PROVIDER_STALE_RETRIES,
-            &mut |store, catalog, member, _| {
-                let pin = member.account.as_ref().map(|label| label.as_str());
-                crate::capacity::provider_ranking::provider_candidates(
-                    store,
-                    catalog,
-                    &member.provider,
-                    &member.model,
-                    pin,
-                    &std::collections::BTreeSet::new(),
-                )
-            },
-        )
-        .await
+        self.admit_replacement_with(request, PROVIDER_STALE_RETRIES, None)
+            .await
     }
 
     /// [`Self::admit_pool_replacement`] over one fixed trusted candidate set.
@@ -1308,7 +1845,7 @@ impl Service {
         request: PoolReplace,
         candidates: QuotaCandidateSet,
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
-        self.admit_replacement_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+        self.admit_replacement_with(request, 0, Some(candidates))
             .await
     }
 
@@ -1332,15 +1869,7 @@ impl Service {
         &self,
         mut request: PoolReplace,
         stale_retries: u32,
-        produce: &mut (
-                 dyn FnMut(
-            &Store,
-            &agent_run_domain::catalog::ProviderCatalog,
-            &ProviderStartRequest,
-            u32,
-        ) -> Result<QuotaCandidateSet>
-                     + Send
-             ),
+        trusted: Option<QuotaCandidateSet>,
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
         request.validate()?;
         let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
@@ -1355,7 +1884,9 @@ impl Service {
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
         let new_id = AgentId::new();
+        let live_quota = trusted.is_none();
         let (mut submission, mut recomposed) = (0, 0);
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
         loop {
             let store = Store::open(&self.home)?;
             let context = match store.pool_replace_context(&request.pool_id, &request.agent_id)? {
@@ -1422,7 +1953,33 @@ impl Service {
             start.validate()?;
             let mut prepared = prepare_provider(&config, &revision, &catalog, start)?;
             self.bind_system_route(&mut prepared)?;
-            let candidates = produce(&store, &catalog, &prepared.request, submission)?;
+            drop(store);
+            let snapshot = if live_quota {
+                decisions.read(config.capacity.quota.as_ref()).await
+            } else {
+                None
+            };
+            let candidates = if let Some(candidates) = &trusted {
+                candidates.clone()
+            } else {
+                let catalog = catalog.clone();
+                let ranked_request = prepared.request.clone();
+                self.read(move |store| {
+                    let pin = ranked_request.account.as_ref().map(|label| label.as_str());
+                    Ok(crate::capacity::quota_adapter::candidates_at(
+                        store,
+                        &catalog,
+                        &ranked_request.provider,
+                        &ranked_request.model,
+                        pin,
+                        &std::collections::BTreeSet::new(),
+                        snapshot.as_deref(),
+                        now(),
+                    )?
+                    .candidates)
+                })
+                .await?
+            };
             let replacement = agent_run_store::ops::ReplacePoolMember {
                 pool_id: request.pool_id.clone(),
                 old: request.agent_id.clone(),
@@ -1445,7 +2002,6 @@ impl Service {
                 }
                 .into(),
             };
-            drop(store);
             let outcome = self
                 .lane("pools")?
                 .local(replacement, crate::broker_writer::BROKER_BUDGET)
@@ -1455,7 +2011,17 @@ impl Service {
                     agent_run_store::ops::PoolOutcome::Denied(denial) => Err(denial),
                 });
             match outcome {
-                Ok(Err(PoolDenial::StaleRoster { .. })) if recomposed < 3 => recomposed += 1,
+                Ok(Err(PoolDenial::StaleRoster { .. })) if recomposed < 3 => {
+                    recomposed += 1;
+                    decisions.require_fresh();
+                }
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if live_quota && decisions.retry_invalidated(&mut submission, stale_retries) => {
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if live_quota && decisions.retry_expired(&mut submission, stale_retries) => {}
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if stale_retries > 0 && submission == stale_retries =>
                 {
@@ -1465,6 +2031,7 @@ impl Service {
                     if submission < stale_retries =>
                 {
                     submission += 1;
+                    decisions.require_fresh();
                 }
                 result => return result,
             }
@@ -2225,19 +2792,34 @@ impl Service {
             .get(&authority.harness)
             .ok_or_else(|| invalid("provider harness is not configured"))?
             .max_active_agents;
-        let pin_label = request.account.as_ref().map(|label| label.as_str());
+        let pin_label = request
+            .account
+            .as_ref()
+            .map(|label| label.as_str().to_owned());
         let mut submission = 0;
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
         let admission = loop {
-            let store = Store::open(&self.home)?;
-            let candidates = crate::capacity::provider_ranking::provider_candidates(
-                &store,
-                &frozen_catalog,
-                &authority.provider,
-                &authority.model,
-                pin_label,
-                &hard,
-            )?;
-            drop(store);
+            let snapshot = decisions.read(current.capacity.quota.as_ref()).await;
+            let ranked_catalog = frozen_catalog.clone();
+            let provider = authority.provider.clone();
+            let model = authority.model.clone();
+            let pin = pin_label.clone();
+            let hard = hard.clone();
+            let candidates = self
+                .read(move |store| {
+                    Ok(crate::capacity::quota_adapter::candidates_at(
+                        store,
+                        &ranked_catalog,
+                        &provider,
+                        &model,
+                        pin.as_deref(),
+                        &hard,
+                        snapshot.as_deref(),
+                        now(),
+                    )?
+                    .candidates)
+                })
+                .await?;
             match self
                 .lane("admission")?
                 .local(
@@ -2262,10 +2844,17 @@ impl Service {
                 )
                 .await
             {
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if decisions.retry_invalidated(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if decisions.retry_expired(&mut submission, PROVIDER_STALE_RETRIES) => {}
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if submission < PROVIDER_STALE_RETRIES =>
                 {
                     submission += 1;
+                    decisions.require_fresh();
                 }
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
                     return Err(QuotaAdmissionError::SelectionBusy {
@@ -2464,6 +3053,52 @@ impl Service {
             )
             .await?;
         Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
+    }
+
+    /// Lists or idempotently releases operator history pins without worker authority.
+    pub async fn history_pins(
+        &self,
+        request: agent_run_domain::batch::HistoryPinsRequest,
+    ) -> Result<Value> {
+        use agent_run_domain::batch::HistoryPinsRequest;
+        match request {
+            HistoryPinsRequest::Release {
+                pin_id,
+                expected_store_id,
+            } => {
+                let result = self
+                    .lane("retention")?
+                    .local(
+                        agent_run_store::ops::ReleaseHistoryPin {
+                            pin_id: pin_id.clone(),
+                            expected_store_id,
+                        },
+                        crate::broker_writer::BROKER_BUDGET,
+                    )
+                    .await?
+                    .ok_or_else(|| Error::PinNotFound(pin_id.to_string()))?;
+                Ok(serde_json::to_value(result)?)
+            }
+            HistoryPinsRequest::List {
+                status,
+                limit,
+                after_pin_id,
+                expected_store_id,
+            } => {
+                let home = self.home.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = Store::open(&home)?;
+                    Ok(serde_json::to_value(store.history_pins_scoped(
+                        status,
+                        limit,
+                        after_pin_id.as_ref(),
+                        expected_store_id.as_ref(),
+                    )?)?)
+                })
+                .await
+                .map_err(|_| Error::Runtime("history pins read failed".into()))?
+            }
+        }
     }
     /// List execution history, optionally waiting for a newer durable revision.
     pub async fn list(&self, query: Query) -> Result<Value> {
@@ -2726,19 +3361,28 @@ impl Service {
 
     /// Public `models` read.
     ///
-    /// A schema-2 config returns the revisioned provider catalog of
-    /// [`crate::capacity::provider_catalog::models`] with exact `query`
-    /// filters. A schema-1 config keeps its historical runtime roster, which
-    /// probes each runtime; filters there are `Unsupported`.
+    /// Schema 2 combines one fresh Quota response with one local read snapshot;
+    /// unavailable quota is unknown. Schema 1 keeps its runtime roster.
     pub async fn models(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
         let active = self.active_config()?;
-        match &active.value {
-            CachedConfigValue::Providers(config) => crate::capacity::provider_catalog::models(
-                &self.home,
-                config,
-                &active.revision,
-                &query,
-            ),
+        match active.value {
+            CachedConfigValue::Providers(config) => {
+                let snapshot =
+                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
+                let home = self.home.clone();
+                self.read(move |store| {
+                    crate::capacity::quota_projection::models_at(
+                        store,
+                        &home,
+                        &config,
+                        &active.revision,
+                        &query,
+                        snapshot.as_ref(),
+                        now(),
+                    )
+                })
+                .await
+            }
             CachedConfigValue::Legacy(_) if query.is_empty() => {
                 crate::capacity::models(&self.home).await
             }
@@ -2747,38 +3391,57 @@ impl Service {
             )),
         }
     }
-    /// Returns stored quota windows and, for schema 2, provider/model numerical
-    /// ranking from one committed snapshot and active config revision. Schema 1
-    /// retains the historical JSON shape. No collection or engine launch occurs.
-    pub fn limits(&self) -> Result<Value> {
+    /// Projects Quota windows and ranking with explicit completeness. Schema 1
+    /// requires migration to schema 2; no collector or engine is launched.
+    pub async fn limits(&self) -> Result<Value> {
         let active = self.active_config()?;
-        match &active.value {
+        match active.value {
             CachedConfigValue::Providers(config) => {
-                crate::capacity::provider_catalog::diagnostics(&self.home, config, &active.revision)
+                let snapshot =
+                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
+                self.read(move |store| {
+                    crate::capacity::quota_projection::limits_at(
+                        store,
+                        &config,
+                        &active.revision,
+                        snapshot.as_ref(),
+                        now(),
+                    )
+                })
+                .await
             }
-            CachedConfigValue::Legacy(_) => crate::capacity::limits(&self.home),
+            CachedConfigValue::Legacy(_) => {
+                crate::capacity::quota_projection::legacy_limits_unavailable()
+            }
         }
     }
 
-    /// Public `capacity_order` read: the provider-only order of
-    /// [`crate::capacity::provider_catalog::order`] for schema 2, or the
-    /// historical route order for schema 1 (where a model filter is
-    /// `Unsupported`).
-    pub fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
+    /// Returns provider order over one Quota response and local snapshot.
+    /// Schema 1 requires an explicit migration to schema 2.
+    pub async fn capacity_order(
+        &self,
+        query: agent_run_domain::CapacityOrderQuery,
+    ) -> Result<Value> {
         let active = self.active_config()?;
-        match &active.value {
-            CachedConfigValue::Providers(config) => crate::capacity::provider_catalog::order(
-                &self.home,
-                config,
-                &active.revision,
-                &query,
-            ),
-            CachedConfigValue::Legacy(_) if query.model.is_none() => {
-                crate::capacity::order(&self.home)
+        match active.value {
+            CachedConfigValue::Providers(config) => {
+                let snapshot =
+                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
+                self.read(move |store| {
+                    crate::capacity::quota_projection::order_at(
+                        store,
+                        &config,
+                        &active.revision,
+                        &query,
+                        snapshot.as_ref(),
+                        now(),
+                    )
+                })
+                .await
             }
-            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
-                "capacity_order model filter requires schema_version 2".into(),
-            )),
+            CachedConfigValue::Legacy(_) => {
+                crate::capacity::quota_projection::legacy_order_unavailable()
+            }
         }
     }
 
@@ -2787,31 +3450,64 @@ impl Service {
     /// default query, rendered by [`crate::delegation_guide::render`] without
     /// any new quota read, collection, or ranking. A schema-1 config has no
     /// provider catalog, so the whole read is `Unsupported` there.
-    pub fn delegation_guide(&self) -> Result<Value> {
+    pub async fn delegation_guide(&self) -> Result<Value> {
         self.delegation_guide_filtered(agent_run_domain::ModelsQuery::default())
+            .await
     }
 
     /// Renders the same compact account-free guidance for exact provider/model/
     /// profile filters, using the catalog's admission rules and one committed
     /// snapshot. Unknown filters are typed ValidationError; schema 1 remains
     /// Unsupported. Omitted filters retain the historical default guidance.
-    pub fn delegation_guide_filtered(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
+    pub async fn delegation_guide_filtered(
+        &self,
+        query: agent_run_domain::ModelsQuery,
+    ) -> Result<Value> {
         let active = self.active_config()?;
-        match &active.value {
+        match active.value {
             CachedConfigValue::Providers(config) => {
-                let catalog = crate::capacity::provider_catalog::models(
-                    &self.home,
-                    config,
-                    &active.revision,
-                    &query,
-                )?;
-                Ok(Value::String(crate::delegation_guide::render(&catalog)?))
+                let snapshot =
+                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
+                let home = self.home.clone();
+                self.read(move |store| {
+                    crate::capacity::quota_projection::delegation_guide_at(
+                        store,
+                        &home,
+                        &config,
+                        &active.revision,
+                        &query,
+                        snapshot.as_ref(),
+                        now(),
+                    )
+                })
+                .await
             }
             CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
                 "delegation_guide requires schema_version 2".into(),
             )),
         }
     }
+}
+
+/// Identifies a possibly committed writer operation or unreadable committed result.
+fn batch_admission_unknown(error: &Error) -> bool {
+    matches!(error, Error::Json(_))
+        || matches!(error,
+            Error::Persistence { source, .. }
+                if matches!(source.as_ref(), Error::WriterFailure(agent_run_domain::storage::WriterFailure::Unknown(_)))
+        )
+}
+
+/// Best-effort, payload-free logging must not stop later independent handoffs.
+fn batch_handoff_log(id: &AgentId, class: &str) {
+    let _ = std::panic::catch_unwind(|| {
+        if let Some(logger) = logging::configured() {
+            logger.log(
+                logging::Level::Warning,
+                &format!("batch_handoff_unavailable agent_id={id} class={class}"),
+            );
+        }
+    });
 }
 
 /// Refuses a provider resume when the current configuration no longer
@@ -3301,4 +3997,30 @@ pub(crate) fn prepare_provider(
         cap,
         pinned,
     })
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use agent_run_domain::storage::{NotEnqueuedReason, SubmitResult, UnknownCause};
+
+    /// A possible commit remains unknown; a proven unqueued operation does not.
+    #[test]
+    fn batch_writer_unknown_is_not_a_refusal() {
+        let unknown =
+            crate::persist::into_result::<()>(SubmitResult::Unknown(UnknownCause::CommitUncertain))
+                .unwrap_err();
+        let unqueued = crate::persist::into_result::<()>(SubmitResult::NotEnqueued(
+            NotEnqueuedReason::DeadlineExpired,
+        ))
+        .unwrap_err();
+        assert!(batch_admission_unknown(&unknown));
+        assert!(!batch_admission_unknown(&unqueued));
+        let public = Error::BatchOutcomeUnknown {
+            source: Box::new(unknown),
+        }
+        .public();
+        assert_eq!(public.kind, "BatchOutcomeUnknown");
+        assert!(public.message.contains("outcome unknown"));
+    }
 }

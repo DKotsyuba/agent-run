@@ -16,6 +16,9 @@ use std::{
     sync::{Arc, Barrier},
 };
 
+#[path = "provider_admission/quota_decision.rs"]
+mod quota_decision_fence;
+
 /// Opens one initialized disposable store with four fake account references.
 fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
@@ -79,6 +82,395 @@ fn provider_request(home: &Path, id: &str) -> ProviderStartRequest {
     request
 }
 
+/// Batch rollback, replay and retention share the ordinary admission transaction.
+#[test]
+fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
+    use agent_run_domain::{batch::StartBatchRequest, domain::AgentId};
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        provider_admission::AdmissionInputs,
+    };
+
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let catalog = catalog(&store);
+    let authority = authority(&catalog, home.path());
+    let mut first = provider_request(home.path(), "temporary-a");
+    first.request_id = None;
+    first.task = "first".into();
+    let mut second = first.clone();
+    second.task = "second".into();
+    let first_effective = first.storage_projection();
+    let second_effective = second.storage_projection();
+    let first_identity = identity(&first, &authority);
+    let second_identity = identity(&second, &authority);
+    let candidates = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let mut request = StartBatchRequest {
+        request_id: "batch-key".into(),
+        jobs: vec![first.clone(), second.clone()],
+        retain_history: true,
+        expected_store_id: Some(store_id.clone()),
+        preconditions: None,
+    };
+    request.validate_intent().unwrap();
+    let fingerprint = request.fingerprint().unwrap();
+    let ids = [AgentId::new(), AgentId::new()];
+    let jobs = |cap| {
+        vec![
+            BatchMember {
+                id: ids[0].clone(),
+                inputs: AdmissionInputs {
+                    request: &first,
+                    effective: &first_effective,
+                    authority: &authority,
+                    candidates: &candidates,
+                    identity: &first_identity,
+                    global_cap: cap,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            },
+            BatchMember {
+                id: ids[1].clone(),
+                inputs: AdmissionInputs {
+                    request: &second,
+                    effective: &second_effective,
+                    authority: &authority,
+                    candidates: &candidates,
+                    identity: &second_identity,
+                    global_cap: cap,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            },
+        ]
+    };
+    let revision = store.quota_capacity_revision().unwrap();
+    // Fail the second owner observation after the first job was written in the
+    // same transaction. Neither the partial job nor the receipt may survive.
+    agent_run_store::fixture::fail_owner_inspection_after(1);
+    let owner_failure = store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(4),
+    });
+    assert!(matches!(owner_failure, Err(Error::Io(_))));
+    for table in ["agents", "attempts", "start_batch_receipts", "history_pins"] {
+        let count: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} must roll back after owner failure");
+    }
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision);
+    let result = store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(1),
+    });
+    assert!(matches!(result, Err(Error::Capacity)));
+    for table in ["agents", "attempts", "start_batch_receipts", "history_pins"] {
+        let count: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} must roll back");
+    }
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision);
+
+    // The writer rechecks the restart fence even if preflight ran earlier.
+    let restart = store.begin_service_restart("batch-restart", 1.0).unwrap();
+    let blocked = store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(4),
+    });
+    assert!(matches!(blocked, Err(Error::Transition(_))));
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM start_batch_receipts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='complete',finished_at=2 WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+
+    let accepted = store
+        .admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: jobs(4),
+        })
+        .unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(accepted.receipt.store_id, store_id);
+    let pins: Vec<_> = accepted
+        .receipt
+        .jobs
+        .iter()
+        .map(|job| job.pin_id.clone().unwrap())
+        .collect();
+    assert_ne!(pins[0], pins[1]);
+    let other_home = self::home();
+    let other_store = agent_run_store::fixture::open(other_home.path()).unwrap();
+    let other_id = agent_run_store::store_identity::read(&other_store.conn).unwrap();
+    assert_ne!(store_id, other_id);
+    let mut foreign_receipt = accepted.receipt.clone();
+    foreign_receipt.store_id = other_id.clone();
+    other_store.conn.execute(
+        "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+        rusqlite::params![request.request_id, "a".repeat(64), serde_json::to_string(&foreign_receipt).unwrap()],
+    ).unwrap();
+    assert!(matches!(
+        other_store.replay_batch_scoped(&request.request_id, &fingerprint, Some(&store_id)),
+        Err(Error::StoreIdentityMismatch)
+    ));
+    let wrong_writer = other_store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(4),
+    });
+    assert!(matches!(wrong_writer, Err(Error::StoreIdentityMismatch)));
+    for table in ["agents", "attempts", "history_pins"] {
+        let count: i64 = other_store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "mismatch cannot admit {table}");
+    }
+    assert!(matches!(
+        store.release_history_pin_scoped(&pins[0], Some(&other_id)),
+        Err(Error::StoreIdentityMismatch)
+    ));
+    assert!(matches!(
+        store.history_pins_scoped(
+            agent_run_domain::batch::HistoryPinFilter::All,
+            10,
+            None,
+            Some(&other_id)
+        ),
+        Err(Error::StoreIdentityMismatch)
+    ));
+    let active: i64 = store
+        .conn
+        .query_row(
+            "SELECT released FROM history_pins WHERE pin_id=?",
+            [pins[0].as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    let mut unpinned = request.clone();
+    unpinned.retain_history = false;
+    assert!(matches!(
+        store.replay_batch(&request.request_id, &unpinned.fingerprint().unwrap()),
+        Err(Error::Conflict)
+    ));
+    let mut unscoped = request.clone();
+    unscoped.expected_store_id = None;
+    assert!(matches!(
+        store.replay_batch_scoped(
+            &request.request_id,
+            &unscoped.fingerprint().unwrap(),
+            Some(&store_id)
+        ),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        accepted
+            .receipt
+            .jobs
+            .iter()
+            .map(|job| &job.agent_id)
+            .collect::<Vec<_>>(),
+        vec![&ids[0], &ids[1]]
+    );
+    for job in &accepted.receipt.jobs {
+        let first_attempt: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM attempts WHERE agent_id=? AND number=1",
+                [job.agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            job.execution_ref,
+            agent_run_domain::batch::ExecutionRef::from_first_provider_attempt(
+                &job.agent_id,
+                &first_attempt
+            )
+            .unwrap()
+        );
+    }
+    assert_ne!(
+        accepted.receipt.jobs[0].execution_ref,
+        accepted.receipt.jobs[1].execution_ref
+    );
+    // A later provider attempt is not a new execution and cannot replace the
+    // number-one attempt used to derive the retained identity.
+    let later = format!("att_{}", uuid::Uuid::new_v4().simple());
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES(?,?,2,'prepared','{}',1,'prepared',0)",
+        rusqlite::params![later, ids[0].as_str()],
+    ).unwrap();
+    let replay = store
+        .admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: jobs(1),
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    // Exact replay bypasses the owner probe, while a new scalar admission fails closed.
+    agent_run_store::fixture::fail_owner_inspection_after(0);
+    assert!(
+        store
+            .admit_batch(BatchAdmission {
+                request_id: &request.request_id,
+                fingerprint: &fingerprint,
+                retain_history: true,
+                expected_store_id: Some(&store_id),
+                preconditions: None,
+                catalog: &catalog,
+                jobs: jobs(1),
+            })
+            .unwrap()
+            .replayed
+    );
+    let fresh_candidates =
+        self::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let scalar = store.admit_provider(
+        &first,
+        &first_effective,
+        &catalog,
+        &authority,
+        &fresh_candidates,
+        &first_identity,
+        4,
+        None,
+        None,
+    );
+    assert!(matches!(scalar, Err(Error::Io(_))));
+    for pin in &pins {
+        let first_release = store.release_history_pin(pin).unwrap().unwrap();
+        assert!(!first_release.already_released);
+        assert!(
+            store
+                .release_history_pin(pin)
+                .unwrap()
+                .unwrap()
+                .already_released
+        );
+    }
+    assert_eq!(
+        store
+            .replay_batch(&request.request_id, &fingerprint)
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+    assert!(matches!(
+        store.replay_batch(&request.request_id, &"a".repeat(64)),
+        Err(Error::Conflict)
+    ));
+    store.conn.execute("INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES('unknown-codec',99,?,'{}')", [&fingerprint]).unwrap();
+    assert!(matches!(
+        store.replay_batch("unknown-codec", &fingerprint),
+        Err(Error::Unsupported(_))
+    ));
+    let mut malformed = serde_json::to_value(&accepted.receipt).unwrap();
+    malformed["request_id"] = json!("missing-incarnation");
+    malformed["jobs"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_ref");
+    store.conn.execute("INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES('missing-incarnation',1,?,?)",
+        rusqlite::params![fingerprint, malformed.to_string()]).unwrap();
+    assert!(matches!(
+        store.replay_batch("missing-incarnation", &fingerprint),
+        Err(Error::Integrity(_))
+    ));
+    assert!(
+        store
+            .conn
+            .execute(
+                "DELETE FROM start_batch_receipts WHERE request_id='batch-key'",
+                []
+            )
+            .is_err()
+    );
+
+    store.conn.execute("UPDATE attempts SET ownership_active=0,phase='cleanup_complete',cleanup_proof_json='{\"never_spawned\":true}',finished_at=1", []).unwrap();
+    store
+        .conn
+        .execute("UPDATE agents SET status='failed',finished_at=1", [])
+        .unwrap();
+    for _ in 0..20 {
+        if store
+            .prune_history(agent_run_domain::domain::now() + 15.0 * 86400.0)
+            .unwrap()
+            == 0
+        {
+            break;
+        }
+    }
+    let remaining: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+    drop(store);
+    let reopened = agent_run_store::fixture::open(home.path()).unwrap();
+    assert_eq!(
+        agent_run_store::store_identity::read(&reopened.conn).unwrap(),
+        store_id
+    );
+    assert_eq!(
+        reopened
+            .replay_batch_scoped(&request.request_id, &fingerprint, Some(&store_id))
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+}
+
 /// Freezes the provider/model/account scope with a valid role revision.
 fn authority(catalog: &ProviderCatalog, workdir: &Path) -> ResolvedLaunchAuthority {
     let provider = catalog.provider(&"glm-user".parse().unwrap()).unwrap();
@@ -126,6 +518,7 @@ fn candidates(revision: i64, items: &[(&str, u32)]) -> QuotaCandidateSet {
             .map(|(id, rank)| candidate(id, *rank))
             .collect(),
         capacity_revision: revision,
+        quota_decision: None,
     }
 }
 
@@ -138,6 +531,1020 @@ fn identity(request: &ProviderStartRequest, authority: &ResolvedLaunchAuthority)
             &serde_json::to_value(request).unwrap(), true),
         "authority":authority,
     })
+}
+
+mod p3 {
+    use super::*;
+    use agent_run_domain::{
+        attempt_binding::Route,
+        domain::AgentId,
+        enrollment::{Key, Start},
+    };
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        managed_enrollment::Grant,
+        provider_admission::AdmissionInputs,
+    };
+
+    fn settings(home: &Path, grant: &Grant, enabled: bool) -> String {
+        format!(
+            "schema_version=2\n[managed_attempt_binding]\nenabled={enabled}\nrole_name='review'\npool_server='pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\npool_resident_executable='/usr/bin/false'\npool_resident_sha256='{}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{}',route_id='run',worker_uid={}}}\npool_route={{component_store_id='{}',route_id='pool',worker_uid={}}}\nbridge_route={{component_store_id='{}',route_id='bridge',worker_uid={}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/true'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/reader'\nbridge_reader_credential_sha256='{}'\n",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            grant.run_route.component_store_id,
+            grant.run_route.worker_uid,
+            grant.pool_route.component_store_id,
+            grant.pool_route.worker_uid,
+            grant.bridge_route.component_store_id,
+            grant.bridge_route.worker_uid,
+            home.display(),
+            home.display(),
+            "d".repeat(64),
+            home.display(),
+            "e".repeat(64)
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, Store<'static>, Grant, String) {
+        let home = super::home();
+        let store = agent_run_store::fixture::open(home.path()).unwrap();
+        let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+        // SAFETY: geteuid is read-only.
+        let uid = unsafe { libc::geteuid() };
+        let grant = Grant {
+            pool_route: Route {
+                component_store_id: "00000000-0000-4000-8000-000000000001".into(),
+                route_id: "pool".into(),
+                worker_uid: uid,
+            },
+            run_route: Route {
+                component_store_id: sid.to_string(),
+                route_id: "run".into(),
+                worker_uid: uid,
+            },
+            bridge_route: Route {
+                component_store_id: "00000000-0000-4000-8000-000000000002".into(),
+                route_id: "bridge".into(),
+                worker_uid: uid,
+            },
+            producer: "pool".into(),
+            host_id: "host".into(),
+            transport_pin_sha256: "0".repeat(64),
+        };
+        std::fs::write(
+            home.path().join("config.toml"),
+            settings(home.path(), &grant, true),
+        )
+        .unwrap();
+        let (config, revision) =
+            agent_run_config::provider_config::ProviderConfig::load(home.path()).unwrap();
+        let grant = Grant::from_config(&config).unwrap();
+        (home, store, grant, revision)
+    }
+
+    fn intent(home: &Path, store: &Store, grant: &Grant, id: &str, count: usize) -> (Value, Key) {
+        let mut jobs = Vec::new();
+        for index in 0..count {
+            let mut spec =
+                serde_json::to_value(super::provider_request(home, "discarded")).unwrap();
+            spec.as_object_mut().unwrap().remove("request_id");
+            spec["task"] = json!(format!("member {index}"));
+            jobs.push(json!({"member_id":format!("member-{index}"),"selector":{"version":1,"role_name":"review"},"spec":spec}));
+        }
+        let expected_store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+        let value = json!({"version":1,"expected_store_id":expected_store_id,"pool_store_id":grant.pool_route.component_store_id,"pool_id":"pool-1","request_id":id,"mode":"start","jobs":jobs,"preconditions":[]});
+        let (_, fingerprint) = Start::parse(&value).unwrap();
+        let key = Key {
+            version: 1,
+            expected_store_id,
+            pool_store_id: grant.pool_route.component_store_id.clone(),
+            request_id: id.into(),
+            fingerprint,
+        };
+        (value, key)
+    }
+
+    #[test]
+    fn p3_absent_abort_late_submit_and_disabled_recovery() {
+        let (home, store, grant, _) = fixture();
+        let (request, key) = intent(home.path(), &store, &grant, "before-stage", 1);
+        assert!(
+            store
+                .managed_enrollment_lookup(&key, &grant.pool_route)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&key, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&key, &grant, &request)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        let (request, key) = intent(home.path(), &store, &grant, "during-stage", 1);
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&key, &grant, &request)
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&key, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&key, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        let mut changed = key.clone();
+        changed.fingerprint = "f".repeat(64);
+        assert!(matches!(
+            store.managed_enrollment_lookup(&changed, &grant.pool_route),
+            Err(Error::Conflict)
+        ));
+        let (pending, pending_key) = intent(home.path(), &store, &grant, "pending-disabled", 1);
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&pending_key, &grant, &pending)
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            settings(home.path(), &grant, false),
+        )
+        .unwrap();
+        assert!(
+            store
+                .managed_enrollment_prepare(&pending_key, &grant, &pending)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_lookup(&pending_key, &grant.pool_route)
+                .unwrap()
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&pending_key, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_lookup(&key, &grant.pool_route)
+                .unwrap()
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        let (fresh, fresh_key) = intent(home.path(), &store, &grant, "disabled", 1);
+        assert!(
+            store
+                .managed_enrollment_prepare(&fresh_key, &grant, &fresh)
+                .is_err()
+        );
+        assert!(
+            store
+                .managed_enrollment_lookup(&fresh_key, &grant.pool_route)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn p3_batch_enrollment_replay_crash_and_membership_ever() {
+        let (home, mut store, grant, revision) = fixture();
+        let (raw, key) = intent(home.path(), &store, &grant, "batch", 2);
+        let (start, _) = Start::parse(&raw).unwrap();
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        let catalog = super::catalog(&store);
+        let authority = super::authority(&catalog, home.path());
+        let role_digest = authority.role_payload["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut requests = Vec::new();
+        for member in &start.jobs {
+            let mut request: ProviderStartRequest =
+                serde_json::from_value(member.spec.clone()).unwrap();
+            request.validate().unwrap();
+            requests.push(request);
+        }
+        let effective: Vec<_> = requests
+            .iter()
+            .map(ProviderStartRequest::storage_projection)
+            .collect();
+        let identities: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let mut identity = super::identity(request, &authority);
+                identity["provider_config_sha256"] = json!(revision);
+                identity
+            })
+            .collect();
+        let candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let ids = [AgentId::new(), AgentId::new()];
+        let jobs = || {
+            (0..2)
+                .map(|i| BatchMember {
+                    id: ids[i].clone(),
+                    inputs: AdmissionInputs {
+                        request: &requests[i],
+                        effective: &effective[i],
+                        authority: &authority,
+                        candidates: &candidates,
+                        identity: &identities[i],
+                        global_cap: 4,
+                        harness_cap: None,
+                        pinned: None,
+                    },
+                })
+                .collect()
+        };
+        let submit = || BatchAdmission {
+            request_id: "p3-internal",
+            fingerprint: &key.fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&key.expected_store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: jobs(),
+        };
+        let digests = vec![role_digest.clone(), role_digest];
+        agent_run_store::fixture::fail_owner_inspection_after(1);
+        assert!(
+            store
+                .managed_enrollment_admit(&key, &grant, &revision, &digests, submit())
+                .is_err()
+        );
+        for table in [
+            "agents",
+            "attempts",
+            "history_pins",
+            "managed_enrollment_members",
+            "start_batch_receipts",
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "partial {table}");
+        }
+        assert_eq!(
+            store
+                .managed_enrollment_lookup(&key, &grant.pool_route)
+                .unwrap()
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        let accepted = store
+            .managed_enrollment_admit(&key, &grant, &revision, &digests, submit())
+            .unwrap();
+        assert!(!accepted.replayed);
+        // The admitted key keeps its fingerprint and receipt, not the task text.
+        let (body, fingerprint): (Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT request_json,fingerprint FROM managed_enrollments WHERE request_id='batch'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((body, fingerprint), (None, key.fingerprint.clone()));
+        assert_eq!(accepted.receipt.jobs.len(), 2);
+        for (index, job) in accepted.receipt.jobs.iter().enumerate() {
+            assert_eq!(job.index, index);
+            assert_eq!(job.lineage_root_id, ids[index]);
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "SELECT pool_membership_ever FROM agents WHERE id=?",
+                        [job.lineage_root_id.as_str()],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert!(store.existing_pool_member(&job.lineage_root_id).is_err());
+        }
+        assert!(
+            store
+                .conn
+                .execute("DELETE FROM managed_enrollment_members", [])
+                .is_err()
+        );
+        let replay = store
+            .managed_enrollment_admit(&key, &grant, &revision, &digests, submit())
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            serde_json::to_value(replay.receipt).unwrap(),
+            serde_json::to_value(&accepted.receipt).unwrap()
+        );
+        let (late, late_key) = intent(home.path(), &store, &grant, "late-aborted", 2);
+        store
+            .managed_enrollment_prepare(&late_key, &grant, &late)
+            .unwrap();
+        store
+            .managed_enrollment_abort(&late_key, &grant.pool_route)
+            .unwrap();
+        assert!(
+            matches!(store.managed_enrollment_admit(&late_key,&grant,&revision,&digests,submit()),Err(Error::Validation(ref text)) if text == "enrollment aborted")
+        );
+        assert!(
+            store
+                .release_history_pin(&accepted.receipt.jobs[0].pin_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .existing_pool_member(&accepted.receipt.jobs[0].lineage_root_id)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM managed_enrollment_members", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            settings(home.path(), &grant, false),
+        )
+        .unwrap();
+        let recovered = store
+            .managed_enrollment_abort(&key, &grant.pool_route)
+            .unwrap();
+        assert_eq!(recovered.state, "admitted");
+        assert_eq!(
+            serde_json::to_value(recovered.receipt.unwrap()).unwrap(),
+            serde_json::to_value(&accepted.receipt).unwrap()
+        );
+        let mut foreign = grant.pool_route.clone();
+        foreign.route_id = "other".into();
+        assert!(matches!(
+            store.managed_enrollment_lookup(&key, &foreign),
+            Err(Error::Conflict)
+        ));
+    }
+
+    #[test]
+    fn p3_replace_precondition_and_resume_race() {
+        use agent_run_domain::batch::BatchPrecondition;
+        let (home, store, grant, revision) = fixture();
+        let catalog = super::catalog(&store);
+        let authority = super::authority(&catalog, home.path());
+        let mut request = super::provider_request(home.path(), "old");
+        request.request_id = None;
+        let effective = request.storage_projection();
+        let mut identity = super::identity(&request, &authority);
+        identity["provider_config_sha256"] = json!(revision);
+        let initial_candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let old_id = AgentId::new();
+        let old = store
+            .admit_batch(BatchAdmission {
+                request_id: "old-internal",
+                fingerprint: &"d".repeat(64),
+                retain_history: true,
+                expected_store_id: Some(
+                    &agent_run_store::store_identity::read(&store.conn).unwrap(),
+                ),
+                preconditions: None,
+                catalog: &catalog,
+                jobs: vec![BatchMember {
+                    id: old_id.clone(),
+                    inputs: AdmissionInputs {
+                        request: &request,
+                        effective: &effective,
+                        authority: &authority,
+                        candidates: &initial_candidates,
+                        identity: &identity,
+                        global_cap: 4,
+                        harness_cap: None,
+                        pinned: None,
+                    },
+                }],
+            })
+            .unwrap()
+            .receipt
+            .jobs
+            .remove(0);
+        let precondition = BatchPrecondition {
+            agent_id: old.agent_id.clone(),
+            sequence: old.sequence,
+            execution_ref: old.execution_ref.clone(),
+            pin_id: old.pin_id.unwrap(),
+        };
+        let (mut raw, _) = intent(home.path(), &store, &grant, "replace", 1);
+        raw["mode"] = json!("replace");
+        raw["jobs"][0]["member_id"] = json!("replacement");
+        raw["preconditions"] = json!([precondition]);
+        let (start, fingerprint) = Start::parse(&raw).unwrap();
+        let key = Key {
+            version: 1,
+            expected_store_id: start.expected_store_id.clone(),
+            pool_store_id: start.pool_store_id.clone(),
+            request_id: start.request_id.clone(),
+            fingerprint,
+        };
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        let mut next: ProviderStartRequest =
+            serde_json::from_value(start.jobs[0].spec.clone()).unwrap();
+        next.validate().unwrap();
+        let next_effective = next.storage_projection();
+        let mut next_identity = super::identity(&next, &authority);
+        next_identity["provider_config_sha256"] = json!(revision);
+        let candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let candidate_id = AgentId::new();
+        let submit = || BatchAdmission {
+            request_id: "replacement-internal",
+            fingerprint: &key.fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&key.expected_store_id),
+            preconditions: Some(&start.preconditions),
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: candidate_id.clone(),
+                inputs: AdmissionInputs {
+                    request: &next,
+                    effective: &next_effective,
+                    authority: &authority,
+                    candidates: &candidates,
+                    identity: &next_identity,
+                    global_cap: 4,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        };
+        let role_digest = authority.role_payload["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(matches!(
+            store.managed_enrollment_admit(
+                &key,
+                &grant,
+                &revision,
+                std::slice::from_ref(&role_digest),
+                submit()
+            ),
+            Err(Error::PreconditionFailed { .. })
+        ));
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM agents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status='failed',finished_at=10 WHERE id=?",
+                [old_id.as_str()],
+            )
+            .unwrap();
+        store.conn.execute("UPDATE attempts SET state='failed',finished_at=10,phase='cleanup_complete',ownership_active=0,cleanup_proof_json=? WHERE agent_id=?",rusqlite::params![json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),old_id.as_str()]).unwrap();
+        let admitted = store
+            .managed_enrollment_admit(
+                &key,
+                &grant,
+                &revision,
+                std::slice::from_ref(&role_digest),
+                submit(),
+            )
+            .unwrap();
+        assert_ne!(admitted.receipt.jobs[0].lineage_root_id, old_id);
+        assert_eq!(admitted.receipt.jobs[0].lineage_root_id, candidate_id);
+        // The Run admission-time snapshot does not hold or cancel the old lineage.
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status='running',finished_at=NULL WHERE id=?",
+                [old_id.as_str()],
+            )
+            .unwrap();
+        let replay = store
+            .managed_enrollment_admit(
+                &key,
+                &grant,
+                &revision,
+                std::slice::from_ref(&role_digest),
+                submit(),
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            serde_json::to_value(replay.receipt).unwrap(),
+            serde_json::to_value(admitted.receipt).unwrap()
+        );
+    }
+
+    #[test]
+    fn p3_batch_twenty_jobs_are_atomic() {
+        let (home, store, grant, revision) = fixture();
+        let (raw, key) = intent(home.path(), &store, &grant, "twenty", 20);
+        let (start, _) = Start::parse(&raw).unwrap();
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        let catalog = super::catalog(&store);
+        let authority = super::authority(&catalog, home.path());
+        let role_digest = authority.role_payload["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let requests: Vec<ProviderStartRequest> = start
+            .jobs
+            .iter()
+            .map(|job| {
+                let mut request: ProviderStartRequest =
+                    serde_json::from_value(job.spec.clone()).unwrap();
+                request.validate().unwrap();
+                request
+            })
+            .collect();
+        let effective: Vec<_> = requests
+            .iter()
+            .map(ProviderStartRequest::storage_projection)
+            .collect();
+        let identities: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let mut value = super::identity(request, &authority);
+                value["provider_config_sha256"] = json!(revision);
+                value
+            })
+            .collect();
+        let candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let ids: Vec<_> = (0..20).map(|_| AgentId::new()).collect();
+        let submit = || BatchAdmission {
+            request_id: "twenty-internal",
+            fingerprint: &key.fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&key.expected_store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: (0..20)
+                .map(|i| BatchMember {
+                    id: ids[i].clone(),
+                    inputs: AdmissionInputs {
+                        request: &requests[i],
+                        effective: &effective[i],
+                        authority: &authority,
+                        candidates: &candidates,
+                        identity: &identities[i],
+                        global_cap: 25,
+                        harness_cap: None,
+                        pinned: None,
+                    },
+                })
+                .collect(),
+        };
+        let digests = vec![role_digest; 20];
+        agent_run_store::fixture::fail_owner_inspection_after(19);
+        assert!(
+            store
+                .managed_enrollment_admit(&key, &grant, &revision, &digests, submit())
+                .is_err()
+        );
+        for table in [
+            "agents",
+            "attempts",
+            "history_pins",
+            "managed_enrollment_members",
+        ] {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table}"
+            );
+        }
+        let admitted = store
+            .managed_enrollment_admit(&key, &grant, &revision, &digests, submit())
+            .unwrap();
+        assert_eq!(admitted.receipt.jobs.len(), 20);
+        for (index, job) in admitted.receipt.jobs.iter().enumerate() {
+            assert_eq!(job.index, index);
+            assert_eq!(job.lineage_root_id, ids[index]);
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM history_pins WHERE released=0",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM managed_enrollment_members", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            20
+        );
+    }
+
+    #[test]
+    fn p3_transport_repin_fences_old_key_but_not_new_enrollment() {
+        let (home, store, old_grant, old_revision) = fixture();
+        let catalog = super::catalog(&store);
+        let authority = super::authority(&catalog, home.path());
+        let role_digest = authority.role_payload["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (old_raw, old_key) = intent(home.path(), &store, &old_grant, "before-upgrade", 1);
+        store
+            .managed_enrollment_prepare(&old_key, &old_grant, &old_raw)
+            .unwrap();
+        let old_start = Start::parse(&old_raw).unwrap().0;
+        let mut old_request: ProviderStartRequest =
+            serde_json::from_value(old_start.jobs[0].spec.clone()).unwrap();
+        old_request.validate().unwrap();
+        let old_effective = old_request.storage_projection();
+        let mut old_identity = super::identity(&old_request, &authority);
+        old_identity["provider_config_sha256"] = json!(old_revision);
+        let old_candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let old_id = AgentId::new();
+        let old_batch = || BatchAdmission {
+            request_id: "upgrade-old-internal",
+            fingerprint: &old_key.fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&old_key.expected_store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: old_id.clone(),
+                inputs: AdmissionInputs {
+                    request: &old_request,
+                    effective: &old_effective,
+                    authority: &authority,
+                    candidates: &old_candidates,
+                    identity: &old_identity,
+                    global_cap: 5,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        };
+        let old_receipt = store
+            .managed_enrollment_admit(
+                &old_key,
+                &old_grant,
+                &old_revision,
+                std::slice::from_ref(&role_digest),
+                old_batch(),
+            )
+            .unwrap()
+            .receipt;
+        let (pending_raw, pending_key) =
+            intent(home.path(), &store, &old_grant, "pending-before-upgrade", 1);
+        store
+            .managed_enrollment_prepare(&pending_key, &old_grant, &pending_raw)
+            .unwrap();
+        let updated = settings(home.path(), &old_grant, true)
+            .replace("producer='pool'", "producer='pool2'")
+            .replace("bridge.sock", "bridge-new.sock");
+        std::fs::write(home.path().join("config.toml"), updated).unwrap();
+        let (new_config, new_revision) =
+            agent_run_config::provider_config::ProviderConfig::load(home.path()).unwrap();
+        let new_grant = Grant::from_config(&new_config).unwrap();
+        assert_ne!(
+            new_grant.transport_pin_sha256,
+            old_grant.transport_pin_sha256
+        );
+        assert!(
+            matches!(store.managed_enrollment_prepare(&old_key,&new_grant,&old_raw),Err(Error::Validation(ref message)) if message=="enrollment transport changed")
+        );
+        assert!(
+            matches!(store.managed_enrollment_prepare(&pending_key,&new_grant,&pending_raw),Err(Error::Validation(ref message)) if message=="enrollment transport changed")
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_lookup(&old_key, &new_grant.pool_route)
+                .unwrap()
+                .unwrap()
+                .state,
+            "admitted"
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&old_key, &new_grant.pool_route)
+                .unwrap()
+                .receipt
+                .unwrap()
+                .receipt_id,
+            old_receipt.receipt_id
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&pending_key, &new_grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        let (mut new_raw, _) = intent(home.path(), &store, &new_grant, "after-upgrade", 1);
+        new_raw["jobs"][0]["member_id"] = json!("new-member");
+        let (new_start, fingerprint) = Start::parse(&new_raw).unwrap();
+        let new_key = Key {
+            version: 1,
+            expected_store_id: new_start.expected_store_id.clone(),
+            pool_store_id: new_start.pool_store_id.clone(),
+            request_id: new_start.request_id.clone(),
+            fingerprint,
+        };
+        store
+            .managed_enrollment_prepare(&new_key, &new_grant, &new_raw)
+            .unwrap();
+        let mut new_request: ProviderStartRequest =
+            serde_json::from_value(new_start.jobs[0].spec.clone()).unwrap();
+        new_request.validate().unwrap();
+        let new_effective = new_request.storage_projection();
+        let mut new_identity = super::identity(&new_request, &authority);
+        new_identity["provider_config_sha256"] = json!(new_revision);
+        let candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let new_id = AgentId::new();
+        let batch = BatchAdmission {
+            request_id: "upgrade-new-internal",
+            fingerprint: &new_key.fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&new_key.expected_store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: new_id.clone(),
+                inputs: AdmissionInputs {
+                    request: &new_request,
+                    effective: &new_effective,
+                    authority: &authority,
+                    candidates: &candidates,
+                    identity: &new_identity,
+                    global_cap: 5,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        };
+        let result = store
+            .managed_enrollment_admit(
+                &new_key,
+                &new_grant,
+                &new_revision,
+                std::slice::from_ref(&role_digest),
+                batch,
+            )
+            .unwrap();
+        assert_eq!(result.receipt.jobs[0].lineage_root_id, new_id);
+        assert_ne!(result.receipt.jobs[0].lineage_root_id, old_id);
+    }
+
+    /// A configuration edit between prepare and the admission writer is a
+    /// retryable in-progress state, not a definitive role refusal.
+    #[test]
+    fn p3_config_revision_race_is_retryable() {
+        let (home, store, grant, revision) = fixture();
+        let (raw, key) = intent(home.path(), &store, &grant, "revision-race", 1);
+        let (start, _) = Start::parse(&raw).unwrap();
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        let catalog = super::catalog(&store);
+        let authority = super::authority(&catalog, home.path());
+        let role_digest = authority.role_payload["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut request: ProviderStartRequest =
+            serde_json::from_value(start.jobs[0].spec.clone()).unwrap();
+        request.validate().unwrap();
+        let effective = request.storage_projection();
+        let stale = "0".repeat(64);
+        let mut identity = super::identity(&request, &authority);
+        identity["provider_config_sha256"] = json!(stale);
+        let candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        macro_rules! submit {
+            ($identity:expr) => {
+                BatchAdmission {
+                    request_id: "revision-race-internal",
+                    fingerprint: &key.fingerprint,
+                    retain_history: true,
+                    expected_store_id: Some(&key.expected_store_id),
+                    preconditions: None,
+                    catalog: &catalog,
+                    jobs: vec![BatchMember {
+                        id: AgentId::new(),
+                        inputs: AdmissionInputs {
+                            request: &request,
+                            effective: &effective,
+                            authority: &authority,
+                            candidates: &candidates,
+                            identity: $identity,
+                            global_cap: 4,
+                            harness_cap: None,
+                            pinned: None,
+                        },
+                    }],
+                }
+            };
+        }
+        assert!(
+            matches!(store.managed_enrollment_admit(&key,&grant,&stale,std::slice::from_ref(&role_digest),submit!(&identity)),Err(Error::Validation(ref text)) if text == "enrollment in progress")
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_lookup(&key, &grant.pool_route)
+                .unwrap()
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        // A genuine role difference stays a definitive refusal.
+        let mut changed = settings(home.path(), &grant, true);
+        changed = changed.replace("role_name='review'", "role_name='other'");
+        std::fs::write(home.path().join("config.toml"), changed).unwrap();
+        let (_, other) =
+            agent_run_config::provider_config::ProviderConfig::load(home.path()).unwrap();
+        assert!(
+            matches!(store.managed_enrollment_admit(&key,&grant,&other,std::slice::from_ref(&role_digest),submit!(&identity)),Err(Error::Validation(ref text)) if text == "enrollment role mismatch")
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            settings(home.path(), &grant, true),
+        )
+        .unwrap();
+        identity["provider_config_sha256"] = json!(revision);
+        let admitted = store
+            .managed_enrollment_admit(
+                &key,
+                &grant,
+                &revision,
+                std::slice::from_ref(&role_digest),
+                submit!(&identity),
+            )
+            .unwrap();
+        assert!(!admitted.replayed);
+    }
+
+    /// Only prepared keys retain request bodies and count against capacity;
+    /// terminal keys stay replayable after the body is discarded.
+    #[test]
+    fn p3_terminal_keys_drop_request_and_free_prepared_capacity() {
+        use agent_run_store::managed_enrollment::MAX_PREPARED_ENROLLMENTS;
+        let (home, store, grant, _) = fixture();
+        let body = |id: &str| -> Option<String> {
+            store
+                .conn
+                .query_row(
+                    "SELECT request_json FROM managed_enrollments WHERE request_id=?",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let (raw, key) = intent(home.path(), &store, &grant, "dropped", 1);
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        assert!(body("dropped").is_some());
+        // The body may only be cleared, and only by the terminal transition.
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE managed_enrollments SET request_json='{}' WHERE request_id='dropped'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE managed_enrollments SET state='aborted' WHERE request_id='dropped'",
+                    []
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&key, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        assert!(body("dropped").is_none());
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&key, &grant, &raw)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        let mut changed = key.clone();
+        changed.fingerprint = "f".repeat(64);
+        assert!(matches!(
+            store.managed_enrollment_lookup(&changed, &grant.pool_route),
+            Err(Error::Conflict)
+        ));
+        let route = serde_json::to_string(&grant.pool_route).unwrap();
+        let pin = serde_json::to_string(&grant).unwrap();
+        // Many terminal tombstones do not consume prepared capacity.
+        for index in 0..MAX_PREPARED_ENROLLMENTS + 8 {
+            store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state) VALUES(?,?,?,1,?,'aborted')",rusqlite::params![route,grant.pool_route.component_store_id,format!("tomb-{index}"),"a".repeat(64)]).unwrap();
+        }
+        for index in 1..MAX_PREPARED_ENROLLMENTS {
+            store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json) VALUES(?,?,?,1,?,'prepared','{}',?)",rusqlite::params![route,grant.pool_route.component_store_id,format!("live-{index}"),"a".repeat(64),pin]).unwrap();
+        }
+        let (last, last_key) = intent(home.path(), &store, &grant, "last", 1);
+        store
+            .managed_enrollment_prepare(&last_key, &grant, &last)
+            .unwrap();
+        let headroom = store.attempt_capacity_headroom().unwrap();
+        assert_eq!(
+            (
+                headroom.enrollments_prepared_used,
+                headroom.enrollments_prepared_limit
+            ),
+            (
+                MAX_PREPARED_ENROLLMENTS as u64,
+                MAX_PREPARED_ENROLLMENTS as u64
+            )
+        );
+        assert_eq!(
+            headroom.enrollments_terminal,
+            MAX_PREPARED_ENROLLMENTS as u64 + 9
+        );
+        let (full, full_key) = intent(home.path(), &store, &grant, "full", 1);
+        assert!(
+            matches!(store.managed_enrollment_prepare(&full_key,&grant,&full),Err(Error::Validation(ref text)) if text == "attempt capacity exhausted")
+        );
+        // An abort fence for an absent key is never refused by prepared capacity.
+        let (_, fence) = intent(home.path(), &store, &grant, "absent-fence", 1);
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&fence, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        store
+            .managed_enrollment_abort(&last_key, &grant.pool_route)
+            .unwrap();
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&full_key, &grant, &full)
+                .unwrap()
+                .state,
+            "prepared"
+        );
+    }
 }
 
 /// Adds a normalized frozen provider document and its digest to a fixture identity.
@@ -1594,6 +3001,407 @@ fn prepared_storage_layout_gates_provider_resume_only() {
         .unwrap();
     assert!(!replay.created);
     assert_eq!(replay.agent_id, resumed.agent_id);
+}
+
+/// The writer evaluates exact lineage proofs atomically and never rechecks a replay.
+#[test]
+fn batch_preconditions_fence_resume_and_preserve_replay() {
+    use agent_run_domain::{
+        PreconditionFailureReason,
+        batch::{BatchPrecondition, ExecutionRef, PinId, StartBatchRequest},
+        domain::AgentId,
+        status::{StatusRequest, StatusSelector, SuccessCommit},
+    };
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        provider_admission::{AdmissionInputs, ProviderResume},
+    };
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let mut other = agent_run_store::fixture::open(home.path()).unwrap();
+    let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let catalog = catalog(&store);
+    let authority = authority(&catalog, home.path());
+    let mut job = provider_request(home.path(), "temporary-job");
+    job.request_id = None;
+    let submit = |store: &mut Store<'_>, request: &StartBatchRequest| {
+        let fingerprint = request.fingerprint().unwrap();
+        let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let effective = request.jobs[0].storage_projection();
+        let frozen = identity(&request.jobs[0], &authority);
+        store.admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: request.retain_history,
+            expected_store_id: request.expected_store_id.as_ref(),
+            preconditions: request.preconditions.as_deref(),
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: AgentId::new(),
+                inputs: AdmissionInputs {
+                    request: &request.jobs[0],
+                    effective: &effective,
+                    authority: &authority,
+                    candidates: &candidate,
+                    identity: &frozen,
+                    global_cap: 8,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        })
+    };
+    let request = |key: &str| StartBatchRequest {
+        request_id: key.into(),
+        jobs: vec![job.clone()],
+        retain_history: true,
+        expected_store_id: Some(store_id.clone()),
+        preconditions: None,
+    };
+    let seed_a = submit(&mut store, &request("prior-a"))
+        .unwrap()
+        .receipt
+        .jobs
+        .remove(0);
+    let seed_b = submit(&mut store, &request("prior-b"))
+        .unwrap()
+        .receipt
+        .jobs
+        .remove(0);
+    for seed in [&seed_a, &seed_b] {
+        store.conn.execute(
+            "UPDATE agents SET status='failed',finished_at=10,runtime_session_id='fixture-session' WHERE id=?",
+            [seed.agent_id.as_str()],
+        ).unwrap();
+        store.conn.execute(
+            "UPDATE attempts SET state='failed',finished_at=10,phase='cleanup_complete',ownership_active=0,cleanup_proof_json=? WHERE agent_id=?",
+            rusqlite::params![json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(), seed.agent_id.as_str()],
+        ).unwrap();
+    }
+    let condition = |job: &agent_run_domain::batch::BatchJobReceipt| BatchPrecondition {
+        agent_id: job.agent_id.clone(),
+        sequence: job.sequence,
+        execution_ref: job.execution_ref.clone(),
+        pin_id: job.pin_id.clone().unwrap(),
+    };
+    let a = condition(&seed_a);
+    let b = condition(&seed_b);
+    let status = |store: &Store<'_>, c: &BatchPrecondition| {
+        store
+            .status_snapshot(&StatusRequest {
+                version: 1,
+                expected_store_id: Some(store_id.clone()),
+                include_view: false,
+                targets: vec![StatusSelector {
+                    agent_id: c.agent_id.clone(),
+                    sequence: c.sequence,
+                    execution_ref: Some(c.execution_ref.clone()),
+                    pin_id: Some(c.pin_id.clone()),
+                }],
+            })
+            .unwrap()
+    };
+    let snapshot = status(&store, &a);
+    assert_eq!(snapshot.items[0].lineage_terminal, Some(true));
+    assert_eq!(snapshot.items[0].success_commit, SuccessCommit::Unknown);
+    let counts = |store: &Store<'_>| -> Vec<i64> {
+        ["agents", "attempts", "start_batch_receipts", "history_pins"]
+            .iter()
+            .map(|table| {
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            })
+            .collect()
+    };
+    let before = counts(&store);
+    let mut guarded = request("guarded");
+    let mut missing = a.clone();
+    missing.agent_id = AgentId::new();
+    missing.pin_id = PinId::new();
+    guarded.preconditions = Some(vec![a.clone(), missing]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::Unknown
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    let mut wrong_ref = a.clone();
+    wrong_ref.execution_ref = format!("ex1_{}", "f".repeat(64))
+        .parse::<ExecutionRef>()
+        .unwrap();
+    guarded.preconditions = Some(vec![wrong_ref]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET cleanup_proof_json='invalid' WHERE agent_id=?",
+            [a.agent_id.as_str()],
+        )
+        .unwrap();
+    guarded.preconditions = Some(vec![a.clone()]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::Unknown
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET cleanup_proof_json=? WHERE agent_id=?",
+            rusqlite::params![
+                json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),
+                a.agent_id.as_str()
+            ],
+        )
+        .unwrap();
+
+    // This independent connection resumes A after the earlier successful read,
+    // before admission takes its own writer snapshot.
+    let resume = |store: &mut Store<'_>, parent: &AgentId, key: &str| {
+        let request = provider_request(home.path(), key);
+        let effective = request.storage_projection();
+        let frozen = identity(&request, &authority);
+        let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let account = "acct-a".parse().unwrap();
+        store
+            .admit_provider_resume(
+                &request,
+                &effective,
+                &catalog,
+                &authority,
+                &candidate,
+                &frozen,
+                8,
+                None,
+                None,
+                ProviderResume {
+                    parent,
+                    prefer: &account,
+                    preflight_digest: None,
+                    restart_id: None,
+                },
+            )
+            .unwrap()
+    };
+    let child_a = resume(&mut other, &a.agent_id, "resume-prior-a");
+    let after_resume = counts(&store);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+    assert_eq!(counts(&store), after_resume);
+    let alias = BatchPrecondition {
+        agent_id: child_a.agent_id.clone(),
+        sequence: 2,
+        execution_ref: ExecutionRef::from_first_provider_attempt(
+            &child_a.agent_id,
+            &child_a.attempt_id,
+        )
+        .unwrap(),
+        pin_id: a.pin_id.clone(),
+    };
+    guarded.preconditions = Some(vec![a.clone(), alias]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::Validation(_))
+    ));
+    assert_eq!(counts(&store), after_resume);
+
+    // B is still complete and clean. Admission succeeds even without success
+    // answer evidence, then a resume remains legal after this transaction.
+    guarded.preconditions = Some(vec![b.clone()]);
+    let accepted = submit(&mut store, &guarded).unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(accepted.receipt.preconditions, guarded.preconditions);
+    let child_b = resume(&mut other, &b.agent_id, "resume-prior-b");
+    assert!(child_b.created);
+    let replay = submit(&mut store, &guarded).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    assert_eq!(
+        store
+            .replay_batch_scoped(
+                &guarded.request_id,
+                &guarded.fingerprint().unwrap(),
+                Some(&store_id)
+            )
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+    store.release_history_pin(&b.pin_id).unwrap().unwrap();
+    let mut released = guarded.clone();
+    released.request_id = "released".into();
+    assert!(matches!(
+        submit(&mut store, &released),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+}
+
+/// A pending technical restart refuses atomic admission until it is resolved.
+#[test]
+fn batch_precondition_restart_pending_blocks_until_resolved() {
+    use agent_run_domain::{
+        PreconditionFailureReason,
+        batch::{BatchPrecondition, StartBatchRequest},
+        domain::AgentId,
+        status::{RestartResume, StatusRequest, StatusSelector},
+    };
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        provider_admission::AdmissionInputs,
+    };
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let catalog = catalog(&store);
+    let authority = authority(&catalog, home.path());
+    let mut job = provider_request(home.path(), "temporary-job");
+    job.request_id = None;
+    let submit = |store: &mut Store<'_>, request: &StartBatchRequest| {
+        let fingerprint = request.fingerprint().unwrap();
+        let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let effective = request.jobs[0].storage_projection();
+        let frozen = identity(&request.jobs[0], &authority);
+        store.admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: request.retain_history,
+            expected_store_id: request.expected_store_id.as_ref(),
+            preconditions: request.preconditions.as_deref(),
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: AgentId::new(),
+                inputs: AdmissionInputs {
+                    request: &request.jobs[0],
+                    effective: &effective,
+                    authority: &authority,
+                    candidates: &candidate,
+                    identity: &frozen,
+                    global_cap: 8,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        })
+    };
+    let request = |key: &str| StartBatchRequest {
+        request_id: key.into(),
+        jobs: vec![job.clone()],
+        retain_history: true,
+        expected_store_id: Some(store_id.clone()),
+        preconditions: None,
+    };
+    let seed = submit(&mut store, &request("restart-source"))
+        .unwrap()
+        .receipt
+        .jobs
+        .remove(0);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed',finished_at=10 WHERE id=?",
+            [seed.agent_id.as_str()],
+        )
+        .unwrap();
+    store.conn.execute("UPDATE attempts SET state='failed',finished_at=10,phase='cleanup_complete',ownership_active=0,cleanup_proof_json=? WHERE agent_id=?",
+        rusqlite::params![json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),seed.agent_id.as_str()]).unwrap();
+    let condition = BatchPrecondition {
+        agent_id: seed.agent_id.clone(),
+        sequence: seed.sequence,
+        execution_ref: seed.execution_ref.clone(),
+        pin_id: seed.pin_id.unwrap(),
+    };
+    let restart = store
+        .begin_service_restart("pending-precondition", 1.0)
+        .unwrap();
+    store.conn.execute("INSERT INTO service_restart_agents(restart_id,agent_id,cancelled_before_restart,resume_status) VALUES(?,?,0,'pending')",
+        rusqlite::params![restart,condition.agent_id.as_str()]).unwrap();
+    let status = |store: &Store<'_>| {
+        store
+            .status_snapshot(&StatusRequest {
+                version: 1,
+                expected_store_id: Some(store_id.clone()),
+                include_view: false,
+                targets: vec![StatusSelector {
+                    agent_id: condition.agent_id.clone(),
+                    sequence: condition.sequence,
+                    execution_ref: Some(condition.execution_ref.clone()),
+                    pin_id: Some(condition.pin_id.clone()),
+                }],
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        status(&store).items[0].restart_resume,
+        RestartResume::Pending
+    );
+    let counts = |store: &Store<'_>| -> Vec<i64> {
+        ["agents", "attempts", "history_pins", "start_batch_receipts"]
+            .iter()
+            .map(|table| {
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            })
+            .collect()
+    };
+    let before = counts(&store);
+    let mut guarded = request("after-restart");
+    guarded.preconditions = Some(vec![condition.clone()]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    store
+        .conn
+        .execute(
+            "UPDATE service_restart_agents SET resume_status='finished' WHERE restart_id=?",
+            [restart],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='complete',finished_at=2 WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+    assert_eq!(status(&store).items[0].restart_resume, RestartResume::None);
+    let admitted = submit(&mut store, &guarded).unwrap();
+    assert!(!admitted.replayed);
+    assert_eq!(admitted.receipt.preconditions, guarded.preconditions);
+    assert_eq!(
+        counts(&store),
+        before
+            .into_iter()
+            .map(|count| count + 1)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Only a captured restart member may use the ordinary resume admission while

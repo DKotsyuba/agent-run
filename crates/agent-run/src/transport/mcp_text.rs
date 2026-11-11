@@ -234,6 +234,7 @@ impl ExecutionReceipt {
         } else if matches!(
             tool,
             "start"
+                | "start_batch"
                 | "resume"
                 | "cancel"
                 | "steer"
@@ -268,6 +269,9 @@ impl ExecutionReceipt {
         }
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.is_error = Some(!self.accepted);
+        if tool == "start_batch" && !self.accepted {
+            result.structured_content = Some(json!({"code":"BatchOutcomeUnknown"}));
+        }
         result
     }
 }
@@ -1021,6 +1025,36 @@ pub fn success_result_with_request(
     value: &Value,
     request_id: Option<&str>,
 ) -> CallToolResult {
+    if tool == "batch_receipt" {
+        return batch_receipt_result(value).unwrap_or_else(|_| {
+            error_result("RuntimeError", "invalid batch receipt lookup response")
+        });
+    }
+    if tool == "transcript_exact" {
+        return transcript_exact_result(value)
+            .unwrap_or_else(|_| error_result("RuntimeError", "invalid exact transcript response"));
+    }
+    if tool == "initial_task" {
+        return initial_task_result(value)
+            .unwrap_or_else(|_| error_result("RuntimeError", "invalid initial task response"));
+    }
+    if tool == "status" {
+        return status_result(value)
+            .unwrap_or_else(|_| error_result("RuntimeError", "invalid status response"));
+    }
+    if tool == "history_pins" {
+        return history_pins_result(value).unwrap_or_else(|_| {
+            error_result(
+                "RuntimeError",
+                "history pin result is invalid; reconcile release by pin_id",
+            )
+        });
+    }
+    if tool == "start_batch" {
+        return batch_result(value, request_id).unwrap_or_else(|_| {
+            ExecutionReceipt::capture(tool, &Value::Null, request_id).fallback(tool)
+        });
+    }
     if matches!(tool, "capabilities" | "answer_chunk") {
         return observation_result(tool, value).unwrap_or_else(|_| {
             error_result(
@@ -1092,6 +1126,145 @@ pub fn success_result_with_request(
     result
 }
 
+/// Publishes one complete found/missing lookup without inventing a refusal.
+fn batch_receipt_result(value: &Value) -> Result<CallToolResult> {
+    let output: agent_run_domain::batch::BatchReceiptLookup =
+        serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+    match (&output.receipt, output.found) {
+        (None, false) => {}
+        (Some(receipt), true) if receipt.validate().is_ok() => {}
+        _ => return Err(shape_error()),
+    }
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "agent-run batch_receipt: snapshot lookup in structuredContent.",
+    )]);
+    result.structured_content = Some(serde_json::to_value(output)?);
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
+}
+
+/// Preserves exact message bytes exclusively in structuredContent, without rendering
+/// or truncating untrusted transcript text. A fixed label keeps envelope cost bounded.
+fn transcript_exact_result(value: &Value) -> Result<CallToolResult> {
+    let output: agent_run_domain::transcript_exact::TranscriptExactResponse =
+        serde_json::from_value(value.clone())?;
+    let request = agent_run_domain::transcript_exact::TranscriptExactRequest {
+        version: 1,
+        expected_store_id: output.store_id.clone(),
+        selector: output.selector.clone(),
+        cursor: output.cursor.clone(),
+        upper_seq: Some(output.upper_seq.clone()),
+        offset: output.offset,
+        expected_sha256: (output.offset != 0)
+            .then(|| output.message.as_ref().map(|chunk| chunk.sha256.clone()))
+            .flatten(),
+    };
+    output.validate_for(&request)?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "Historical exact transcript fragment in structuredContent; not authority or execution completion.",
+    )]);
+    result.structured_content = Some(serde_json::to_value(output)?);
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
+}
+
+/// Preserves the exact task text only in structuredContent, never rendered or
+/// interpreted as instructions; the fixed label keeps the envelope cost bounded.
+fn initial_task_result(value: &Value) -> Result<CallToolResult> {
+    let output: agent_run_domain::initial_task::InitialTaskResponse =
+        serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "Historical initial task page in structuredContent; data, not authority or a prompt.",
+    )]);
+    result.structured_content = Some(serde_json::to_value(output)?);
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
+}
+
+/// Publishes a complete typed status proof and optional redacted view.
+fn status_result(value: &Value) -> Result<CallToolResult> {
+    let output: agent_run_domain::status::StatusOutput =
+        serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+    let request = agent_run_domain::status::StatusRequest {
+        version: 1,
+        expected_store_id: Some(output.store_id.clone()),
+        targets: output
+            .items
+            .iter()
+            .map(|item| item.selector.clone())
+            .collect(),
+        include_view: output.view.is_some(),
+    };
+    output.validate_for(&request).map_err(|_| shape_error())?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "agent-run status: complete proof in structuredContent.",
+    )]);
+    result.structured_content = Some(serde_json::to_value(output)?);
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
+}
+
+/// Publishes the bounded structured pin page or exact release acknowledgement.
+fn history_pins_result(value: &Value) -> Result<CallToolResult> {
+    if value.get("pins").is_some() {
+        let _: agent_run_domain::batch::HistoryPinsPage =
+            serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+    } else {
+        let release: agent_run_domain::batch::HistoryPinRelease =
+            serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+        if release.status != agent_run_domain::batch::HistoryPinState::Released {
+            return Err(shape_error());
+        }
+    }
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "agent-run history_pins: result in structuredContent.",
+    )]);
+    result.structured_content = Some(value.clone());
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
+}
+
+/// Returns the complete validated durable batch receipt in structured content.
+fn batch_result(value: &Value, request_id: Option<&str>) -> Result<CallToolResult> {
+    let batch: agent_run_domain::batch::StartBatchResult =
+        serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+    if batch.receipt.validate().is_err()
+        || request_id.is_some_and(|request_id| request_id != batch.receipt.request_id)
+    {
+        return Err(shape_error());
+    }
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        "agent-run start_batch: durable admission receipt in structuredContent. Automatic batch hook binding is not provided.",
+    )]);
+    result.structured_content = Some(serde_json::to_value(batch)?);
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
+}
+
 /// Preserves the two additive machine-readable reads as structured MCP results
 /// with a fixed text summary. Typed allowlists discard no bytes or proof facts;
 /// the entire encoded result must fit the existing wire reserve before publish.
@@ -1148,9 +1321,40 @@ pub fn failure_result(
     request_id: Option<&str>,
     target_id: Option<&str>,
 ) -> CallToolResult {
+    if tool == "start_batch" && error.machine_code().as_str() == "PreconditionFailed" {
+        let public = error.public();
+        let Some(reason) = public.reason else {
+            return failure_result(
+                tool,
+                &Error::BatchOutcomeUnknown {
+                    source: Box::new(crate::error::invalid("invalid precondition refusal")),
+                },
+                request_id,
+                target_id,
+            );
+        };
+        let mut result = error_result(public.kind, &public.message);
+        result.structured_content = Some(json!({"code":public.kind,"reason":reason}));
+        return result;
+    }
+    if (tool == "start_batch"
+        && error.machine_code() == agent_run_domain::MachineCode::BatchOutcomeUnknown)
+        || (tool == "batch_receipt"
+            && matches!(
+                error.machine_code(),
+                agent_run_domain::MachineCode::StoreIdentityMismatch
+                    | agent_run_domain::MachineCode::RequestConflict
+            ))
+    {
+        let public = error.public();
+        let mut result = error_result(public.kind, &public.message);
+        result.structured_content = Some(json!({"code": public.kind}));
+        return result;
+    }
     let write = matches!(
         tool,
         "start"
+            | "start_batch"
             | "resume"
             | "cancel"
             | "steer"
@@ -1163,6 +1367,14 @@ pub fn failure_result(
             | "pool_vote"
     );
     let uncertain = matches!(error, Error::Runtime(_) | Error::Io(_) | Error::Json(_))
+        || (tool == "start_batch"
+            && matches!(
+                error.machine_code(),
+                agent_run_domain::MachineCode::RuntimeError
+                    | agent_run_domain::MachineCode::IOError
+                    | agent_run_domain::MachineCode::StorageError
+                    | agent_run_domain::MachineCode::BrokerUnavailable
+            ))
         || (tool == "resume" && matches!(error, Error::BrokerUnavailable));
     if write && uncertain {
         let receipt = ExecutionReceipt {
@@ -1381,11 +1593,68 @@ struct LimitsTextView {
     items: Vec<LimitTextView>,
     /// Optional account-free schema-2 standing from the same diagnostic snapshot.
     ranking: Option<CatalogTextView>,
+    /// Account-free source coverage and its evaluation clock, when available.
+    coverage_note: Option<String>,
+    /// An incomplete empty page is not evidence that no samples exist.
+    coverage_incomplete: bool,
 }
 
 /// Converts the existing dynamic catalog projection to its allowlisted typed view.
 fn render_catalog(name: &str, value: Value, limit: usize) -> Result<String> {
     render_view(name, &projected::<CatalogTextView>(value)?, limit)
+}
+
+/// Adds source-clock and incompleteness information without exposing account IDs.
+fn render_catalog_coverage(
+    name: &str,
+    context: Value,
+    source: &Value,
+    limit: usize,
+) -> Result<String> {
+    let mut text = render_catalog(name, context, limit)?;
+    if let Some(note) = coverage_note(source.get("quota_coverage")) {
+        text.push('\n');
+        text.push_str(&note);
+        text.push('\n');
+    }
+    if text.len() > limit {
+        return Err(Error::Runtime("presentation_budget_exceeded".into()));
+    }
+    Ok(text)
+}
+
+/// Extracts only bounded, nonsecret coverage facts for human-readable pages.
+fn coverage_note(coverage: Option<&Value>) -> Option<String> {
+    let coverage = coverage?;
+    let mut note = if coverage["incomplete"] == true {
+        "Quota coverage incomplete; unreported capacity is unknown.".to_owned()
+    } else {
+        "Quota coverage complete.".to_owned()
+    };
+    if let Some(at) = coverage["evaluated_at"].as_f64() {
+        note.push_str(&format!(" Quota evaluated at Unix seconds {at}."));
+    }
+    Some(note)
+}
+
+/// Rejects contradictory or malformed source coverage when it is present.
+fn validate_coverage(coverage: Option<&Value>) -> Result<()> {
+    let Some(coverage) = coverage else {
+        return Ok(());
+    };
+    let state = coverage["state"].as_str().ok_or_else(shape_error)?;
+    let evaluated_at = coverage.get("evaluated_at").ok_or_else(shape_error)?;
+    let valid_clock = evaluated_at
+        .as_f64()
+        .is_some_and(|at| at.is_finite() && at >= 0.0);
+    if !matches!(state, "complete" | "partial" | "unknown")
+        || (state != "complete" && coverage["incomplete"] != true)
+        || !coverage["incomplete"].is_boolean()
+        || !(valid_clock || (state == "unknown" && evaluated_at.is_null()))
+    {
+        return Err(shape_error());
+    }
+    Ok(())
 }
 
 /// Fixed safe error for shape, enum or critical-fidelity rejection.
@@ -1677,6 +1946,7 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
             }
         }
         "models" | "capacity_order" if value.get("providers").is_some() => {
+            validate_coverage(value.get("quota_coverage"))?;
             if value.get("schema_version").is_some_and(|s| s != 2) {
                 return Err(shape_error());
             }
@@ -1776,6 +2046,7 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
             required_rows(value, "unavailable_runtimes", policy.rows)?;
         }
         "limits" => {
+            validate_coverage(value.get("coverage"))?;
             if let Some(ranking) = value.get("ranking") {
                 if ranking["schema_version"] != 2 || ranking["ranked_at"] != value["observed_at"] {
                     return Err(shape_error());
@@ -2104,8 +2375,8 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
             let page = pool_page(value.clone()).map_err(|_| shape_error())?;
             render_view(name, &projected::<PoolPageTextView>(page)?, limit)
         }
-        "models" => render_catalog(name, models_context(value), limit),
-        "capacity_order" => render_catalog(name, order_context(value), limit),
+        "models" => render_catalog_coverage(name, models_context(value), value, limit),
+        "capacity_order" => render_catalog_coverage(name, order_context(value), value, limit),
         _ => Err(shape_error()),
     }
 }
@@ -2419,6 +2690,8 @@ fn limits_context(value: &Value) -> Value {
     let observed_at = value["observed_at"].as_f64();
     json!({
         "ranking": value.get("ranking").map(order_context),
+        "coverage_note": coverage_note(value.get("coverage")),
+        "coverage_incomplete": value["coverage"]["incomplete"] == true,
         "items": value["items"].as_array().into_iter().flatten().map(|item| {
             let key = &item["key"];
             json!({
@@ -2528,6 +2801,152 @@ fn exact_display(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Structured batch receipts preserve every identity; malformed or unknown outcomes retain the key.
+    #[test]
+    fn batch_receipt_and_uncertain_failure_are_not_replayed_as_new_work() {
+        let value = serde_json::json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"batch-key","jobs":[
+            {"index":0,"agent_id":"ag-20200101-000000-0000000001","sequence":1,"execution_ref":format!("ex1_{}", "a".repeat(64))},
+            {"index":1,"agent_id":"ag-20200101-000000-0000000002","sequence":1,"execution_ref":format!("ex1_{}", "b".repeat(64))}
+        ]}});
+        let result = super::success_result_with_request("start_batch", &value, Some("batch-key"));
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, Some(value.clone()));
+        for bad_ref in [None, Some("ex1_bad")] {
+            let mut bad = value.clone();
+            match bad_ref {
+                Some(reference) => bad["receipt"]["jobs"][0]["execution_ref"] = json!(reference),
+                None => {
+                    bad["receipt"]["jobs"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("execution_ref");
+                }
+            }
+            let result = super::success_result_with_request("start_batch", &bad, Some("batch-key"));
+            assert_eq!(result.is_error, Some(true));
+        }
+        let mut malformed = value;
+        malformed["receipt"]["jobs"][1]["agent_id"] =
+            malformed["receipt"]["jobs"][0]["agent_id"].clone();
+        let result =
+            super::success_result_with_request("start_batch", &malformed, Some("batch-key"));
+        assert_eq!(result.is_error, Some(true));
+        let wire = serde_json::to_value(result).unwrap();
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("OUTCOME_UNKNOWN")
+        );
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("batch-key")
+        );
+
+        let error = crate::Error::Broker {
+            message: "writer uncertain".into(),
+            broker_error_code: Some("RuntimeError".into()),
+            broker_error_data: None,
+        };
+        let result = super::failure_result("start_batch", &error, Some("batch-key"), None);
+        let wire = serde_json::to_value(result).unwrap();
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("OUTCOME_UNKNOWN")
+        );
+        let unknown = crate::Error::BatchOutcomeUnknown {
+            source: Box::new(crate::Error::BrokerUnavailable),
+        };
+        let wire = serde_json::to_value(super::failure_result(
+            "start_batch",
+            &unknown,
+            Some("batch-key"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(wire["isError"], true);
+        assert_eq!(wire["structuredContent"]["code"], "BatchOutcomeUnknown");
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("retry the same request_id")
+        );
+    }
+
+    /// Closed failure reasons survive MCP; a malformed broker refusal stays unknown.
+    #[test]
+    fn batch_precondition_error_is_structured_and_fail_closed() {
+        for reason in ["not_met", "unknown"] {
+            let error = crate::Error::Broker {
+                message: "condition failed".into(),
+                broker_error_code: Some("PreconditionFailed".into()),
+                broker_error_data: Some(json!({"code":"PreconditionFailed","reason":reason})),
+            };
+            let result = super::failure_result("start_batch", &error, Some("batch-key"), None);
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content,
+                Some(json!({"code":"PreconditionFailed","reason":reason}))
+            );
+        }
+        let error = crate::Error::Broker {
+            message: "condition failed".into(),
+            broker_error_code: Some("PreconditionFailed".into()),
+            broker_error_data: Some(json!({"code":"PreconditionFailed","reason":"bad"})),
+        };
+        let result = super::failure_result("start_batch", &error, Some("batch-key"), None);
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"code":"BatchOutcomeUnknown"}))
+        );
+    }
+
+    /// A maximum valid batch keeps every prerequisite; oversized output is
+    /// explicitly unknown instead of a truncated successful receipt.
+    #[test]
+    fn batch_precondition_receipt_fits_or_fails_whole() {
+        let request_id = "r".repeat(512);
+        let conditions: Vec<_> = (0..20)
+            .map(|i| {
+                json!({
+                    "agent_id":format!("ag-20260826-120000-{i:010x}"), "sequence":1,
+                    "execution_ref":format!("ex1_{:064x}", i+1),
+                    "pin_id":format!("pin_{:012x}4{:03x}8{i:015x}",0,0)
+                })
+            })
+            .collect();
+        let jobs: Vec<_> = (0..20)
+            .map(|i| {
+                json!({
+                    "index":i,"agent_id":format!("ag-20260826-120001-{i:010x}"),"sequence":1,
+                    "execution_ref":format!("ex1_{:064x}", i+21)
+                })
+            })
+            .collect();
+        let value = json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef",
+            "request_id":request_id,"preconditions":conditions,"jobs":jobs}});
+        let result = super::success_result_with_request("start_batch", &value, Some(&request_id));
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, Some(value.clone()));
+        let lookup = json!({"found":true,"receipt":value["receipt"]});
+        let result = super::success_result("batch_receipt", &lookup);
+        assert_eq!(result.structured_content, Some(lookup));
+        let mut oversized = value;
+        oversized["receipt"]["request_id"] = json!("x".repeat(super::MAX_RESULT_WIRE_BYTES));
+        let result =
+            super::success_result_with_request("start_batch", &oversized, Some(&request_id));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"code":"BatchOutcomeUnknown"}))
+        );
+    }
+
     /// A long verified answer keeps its proof and existing file without inline overflow.
     #[test]
     fn large_answer_presents_existing_file_and_retrieval_proof() {
@@ -3797,5 +4216,54 @@ mod tests {
         wrong = value.clone();
         wrong["ranking"]["providers"] = json!(vec![value["ranking"]["providers"][0].clone(); 101]);
         assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+    }
+
+    /// Partial and unavailable quota never masquerade as an authoritative empty page.
+    #[test]
+    fn limits_reports_incomplete_coverage_without_private_ids() {
+        let mut value = json!({
+            "observed_at":100.0,
+            "items":[{"key":{"runtime":"glm","lane":"m","window":"5h"},
+                "known":true,"remaining_percent":80.0,"reset_at":200.0,
+                "account":"PRIVATE_ACCOUNT","pool":"PRIVATE_POOL"}],
+            "coverage":{"state":"partial","incomplete":true,"evaluated_at":90.0}
+        });
+        let partial = text("limits", &value);
+        assert!(partial.contains("80.0% remaining"));
+        assert!(partial.contains("Quota coverage incomplete"));
+        assert!(partial.contains("Quota evaluated at Unix seconds 90"));
+        assert!(!partial.contains("PRIVATE_ACCOUNT") && !partial.contains("PRIVATE_POOL"));
+        value["items"] = json!([]);
+        value["coverage"] = json!({"state":"unknown","incomplete":true,"evaluated_at":null});
+        let outage = text("limits", &value);
+        assert!(outage.contains("Quota coverage incomplete"));
+        assert!(!outage.contains("no stored capacity samples"));
+        value["coverage"]["incomplete"] = json!(false);
+        assert_eq!(success_result("limits", &value).is_error, Some(true));
+        value["coverage"] = json!({"state":"complete","incomplete":false,"evaluated_at":null});
+        assert_eq!(success_result("limits", &value).is_error, Some(true));
+        value["coverage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("evaluated_at");
+        assert_eq!(success_result("limits", &value).is_error, Some(true));
+    }
+    /// Maximum escaped fragments remain intact in the MCP frame and schema result.
+    #[test]
+    fn transcript_exact_mcp_preserves_bounded_structured_fragment() {
+        let text = "\u{1}".repeat(32 * 1024);
+        let value = json!({"version":1,"store_id":"store_00000000000000000000000000000000",
+            "selector":{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":format!("ex1_{}","0".repeat(64)),"pin_id":"pin_00000000000040008000000000000000"},
+            "cursor":"0","upper_seq":"9007199254740993","offset":0,
+            "message":{"seq":"9007199254740993","sha256":"0".repeat(64),"total_bytes":32768,"start":0,"end":32768,"text":text,"complete":true},
+            "next_cursor":"9007199254740993","next_offset":0,"snapshot_complete":true});
+        let result = success_result("transcript_exact", &value);
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.as_ref(), Some(&value));
+        let wire = json!({"jsonrpc":"2.0","id":"i".repeat(agent_run_domain::observation::MAX_RPC_ID_BYTES-2),"result":result});
+        assert!(
+            serde_json::to_vec(&wire).unwrap().len()
+                < agent_run_domain::observation::SOCKET_MAX_FRAME_BYTES
+        );
     }
 }

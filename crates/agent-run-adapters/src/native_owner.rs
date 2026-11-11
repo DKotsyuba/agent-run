@@ -167,12 +167,12 @@ impl Call {
 }
 /// Protected channel locator; each connection proves the current live same-user kernel peer.
 #[derive(Clone)]
-struct Trust {
+pub(crate) struct Trust {
     /// Protected semantic adapter channel, distinct from producer registration/core RPC.
-    channel: PathBuf,
+    pub(crate) channel: PathBuf,
 }
 /// Reject symlink traversal and require an existing absolute path of the expected private type.
-fn protected(path: &Path, socket: bool) -> Result<()> {
+pub(crate) fn protected(path: &Path, socket: bool) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     if !path.is_absolute()
         || path.components().any(|c| {
@@ -211,7 +211,7 @@ fn protected(path: &Path, socket: bool) -> Result<()> {
     Ok(())
 }
 /// Capture one live same-user kernel peer with a full PID-reuse fence.
-fn peer(stream: &UnixStream) -> Result<process::Identity> {
+pub(crate) fn peer(stream: &UnixStream) -> Result<process::Identity> {
     let credentials = stream.peer_cred()?;
     // SAFETY: geteuid has no arguments or memory preconditions.
     if credentials.uid() != unsafe { libc::geteuid() } {
@@ -229,7 +229,7 @@ fn peer(stream: &UnixStream) -> Result<process::Identity> {
 }
 impl Trust {
     /// Authenticate against the current protected channel peer, not an obsolete launch-time PID.
-    async fn verify(&self, stream: &UnixStream, deadline: Instant) -> Result<()> {
+    pub(crate) async fn verify(&self, stream: &UnixStream, deadline: Instant) -> Result<()> {
         protected(&self.channel, true)?;
         let actual = peer(stream)?;
         let channel = timeout_at(deadline, UnixStream::connect(&self.channel))
@@ -268,6 +268,8 @@ impl Owner {
     /// Retired build qualifiers are removed. Missing channel/directory settings clear a forged locator;
     /// partial or unsafe settings fail before a child exists. No executable path or digest admits a caller.
     pub fn prepare(environment: &mut BTreeMap<String, String>) -> Result<Option<Self>> {
+        // V2 is not implemented here; never advertise an inherited locator.
+        environment.remove("BRIDGE_NATIVE_OWNER_SOCKET_V2");
         for key in RETIRED_SETTINGS {
             environment.remove(key);
         }
@@ -687,9 +689,13 @@ mod tests {
         std::fs::write(&socket, b"foreign replacement").unwrap();
         drop(owner);
         assert_eq!(std::fs::read(&socket).unwrap(), b"foreign replacement");
-        let mut env = BTreeMap::from([(LOCATOR.into(), "forged-locator".into())]);
+        let mut env = BTreeMap::from([
+            (LOCATOR.into(), "forged-locator".into()),
+            ("BRIDGE_NATIVE_OWNER_SOCKET_V2".into(), "forged-v2".into()),
+        ]);
         assert!(Owner::prepare(&mut env).unwrap().is_none());
         assert!(!env.contains_key(LOCATOR));
+        assert!(!env.contains_key("BRIDGE_NATIVE_OWNER_SOCKET_V2"));
         for key in RETIRED_SETTINGS {
             env.insert(key.into(), "retired-setting".into());
         }

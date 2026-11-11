@@ -19,12 +19,11 @@ them from `agent_run_domain::catalog` rather than redefining business types.
   settings, allowed parameter values, plain-text recommendations, and typed
   preserved restrictions. There is no model intelligence, classification, or
   scoring in the catalog.
-* Current capacity sources are `exec` and `none`. An exec source names an
-  absolute executable and literal arguments through `CollectorBinding`.
-  The command receives versioned private JSON on stdin and returns the common
-  observation envelope on stdout. Provider endpoints and response formats live
-  in external files. Old source spellings deserialize only for frozen historical
-  runs; fresh configurations must migrate.
+* Retained collector settings use `exec` or `none`; an exec source names an
+  absolute command and literal arguments through `CollectorBinding`. These
+  settings remain compatibility and migration inputs; Run does not execute
+  their commands. Schema-2 selection reads Agent Quota. Older source spellings deserialize only
+  for frozen historical runs; fresh configurations must migrate.
 * A registered account (`AccountRecord`) has an immutable global opaque
   `AccountId`, an auth family, a secret *reference*, and a status. A provider
   binding (`ProviderBinding`) carries a validated `AccountLabel`, an optional
@@ -72,7 +71,17 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
 
 ## C3 Quota admission contracts
 
-* `NormalizedQuotaSnapshot` carries collector facts per host-bound account
+Schema-2 admission and reads use one newly fetched Agent Quota snapshot per
+decision or projection. Quota owns observations, exhaustion classes and scores;
+Run applies local bindings, status, cooldowns, weights and reservations. An
+unavailable or invalid response leaves quota unknown. The Quota snapshot is
+read before the local SQLite transaction; no cross-service atomicity is implied.
+Low-level historical storage and native-latch operations remain, but the
+supervisor no longer writes native failures to the latch. Local history is not
+the source for new schema-2 selection or public quota reads. Previously installed
+collection jobs require a separate migration.
+
+* The retained historical `NormalizedQuotaSnapshot` carries collector facts per host-bound account
   and explicit model: each physical key owns its source-labelled,
   provider-reported windows with remaining percent, optional reset,
   observation time, and validity. Unknown values remain absent. Validation
@@ -81,10 +90,9 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   `(key, source, window)`: models sharing a pool may each carry only the
   windows that govern them, and one physical window repeated under several
   models must carry identical facts. The store persists each physical
-  window's own members, and the ranker applies samples and durable latches
-  only to the models of that exact `(key, source, window)`, so after a
-  collector source switch a carried latch keeps restricting only its own
-  models. Latch lookup, membership, carry and sample retention all use that full
+  window's own members, so after a collector source switch a carried latch
+  retains its own model membership. Latch lookup, membership, carry and sample
+  retention all use that full
   identity (retention always keeps each latched window's own newest row),
   and a latch is released only by its reset passing or by fresh positive
   (or fresher zero) evidence for the same pool and window, from any source,
@@ -93,27 +101,25 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   can settle it before that reset, while evidence for a different model set or
   a stale positive cannot. A fresher zero replaces the old fact without
   inventing usable capacity.
-  Scoring stays outside this DTO and the store.
+  This describes the retained legacy storage path, not the new schema-2 Run
+  selection or public quota reads. Scoring stays outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
   auto or pinned intent, deterministically ordered rank groups, and the
   committed capacity revision the ordering was computed against. Each
   candidate carries the exact account-bound physical key set that admission
   must reserve with the attempt. Rank is a producer-assigned ordinal: lower
   groups win, and only equal ranks use active-count then stable global account
-  id as admission tie-breaks. Producing and ordering the set (scoring)
-  belongs to the quota side. Unknown capacity
+  id as admission tie-breaks. Quota supplies each quota class and score; Run
+  applies its local weights and ordering when building the candidate set. Unknown capacity
   candidates follow known usable capacity; missing data is never invented.
-* Transactional admission (session side) re-validates the committed revision
-  in `BEGIN IMMEDIATE`, filters by current account status and reservations,
-  and persists the chosen account plus the attempt. The store exposes only the
-  raw facts it owns: `Store::quota_capacity_revision` and
-  `Store::active_attempt_counts` and `Store::active_reservation_counts`;
-  matching `*_in` methods read through the admission transaction;
-  it performs no scoring. One global monotonic `quota_capacity_revision`
-  covers the entire scored snapshot. A quota producer advances it in the same
-  transaction as each relevant quota mutation, then reads that value for its
-  candidate set; admission compares that same singleton in its transaction.
-  A change to either of two pools invalidates a set scored before it.
+* Transactional admission re-validates Run's local capacity revision in
+  `BEGIN IMMEDIATE`, filters by current account status and reservations, and
+  persists the chosen account plus the attempt. That revision covers local
+  registry, cooldown and reservation changes; retained legacy writes may also
+  advance it. It is not Agent Quota's revision and does not make an external
+  snapshot current at commit. Run checks the returned state-validity boundary
+  before admission and retries a stale local decision; a Quota update after
+  the read can still be observed only by a later request.
 * Typed verdicts (`QuotaAdmissionError`) with stable machine names:
   `selection_stale` (revision moved; the quota consumer recomputes
   outside the transaction, at most three retries), `selection_busy` (retry budget spent,
@@ -423,20 +429,24 @@ Executable boundary coverage lives beside the contracts:
 `delegation_guide` and `limits` are the advertised routing reads in the shared
 `assets/tools.json` registry and CLI/socket/MCP dispatcher. `models` and
 `capacity_order` retain their original call-only compatibility views. These
-reads are read-only over one validated
-config revision from the service's exact-byte last-valid cache, the canonical
-role files, and one committed quota read. They never collect quota, call a
-harness, reserve, consume reset credits, write samples or start agents.
+reads use one validated config revision from the service's exact-byte
+last-valid cache, canonical role files, one fresh Quota response, and one local
+committed read. The guide renders that one response without fetching again.
+They never collect quota, call a harness, reserve, consume reset credits,
+write samples or start agents.
 
 * `delegation_guide` renders compact account-free routing text, optionally
   filtered by exact provider/model/profile names on CLI, socket and MCP. It
   reuses catalog admission rules, efforts, restrictions and recommendations;
   unknown names are typed validation errors and omitted filters retain defaults.
-* `limits` keeps quota windows, percentages, resets and freshness and adds
-  schema-2 provider/model ranking from the same committed transaction, config
-  revision and advice clock (`observed_at` equals `ranking.ranked_at`). It uses
-  all governing windows and exhaustion facts; a healthy short window does not
-  override a weekly zero. Schema 1 keeps its historical window response.
+* `limits` keeps Quota windows, percentages, resets and freshness and adds
+  schema-2 provider/model ranking from the same Quota response and local read.
+  `observed_at` equals `ranking.ranked_at`; `coverage` reports the source state,
+  a separate `incomplete` flag and Quota's nullable `evaluated_at`. A partial
+  or unavailable response leaves unreported quota unknown. Truncation at 1000
+  rows also sets `incomplete`; MCP refuses a page exceeding its smaller budget
+  rather than hiding that marker. Schema 1 returns `Unsupported` with guidance
+  to migrate to schema 2.
 * Compatibility `capacity_order` returns providers, never provider/account pairs, ranked
   by `capacity::provider_ranking` (known before unknown; exhausted, disabled
   and ineligible accounts excluded). Each offered model keeps its own
@@ -450,11 +460,13 @@ harness, reserve, consume reset credits, write samples or start agents.
   the model's restrictions admits on that harness — the same checks a start
   applies. Exact `provider`/`profile`/`model` filters; unknown values are
   validation errors.
-* Results carry `config_revision`, `capacity_revision`, `ranked_at` (the
-  advice clock, not sample age), and (`models`) `roles_sha256`. Registry
-  status, samples, latches and the advertised capacity revision come from
-  one committed read transaction; config and roles are frozen inputs.
-  Reuse a catalog result only while all three revisions match. Raw CLI/socket
+* Results carry `config_revision`, local `capacity_revision`, `ranked_at`,
+  account-free `quota_coverage` with Quota's `evaluated_at`, and (`models`)
+  `roles_sha256`. Registry status, cooldowns and the local capacity revision
+  come from one committed local read; Quota facts come from its separate
+  response. `ranked_at` is not the clock at which Quota computed its score,
+  and revision equality does not freeze time or prove fresh quota. Schema-1
+  `capacity_order` also returns `Unsupported` with migration guidance. Raw CLI/socket
   `limits` keeps account-bound rows distinct by `account` and physical `pool`;
   MCP diagnostic text omits those identities and retains existing byte/row
   bounds. Guide and provider/model ranking emit no account id, label or secret
@@ -525,12 +537,9 @@ records the failure and history seal and may continue on another account:
   affected. The persisted cooldown is rechecked at admission and expires after
   a restart as well. A pinned binding is refused with `binding_cooldown` rather
   than silently redirected; automatic selection uses another eligible binding.
-- Exhaustion feeds the durable latch only when `collector.exhaustion_windows`
-  explicitly identifies the physical pool for that native window. The mapping
-  governs the account's eligible model lanes and is journaled under
-  `native-quota-exhaustion`. Windowless or unmapped failures do not invent a
-  shared quota pool. Ranking consumes the stored per-window model membership;
-  ordered Claude bindings additionally use the separate one-hour cooldown above.
+- Native quota failures remain attempt-bound events; the supervisor neither
+  writes a global quota latch nor sends the failure to Agent Quota. Ordered
+  Claude bindings continue to use the separate one-hour cooldown above.
 
 ### Unlimited executions, handoff serialization and recovery
 

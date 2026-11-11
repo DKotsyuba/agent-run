@@ -1,0 +1,95 @@
+{
+ "additional_directories": [],
+ "agents": [
+  "claude",
+  "Explore",
+  "general-purpose",
+  "Plan",
+  "statusline-setup"
+ ],
+ "analytics_disabled": true,
+ "apiKeySource": "ANTHROPIC_API_KEY",
+ "capabilities": [
+  "interrupt_receipt_v1",
+  "interrupt_cancel_queued_v1",
+  "interrupt_send_now_v1",
+  "interrupt_requeue_taken_v1",
+  "msg_lifecycle_v1",
+  "request_marker_lists_v1",
+  "lifecycle_wakeup_source_v1",
+  "sdk_mcp_tools_list_changed",
+  "sdk_mcp_manifests",
+  "mcp_read_resource_v1",
+  "mcp_tool_ui_meta_v1",
+  "ui_surface_v1",
+  "mcp_call_result_not_for_model_v1"
+ ],
+ "claude_code_version": "2.1.311",
+ "cwd": "/home/agent-mcp/.agent-pool-qual/work/m1",
+ "fast_mode_disabled_reason": "sdk_opt_in_required",
+ "fast_mode_state": "off",
+ "mcp_servers": [
+  {
+   "name": "agent-pool",
+   "source": "dynamic",
+   "status": "connected"
+  },
+  {
+   "name": "agent_run_worker",
+   "source": "dynamic",
+   "status": "connected"
+  }
+ ],
+ "memory_paths": {
+  "auto": "/home/agent-mcp/.agent-run/service-runtime/claude/runs/ag-20261111-033955-98bc33fa67/projects/-home-agent-mcp--agent-pool-qual-work-m1/memory/"
+ },
+ "messaging_socket_path": "/tmp/cc-socks/0.sock",
+ "model": "claude-haiku-5-5",
+ "original_cwd": "/home/agent-mcp/.agent-pool-qual/work/m1",
+ "output_style": "default",
+ "per_turn_effort_active": true,
+ "permissionMode": "default",
+ "plugins": [
+  {
+   "name": "cc-plugin-agents-md",
+   "path": "builtin",
+   "source": "cc-plugin-agents-md@builtin"
+  },
+  {
+   "name": "cc-plugin-plugin-authoring",
+   "path": "builtin",
+   "source": "cc-plugin-plugin-authoring@builtin"
+  }
+ ],
+ "product_feedback_disabled": true,
+ "session_id": "00000000-0000-4000-8000-000000000001",
+ "skills": [],
+ "slash_commands": [],
+ "subtype": "init",
+ "tools": [
+  "mcp__agent_run_worker__finish",
+  "mcp__agent_run_worker__health_reply",
+  "mcp__agent-pool__pool_add",
+  "mcp__agent-pool__pool_cancel_replacement",
+  "mcp__agent-pool__pool_close",
+  "mcp__agent-pool__pool_create",
+  "mcp__agent-pool__pool_get",
+  "mcp__agent-pool__pool_join",
+  "mcp__agent-pool__pool_list",
+  "mcp__agent-pool__pool_member_update",
+  "mcp__agent-pool__pool_notify_owner",
+  "mcp__agent-pool__pool_post",
+  "mcp__agent-pool__pool_propose",
+  "mcp__agent-pool__pool_release_history",
+  "mcp__agent-pool__pool_remove",
+  "mcp__agent-pool__pool_send_member",
+  "mcp__agent-pool__pool_update",
+  "mcp__agent-pool__pool_vote"
+ ],
+ "type": "system",
+ "user_message_uuids": [
+  "f8d684d7-c08d-47f1-84f8-6a9c589777ff"
+ ],
+ "uuid": "00000000-0000-4000-8000-000000000002",
+ "view_mode": "default"
+}

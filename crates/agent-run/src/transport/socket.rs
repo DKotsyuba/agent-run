@@ -63,6 +63,10 @@ struct ClientConnection {
 enum ClientAttemptError {
     /// The socket or response was lost before a usable broker envelope arrived.
     Transport,
+    /// A batch response arrived but was malformed; do not retry it implicitly.
+    MalformedBatchResponse,
+    /// A hold reply cannot be correlated safely and must not be retried implicitly.
+    MalformedHoldResponse,
     /// The broker returned a typed protocol/domain error.
     Domain(Error),
     /// The caller explicitly aborted this client.
@@ -104,6 +108,8 @@ impl BrokerClient {
     /// Resume calls without a key receive one idempotency key shared by reconnect
     /// retries; an explicitly supplied key is preserved, including invalid values
     /// which remain the server's responsibility to reject.
+    /// A batch or lineage-hold mutation transport loss stays unknown without
+    /// an implicit retry.
     pub async fn call_with_timeout(
         &self,
         method: &str,
@@ -131,6 +137,9 @@ impl BrokerClient {
             arguments.insert("request_id".into(), json!(uuid::Uuid::new_v4().to_string()));
         }
         let mut connection = self.connection.lock().await;
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(Error::Runtime("broker call cancelled".into()));
+        }
         for attempt in 0..2 {
             if connection.is_none() {
                 match self.connect(timeout_seconds).await {
@@ -144,14 +153,129 @@ impl BrokerClient {
                 .request(&mut connection, id, method, params.clone(), timeout_seconds)
                 .await
             {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    if LINEAGE_HOLD_METHODS.contains(&method)
+                        && params.as_ref().is_none_or(|params| {
+                            !valid_lineage_hold_response(method, &value, params)
+                        })
+                    {
+                        *connection = None;
+                        return Err(
+                            Error::Runtime(
+                                if matches!(
+                                    method,
+                                    "_lineage_hold_acquire" | "_lineage_hold_release"
+                                ) {
+                                    "lineage hold outcome unknown"
+                                } else {
+                                    "invalid lineage hold response"
+                                }
+                                .into(),
+                            ),
+                        );
+                    }
+                    if method == "batch_receipt"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_batch_receipt_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime(
+                            "invalid batch receipt lookup response".into(),
+                        ));
+                    }
+                    if method == "transcript_exact"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_transcript_exact_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime("invalid exact transcript response".into()));
+                    }
+                    if method == "initial_task"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_initial_task_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime("invalid initial task response".into()));
+                    }
+                    if method == "status"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_status_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime("invalid status response".into()));
+                    }
+                    if method == "capabilities"
+                        && params
+                            .as_ref()
+                            .is_some_and(|params| !valid_capabilities_scope(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime("invalid capabilities store identity".into()));
+                    }
+                    if method == "start_batch"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_batch_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(batch_response_error(
+                            method,
+                            crate::error::invalid("invalid batch receipt"),
+                        ));
+                    }
+                    if method == "history_pins"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_history_pin_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime(
+                            "history pin result is invalid; reconcile release by pin_id".into(),
+                        ));
+                    }
+                    return Ok(value);
+                }
                 Err(ClientAttemptError::Domain(error)) => return Err(error),
+                Err(ClientAttemptError::MalformedBatchResponse) => {
+                    *connection = None;
+                    return Err(batch_response_error(
+                        method,
+                        Error::Runtime("invalid batch broker response".into()),
+                    ));
+                }
+                Err(ClientAttemptError::MalformedHoldResponse) => {
+                    *connection = None;
+                    return Err(Error::Runtime(
+                        if matches!(method, "_lineage_hold_acquire" | "_lineage_hold_release") {
+                            "lineage hold outcome unknown"
+                        } else {
+                            "invalid lineage hold response"
+                        }
+                        .into(),
+                    ));
+                }
                 Err(ClientAttemptError::Cancelled) => {
                     *connection = None;
-                    return Err(Error::Runtime("broker call cancelled".into()));
+                    if matches!(method, "_lineage_hold_acquire" | "_lineage_hold_release") {
+                        return Err(Error::Runtime("lineage hold outcome unknown".into()));
+                    }
+                    return Err(batch_response_error(
+                        method,
+                        Error::Runtime("broker call cancelled".into()),
+                    ));
                 }
                 Err(ClientAttemptError::Transport) => {
                     *connection = None;
+                    if method == "start_batch" {
+                        return Err(batch_response_error(method, Error::BrokerUnavailable));
+                    }
+                    if matches!(method, "_lineage_hold_acquire" | "_lineage_hold_release") {
+                        return Err(Error::Runtime("lineage hold outcome unknown".into()));
+                    }
                     if self.aborted.load(Ordering::Acquire) {
                         return Err(Error::Runtime("broker call cancelled".into()));
                     }
@@ -221,8 +345,14 @@ impl BrokerClient {
     /// Opens and authenticates one broker stream, interruptible by [`Self::abort`].
     async fn connect(&self, timeout_seconds: f64) -> Result<ClientConnection> {
         let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(Error::Runtime("broker call cancelled".into()));
+        }
         let stream = tokio::select! {
-            _ = notified => return Err(Error::Runtime("broker call cancelled".into())),
+            biased;
+            _ = &mut notified => return Err(Error::Runtime("broker call cancelled".into())),
             result = tokio::time::timeout(Duration::from_secs_f64(timeout_seconds), UnixStream::connect(&self.socket_path)) => {
                 result.map_err(|_| Error::BrokerUnavailable)?.map_err(|_| Error::BrokerUnavailable)?
             }
@@ -258,8 +388,14 @@ impl BrokerClient {
             request["params"] = params;
         }
         let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(ClientAttemptError::Cancelled);
+        }
         let written = tokio::select! {
-            _ = notified => return Err(ClientAttemptError::Cancelled),
+            biased;
+            _ = &mut notified => return Err(ClientAttemptError::Cancelled),
             result = tokio::time::timeout(Duration::from_secs_f64(timeout_seconds), frame::write(&mut connection.output, &request, MAX_FRAME)) => result,
         };
         match written {
@@ -267,31 +403,74 @@ impl BrokerClient {
             _ => return Err(ClientAttemptError::Transport),
         }
         let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(ClientAttemptError::Cancelled);
+        }
         let raw = tokio::select! {
-            _ = notified => return Err(ClientAttemptError::Cancelled),
+            biased;
+            _ = &mut notified => return Err(ClientAttemptError::Cancelled),
             result = tokio::time::timeout(Duration::from_secs_f64(timeout_seconds), frame::read(&mut connection.input, MAX_FRAME)) => result,
         };
         let raw = match raw {
             Ok(Ok(Some(raw))) => raw,
             _ => return Err(ClientAttemptError::Transport),
         };
-        let value: Value =
-            serde_json::from_slice(&raw).map_err(|_| ClientAttemptError::Transport)?;
+        if !valid_raw_batch_response(method, &raw) {
+            return Err(ClientAttemptError::MalformedBatchResponse);
+        }
+        if !valid_raw_lineage_hold_response(method, &raw) {
+            return Err(ClientAttemptError::MalformedHoldResponse);
+        }
+        let malformed = || {
+            if matches!(method, "start_batch" | "batch_receipt") {
+                ClientAttemptError::MalformedBatchResponse
+            } else if LINEAGE_HOLD_METHODS.contains(&method) {
+                ClientAttemptError::MalformedHoldResponse
+            } else {
+                ClientAttemptError::Transport
+            }
+        };
+        let value: Value = serde_json::from_slice(&raw).map_err(|_| malformed())?;
         if value.get("id") != Some(&json!(id))
             || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         {
-            return Err(ClientAttemptError::Transport);
+            return Err(malformed());
+        }
+        if matches!(method, "start_batch" | "batch_receipt")
+            && value.get("error").is_some()
+            && value.get("result").is_some()
+        {
+            return Err(malformed());
+        }
+        if LINEAGE_HOLD_METHODS.contains(&method)
+            && value.get("error").is_some()
+            && value.get("result").is_some()
+        {
+            return Err(malformed());
         }
         if let Some(error) = value.get("error") {
             let Some(object) = error.as_object() else {
-                return Err(ClientAttemptError::Transport);
+                return Err(malformed());
             };
-            return Err(ClientAttemptError::Domain(broker_error(object)));
+            if matches!(method, "start_batch" | "batch_receipt")
+                && (object.get("code").and_then(Value::as_i64).is_none()
+                    || object.get("message").and_then(Value::as_str).is_none()
+                    || !valid_batch_precondition_error(method, object))
+            {
+                return Err(malformed());
+            }
+            if LINEAGE_HOLD_METHODS.contains(&method) && !valid_lineage_hold_error(object) {
+                return Err(ClientAttemptError::MalformedHoldResponse);
+            }
+            let error = broker_error(object);
+            if method == "batch_receipt" && matches!(error, Error::BatchOutcomeUnknown { .. }) {
+                return Err(ClientAttemptError::MalformedBatchResponse);
+            }
+            return Err(ClientAttemptError::Domain(error));
         }
-        value
-            .get("result")
-            .cloned()
-            .ok_or(ClientAttemptError::Transport)
+        value.get("result").cloned().ok_or_else(malformed)
     }
 }
 
@@ -304,6 +483,10 @@ const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_METHODS: &[&str] = &[
     "start",
+    "start_batch",
+    "history_pins",
+    "_lineage_hold_acquire",
+    "_lineage_hold_release",
     "resume",
     "cancel",
     "steer",
@@ -558,6 +741,46 @@ impl Lanes {
         lane.clone().try_acquire_owned().ok()
     }
 }
+
+/// Owns one batch control slot and records an interrupted task without payloads.
+struct BatchControlGuard {
+    /// Released only when the owned dispatch future ends or is dropped.
+    _permit: OwnedSemaphorePermit,
+    /// Set only after the dispatch future returns normally.
+    completed: bool,
+}
+
+impl Drop for BatchControlGuard {
+    /// The logger is best effort and must not panic during another unwind.
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = std::panic::catch_unwind(|| {
+                if let Some(logger) = agent_run_core::logging::configured() {
+                    logger.log(
+                        agent_run_core::logging::Level::Warning,
+                        "batch_dispatch_interrupted outcome=unknown",
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Keeps a control slot owned by work even after its caller stops awaiting it.
+fn spawn_controlled<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::spawn(async move {
+        let mut guard = BatchControlGuard {
+            _permit: permit,
+            completed: false,
+        };
+        let output = work.await;
+        guard.completed = true;
+        output
+    })
+}
 /// Removes only the listener inode this broker created while retaining its lock.
 pub(crate) struct SocketGuard {
     path: PathBuf,
@@ -602,12 +825,47 @@ fn domain_err(id: Value, error: &Error) -> Value {
             Some(json!({"code":code,"message":public.message})),
         );
     }
-    err(
-        id,
-        -32000,
-        &public.message,
-        Some(json!({"code":public.kind,"message":public.message})),
-    )
+    if public.kind == "PreconditionFailed" && public.reason.is_none() {
+        return domain_err(
+            id,
+            &Error::BatchOutcomeUnknown {
+                source: Box::new(crate::error::invalid("invalid precondition refusal")),
+            },
+        );
+    }
+    let mut data = json!({"code":public.kind,"message":public.message});
+    if let Some(reason) = public.reason {
+        data["reason"] = json!(reason);
+    }
+    err(id, -32000, &public.message, Some(data))
+}
+
+/// Preserves batch uncertainty when dispatch fails or outlives the socket wait.
+async fn batch_control_response(
+    task: tokio::task::JoinHandle<Option<Value>>,
+    deadline: Duration,
+    id: Value,
+    has_id: bool,
+) -> Option<Value> {
+    let failure = match tokio::time::timeout(deadline, task).await {
+        Ok(Ok(response)) => return response,
+        Ok(Err(_)) => (-32000, "batch outcome unknown; retry the same request"),
+        Err(_) => (
+            -32002,
+            "API request deadline exceeded; batch outcome unknown",
+        ),
+    };
+    has_id.then(|| {
+        err(
+            id,
+            failure.0,
+            failure.1,
+            Some(json!({
+                "code": agent_run_domain::MachineCode::BatchOutcomeUnknown.as_str(),
+                "message": failure.1,
+            })),
+        )
+    })
 }
 /// Validates and dispatches one decoded JSON-RPC object without socket I/O.
 ///
@@ -649,6 +907,14 @@ const SERVICE_RESTART_METHODS: &[&str] = &[
     "_service_restart_status",
     "_service_restart_failed",
     "_service_restart_claim",
+];
+
+/// Generic hold controls are operator-socket methods, never MCP model tools.
+const LINEAGE_HOLD_METHODS: &[&str] = &[
+    "_lineage_hold_acquire",
+    "_lineage_hold_lookup",
+    "_lineage_hold_list",
+    "_lineage_hold_release",
 ];
 
 /// Returns only the broker's fixed policy verdict for a stored execution.
@@ -738,6 +1004,27 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
     }
     let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
     let notification = absent_id;
+    // Keep a bounded response envelope for a committed batch receipt.
+    if matches!(
+        method,
+        "start_batch"
+            | "status"
+            | "batch_receipt"
+            | "transcript_exact"
+            | "initial_task"
+            | "_lineage_hold_acquire"
+            | "_lineage_hold_lookup"
+            | "_lineage_hold_list"
+            | "_lineage_hold_release"
+    ) && serde_json::to_vec(&id)
+        .is_ok_and(|bytes| bytes.len() > agent_run_domain::observation::MAX_RPC_ID_BYTES)
+    {
+        return if notification {
+            None
+        } else {
+            Some(err(Value::Null, -32600, "request id is too large", None))
+        };
+    }
     let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
     if !params.is_object() {
         return if notification {
@@ -746,9 +1033,14 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
             Some(err(id, -32602, "params must be an object", None))
         };
     }
+    // Do not create an unacknowledged hold or release through a notification.
+    if notification && matches!(method, "_lineage_hold_acquire" | "_lineage_hold_release") {
+        return None;
+    }
     let known = dispatch::is_tool(method)
         || CLI_READ_METHODS.contains(&method)
         || SERVICE_RESTART_METHODS.contains(&method)
+        || LINEAGE_HOLD_METHODS.contains(&method)
         || [
             "tools",
             "ping",
@@ -835,6 +1127,7 @@ async fn connection(
             Err(_) => return Ok(()),
         };
         let mut answer_response = false;
+        let mut batch_response = false;
         let response = match serde_json::from_slice::<Value>(&raw) {
             Ok(mut value) => {
                 if !valid_start_frame(
@@ -847,6 +1140,7 @@ async fn connection(
                 }
                 let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                 answer_response = method == "answer";
+                batch_response = method == "start_batch";
                 if control_only && !CONTROL_METHODS.contains(&method) {
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
                     if value.get("id").is_some() {
@@ -869,19 +1163,92 @@ async fn connection(
                                 .is_some_and(|seconds| seconds > 0.0));
                     if long_poll {
                         respond_with_access(&service, value, access).await
-                    } else if let Some(_permit) = lanes.try_acquire(method) {
+                    } else if let Some(permit) = lanes.try_acquire(method) {
                         let request_id = value.get("id").cloned().unwrap_or(Value::Null);
                         let has_id = value.get("id").is_some();
-                        match tokio::time::timeout(
-                            options.request_timeout,
-                            respond_with_access(&service, value, access),
-                        )
-                        .await
-                        {
-                            Ok(response) => response,
-                            Err(_) => has_id.then(|| {
-                                err(request_id, -32002, "API request deadline exceeded", None)
-                            }),
+                        if method == "start_batch" {
+                            let service = service.clone();
+                            // The detached operation retains its control slot even
+                            // when a caller's wait expires or its socket closes.
+                            let task = spawn_controlled(permit, async move {
+                                respond_with_access(&service, value, access).await
+                            });
+                            batch_control_response(
+                                task,
+                                options.request_timeout,
+                                request_id,
+                                has_id,
+                            )
+                            .await
+                        } else if matches!(
+                            method,
+                            "_lineage_hold_acquire" | "_lineage_hold_release"
+                        ) {
+                            let service = service.clone();
+                            // An accepted mutation keeps its slot and completes even
+                            // if the socket caller stops waiting for its response.
+                            let task = tokio::spawn(async move {
+                                let _permit = permit;
+                                respond_with_access(&service, value, access).await
+                            });
+                            match tokio::time::timeout(options.request_timeout, task).await {
+                                Ok(Ok(response)) => response,
+                                Ok(Err(_)) => has_id.then(|| {
+                                    err(request_id, -32000, "lineage hold outcome unknown", None)
+                                }),
+                                Err(_) => has_id.then(|| {
+                                    err(request_id, -32002, "lineage hold outcome unknown", None)
+                                }),
+                            }
+                        } else if matches!(
+                            method,
+                            "status"
+                                | "batch_receipt"
+                                | "transcript_exact"
+                                | "initial_task"
+                                | "_lineage_hold_lookup"
+                                | "_lineage_hold_list"
+                        ) {
+                            let service = service.clone();
+                            let failure = if method == "status" {
+                                "status read failed"
+                            } else if method == "transcript_exact" {
+                                "exact transcript read failed"
+                            } else if method == "initial_task" {
+                                "initial task read failed"
+                            } else if method == "batch_receipt" {
+                                "batch receipt read failed"
+                            } else {
+                                "lineage hold read failed"
+                            };
+                            // A timed-out observer leaves its read slot with the
+                            // owned task until its blocking snapshot actually ends.
+                            let task = tokio::spawn(async move {
+                                let _permit = permit;
+                                respond_with_access(&service, value, access).await
+                            });
+                            match tokio::time::timeout(options.request_timeout, task).await {
+                                Ok(Ok(response)) => response,
+                                Ok(Err(_)) => {
+                                    has_id.then(|| err(request_id, -32000, failure, None))
+                                }
+                                Err(_) => has_id.then(|| {
+                                    err(request_id, -32002, "API request deadline exceeded", None)
+                                }),
+                            }
+                        } else {
+                            let _permit = permit;
+                            match tokio::time::timeout(
+                                options.request_timeout,
+                                respond_with_access(&service, value, access),
+                            )
+                            .await
+                            {
+                                Ok(response) => response,
+                                Err(_) => has_id.then(|| {
+                                    err(request_id, -32002, "API request deadline exceeded", None)
+                                }),
+                            }
                         }
                     } else {
                         let id = value.get("id").cloned().unwrap_or(Value::Null);
@@ -896,7 +1263,7 @@ async fn connection(
             Err(_) => Some(err(Value::Null, -32700, "parse error", None)),
         };
         if let Some(response) = response {
-            let response = fit_response(response, answer_response)?;
+            let response = fit_response(response, answer_response, batch_response)?;
             tokio::time::timeout(
                 Duration::from_secs(15),
                 frame::write(&mut output, &response, MAX_FRAME),
@@ -912,9 +1279,9 @@ async fn connection(
 
 /// Fits a complete newline-terminated reply to the wire budget. Only oversized
 /// successful answer envelopes may shed inline content through AnswerView;
-/// ordinary answers are byte-for-byte unchanged and all other oversized replies
-/// retain the historical internal error. The metadata-only form is rechecked.
-fn fit_response(mut response: Value, answer_response: bool) -> Result<Value> {
+/// ordinary answers are byte-for-byte unchanged. An oversized batch result
+/// remains uncertain rather than becoming a partial receipt or a refusal.
+fn fit_response(mut response: Value, answer_response: bool, batch_response: bool) -> Result<Value> {
     if serde_json::to_vec(&response)?.len() < MAX_FRAME {
         return Ok(response);
     }
@@ -930,6 +1297,14 @@ fn fit_response(mut response: Value, answer_response: bool) -> Result<Value> {
             return Ok(response);
         }
     }
+    if batch_response && response.get("result").is_some() {
+        return Ok(domain_err(
+            response["id"].clone(),
+            &Error::BatchOutcomeUnknown {
+                source: Box::new(crate::error::invalid("batch receipt exceeds maximum size")),
+            },
+        ));
+    }
     Ok(err(
         response["id"].clone(),
         -32603,
@@ -938,9 +1313,9 @@ fn fit_response(mut response: Value, answer_response: bool) -> Result<Value> {
     ))
 }
 
-/// Decodes start parameters from their original frame before a generic JSON map
-/// can erase duplicate required_mcp keys. Other methods retain existing decoding.
-/// No filesystem/config/admission work occurs at this protocol boundary.
+/// Checks selected start, status and hold requests from their original frame
+/// before a generic JSON map can erase duplicate fields. No filesystem,
+/// configuration or admission work occurs at this protocol boundary.
 fn valid_start_frame(raw: &[u8], method: &str) -> bool {
     /// Only parameters need typed validation here; the normal responder owns the envelope.
     #[derive(serde::Deserialize)]
@@ -952,13 +1327,64 @@ fn valid_start_frame(raw: &[u8], method: &str) -> bool {
         "start" => serde_json::from_slice::<Frame<agent_run_domain::ProviderStartRequest>>(raw)
             .map(|frame| frame.params)
             .is_ok(),
+        "start_batch" => {
+            serde_json::from_slice::<Frame<agent_run_domain::batch::StartBatchRequest>>(raw)
+                .map(|frame| frame.params)
+                .is_ok()
+        }
+        "batch_receipt" => {
+            serde_json::from_slice::<Frame<agent_run_domain::batch::StartBatchRequest>>(raw)
+                .map(|frame| frame.params)
+                .is_ok()
+        }
         "start_pool" => {
             serde_json::from_slice::<Frame<agent_run_domain::pool::PoolStartRequest>>(raw)
                 .map(|frame| frame.params)
                 .is_ok()
         }
+        "transcript_exact" => serde_json::from_slice::<
+            Frame<agent_run_domain::transcript_exact::TranscriptExactRequest>,
+        >(raw)
+        .map(|frame| frame.params)
+        .is_ok(),
+        "initial_task" => {
+            serde_json::from_slice::<Frame<agent_run_domain::initial_task::InitialTaskRequest>>(raw)
+                .map(|frame| frame.params)
+                .is_ok()
+        }
+        "status" => serde_json::from_slice::<Frame<agent_run_domain::status::StatusRequest>>(raw)
+            .map(|frame| frame.params)
+            .is_ok(),
+        "_lineage_hold_acquire" => valid_hold_frame::<
+            agent_run_domain::lineage_hold_wire::LineageHoldAcquireRequest,
+        >(raw, method),
+        "_lineage_hold_lookup" => valid_hold_frame::<
+            agent_run_domain::lineage_hold_wire::LineageHoldLookupRequest,
+        >(raw, method),
+        "_lineage_hold_list" => valid_hold_frame::<
+            agent_run_domain::lineage_hold_wire::LineageHoldListRequest,
+        >(raw, method),
+        "_lineage_hold_release" => valid_hold_frame::<
+            agent_run_domain::lineage_hold_wire::LineageHoldReleaseRequest,
+        >(raw, method),
         _ => true,
     }
+}
+
+/// Checks the original hold envelope and nested DTO before JSON maps erase duplicates.
+fn valid_hold_frame<T: serde::de::DeserializeOwned>(raw: &[u8], method: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HoldFrame<T> {
+        jsonrpc: String,
+        method: String,
+        #[serde(default, rename = "id")]
+        _id: Option<Value>,
+        #[serde(rename = "params")]
+        _params: T,
+    }
+    serde_json::from_slice::<JsonObject<HoldFrame<T>>>(raw)
+        .is_ok_and(|JsonObject(frame)| frame.jsonrpc == "2.0" && frame.method == method)
 }
 /// Binds one private same-user broker socket under its exclusive startup lock.
 ///
@@ -1495,6 +1921,33 @@ async fn serve_endpoints(
         Some(settings) => Some(bind_shared(&settings.writer_socket).await?),
         None => None,
     };
+    // Explicitly configured readers retain exact-key recovery after disabling
+    // the managed switch, including across a broker restart.
+    let bridge_receipt_endpoint = if system.is_none()
+        && agent_run_config::provider_config::ProviderConfig::load(home)
+            .ok()
+            .is_some_and(|(config, _)| {
+                config.managed_attempt_binding.is_some_and(|settings| {
+                    !settings.bridge_receipt_readers.is_empty()
+                        || !settings.bridge_custody_readers.is_empty()
+                })
+            }) {
+        Some(bind_private(&home.join("attempt-receipts.sock")).await?)
+    } else {
+        None
+    };
+    let pool_attempt_endpoint = if system.is_none()
+        && agent_run_config::provider_config::ProviderConfig::load(home)
+            .ok()
+            .is_some_and(|(config, _)| {
+                config
+                    .managed_attempt_binding
+                    .is_some_and(|settings| settings.transport.is_some())
+            }) {
+        Some(bind_private(&home.join("attempt.sock")).await?)
+    } else {
+        None
+    };
     let launcher = system.as_ref().map(|settings| settings.launcher.clone());
     let system_group = system.is_some();
     // The one resident writer: acquires the home-wide writer lease and opens the
@@ -1545,6 +1998,45 @@ async fn serve_endpoints(
     // JoinSet aborts maintenance on every exit path, including cancellation of
     // serve_at itself; dropping a bare JoinHandle would detach these loops.
     let mut workers = JoinSet::new();
+    // Peer verification consults the installed-interpreter index; build it now
+    // so the first managed peer does not pay a cold-disk scan inside its budget.
+    drop(tokio::task::spawn_blocking(
+        agent_run_config::provider_config::warm_interpreter_index,
+    ));
+    if let Some((listener, guard)) = pool_attempt_endpoint {
+        let attempt_service = service.clone();
+        workers.spawn(async move {
+            let _guard=guard;let capacity=Arc::new(Semaphore::new(32));let mut handlers=JoinSet::new();
+            loop {tokio::select! {
+                accepted=listener.accept()=>match accepted {
+                    Ok((stream,_))=>{let Ok(permit)=capacity.clone().try_acquire_owned() else {continue};let service=attempt_service.clone();handlers.spawn(async move {let _permit=permit;let _=agent_run_core::attempt_wire::serve_pool_attempt(stream,&service).await;});},
+                    Err(_)=>break,
+                },
+                Some(_)=handlers.join_next(),if !handlers.is_empty()=>{},
+            }}
+        });
+    }
+    if let Some((listener, guard)) = bridge_receipt_endpoint {
+        let receipt_service = service.clone();
+        workers.spawn(async move {
+            let _guard=guard;
+            let capacity=Arc::new(Semaphore::new(32));
+            let mut readers=JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted=listener.accept()=>match accepted {
+                        Ok((stream,_))=>{
+                            let Ok(permit)=capacity.clone().try_acquire_owned() else {continue};
+                            let service=receipt_service.clone();
+                            readers.spawn(async move {let _permit=permit;let _=agent_run_core::attempt_wire::serve_bridge_receipt(stream,&service).await;});
+                        }
+                        Err(_)=>break,
+                    },
+                    Some(_)=readers.join_next(), if !readers.is_empty()=>{},
+                }
+            }
+        });
+    }
     workers.spawn(agent_run_core::service_restart::run(service.clone()));
     let history_home = home.to_owned();
     let retention_lane = broker_writer.lane("retention");
@@ -1568,7 +2060,7 @@ async fn serve_endpoints(
                 // short SQL deadlines also bound it if the broker task is aborted.
                 let result: Result<usize> = async {
                     let (batch, next_cursor, pending) = tokio::task::spawn_blocking(move || {
-                        let reader = crate::state::writer::StoreReader::open_with(
+                        let mut reader = crate::state::writer::StoreReader::open_with(
                             &home,
                             Duration::from_millis(100),
                         )?;
@@ -1936,6 +2428,21 @@ async fn client_with_uid(
 /// allowlisted, so the CLI, MCP and socket clients show the same class. The
 /// message is bounded to 512 characters.
 fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
+    let data = object.get("data").and_then(Value::as_object);
+    if data
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        == Some("PreconditionFailed")
+        && !matches!(
+            data.and_then(|data| data.get("reason"))
+                .and_then(Value::as_str),
+            Some("not_met" | "unknown")
+        )
+    {
+        return Error::BatchOutcomeUnknown {
+            source: Box::new(crate::error::invalid("invalid precondition refusal")),
+        };
+    }
     let message: String = object
         .get("message")
         .and_then(Value::as_str)
@@ -1966,6 +2473,518 @@ fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
         message,
         broker_error_code,
         broker_error_data,
+    }
+}
+
+/// Batch error envelopes may only claim a proved precondition refusal with
+/// the server's domain-error code, never its timeout/transport codes.
+fn valid_batch_precondition_error(method: &str, object: &serde_json::Map<String, Value>) -> bool {
+    !matches!(method, "start_batch" | "batch_receipt")
+        || object
+            .get("data")
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            != Some("PreconditionFailed")
+        || object.get("code").and_then(Value::as_i64) == Some(-32000)
+}
+
+/// Hold errors require typed fields before they can be treated as a broker refusal.
+fn valid_lineage_hold_error(object: &serde_json::Map<String, Value>) -> bool {
+    if object.get("code").and_then(Value::as_i64).is_none()
+        || object.get("message").and_then(Value::as_str).is_none()
+    {
+        return false;
+    }
+    match object.get("data") {
+        None => true,
+        Some(Value::Object(data)) => ["code", "message", "reason"]
+            .into_iter()
+            .all(|key| data.get(key).is_none_or(Value::is_string)),
+        _ => false,
+    }
+}
+
+/// A nonrecursive object wrapper: nested values retain their own decoders.
+struct JsonObject<T>(T);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for JsonObject<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
+            type Value = JsonObject<T>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(JsonObject)
+            }
+        }
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
+}
+
+/// Duplicate known error data keys must not become a fabricated closed reason.
+#[derive(serde::Deserialize)]
+struct BatchErrorData {
+    #[serde(default, rename = "code")]
+    _code: Option<Value>,
+    #[serde(default, rename = "message")]
+    _message: Option<Value>,
+    #[serde(default, rename = "reason")]
+    _reason: Option<Value>,
+}
+
+/// Error fields are checked from the raw stream before any generic JSON map.
+#[derive(serde::Deserialize)]
+struct BatchRpcError {
+    #[serde(rename = "code")]
+    _code: Value,
+    #[serde(rename = "message")]
+    _message: Value,
+    #[serde(default, rename = "data")]
+    _data: Option<JsonObject<BatchErrorData>>,
+}
+
+/// Method-specific batch envelopes preserve duplicate-key detection.
+#[derive(serde::Deserialize)]
+#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
+struct BatchRpcEnvelope<T> {
+    #[serde(rename = "jsonrpc")]
+    _jsonrpc: Value,
+    #[serde(rename = "id")]
+    _id: Value,
+    #[serde(default, rename = "result")]
+    _result: Option<T>,
+    #[serde(default, rename = "error")]
+    _error: Option<JsonObject<BatchRpcError>>,
+}
+
+/// Checks only the two batch response shapes; unrelated JSON remains untouched.
+fn valid_raw_batch_response(method: &str, raw: &[u8]) -> bool {
+    match method {
+        "start_batch" => serde_json::from_slice::<
+            JsonObject<BatchRpcEnvelope<agent_run_domain::batch::StartBatchResult>>,
+        >(raw)
+        .is_ok(),
+        "batch_receipt" => serde_json::from_slice::<
+            JsonObject<BatchRpcEnvelope<agent_run_domain::batch::BatchReceiptLookup>>,
+        >(raw)
+        .is_ok(),
+        _ => true,
+    }
+}
+
+/// Strict client-side receipt; IDs and selectors use their domain parsers.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldClientReceipt {
+    version: u32,
+    store_id: agent_run_domain::StoreId,
+    hold_id: agent_run_domain::lineage_hold::HoldId,
+    fingerprint: agent_run_domain::lineage_hold_wire::LowerHex32,
+    targets: Vec<agent_run_domain::lineage_hold::LineageHoldTarget>,
+    canonical_roots: Vec<agent_run_domain::domain::AgentId>,
+}
+
+/// Only these durable hold states may occur in a client response.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HoldClientState {
+    Active,
+    Released,
+}
+
+/// One exact acquire receipt and its durable lifecycle state.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldClientAcquire {
+    receipt: HoldClientReceipt,
+    state: HoldClientState,
+    replayed: bool,
+}
+
+/// A listed receipt with the state observed in that page's snapshot.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldClientObservation {
+    receipt: HoldClientReceipt,
+    state: HoldClientState,
+}
+
+/// Optional result of one store-scoped hold lookup.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldClientLookup {
+    store_id: agent_run_domain::StoreId,
+    found: bool,
+    #[serde(default)]
+    receipt: Option<HoldClientReceipt>,
+    #[serde(default)]
+    state: Option<HoldClientState>,
+}
+
+/// One ordered, cursor-bounded page of hold observations.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldClientList {
+    store_id: agent_run_domain::StoreId,
+    holds: Vec<HoldClientObservation>,
+    next_after_hold_id: Option<agent_run_domain::lineage_hold::HoldId>,
+}
+
+/// Optional authenticated release result for one exact hold.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldClientRelease {
+    store_id: agent_run_domain::StoreId,
+    found: bool,
+    #[serde(default)]
+    hold_id: Option<agent_run_domain::lineage_hold::HoldId>,
+    #[serde(default)]
+    state: Option<HoldClientState>,
+    #[serde(default)]
+    already_released: Option<bool>,
+}
+
+/// Rejects repeated fields in the original response before decoding a JSON map.
+fn valid_raw_lineage_hold_response(method: &str, raw: &[u8]) -> bool {
+    match method {
+        "_lineage_hold_acquire" => serde_json::from_slice::<
+            JsonObject<BatchRpcEnvelope<JsonObject<HoldClientAcquire>>>,
+        >(raw)
+        .is_ok(),
+        "_lineage_hold_lookup" => serde_json::from_slice::<
+            JsonObject<BatchRpcEnvelope<JsonObject<HoldClientLookup>>>,
+        >(raw)
+        .is_ok(),
+        "_lineage_hold_list" => {
+            serde_json::from_slice::<JsonObject<BatchRpcEnvelope<JsonObject<HoldClientList>>>>(raw)
+                .is_ok()
+        }
+        "_lineage_hold_release" => serde_json::from_slice::<
+            JsonObject<BatchRpcEnvelope<JsonObject<HoldClientRelease>>>,
+        >(raw)
+        .is_ok(),
+        _ => true,
+    }
+}
+
+/// Checks the fixed receipt shape and uniqueness without granting worker authority.
+fn valid_hold_receipt(receipt: &HoldClientReceipt, store: &agent_run_domain::StoreId) -> bool {
+    let count = receipt.targets.len();
+    if receipt.version != 1
+        || &receipt.store_id != store
+        || !(1..=20).contains(&count)
+        || receipt.canonical_roots.len() != count
+    {
+        return false;
+    }
+    let mut roots = std::collections::HashSet::new();
+    let mut pins = std::collections::HashSet::new();
+    let mut executions = std::collections::HashSet::new();
+    receipt
+        .canonical_roots
+        .iter()
+        .all(|root| roots.insert(root))
+        && receipt.targets.iter().all(|target| {
+            target.sequence != 0
+                && pins.insert(&target.pin_id)
+                && executions.insert(&target.execution_ref)
+        })
+}
+
+/// Requires target entries to be JSON objects rather than positional arrays.
+fn hold_target_objects(receipt: &Value) -> bool {
+    receipt["targets"]
+        .as_array()
+        .is_some_and(|targets| targets.iter().all(Value::is_object))
+}
+
+/// Correlates a complete hold response to the exact store, intent and cursor.
+fn valid_lineage_hold_response(method: &str, value: &Value, params: &Value) -> bool {
+    use agent_run_domain::lineage_hold::LineageHoldAcquire;
+    use agent_run_domain::lineage_hold_wire::{
+        LineageHoldAcquireRequest, LineageHoldListRequest, LineageHoldListState,
+        LineageHoldLookupRequest, LineageHoldReleaseRequest,
+    };
+
+    match method {
+        "_lineage_hold_acquire" => {
+            let Ok(request) = serde_json::from_value::<LineageHoldAcquireRequest>(params.clone())
+            else {
+                return false;
+            };
+            let Ok(intent) = LineageHoldAcquire::try_from(request) else {
+                return false;
+            };
+            let Ok(response) = serde_json::from_value::<HoldClientAcquire>(value.clone()) else {
+                return false;
+            };
+            let Ok(fingerprint) = intent.fingerprint() else {
+                return false;
+            };
+            valid_hold_receipt(&response.receipt, &intent.store_id)
+                && hold_target_objects(&value["receipt"])
+                && response.receipt.fingerprint.into_bytes() == fingerprint
+                && response.receipt.targets == intent.targets
+                && (response.replayed || response.state == HoldClientState::Active)
+        }
+        "_lineage_hold_lookup" => {
+            let Ok(request) = serde_json::from_value::<LineageHoldLookupRequest>(params.clone())
+            else {
+                return false;
+            };
+            let Ok(response) = serde_json::from_value::<HoldClientLookup>(value.clone()) else {
+                return false;
+            };
+            if request.validate().is_err() || response.store_id != request.expected_store_id {
+                return false;
+            }
+            match (response.found, response.receipt, response.state) {
+                (false, None, None) => {
+                    value.get("receipt").is_none() && value.get("state").is_none()
+                }
+                (true, Some(receipt), Some(_)) => {
+                    valid_hold_receipt(&receipt, &request.expected_store_id)
+                        && hold_target_objects(&value["receipt"])
+                        && receipt.fingerprint == request.fingerprint
+                }
+                _ => false,
+            }
+        }
+        "_lineage_hold_list" => {
+            let Ok(request) = serde_json::from_value::<LineageHoldListRequest>(params.clone())
+            else {
+                return false;
+            };
+            let Ok(response) = serde_json::from_value::<HoldClientList>(value.clone()) else {
+                return false;
+            };
+            if request.validate().is_err()
+                || response.store_id != request.expected_store_id
+                || response.holds.len() > request.limit
+                || value.get("next_after_hold_id").is_none()
+            {
+                return false;
+            }
+            let Some(raw_holds) = value["holds"].as_array() else {
+                return false;
+            };
+            let mut previous = request.after_hold_id.as_ref().map(|hold| hold.as_str());
+            for (observation, raw) in response.holds.iter().zip(raw_holds) {
+                let receipt = &observation.receipt;
+                if !valid_hold_receipt(receipt, &request.expected_store_id)
+                    || !raw.is_object()
+                    || !raw["receipt"].is_object()
+                    || !hold_target_objects(&raw["receipt"])
+                    || previous.is_some_and(|id| receipt.hold_id.as_str() <= id)
+                    || matches!(request.state, LineageHoldListState::Active)
+                        && observation.state != HoldClientState::Active
+                    || matches!(request.state, LineageHoldListState::Released)
+                        && observation.state != HoldClientState::Released
+                {
+                    return false;
+                }
+                previous = Some(receipt.hold_id.as_str());
+            }
+            response.next_after_hold_id.as_ref().is_none_or(|next| {
+                response.holds.len() == request.limit
+                    && response
+                        .holds
+                        .last()
+                        .is_some_and(|last| &last.receipt.hold_id == next)
+            })
+        }
+        "_lineage_hold_release" => {
+            let Ok(request) = serde_json::from_value::<LineageHoldReleaseRequest>(params.clone())
+            else {
+                return false;
+            };
+            let Ok(response) = serde_json::from_value::<HoldClientRelease>(value.clone()) else {
+                return false;
+            };
+            if request.validate().is_err() || response.store_id != request.expected_store_id {
+                return false;
+            }
+            match (
+                response.found,
+                response.hold_id,
+                response.state,
+                response.already_released,
+            ) {
+                (false, None, None, None) => {
+                    value.get("hold_id").is_none()
+                        && value.get("state").is_none()
+                        && value.get("already_released").is_none()
+                }
+                (true, Some(hold_id), Some(HoldClientState::Released), Some(_)) => {
+                    hold_id == request.hold_id
+                }
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
+/// A malformed response after a batch send cannot prove the admission was refused.
+fn batch_response_error(method: &str, source: Error) -> Error {
+    if method == "start_batch" {
+        Error::BatchOutcomeUnknown {
+            source: Box::new(source),
+        }
+    } else {
+        source
+    }
+}
+
+/// A malformed lookup is a read failure, while old scalar error classes stay intact.
+fn malformed_response_error(method: &str, message: &str) -> Error {
+    let error = if method == "batch_receipt" {
+        Error::Runtime(message.into())
+    } else {
+        crate::error::invalid(message)
+    };
+    batch_response_error(method, error)
+}
+
+/// Requires a canonical database identity only when capabilities opted in.
+pub(crate) fn valid_capabilities_scope(value: &Value, params: &Value) -> bool {
+    (params.get("include_store_id") != Some(&json!(true))
+        || value
+            .get("store_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.parse::<agent_run_domain::StoreId>().is_ok()))
+        && (params.get("include_initial_task") != Some(&json!(true))
+            || value.get("initial_task").is_some_and(|capability| {
+                serde_json::from_value::<agent_run_domain::initial_task::InitialTaskCapability>(
+                    capability.clone(),
+                )
+                .is_ok()
+            }))
+}
+
+/// Rejects wrong-store/selector or inconsistent exact-export continuations.
+pub(crate) fn valid_transcript_exact_response(value: &Value, params: &Value) -> bool {
+    let Ok(request) = serde_json::from_value::<
+        agent_run_domain::transcript_exact::TranscriptExactRequest,
+    >(params.clone()) else {
+        return false;
+    };
+    let Ok(response) = serde_json::from_value::<
+        agent_run_domain::transcript_exact::TranscriptExactResponse,
+    >(value.clone()) else {
+        return false;
+    };
+    response.validate_for(&request).is_ok()
+}
+
+/// Rejects wrong-store/agent/fence or inconsistent initial-task pages.
+pub(crate) fn valid_initial_task_response(value: &Value, params: &Value) -> bool {
+    let Ok(request) = serde_json::from_value::<agent_run_domain::initial_task::InitialTaskRequest>(
+        params.clone(),
+    ) else {
+        return false;
+    };
+    let Ok(response) = serde_json::from_value::<agent_run_domain::initial_task::InitialTaskResponse>(
+        value.clone(),
+    ) else {
+        return false;
+    };
+    response.validate_for(&request).is_ok()
+}
+
+/// Rejects incomplete or unrelated status proofs instead of publishing them.
+pub(crate) fn valid_status_response(value: &Value, params: &Value) -> bool {
+    let Ok(request) =
+        serde_json::from_value::<agent_run_domain::status::StatusRequest>(params.clone())
+    else {
+        return false;
+    };
+    let Ok(output) =
+        serde_json::from_value::<agent_run_domain::status::StatusOutput>(value.clone())
+    else {
+        return false;
+    };
+    output.validate_for(&request).is_ok()
+}
+
+/// Validates the entire batch receipt against the exact submitted intent.
+pub(crate) fn valid_batch_response(value: &Value, params: &Value) -> bool {
+    let Ok(result) =
+        serde_json::from_value::<agent_run_domain::batch::StartBatchResult>(value.clone())
+    else {
+        return false;
+    };
+    let Ok(request) =
+        serde_json::from_value::<agent_run_domain::batch::StartBatchRequest>(params.clone())
+    else {
+        return false;
+    };
+    result.validate_for_request(&request).is_ok()
+}
+
+/// Validates a read-only receipt lookup against its exact scoped batch intent.
+pub(crate) fn valid_batch_receipt_response(value: &Value, params: &Value) -> bool {
+    let Ok(request) =
+        serde_json::from_value::<agent_run_domain::batch::StartBatchRequest>(params.clone())
+    else {
+        return false;
+    };
+    let Ok(output) =
+        serde_json::from_value::<agent_run_domain::batch::BatchReceiptLookup>(value.clone())
+    else {
+        return false;
+    };
+    output.validate_for(&request).is_ok()
+}
+
+/// Verifies a pin response against the operator request before reporting success.
+pub(crate) fn valid_history_pin_response(value: &Value, params: &Value) -> bool {
+    use agent_run_domain::batch::{
+        HistoryPinFilter, HistoryPinRelease, HistoryPinState, HistoryPinsPage, HistoryPinsRequest,
+    };
+    let Ok(request) = serde_json::from_value::<HistoryPinsRequest>(params.clone()) else {
+        return false;
+    };
+    match request {
+        HistoryPinsRequest::Release { pin_id, .. } => {
+            serde_json::from_value::<HistoryPinRelease>(value.clone()).is_ok_and(|response| {
+                response.pin_id == pin_id && response.status == HistoryPinState::Released
+            })
+        }
+        HistoryPinsRequest::List {
+            status,
+            limit,
+            after_pin_id,
+            ..
+        } => {
+            let Ok(page) = serde_json::from_value::<HistoryPinsPage>(value.clone()) else {
+                return false;
+            };
+            if !(1..=1000).contains(&limit) || page.pins.len() > limit {
+                return false;
+            }
+            let mut previous = after_pin_id.as_ref().map(|pin| pin.as_str());
+            for pin in &page.pins {
+                if previous.is_some_and(|previous| pin.pin_id.as_str() <= previous)
+                    || (status == HistoryPinFilter::Active && pin.status != HistoryPinState::Active)
+                    || (status == HistoryPinFilter::Released
+                        && pin.status != HistoryPinState::Released)
+                {
+                    return false;
+                }
+                previous = Some(pin.pin_id.as_str());
+            }
+            page.next_after_pin_id.as_ref().is_none_or(|next| {
+                page.pins.len() == limit && page.pins.last().is_some_and(|pin| &pin.pin_id == next)
+            })
+        }
     }
 }
 
@@ -2006,10 +3025,14 @@ async fn client_with_wait_deadlines(
         )
         .await
         .map_err(|_| {
-            Error::Runtime(
-                "broker request write deadline exceeded; admission may be ambiguous".into(),
+            batch_response_error(
+                method,
+                Error::Runtime(
+                    "broker request write deadline exceeded; admission may be ambiguous".into(),
+                ),
             )
-        })??;
+        })?
+        .map_err(|error| batch_response_error(method, error))?;
         let mut input = BufReader::new(stream);
         // Wait uses a finite observer deadline and a slightly longer client read deadline;
         // timed-out observations are retried against the same durable agent.
@@ -2021,37 +3044,224 @@ async fn client_with_wait_deadlines(
         let raw = tokio::time::timeout(response_timeout, frame::read(&mut input, MAX_FRAME))
             .await
             .map_err(|_| {
-                Error::Runtime(
-                    "broker response deadline exceeded; an admitted run is not cancelled".into(),
+                batch_response_error(
+                    method,
+                    Error::Runtime(
+                        "broker response deadline exceeded; an admitted run is not cancelled"
+                            .into(),
+                    ),
                 )
-            })??;
-        let value: Value =
-            serde_json::from_slice(&raw.ok_or_else(|| {
-                Error::Runtime("broker disconnected before its response".into())
-            })?)?;
+            })?
+            .map_err(|error| batch_response_error(method, error))?;
+        let raw = raw.ok_or_else(|| {
+            batch_response_error(
+                method,
+                Error::Runtime("broker disconnected before its response".into()),
+            )
+        })?;
+        if !valid_raw_batch_response(method, &raw) {
+            return Err(batch_response_error(
+                method,
+                Error::Runtime("invalid batch broker response".into()),
+            ));
+        }
+        let value: Value = serde_json::from_slice(&raw)
+            .map_err(|error| batch_response_error(method, Error::Json(error)))?;
         if value.get("id").and_then(Value::as_str) != Some(id.as_str())
             || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         {
-            return Err(crate::error::invalid("invalid broker response identity"));
+            return Err(malformed_response_error(
+                method,
+                "invalid broker response identity",
+            ));
+        }
+        if matches!(method, "start_batch" | "batch_receipt")
+            && value.get("error").is_some()
+            && value.get("result").is_some()
+        {
+            return Err(malformed_response_error(
+                method,
+                "conflicting broker response",
+            ));
         }
         if let Some(error) = value.get("error") {
-            return Err(error
+            if matches!(method, "start_batch" | "batch_receipt")
+                && !error.as_object().is_some_and(|object| {
+                    object.get("code").and_then(Value::as_i64).is_some()
+                        && object.get("message").and_then(Value::as_str).is_some()
+                        && valid_batch_precondition_error(method, object)
+                })
+            {
+                return Err(malformed_response_error(method, "invalid broker error"));
+            }
+            let error = error
                 .as_object()
                 .map(broker_error)
-                .unwrap_or_else(|| Error::Runtime("broker request failed".into())));
+                .unwrap_or_else(|| Error::Runtime("broker request failed".into()));
+            if method == "batch_receipt" && matches!(error, Error::BatchOutcomeUnknown { .. }) {
+                return Err(Error::Runtime("invalid batch broker error".into()));
+            }
+            return Err(error);
         }
         if is_wait && value["result"]["timed_out"] == true {
             continue;
         }
-        return value
-            .get("result")
-            .cloned()
-            .ok_or_else(|| crate::error::invalid("broker returned neither result nor error"));
+        let result = value.get("result").cloned().ok_or_else(|| {
+            malformed_response_error(method, "broker returned neither result nor error")
+        })?;
+        if method == "capabilities" && !valid_capabilities_scope(&result, &params) {
+            return Err(Error::Runtime("invalid capabilities store identity".into()));
+        }
+        if method == "transcript_exact" && !valid_transcript_exact_response(&result, &params) {
+            return Err(Error::Runtime("invalid exact transcript response".into()));
+        }
+        if method == "initial_task" && !valid_initial_task_response(&result, &params) {
+            return Err(Error::Runtime("invalid initial task response".into()));
+        }
+        if method == "status" && !valid_status_response(&result, &params) {
+            return Err(Error::Runtime("invalid status response".into()));
+        }
+        if method == "batch_receipt" && !valid_batch_receipt_response(&result, &params) {
+            return Err(Error::Runtime(
+                "invalid batch receipt lookup response".into(),
+            ));
+        }
+        if method == "start_batch" && !valid_batch_response(&result, &params) {
+            return Err(batch_response_error(
+                method,
+                crate::error::invalid("invalid batch receipt"),
+            ));
+        }
+        if method == "history_pins" && !valid_history_pin_response(&result, &params) {
+            return Err(Error::Runtime(
+                "history pin result is invalid; reconcile release by pin_id".into(),
+            ));
+        }
+        return Ok(result);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A pin acknowledgement must match the exact release or requested page.
+    #[test]
+    fn history_pin_responses_are_correlated_and_bounded() {
+        let first = "pin_550e8400e29b41d4a716446655440000";
+        let next = "pin_550e8400e29b41d4a716446655440001";
+        let request = json!({"action":"release","pin_id":first});
+        let mut result = json!({"pin_id":first,"status":"released","already_released":false});
+        assert!(valid_history_pin_response(&result, &request));
+        result["status"] = json!("active");
+        assert!(!valid_history_pin_response(&result, &request));
+        result["status"] = json!("released");
+        result["pin_id"] = json!(next);
+        assert!(!valid_history_pin_response(&result, &request));
+
+        let request = json!({"action":"list","status":"active","limit":1});
+        let mut result = json!({"pins":[{"pin_id":first,"agent_id":"ag-20260826-120000-0123456789","status":"active"}],"next_after_pin_id":first});
+        assert!(valid_history_pin_response(&result, &request));
+        result["next_after_pin_id"] = json!(next);
+        assert!(!valid_history_pin_response(&result, &request));
+        result["next_after_pin_id"] = json!(null);
+        result["pins"][0]["status"] = json!("released");
+        assert!(!valid_history_pin_response(&result, &request));
+    }
+
+    /// A batch receipt must provide exactly the requested set of pin IDs.
+    #[test]
+    fn batch_pin_receipt_matches_requested_retention() {
+        let job = json!({"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"});
+        let mut request = json!({"request_id":"batch", "jobs":[job.clone(),job]});
+        let mut result = json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"batch","jobs":[
+            {"index":0,"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":format!("ex1_{}", "a".repeat(64))},
+            {"index":1,"agent_id":"ag-20260826-120001-0123456789","sequence":1,"execution_ref":format!("ex1_{}", "b".repeat(64))}
+        ]}});
+        assert!(valid_batch_response(&result, &request));
+        request["retain_history"] = json!(true);
+        assert!(!valid_batch_response(&result, &request));
+        result["receipt"]["jobs"][0]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440000");
+        assert!(!valid_batch_response(&result, &request));
+        result["receipt"]["jobs"][1]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440001");
+        assert!(valid_batch_response(&result, &request));
+        result["receipt"]["jobs"][1]["pin_id"] = result["receipt"]["jobs"][0]["pin_id"].clone();
+        assert!(!valid_batch_response(&result, &request));
+        result["receipt"]["jobs"][1]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440001");
+        request["expected_store_id"] = json!("store_0123456789abcdef0123456789abcdef");
+        assert!(valid_batch_response(&result, &request));
+        result["receipt"]["store_id"] = json!("store_ffffffffffffffffffffffffffffffff");
+        assert!(!valid_batch_response(&result, &request));
+        result["receipt"]["store_id"] = json!("bad-store");
+        assert!(!valid_batch_response(&result, &request));
+    }
+
+    /// A batch result can only confirm the exact ordered prerequisites sent.
+    #[test]
+    fn batch_receipt_checks_ordered_preconditions_and_omission() {
+        let a = json!({"agent_id":"ag-20260826-120000-0123456789","sequence":1,
+            "execution_ref":format!("ex1_{}", "a".repeat(64)), "pin_id":"pin_550e8400e29b41d4a716446655440000"});
+        let b = json!({"agent_id":"ag-20260826-120001-0123456789","sequence":2,
+            "execution_ref":format!("ex1_{}", "b".repeat(64)), "pin_id":"pin_550e8400e29b41d4a716446655440001"});
+        let request = json!({"request_id":"batch","expected_store_id":"store_0123456789abcdef0123456789abcdef",
+            "preconditions":[a.clone(),b.clone()],"jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/missing"}]});
+        let mut result = json!({"replayed":false,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"batch",
+            "preconditions":[a,b],"jobs":[{"index":0,"agent_id":"ag-20260826-120002-0123456789","sequence":1,"execution_ref":format!("ex1_{}", "c".repeat(64))}]}});
+        assert!(valid_batch_response(&result, &request));
+        result["receipt"]["preconditions"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(!valid_batch_response(&result, &request));
+        result["receipt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("preconditions");
+        assert!(!valid_batch_response(&result, &request));
+        let mut old = request.clone();
+        old.as_object_mut().unwrap().remove("preconditions");
+        assert!(valid_batch_response(&result, &old));
+        let mut lookup = json!({"found":true,"receipt":result["receipt"]});
+        assert!(!valid_batch_receipt_response(&lookup, &request));
+        lookup["receipt"]["preconditions"] = request["preconditions"].clone();
+        assert!(valid_batch_receipt_response(&lookup, &request));
+    }
+
+    /// Unknown or missing reason cannot convert a possibly committed batch into refusal.
+    #[test]
+    fn precondition_refusal_preserves_only_closed_reasons() {
+        for reason in ["not_met", "unknown"] {
+            let wire = json!({"code":-32000,"message":"refused", "data":{"code":"PreconditionFailed","reason":reason}});
+            let error = broker_error(wire.as_object().unwrap());
+            assert_eq!(error.machine_code().as_str(), "PreconditionFailed");
+            assert_eq!(
+                serde_json::to_value(error.public().reason).unwrap(),
+                json!(reason)
+            );
+            let response = domain_err(json!(1), &error);
+            assert_eq!(response["error"]["data"]["reason"], reason);
+        }
+        for data in [
+            json!({"code":"PreconditionFailed"}),
+            json!({"code":"PreconditionFailed","reason":"unrecognized"}),
+        ] {
+            let wire = json!({"code":-32000,"message":"refused", "data":data});
+            let error = broker_error(wire.as_object().unwrap());
+            assert!(matches!(error, Error::BatchOutcomeUnknown { .. }));
+            assert_eq!(
+                domain_err(json!(1), &error)["error"]["data"]["code"],
+                "BatchOutcomeUnknown"
+            );
+        }
+    }
+
+    /// A response frame never drops part of a committed batch receipt.
+    #[test]
+    fn oversized_batch_frame_is_unknown_without_partial_receipt() {
+        let response = json!({"jsonrpc":"2.0","id":1,"result":{"receipt":{"preconditions":[{"oversized":"x".repeat(MAX_FRAME)}]}}});
+        let fitted = fit_response(response, false, true).unwrap();
+        assert!(fitted.get("result").is_none());
+        assert_eq!(fitted["error"]["data"]["code"], "BatchOutcomeUnknown");
+        assert!(serde_json::to_vec(&fitted).unwrap().len() < MAX_FRAME);
+    }
     /// Restart control stays on the existing operator socket, not the MCP catalog.
     #[tokio::test]
     async fn service_restart_control_is_not_an_mcp_tool() {
@@ -2170,7 +3380,7 @@ mod tests {
             );
             let original = json!({"jsonrpc":"2.0","id":1,"result":answer});
             assert!(serde_json::to_vec(&original).unwrap().len() + 1 > MAX_FRAME);
-            let fitted = fit_response(original.clone(), true).unwrap();
+            let fitted = fit_response(original.clone(), true, false).unwrap();
             assert!(fitted["result"]["content"].is_null());
             assert_eq!(fitted["result"]["inline_complete"], false);
             for key in [
@@ -2186,25 +3396,33 @@ mod tests {
             }
             assert!(serde_json::to_vec(&fitted).unwrap().len() < MAX_FRAME);
             assert_eq!(
-                fit_response(original, false).unwrap()["error"]["code"],
+                fit_response(original, false, false).unwrap()["error"]["code"],
                 -32603
             );
         }
         let (_temp, service, id, _) = answer_fixture("ordinary \"é\"\n");
         let mut ordinary =
             json!({"jsonrpc":"2.0","id":"ordinary","result":service.answer(&id).unwrap()});
-        assert_eq!(fit_response(ordinary.clone(), true).unwrap(), ordinary);
+        assert_eq!(
+            fit_response(ordinary.clone(), true, false).unwrap(),
+            ordinary
+        );
         // Account for escaping by measuring an empty content envelope directly.
         ordinary["result"]["content"] = json!("");
         let empty_bytes = serde_json::to_vec(&ordinary).unwrap().len() + 1;
         ordinary["result"]["content"] = json!("x".repeat(MAX_FRAME - empty_bytes));
         assert_eq!(serde_json::to_vec(&ordinary).unwrap().len() + 1, MAX_FRAME);
-        assert_eq!(fit_response(ordinary.clone(), true).unwrap(), ordinary);
+        assert_eq!(
+            fit_response(ordinary.clone(), true, false).unwrap(),
+            ordinary
+        );
         ordinary["result"]["content"] = json!("x".repeat(MAX_FRAME - empty_bytes + 1));
-        assert!(fit_response(ordinary.clone(), true).unwrap()["result"]["content"].is_null());
+        assert!(
+            fit_response(ordinary.clone(), true, false).unwrap()["result"]["content"].is_null()
+        );
         ordinary["result"]["path"] = json!("x".repeat(MAX_FRAME));
         assert_eq!(
-            fit_response(ordinary, true).unwrap()["error"]["code"],
+            fit_response(ordinary, true, false).unwrap()["error"]["code"],
             -32603
         );
     }
@@ -2308,6 +3526,98 @@ mod tests {
         assert!(!valid_start_frame(frame, "start"));
         let valid = br#"{"jsonrpc":"2.0","id":1,"method":"start","params":{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[]}}}"#;
         assert!(valid_start_frame(valid, "start"));
+        let batch = br#"{"jsonrpc":"2.0","id":1,"method":"start_batch","params":{"request_id":"b","jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}]}}"#;
+        assert!(!valid_start_frame(batch, "start_batch"));
+        let receipt = br#"{"jsonrpc":"2.0","id":1,"method":"batch_receipt","params":{"request_id":"b","expected_store_id":"store_0123456789abcdef0123456789abcdef","jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}]}}"#;
+        assert!(!valid_start_frame(receipt, "batch_receipt"));
+        let unknown = br#"{"jsonrpc":"2.0","id":1,"method":"batch_receipt","params":{"request_id":"b","expected_store_id":"store_0123456789abcdef0123456789abcdef","jobs":[{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","unexpected":true}]}}"#;
+        assert!(!valid_start_frame(unknown, "batch_receipt"));
+        let status = br#"{"jsonrpc":"2.0","id":1,"method":"status","params":{"version":1,"targets":[{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"sequence":2}]}}"#;
+        assert!(!valid_start_frame(status, "status"));
+    }
+
+    /// Duplicate prerequisite fields never survive as a lossy JSON map.
+    #[test]
+    fn batch_precondition_duplicate_socket_keys_are_rejected() {
+        for method in ["start_batch", "batch_receipt"] {
+            let base = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"request_id":"b","expected_store_id":"store_0123456789abcdef0123456789abcdef","jobs":[{{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/missing"}}],"preconditions":[{{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":"ex1_{}","pin_id":"pin_550e8400e29b41d4a716446655440000"}}]}}}}"#,
+                "a".repeat(64)
+            );
+            assert!(valid_start_frame(base.as_bytes(), method));
+            for bad in [
+                base.replace("\"sequence\":1", "\"sequence\":1,\"sequence\":2"),
+                base.replace(
+                    "\"preconditions\":[",
+                    "\"preconditions\":[],\"preconditions\":[",
+                ),
+            ] {
+                assert!(!valid_start_frame(bad.as_bytes(), method), "{method}");
+            }
+            let mut positional: Value = serde_json::from_str(&base).unwrap();
+            let selector = positional["params"]["preconditions"][0].clone();
+            positional["params"]["preconditions"][0] = json!([
+                selector["agent_id"],
+                selector["sequence"],
+                selector["execution_ref"],
+                selector["pin_id"]
+            ]);
+            assert!(!valid_start_frame(
+                positional.to_string().as_bytes(),
+                method
+            ));
+            let mut positional: Value = serde_json::from_str(&base).unwrap();
+            positional["params"]["jobs"][0] = json!(["p", "m", "review", "t", "/missing"]);
+            assert!(!valid_start_frame(
+                positional.to_string().as_bytes(),
+                method
+            ));
+            let mut positional: Value = serde_json::from_str(&base).unwrap();
+            positional["params"] = json!(["b", [], false, null, null]);
+            assert!(!valid_start_frame(
+                positional.to_string().as_bytes(),
+                method
+            ));
+        }
+    }
+
+    /// The older scalar TUI call cannot be misinterpreted as a status view.
+    #[tokio::test]
+    async fn status_legacy_scalar_is_rejected() {
+        let service = Service::new("/unused-status-fixture".into());
+        let response = respond(&service,json!({"jsonrpc":"2.0","id":1,"method":"status","params":{"agent_id":"ag-20260826-120000-0123456789"}})).await.unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response.get("result").is_none());
+    }
+
+    /// A large encoded task is refused by the frame boundary before admission.
+    #[tokio::test]
+    async fn batch_frame_limit_counts_escaped_json_bytes() {
+        let args = json!({"request_id":"b","jobs":[{"provider":"p","model":"m","profile":"review","task":"\\".repeat(512 * 1024),"workdir":"/gone"}]});
+        let mut typed: agent_run_domain::batch::StartBatchRequest =
+            serde_json::from_value(args.clone()).unwrap();
+        typed.validate_intent().unwrap();
+        let mut bytes = serde_json::to_vec(
+            &json!({"jsonrpc":"2.0","id":1,"method":"start_batch","params":args}),
+        )
+        .unwrap();
+        bytes.push(b'\n');
+        assert!(bytes.len() > MAX_FRAME);
+        let mut reader = tokio::io::BufReader::new(bytes.as_slice());
+        assert!(frame::read(&mut reader, MAX_FRAME).await.is_err());
+    }
+
+    /// Oversized response-correlation IDs are refused before touching the broker.
+    #[tokio::test]
+    async fn batch_oversized_rpc_id_refuses_before_dispatch() {
+        let service = Service::new(PathBuf::from("/nonexistent-batch-protocol-fixture"));
+        let reply = respond(
+            &service,
+            json!({"jsonrpc":"2.0","id":"x".repeat(1025),"method":"start_batch","params":{}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["error"]["code"], -32600);
     }
 
     /// Raw duplicate-map requests retain protocol correlation, envelope precedence
@@ -2365,8 +3675,105 @@ mod tests {
         let read = lanes.try_acquire("list_pools").unwrap();
         assert!(lanes.try_acquire("list_agents").is_none());
         assert!(lanes.try_acquire("start_pool").is_some());
+        assert!(lanes.try_acquire("start_batch").is_some());
         drop(read);
         assert!(lanes.try_acquire("list_pools").is_some());
+    }
+
+    /// A cancelled batch wait cannot release control capacity while work is running.
+    #[tokio::test]
+    async fn batch_control_slot_outlives_cancelled_wait() {
+        let lanes = Lanes::new(0);
+        let permit = lanes.try_acquire("start_batch").unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut task = spawn_controlled(permit, async move {
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        });
+        entered_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut task)
+                .await
+                .is_err()
+        );
+        drop(task);
+        assert!(lanes.try_acquire("start_batch").is_none());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if lanes.try_acquire("start_batch").is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Both dispatch interruption paths keep uncertainty typed through socket and MCP.
+    #[tokio::test]
+    async fn batch_control_timeout_and_panic_are_typed_unknown() {
+        let lanes = Lanes::new(0);
+        let permit = lanes.try_acquire("start_batch").unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = spawn_controlled(permit, async move {
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            None
+        });
+        entered_rx.await.unwrap();
+        let timeout = batch_control_response(task, Duration::ZERO, json!("batch-1"), true)
+            .await
+            .unwrap();
+        assert!(lanes.try_acquire("start_batch").is_none());
+        release_tx.send(()).unwrap();
+
+        let other_lanes = Lanes::new(0);
+        let permit = other_lanes.try_acquire("start_batch").unwrap();
+        let task: tokio::task::JoinHandle<Option<Value>> = spawn_controlled(permit, async {
+            panic!("synthetic dispatch panic");
+        });
+        let panic = batch_control_response(task, Duration::from_secs(2), json!("batch-2"), true)
+            .await
+            .unwrap();
+        for (response, id, rpc_code) in [(timeout, "batch-1", -32002), (panic, "batch-2", -32000)] {
+            assert_eq!(response["id"], id);
+            assert_eq!(response["error"]["code"], rpc_code);
+            assert_eq!(response["error"]["data"]["code"], "BatchOutcomeUnknown");
+            let error = broker_error(response["error"].as_object().unwrap());
+            assert_eq!(error.public().kind, "BatchOutcomeUnknown");
+            let mcp = crate::transport::mcp_text::failure_result("start_batch", &error, None, None);
+            assert_eq!(
+                mcp.structured_content.unwrap()["code"],
+                "BatchOutcomeUnknown"
+            );
+        }
+    }
+
+    /// Runtime shutdown drops pending work and releases the bounded control slot.
+    #[test]
+    fn batch_control_slot_releases_on_runtime_shutdown() {
+        let lanes = Lanes::new(0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let permit = lanes.try_acquire("start_batch").unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let task = spawn_controlled(permit, async move {
+                entered_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            entered_rx.await.unwrap();
+            drop(task);
+        });
+        assert!(lanes.try_acquire("start_batch").is_none());
+        drop(runtime);
+        assert!(lanes.try_acquire("start_batch").is_some());
     }
 
     /// Observation reads use the ordinary read permit and leave the control
@@ -2636,6 +4043,156 @@ mod tests {
         assert!(
             passes.load(SeqCst) <= settled_p + 1,
             "reconcile loop outlived shutdown"
+        );
+    }
+    /// Duplicate continuation fields must fail before generic JSON map decoding.
+    #[test]
+    fn transcript_exact_duplicate_cursor_rejected() {
+        let params = format!(
+            r#"{{"version":1,"expected_store_id":"store_00000000000000000000000000000000","selector":{{"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":"ex1_{}","pin_id":"pin_00000000000040008000000000000000"}},"cursor":"0","cursor":"1","offset":0}}"#,
+            "0".repeat(64)
+        );
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","id":7,"method":"transcript_exact","params":{params}}}"#);
+        assert!(!valid_start_frame(frame.as_bytes(), "transcript_exact"));
+    }
+
+    /// Hold methods remain unavailable to model tools and reject duplicate raw fields.
+    #[test]
+    fn lineage_hold_frames_reject_duplicate_proofs() {
+        for method in LINEAGE_HOLD_METHODS {
+            assert!(!dispatch::is_tool(method));
+        }
+        let proof = "0".repeat(128);
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"_lineage_hold_release","params":{{"version":1,"expected_store_id":"store_00000000000000000000000000000000","hold_id":"hold_00000000000040008000000000000000","signature":"{proof}","signature":"{proof}"}}}}"#
+        );
+        assert!(!valid_start_frame(
+            frame.as_bytes(),
+            "_lineage_hold_release"
+        ));
+        let valid = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"_lineage_hold_release","params":{{"version":1,"expected_store_id":"store_00000000000000000000000000000000","hold_id":"hold_00000000000040008000000000000000","signature":"{proof}"}}}}"#
+        );
+        assert!(valid_start_frame(valid.as_bytes(), "_lineage_hold_release"));
+        for duplicate in [
+            valid.replace(r#""id":7"#, r#""id":7,"id":8"#),
+            valid.replace(
+                r#""method":"_lineage_hold_release""#,
+                r#""method":"_lineage_hold_release","method":"_lineage_hold_release""#,
+            ),
+        ] {
+            assert!(!valid_start_frame(
+                duplicate.as_bytes(),
+                "_lineage_hold_release"
+            ));
+        }
+    }
+
+    /// The client never accepts a hold receipt for a different store or intent.
+    #[test]
+    fn lineage_hold_client_correlates_receipts_and_rejects_ambiguous_results() {
+        let store = "store_00112233445566778899aabbccddeeff";
+        let id = "hold_0123456789ab4cde8f0123456789abcd";
+        let agent = "ag-20261107-010203-0123456789";
+        let target = json!({"agent_id":agent,"sequence":2,"execution_ref":format!("ex1_{}", "2".repeat(64)),
+            "pin_id":"pin_112233445566478899aabbccddeeff00"});
+        let acquire = json!({"version":1,"expected_store_id":store,"request_id":"hold-fixture-1",
+            "targets":[target.clone()],
+            "verifying_key":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"});
+        let receipt = json!({"version":1,"store_id":store,"hold_id":id,
+            "fingerprint":"5407d58ddf96ca0e0b2fe7c7f3a74b363a7b502c121e4b594d7c0aa190d12f66",
+            "targets":[target],"canonical_roots":[agent]});
+        let response = json!({"receipt":receipt,"state":"active","replayed":false});
+        assert!(valid_lineage_hold_response(
+            "_lineage_hold_acquire",
+            &response,
+            &acquire
+        ));
+        let mut wrong = response.clone();
+        wrong["receipt"]["store_id"] = json!("store_ffffffffffffffffffffffffffffffff");
+        assert!(!valid_lineage_hold_response(
+            "_lineage_hold_acquire",
+            &wrong,
+            &acquire
+        ));
+        wrong = response.clone();
+        wrong["receipt"]["targets"][0]["sequence"] = json!(3);
+        assert!(!valid_lineage_hold_response(
+            "_lineage_hold_acquire",
+            &wrong,
+            &acquire
+        ));
+        wrong = response.clone();
+        wrong["state"] = json!("released");
+        assert!(!valid_lineage_hold_response(
+            "_lineage_hold_acquire",
+            &wrong,
+            &acquire
+        ));
+
+        let lookup = json!({"version":1,"expected_store_id":store,"request_id":"hold-fixture-1",
+            "fingerprint":receipt["fingerprint"]});
+        assert!(valid_lineage_hold_response(
+            "_lineage_hold_lookup",
+            &json!({"store_id":store,"found":true,"receipt":receipt,"state":"active"}),
+            &lookup
+        ));
+        assert!(!valid_lineage_hold_response(
+            "_lineage_hold_lookup",
+            &json!({"store_id":store,"found":false,"receipt":null}),
+            &lookup
+        ));
+        let release =
+            json!({"version":1,"expected_store_id":store,"hold_id":id,"signature":"0".repeat(128)});
+        let done = json!({"store_id":store,"found":true,"hold_id":id,"state":"released","already_released":false});
+        assert!(valid_lineage_hold_response(
+            "_lineage_hold_release",
+            &done,
+            &release
+        ));
+        let mut wrong = done.clone();
+        wrong["hold_id"] = json!("hold_ffffffffffff4fff8fffffffffffffff");
+        assert!(!valid_lineage_hold_response(
+            "_lineage_hold_release",
+            &wrong,
+            &release
+        ));
+        let raw = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"store_id":"{store}","found":true,"hold_id":"{id}","state":"active","state":"released","already_released":false}}}}"#
+        );
+        assert!(!valid_raw_lineage_hold_response(
+            "_lineage_hold_release",
+            raw.as_bytes()
+        ));
+    }
+
+    /// A call already waiting for the client lock cannot send after abort.
+    #[tokio::test]
+    async fn lineage_hold_abort_while_waiting_for_client_lock_never_sends() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("hold.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = BrokerClient::new(path);
+        let guard = client.connection.lock().await;
+        let mut request = Box::pin(client.call_with_timeout(
+            "_lineage_hold_acquire",
+            Some(json!({"fixture":true})),
+            2.0,
+        ));
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("request unexpectedly completed: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        client.abort();
+        drop(guard);
+        let error = request.await.unwrap_err();
+        assert!(matches!(error, Error::Runtime(ref message) if message == "broker call cancelled"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
         );
     }
 }

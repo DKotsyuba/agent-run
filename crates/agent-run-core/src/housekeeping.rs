@@ -364,7 +364,7 @@ pub async fn sweep_shared_on<B: crate::runtime_storage::LayoutBackend>(
 pub fn sweep_account_runtime(
     home: &Path,
     now: f64,
-    store: &Store,
+    store: &mut Store,
     configured_paths: &[PathBuf],
 ) -> Result<usize> {
     if !now.is_finite() || now < STORAGE_SECONDS {
@@ -455,7 +455,7 @@ async fn sweep_inner<B: crate::runtime_storage::LayoutBackend>(
             "filesystem retention requires an owned home directory",
         ));
     }
-    let mut proof = store.reader().storage_protection_snapshot()?;
+    let mut proof = store.storage_protection()?;
     let config = current_config(home, &root)
         .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
     collect_config_paths(&config, &mut proof);
@@ -1238,6 +1238,7 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
 /// Drops recognized per-attempt process recovery details only after a committed compact summary.
 /// Read-only database guards and descriptor-relative owned-file checks fail closed. Other artifacts,
 /// including candidate answers, transcripts and unresolved command receipts, are retained.
+/// Any active pin on the canonical root retains recovery details for the whole lineage.
 /// A crash or removal failure leaves files for the next collection pass without changing outcome.
 /// Handles at most budget files and returns the number removed or compacted; zero does nothing.
 /// A failed execution's sealed candidate proof is retained in a receipt without the ownership list.
@@ -1249,8 +1250,13 @@ pub fn compact_process_artifacts(
     budget: usize,
 ) -> Result<usize> {
     let _: AgentId = id.parse()?;
+    // A pin is committed atomically with its new root, before process evidence
+    // exists, and release is permanent. Thus an unpinned existing lineage cannot
+    // become pinned between this read and unlink. A future pin-existing operation
+    // must revisit that filesystem race; a read-only guard would no longer suffice.
     let safe: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN agents a ON a.id=e.agent_id
         WHERE a.id=? AND e.kind='process_summary_v1' AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')
+        AND NOT EXISTS(SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) AND hp.released=0)
         AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND (t.ownership_active=1 OR t.phase IS NOT 'cleanup_complete' OR (COALESCE(json_extract(t.cleanup_proof_json,'$.confirmed'),0)!=1 AND NOT (COALESCE(json_extract(t.cleanup_proof_json,'$.never_spawned'),0)=1 AND t.process_identity IS NULL)))))",
         [id], |row| row.get(0))?;
     if !safe || budget == 0 {
@@ -1319,7 +1325,7 @@ mod tests {
     fn count_collection_rechecks_admission_after_protection_capture() {
         let home = tempfile::tempdir().unwrap();
         agent_run_store::fixture::initialize(home.path()).unwrap();
-        let store = agent_run_store::fixture::open(home.path()).unwrap();
+        let mut store = agent_run_store::fixture::open(home.path()).unwrap();
         let at = 2_000_000_000.0;
         for index in 0..100 {
             let id = format!("ag-20330518-040000-{index:010x}");

@@ -170,9 +170,139 @@ Discover the authoritative surface at runtime:
   for every tool's parameters**. This is the contract; prefer it over any
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
-- `capabilities` (no params) — versioned compiled read schemas and transport
-  bounds. New observers should try this first, retaining `ping`/`tools` fallback
-  for older brokers. The historical `ping` response is unchanged.
+- `capabilities` — versioned compiled read schemas and transport bounds.
+  With `include_store_id:true`, it also reads this database's `store_id`;
+  without that opt-in it needs no database and returns the existing shape.
+  New observers should retain `ping`/`tools` fallback for older brokers.
+
+`start_batch` takes one `request_id` and an ordered `jobs` array of 1–20
+ordinary provider start requests. A job must omit its own `request_id` or set
+it to null. Optional `retain_history` defaults to false and is part of the
+batch identity. When true, each job receives a distinct `pin_id` in its
+receipt and the pins commit with all jobs and the receipt. All jobs and one
+permanent batch receipt commit together, or no
+job is admitted. The shared key is scoped to this Run home, not to a caller
+identity. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
+Pool enrollment namespace; `start_batch` and `batch_receipt` refuse them as
+invalid input, so a public caller can neither pre-claim nor read such a key. Exact replay requires the same durable database; replacing it under
+the same socket or restoring an older copy cannot preserve absent receipts or
+pins. A matching retry returns the original ordered `agent_id`, `sequence`,
+and opaque `execution_ref` receipt; changed intent conflicts. The reference
+identifies the admitted execution across provider attempts and is not a secret
+or an authorization capability. The receipt outlives ordinary agent history
+retention, so an old ID may no longer have a readable status or answer. Status
+and batch preconditions accept the reference together with its exact sequence.
+
+The receipt includes the actual `store_id`. Clients that need a database fence
+can record the opt-in capabilities identity with their durable intent and supply
+it as `expected_store_id` on `start_batch`. The expected ID is part of the
+fingerprint and is checked with the receipt or admission in one database
+snapshot. A different ID yields `StoreIdentityMismatch`; if a prior outcome
+was unknown, this mismatch does not prove whether that earlier request committed.
+Do not add an expected ID retrospectively to an unresolved older intent.
+The ID is generated on database creation or migration and survives ordinary
+restart. A clone or restored backup keeps the same ID, so it cannot detect
+rollback to an earlier copy; it is public identity, never a credential.
+
+An optional `preconditions` array requires a non-null `expected_store_id` and
+contains 1–20 distinct lineages in the caller's chosen order. Every element
+requires `agent_id`, positive `sequence`, `execution_ref`, and `pin_id`; null,
+an empty array, duplicate typed fields or duplicate canonical lineages are invalid.
+Inside the same local admission transaction, every selector must identify the
+latest retained execution of its lineage with verified identity, an active
+pin, complete history, no pending restart, terminal lineage and confirmed
+lineage cleanup. Any terminal outcome may qualify; this does not prove success
+or that an answer file is currently readable. The ordered conditions are part
+of the immutable intent and are echoed in the receipt. Omission preserves the
+older wire shape, and exact receipt replay precedes any new condition check.
+
+`PreconditionFailed` describes only the current physical admission attempt.
+Its `reason` is `not_met` when a required fact is known false or `unknown` when
+the evidence is insufficient. The socket exposes `error.data.code` and
+`error.data.reason`, CLI exposes `error.type` and `error.reason`, and MCP uses
+`structuredContent.code` and `structuredContent.reason`. A prior lost or
+uncertain submission remains unresolved even if a later submission fails a
+condition; retain its original intent and reconcile its permanent receipt.
+Separate CLI/MCP processes do not remember earlier outcomes for the caller.
+
+An active history pin retains the database execution and attempt rows, including
+cleanup proofs, for its entire lineage and future resumes, against both age and
+count retention. It does not prevent resume or promise to retain process files.
+The operator group calls `history_pins {"action":"release","pin_id":"..."}`
+to release it; both `already_released:false` and `true` confirm release.
+The permanent released tombstone prevents an old batch replay from reviving it.
+`PinNotFound`, timeout or an absent reply does not confirm release and does not
+restore a missing tombstone. Retry the same pin ID to reconcile an uncertain
+release. A pin ID itself grants no authority.
+
+`history_pins {"action":"list"}` lists active and released pins, with optional
+`status` (`active`, `released` or `all`), `limit` (default 100, maximum 1000),
+and exclusive `after_pin_id`. Continue with `next_after_pin_id`; null marks the
+last page. The ordering is by pin ID; concurrent new pins can require a fresh
+scan. CLI equivalents are `agent-run history-pins list` and
+`agent-run history-pins release --pin-id PIN_ID`.
+Both list and release also accept optional `expected_store_id`; their database
+scope check shares the list snapshot or release transaction respectively.
+CLI supplies it with `--expected-store-id` and obtains an ID with
+`agent-run capabilities --include-store-id`.
+
+The receipt proves admission, not process launch or task completion. Supervisor
+handoffs happen separately, and a lost reply, timeout, or uncertain commit must
+be reconciled using the same key and exact intent. `BatchOutcomeUnknown` is the
+stable error code when admission may have committed; a missing or malformed
+response remains unknown even if no code arrives. Batch transport loss is not
+retried implicitly. The whole encoded request
+must fit the existing 1 MiB socket frame and the writer's limits, even though
+each job separately permits a task up to 512 KiB. Automatic multi-agent hook
+binding is not provided. Supply an explicit `orchestrator` on each job when a
+completion notice is required, and inspect each agent's status independently.
+CLI callers can use `agent-run start-batch --spec FILE`, or `--spec -` for
+standard input. Restoring a backup taken before admission or resetting the
+state database cannot preserve a receipt absent from that database.
+
+`batch_receipt` performs a read-only lookup using the original `start_batch`
+intent, including `request_id`, ordered `jobs`, `retain_history`, optional
+ordered `preconditions`, and a required non-null `expected_store_id`. It uses the same strict decoder and fingerprint,
+without loading workdirs, configuration or quota. A committed exact match
+returns `{"found":true,"receipt":{...}}`; an absent receipt returns only
+`{"found":false}`. Absence is a snapshot fact: an earlier in-flight request
+may still commit. Wrong database or conflicting intent returns the existing
+typed error and does not establish the outcome of an earlier unknown request.
+CLI uses `agent-run batch-receipt --spec FILE` (or `--spec -`).
+For a new scoped batch, admission checks that its normalized lookup fits a
+compact MCP JSON-RPC frame with an encoded ID of up to 1024 bytes and a trailing
+LF; the same bound covers the shorter socket envelope. Extra metadata, whitespace
+or noncompact escaping still consume frame space. Existing exact replays are
+checked first. Unscoped batches cannot use the scoped receipt lookup.
+
+`status` reads one to twenty exact selectors in one SQLite snapshot:
+`{"version":1,"expected_store_id":"store_…","targets":[{"agent_id":"ag-…","sequence":1,"execution_ref":"ex1_…","pin_id":"pin_…"}]}`.
+`expected_store_id`, `execution_ref`, and `pin_id` are optional, but omitted
+identity or retention evidence cannot establish the corresponding guarantee.
+Items follow request order; each reports `match`, pin state, selected and
+retained-latest facts, coverage, restart state, lineage terminality, historical
+`success_commit`, and lineage cleanup. `retained_latest` proves latest-ever
+only when coverage is complete. `terminal_outcome` and `success_commit` refer
+to that retained latest execution in the same snapshot. `success_commit` is a
+historical database fact: it neither opens the answer file nor proves its
+current existence or bytes. A reference or pin ID is not authorization.
+
+`include_view:true` is accepted only for one selector. A verified or
+unverified selected row receives a redacted `view`; missing, mismatch, and
+unknown matches do not. The view is of the selected row, never a substituted
+tail. `view.sampled_at` and its process state are separately sampled from the
+database proof's `observed_at` and are not authority. Process IDs, process
+tokens, cleanup details, unverified policy/health payloads, raw failure text,
+and delivery attempt evidence are not returned. CLI uses
+`agent-run status --spec FILE` (or `--spec -`). Old scalar
+`status {agent_id}` requests are invalid; existing list methods are unchanged.
+The complete response must fit the transport frame; no proof is truncated.
+`view.status_scope` is always `selected_execution_raw`: its agent status,
+phase, runtime outcome and answer-available flag describe the selected row,
+even during a pending restart. Use the item's restart and lineage fields for
+the logical outcome.
+The store's row/byte/time checks are cooperative and do not impose a hard
+deadline on an individual SQLite query.
 
 Cooperative pools use five strict methods from the same table: `start_pool`
 (two to five members sharing one goal and acceptance criteria, admitted
@@ -203,8 +333,8 @@ automatic PostToolUse binding can pin its exact admission. The numeric counter
 is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
-The additive `capabilities` and `answer_chunk` methods return their exact
-structured result in MCP `structuredContent`, with a fixed text summary.
+The additive `capabilities`, `answer_chunk`, and `start_batch` methods return
+their exact structured result in MCP `structuredContent`, with a fixed text summary.
 When an answer exceeds the MCP text budget, `answer` returns a bounded summary
 with the verified artifact size, SHA-256 and execution sequence, plus a link to
 the existing local answer file where its managed path permits one. Access to
@@ -219,20 +349,89 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-Shared MCP/socket discovery advertises 18 tools: `start`, `resume`, `cancel`,
+Shared MCP/socket discovery advertises 20 tools: `start`, `start_batch`, `resume`, `cancel`,
 `steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
-`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, and
+`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, `history_pins`, and
 `agent_integration`, `capabilities`, and `answer_chunk`.
 `models` and `capacity_order` remain call-only compatibility methods in the
 same registry/dispatcher; their original structured CLI/socket responses and
-schema-1 behavior remain available, including direct MCP calls by known name.
+direct MCP calls by known name remain available. Schema-1 `capacity_order`
+and `limits` return `Unsupported` with guidance to migrate to schema 2.
+
+### Operator lineage holds (v1)
+
+The operator socket provides an opt-in compare-and-hold over 1–20 ordered,
+distinct lineages. Query `capabilities` with `{"include_lineage_holds":true}`
+to discover the v1 method names. These methods are not MCP tools; in particular,
+do not put release signatures in model calls, command-line arguments, logs or
+transcripts. Run does not control whether an external client records its input.
+
+Every request below requires `version:1` and `expected_store_id`. IDs and
+hexadecimal values use their canonical lowercase forms. The operator must
+durably retain its exact request, private signing key and optional intent
+digest before acquire; Run receives only the Ed25519 public key.
+
+| Method | Additional request fields |
+| --- | --- |
+| `_lineage_hold_acquire` | `request_id`, ordered `targets` of `{agent_id,sequence,execution_ref,pin_id}`, `verifying_key` (64 hex), optional `intent_digest` (64 hex or null) |
+| `_lineage_hold_lookup` | Original `request_id` and `fingerprint` (64 hex) |
+| `_lineage_hold_list` | `state` (`all`, `active`, or `released`), `limit` (1–100), and `after_hold_id` (exclusive cursor or null) |
+| `_lineage_hold_release` | `hold_id` and `signature` (128 hex) |
+
+Acquire verifies, in the same writer transaction, the exact store and latest
+execution, an active original pin with complete coverage, no pending or unknown
+restart, recorded successful terminal commit, and confirmed cleanup of the
+whole lineage. No hold is created if any target is unverified. An active hold
+prevents resuming or replacing its evidence and releasing its pin; overlapping
+holds protect independently. It does not authenticate a worker or a ballot.
+
+The immutable receipt contains `version`, `store_id`, `hold_id`,
+`fingerprint`, the exact ordered `targets` and corresponding
+`canonical_roots`. Acquire also returns `state` and `replayed`. An exact
+replay returns the original receipt before rechecking mutable history and never
+reactivates a released hold; a changed intent conflicts. Lookup returns
+`{store_id,found:false}` or `{store_id,found:true,receipt,state}`. Release
+returns `{store_id,found:false}` when absent or
+`{store_id,found:true,hold_id,state:"released",already_released}` after
+signature verification, including on every new repeated release. Neither
+response includes the signing key, signature or intent digest.
+
+For the v1 fingerprint, SHA-256 covers the following unambiguous bytes in
+order: ASCII `agent-run:lineage-hold:acquire:v1` and NUL; 16 raw store-ID
+bytes; the UTF-8 request-ID byte length as u16 big-endian and its exact bytes;
+the target count as u8; each target's exact 29 ASCII agent-ID bytes, sequence
+as u32 big-endian, 32 raw execution-ref bytes and 16 raw pin-ID bytes; 32
+public-key bytes; and either byte 0 for no intent digest or byte 1 followed by
+its 32 bytes. The signed release message is ASCII
+`agent-run:lineage-hold:release:v1` and NUL, followed by the 16 store-ID
+bytes, 16 hold-ID bytes and 32 fingerprint bytes. Keys must be canonical,
+nonidentity prime-order Ed25519 public keys; release uses strict verification.
+
+An error, lost acknowledgement or timeout after sending a mutation leaves its
+outcome unknown. Recover using the same store, request ID and fingerprint;
+`found:false` only describes that snapshot and does not exclude an in-flight
+commit. Do not generate another request ID as a retry. Each list page is its
+own snapshot: concurrent new holds can sort before a saved cursor. A null
+cursor marks the end of that page's snapshot; oversized responses fail rather
+than truncate. Mutations sent as JSON-RPC notifications do nothing.
+
+Holds never expire automatically, and released tombstones remain durable.
+Each store permits at most 1024 active holds; exact receipt replay and signed
+release remain available at that limit. Released tombstones continue to consume
+storage, so operators must monitor growth and abandoned holds using list and
+preserve the signing key;
+loss of the key needs separate trusted administrative recovery. There is no
+automatic protection against restoring or cloning an old database backup.
+Direct write access to the database and the broker process remains a trusted
+administrative boundary.
 
 ### Read-only observer discovery and complete answers
 
-`capabilities` accepts only `{}` and returns:
+`capabilities` accepts `{}` or `{"include_store_id":true}`. The default response
+omits the store ID and has this shape:
 
 ```json
-{"schema_version":1,"product":"agent-run","version":"0.30.0","source_revision":null,"transports":["cli","mcp","unix_socket"],"limits":{"socket_max_frame_bytes":1048576,"answer_max_bytes":16777216,"answer_chunk_default_bytes":65536,"answer_chunk_max_bytes":131072},"read_methods":[{"name":"answer_chunk","input_schema":{"type":"object"},"result_shape":{"type":"object"}}]}
+{"schema_version":1,"product":"agent-run","version":"0.31.0","source_revision":null,"transports":["cli","mcp","unix_socket"],"limits":{"socket_max_frame_bytes":1048576,"answer_max_bytes":16777216,"answer_chunk_default_bytes":65536,"answer_chunk_max_bytes":131072},"read_methods":[{"name":"answer_chunk","input_schema":{"type":"object"},"result_shape":{"type":"object"}}]}
 ```
 
 The example abbreviates schemas and the method list. The actual list derives
@@ -241,9 +440,11 @@ compatibility reads. Each entry contains its exact `name`, full `input_schema`
 and registered `result_shape` (null for historical undeclared result shapes).
 `version` is the compiled package version. `source_revision` is null because
 this build has no verified source identity input; it never guesses a deployed
-commit from a checkout or asserts release qualification. This method performs
-no database access, provider collection, inference or Bridge lookup. The CLI
-equivalent is `agent-run capabilities`, querying the resident broker.
+commit from a checkout or asserts release qualification. The default request
+does not read the database; the opt-in reads the current store ID. Neither form
+collects provider data, runs inference or looks up Bridge. The CLI equivalents
+are `agent-run capabilities` and `agent-run capabilities --include-store-id`,
+querying the resident broker.
 
 `answer_chunk` accepts the strict object
 `{"agent_id":"...","sequence":1,"expected_sha256":"64 lowercase hex characters","offset_bytes":0,"max_bytes":65536}`.
@@ -481,17 +682,19 @@ caller required it, exact scope, and reason. Historical rows return `null`.
 
 With schema 2, `capacity_order` accepts an optional exact `model` filter and
 returns provider-only advice: `schema_version`, `config_revision`,
-`capacity_revision`, `ranked_at`, and ordered `providers`. Each provider has its
+`capacity_revision`, `ranked_at`, account-free `quota_coverage`, and ordered `providers`. Each provider has its
 id, `priority_multiplier`, nullable `score`, and models with `native_model`
-and cached `quota` standing. It does not expose accounts or legacy physical-route
-aliases. An unknown model is a `ValidationError`. The view reads one committed
-snapshot without collecting quota, reserving capacity or starting work.
+and Quota-provided `quota` standing. It does not expose accounts or legacy physical-route
+aliases. An unknown model is a `ValidationError`. The view uses one newly fetched
+Quota response and one separate local read without collecting quota, reserving
+capacity or starting work. `quota_coverage.evaluated_at` is the Quota score's
+source clock, while `ranked_at` is the local projection time; local revision
+equality does not establish score freshness or cross-service atomicity.
 
 The CLI equivalent is `agent-run capacity order [--model MODEL]`. Select a
 compatible model and canonical role using `delegation_guide`; `models` is a
 structured compatibility read for existing clients.
-Schema 1 retains its historical physical-route output and rejects a model
-filter with `Unsupported`.
+Schema 1 returns `Unsupported` and suggests migration to schema 2.
 
 Three methods exist only on this socket transport: `tools` and `ping` above,
 plus:
@@ -541,13 +744,17 @@ Notes for the loop:
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
-- Use `limits` for stored quota windows, percentages, reset times and freshness.
-  With schema 2 it adds `ranking`: provider/model standing, numerical scores and
-  provider multipliers from the same committed snapshot, config revision and
-  advice clock as `items`/`observed_at`. All governing windows and exhaustion
-  facts participate; a healthy short window does not override a weekly zero.
-  Schema 1 keeps its historical window response. MCP text omits account/pool
-  identities and stays within the existing whole-response byte/row bounds.
+- Use `limits` for available Quota windows, percentages, reset times and
+  freshness. Schema 2 adds `ranking` and `coverage` (`state`, `incomplete`,
+  nullable `evaluated_at`); unreported quota is unknown when coverage is
+  incomplete. Quota unavailability produces unknown coverage, not a confirmed
+  empty history. `observed_at` equals the local `ranking.ranked_at`; score
+  evaluation uses Quota's separate clock. At most 1000 rows are returned and
+  truncation marks coverage incomplete. MCP omits account/pool identities and
+  refuses a page over its whole-response budget. Schema 1 returns `Unsupported`
+  with migration guidance. Historical storage and low-level latch code do not
+  supply these schema-2 reads; the
+  supervisor no longer writes native failures to that latch.
 - `models` and `capacity_order` retain their structured compatibility responses
   for existing CLI/socket clients, without joining the advertised MCP catalog.
 - `delegation_guide` (optional exact `provider`, `model`, `profile` filters;
@@ -594,6 +801,214 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 35, reached through the paired
+- The current database schema is version 40, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.
+
+Linux provider launches for Codex and Claude record an attempt launch journal
+and kernel incarnation. Launch correlation is not a credential or managed
+Pool authorization: managed enrollment remains unqualified until the separate
+role, admission and real-provider checks are complete. A spawning record left
+without a bound leader is unresolved; recovery must not infer that no child ran.
+
+### Exact pinned transcript export (v1)
+
+`transcript_exact` is a read-only public tool on the same CLI/socket/MCP registry.
+`capabilities.read_methods` publishes its input and output schemas. The CLI reads
+one page with `agent-run transcript-exact --spec request.json` (`--spec -` uses stdin).
+MCP returns the same complete JSON result in `structuredContent`, with a fixed text
+label; transcript text is not interpreted or rendered as instructions.
+
+```json
+{
+  "version": 1,
+  "expected_store_id": "store_0123456789abcdef0123456789abcdef",
+  "selector": {
+    "agent_id": "ag-20260826-120000-0123456789",
+    "sequence": 1,
+    "execution_ref": "ex1_0000000000000000000000000000000000000000000000000000000000000000",
+    "pin_id": "pin_00000000000040008000000000000000"
+  },
+  "cursor": "0",
+  "offset": 0
+}
+```
+
+The identities above illustrate syntax; use the real receipt and active pin.
+Each call verifies store identity, exact execution incarnation, active pin and
+complete lineage/attempt coverage through the existing status proof, in the same
+SQLite read snapshot used for message bounds and bytes. It reads only that selected
+execution. Wrong or unknown evidence returns no content. Pins prevent ordinary
+retention, not arbitrary database tampering. No filesystem spool is expanded.
+
+The first response captures `upper_seq`, the selected execution's maximum message
+sequence in that snapshot (or `"0"` for an empty transcript). All global message
+sequences/cursors are canonical decimal **strings**, bounded by `9223372036854775807`.
+They must never pass through JavaScript `Number`. Later calls must echo `upper_seq`;
+new messages and later resume executions remain outside this export.
+
+Every response repeats `store_id`, `selector`, `cursor`, `upper_seq`, and `offset`,
+with `message`, `next_cursor`, `next_offset`, and `snapshot_complete`. `message` is
+null only at the empty/end boundary. Otherwise it contains:
+
+| Field | Meaning |
+|---|---|
+| `seq` | Decimal string identifying this selected execution's immutable message |
+| `sha256` | SHA-256 of the exact complete serialized UTF-8 JSON message |
+| `total_bytes` | Complete serialized byte length |
+| `start`, `end` | Inclusive start and exclusive end byte offsets |
+| `text` | At most 32 KiB of the serialized JSON, split only at UTF-8 boundaries |
+| `complete` | This fragment reaches the end of that one message |
+
+Assemble `text` bytes in order; check offsets, identity, hash and length on every
+page, then verify the full SHA-256 before parsing the JSON. Its v1 ordered fields
+are `seq` (string), `at`, `role`, `name`, `content`, `raw_ref`, `error`,
+`error_source`, and `content_complete` (always true). Optional stored fields remain
+null. `raw_ref` is opaque historical data, never a path to open automatically.
+
+Continue with `cursor = next_cursor`, `offset = next_offset` and the unchanged
+`upper_seq`. For a nonzero offset, also send `expected_sha256 = message.sha256`;
+otherwise omit that field. The cursor advances only when that whole message ends.
+An omitted watermark requires cursor `"0"` and offset 0. Null options, ambiguous
+numeric spellings, non-UTF-8 offsets, missing cursor/watermark rows and digest
+changes are refused. One message may require many calls. Source content and
+serialized JSON are independently limited to 16 MiB; each metadata string to
+4096 bytes. Limits reject rather than truncate. Responses reserve envelope space
+within the shared 1 MiB socket/MCP frame budget.
+
+`TranscriptExportAborted` means stop: no fragment from that call is usable. In
+particular, `content_complete=false` or null aborts at the first such row; old
+spools have no stored content digest and cannot establish full content. A released
+pin aborts the next read snapshot. Already-returned pages remain historical partial
+data. `StoreIdentityMismatch` separately reports the wrong store; malformed
+continuations report `ValidationError`.
+
+Only after collecting every message from cursor `"0"` through a response with
+`snapshot_complete=true` may a client call the captured export complete. That flag
+alone is not proof the client collected preceding pages. It never proves execution
+completion, success, present filesystem contents or authority. The empty captured
+snapshot is explicit (`message=null`, watermark/cursors `"0"`, completion true),
+and stays empty when its watermark is echoed after later appends.
+
+### Exact initial task (v1)
+
+`initial_task` is a read-only public tool on the same CLI/socket/MCP registry
+(one dispatcher entry). It returns the exact initial task text of one retained
+**root** execution (sequence 1), in verified pages, or a typed `unavailable`
+state. It never reconstructs a system prompt, a Pool binding or any text from
+another string, never truncates, and does not change retention. The CLI reads one
+page with `agent-run initial-task --spec request.json` (`--spec -` uses stdin).
+MCP returns the same complete JSON in `structuredContent` with a fixed text
+label; the task is data, not instructions or authority.
+
+**Capability.** `capabilities` with `{"include_initial_task":true}` (CLI:
+`agent-run capabilities --include-initial-task`) adds
+`"initial_task":{"version":1,"method":"initial_task","modes":["strict","current"],"max_task_bytes":524288,"max_page_bytes":65536}`.
+Without the flag the key is absent, like `lineage_holds`; `initial_task` also
+appears in `read_methods` with its schemas. A build that predates the method
+rejects the unknown flag and lacks the read method.
+
+**Request** (strict object; omit optional fields, explicit `null` is refused):
+
+| Field | Meaning |
+|---|---|
+| `version` | exactly `1` |
+| `mode` | `strict` or `current` |
+| `expected_store_id` | database identity fence; required for `strict`, optional for `current` |
+| `agent_id` | canonical root agent ID; a resume alias is never normalized |
+| `sequence` | `strict`: required; `current`: optional. Only `1` can be available |
+| `execution_ref` | `strict`: required `ex1_…` receipt of the first provider attempt; `current`: optional per-page identity fence |
+| `pin_id` | `strict`: required active history pin; `current`: rejected |
+| `offset` | UTF-8 byte offset of the page, default 0, must be a character boundary |
+| `max_bytes` | page budget 4..=65536, default 65536; the page ends at a character boundary |
+| `expected_sha256`, `expected_total_bytes` | whole-text fences from an earlier page; both or neither; required for a nonzero `offset` |
+
+**Strict mode** proves, in the same SQLite read snapshot as the bytes: store
+identity, canonical root/self (`id` = root, sequence 1, no parent), the first
+attempt's computed `execution_ref`, an **active** pin of this root, and
+*complete* lineage/attempt coverage (the `status` proof: every retained
+execution and attempt is continuous with verified provider-v2 identity). **Current mode**
+reads the currently retained root without a pin: it makes no pin, coverage or
+latest-ever claim, and an unpinned result proves nothing about an older Pool
+binding or system prompt. It still checks store (if given), canonical root, first
+provider-v2 attempt and ref (and the client's `execution_ref` fence, if any).
+
+Both modes require `agents.task`, `request_json.task` and the frozen provider-v2
+task (the replay-proven `provider_request.task`) to be byte-identical text of at
+most 512 KiB (524288 bytes), NUL-free and not blank.
+
+**Result.** `state` is `available` or `unavailable`:
+
+```json
+{"state":"available","version":1,"mode":"strict","store_id":"store_0123456789abcdef0123456789abcdef",
+ "agent_id":"ag-20261109-120000-0123456789","sequence":1,
+ "execution_ref":"ex1_0000000000000000000000000000000000000000000000000000000000000000",
+ "pin_id":"pin_00000000000040008000000000000000","total_bytes":70000,
+ "sha256":"<64 lowercase hex of the whole text>","offset":0,"end":65536,"next_offset":65536,
+ "text":"…first 65536 bytes…","complete":false}
+```
+
+`pin_id` appears only in `strict`. `total_bytes` and `sha256` describe the whole
+text and are identical on every page; `next_offset` is `null` on the last page
+(`complete: true`, `end == total_bytes`). Pages are split only at UTF-8
+boundaries, so a page may be shorter than `max_bytes`.
+
+```json
+{"state":"unavailable","version":1,"mode":"strict","store_id":"store_0123456789abcdef0123456789abcdef",
+ "agent_id":"ag-20261109-120000-0123456789","reason":"pin_released"}
+```
+
+`unavailable` is a successful result, never accompanied by text, and `reason`
+is one of:
+
+| `reason` | Meaning |
+|---|---|
+| `not_found` | no retained execution has this ID (absent, or removed with no pin tombstone) |
+| `retention_deleted` | `strict` only: the pin tombstone exists but retention removed the lineage |
+| `not_root_execution` | not a canonical root, or `sequence` is not 1 (resume executions are never exported) |
+| `execution_ref_unavailable` | no usable first provider attempt to derive a ref |
+| `execution_ref_mismatch` | the supplied ref differs from the computed ref |
+| `pin_missing`, `pin_released`, `pin_mismatch` | `strict` only: pin absent, released, or owned by another root |
+| `coverage_incomplete` | `strict` only: lineage/attempt continuity is not proven complete |
+| `task_missing` | a task source is absent, not text, blank, unparsable or beyond the read budget |
+| `task_mismatch` | the three task sources disagree |
+| `task_too_large` | a task source exceeds 512 KiB |
+| `provider_identity_invalid` | the frozen provider-v2 identity does not verify |
+| `content_changed` | the supplied `expected_sha256` or `expected_total_bytes` differs from the stored text |
+
+**Errors** stay typed on every transport: `ValidationError` (malformed request,
+`null`/unknown fields, a missing strict fence, a bad `offset`/`max_bytes`, an
+offset inside a character or past the text), `StoreIdentityMismatch` (a wrong
+`expected_store_id`; no content, and not an `unavailable` result), and the usual
+`StorageError`/`IOError`/`RuntimeError` classes.
+
+**Client protocol.** Start at `offset` 0 without fences. Buffer each page's
+`text`; continue with `offset = next_offset` and the first page's `sha256` as
+`expected_sha256` and `total_bytes` as `expected_total_bytes`, every time. Check
+that each page's `offset` equals the bytes buffered so far and that `store_id`,
+`agent_id`, `execution_ref` (and, in `strict`, `pin_id`) never change; cancel on
+any change or on a session change. Only after `complete`, verify the buffered
+byte length and the SHA-256 of the whole text; use nothing before that. Any
+`unavailable` page (including `content_changed`) discards the buffer: earlier
+pages are partial historical data. Each page is its own snapshot; the fences,
+not a retained snapshot, bind the pages together.
+
+Example `strict` request:
+
+```json
+{"version":1,"mode":"strict","expected_store_id":"store_0123456789abcdef0123456789abcdef",
+ "agent_id":"ag-20261109-120000-0123456789","sequence":1,
+ "execution_ref":"ex1_0000000000000000000000000000000000000000000000000000000000000000",
+ "pin_id":"pin_00000000000040008000000000000000"}
+```
+
+Example `current` continuation (second page):
+
+```json
+{"version":1,"mode":"current","agent_id":"ag-20261109-120000-0123456789",
+ "execution_ref":"ex1_0000000000000000000000000000000000000000000000000000000000000000",
+ "offset":65536,"expected_sha256":"<sha256 from page one>","expected_total_bytes":70000}
+```
+
+The identities above illustrate syntax. A page is bounded to fit the shared 1 MiB
+socket/MCP frame even with worst-case JSON escaping. No SQLite schema change.

@@ -4,7 +4,75 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.0
+
+Released 2026-11-11.
+
+- fix(adapters): qualify managed roles on Claude Code 2.1.311 and codex-cli
+  0.167.0. Claude `mcp_status` may list the exact discovered Pool catalog
+  whose complement Run denies; the post-input `system/init` stays exact. Codex
+  managed launches disable four default-on features and `features.view_image`;
+  other reported features must be disabled, other hook events empty, and echoed
+  hook handler fields inert. Accepted drift is digested and journaled.
+- fix(core): pass real managed qualification on Claude Code 2.1.311 and
+  codex-cli 0.167.0. The worker MCP of a managed role serves exactly
+  `health_reply` and `finish` (new `AGENT_RUN_WORKER_MANAGED` marker and a
+  completion-only catalog that is never pool-capable). Claude's `mcp_status`
+  is repeated while a server is `pending`, and the identified input's
+  `command_lifecycle` acknowledgements may precede `system/init`. A managed
+  Codex thread (`environments: []`) requests and verifies no runtime
+  workspace roots, and its MCP inventory is read once servers settle.
+  Execution failure diagnostics keep a validation error's static reason.
+- feat(adapters): constrained Code Mode for managed Codex members on
+  codex-cli 0.167.0, whose models are all `code_mode_only`. The optional
+  `managed_attempt_binding.codex_code_mode_host_sha256` pins the
+  `codex-code-mode-host` Codex resolves from its own package; with it, managed
+  launches enable the host fail-closed and exclude the `clock` and `functions`
+  namespaces from Code Mode, so model code reaches exactly the allowed Pool
+  tools and `finish`/`health_reply`. `goals`, `sleep_tool`, user-input and plan
+  tools are written disabled. Without the pin a `code_mode_only` model is
+  refused before any thread. The Bridge `PreToolUse` matcher uses Codex's
+  normalized server name (`agent-pool` becomes `agent_pool`), which the
+  selector proves unambiguous. Doctor reports the host.
 - feat(release): report CI job progress while observing an exact release.
+- feat(core): add attempt-bound managed launches and the `initial_task` read.
+- feat(core): add managed enrollment for Pool members (P3) and report egress
+  actor recovery; accept custody scope prefixes.
+- feat(quotas): extract quota collection into Agent Quota and add batch,
+  status and lineage holds.
+- feat(config): allow fixed headers on custom Claude Code provider connections.
+- fix(batch): reserve `p3_` and `p3c_` batch keys for private Pool enrollment;
+  public `start_batch` and `batch_receipt` refuse them.
+- fix(core): pin the current Bridge build for each new managed execution, verify
+  current component builds when resuming a managed role, and settle, resume and
+  type stale managed launches after a Bridge upgrade.
+- fix(platform): prove peer executables by immutable loaded build and compare
+  pinned executable age on calibrated clocks.
+- fix(adapters): suppress native owner state during catalog discovery.
+- fix(core): isolate the GC memo by store incarnation.
+- build(deps): pin Bridge SDK to Agent Bridge v0.7.0.
+- build(deps): update rmcp to 3.9.0 (RUSTSEC-2026-0457, -0461, -0462) and
+  rusqlite to 0.41.1 with bundled SQLite from libsqlite3-sys 0.39.1
+  (RUSTSEC-2026-0459). tokio-rusqlite 0.8.0 is vendored in `vendor/tokio-rusqlite`
+  on rusqlite 0.41 until upstream releases it.
+- fix(config): index installed interpreters once, bound the scan per root
+  (flat bin directories, `/opt` to five levels, `~/.nvm` to four, `/usr/lib` to
+  three) and build the index outside the five-second peer-verification
+  deadline; the broker warms it at start. Hosted runners with hundreds of
+  thousands of entries under `/opt` no longer refuse legitimate managed peers.
+- fix(platform): build the managed-attempt code on macOS, and build the live
+  managed probe setup on Linux only.
+- fix(build): optimize the digest crates in the dev profile so peer
+  verification of a large pinned test executable stays inside its budget on
+  loaded CI runners; release builds are unchanged.
+- fix(ci): accept the agent/kind event index in the unresolved-cleanup probe
+  and resolve clippy findings on macOS.
+- docs(api): mirror 0.31.0 in the capabilities example.
+- Qualification on dobi (2026-11-10/11): ordinary Claude and Codex fresh and
+  resume runs passed on 2026-11-10; the managed Pool run 6c passed on
+  2026-11-11 with Agent Run e17fdf9 (runtime-identical to this release; later
+  commits change only test configuration and the dev profile), Agent Bridge
+  0.7.1 and Agent Pool 0.1.0 RC.
 
 ## 0.30.0
 

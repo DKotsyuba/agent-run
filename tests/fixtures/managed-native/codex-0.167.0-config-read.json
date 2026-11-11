@@ -1,0 +1,823 @@
+{
+ "config": {
+  "model": null,
+  "review_model": null,
+  "model_context_window": 1000000,
+  "model_auto_compact_token_limit": 780000,
+  "model_auto_compact_token_limit_scope": "total",
+  "model_provider": null,
+  "approval_policy": null,
+  "approvals_reviewer": null,
+  "sandbox_mode": null,
+  "sandbox_workspace_write": null,
+  "forced_chatgpt_workspace_id": null,
+  "forced_login_method": null,
+  "web_search": "disabled",
+  "tools": {
+   "web_search": null
+  },
+  "instructions": null,
+  "developer_instructions": null,
+  "compact_prompt": null,
+  "model_reasoning_effort": null,
+  "model_reasoning_summary": null,
+  "model_verbosity": null,
+  "service_tier": null,
+  "analytics": null,
+  "apps": null,
+  "browser_use": null,
+  "computer_use": null,
+  "desktop": null,
+  "windows": null,
+  "mcp_oauth_callback_port": null,
+  "allow_login_shell": true,
+  "cli_auth_credentials_store": "file",
+  "mcp_servers": {
+   "agent-pool": {
+    "command": "/home/agent-mcp/.local/bin/agent-pool",
+    "args": [
+     "mcp",
+     "--config",
+     "/home/agent-mcp/.agent-pool/config.toml"
+    ],
+    "env_vars": [
+     "RUSTUP_HOME",
+     "CARGO_HOME"
+    ],
+    "environment_id": "local",
+    "enabled": true,
+    "tool_timeout_sec": null,
+    "default_tools_approval_mode": "approve",
+    "enabled_tools": [
+     "pool_add",
+     "pool_cancel_replacement",
+     "pool_close",
+     "pool_create",
+     "pool_get",
+     "pool_join",
+     "pool_list",
+     "pool_member_update",
+     "pool_notify_owner",
+     "pool_post",
+     "pool_propose",
+     "pool_release_history",
+     "pool_remove",
+     "pool_send_member",
+     "pool_update",
+     "pool_vote"
+    ]
+   },
+   "agent_run_worker": {
+    "command": "/home/agent-mcp/.local/bin/agent-run",
+    "args": [
+     "_worker-mcp"
+    ],
+    "env_vars": [
+     "AGENT_RUN_WORKER_HOME",
+     "AGENT_RUN_WORKER_RUN_ID",
+     "AGENT_RUN_WORKER_ATTEMPT_ID",
+     "AGENT_RUN_WORKER_TOKEN",
+     "AGENT_RUN_WORKER_FINISH"
+    ],
+    "environment_id": "local",
+    "enabled": true,
+    "tool_timeout_sec": null,
+    "default_tools_approval_mode": "approve",
+    "enabled_tools": [
+     "finish",
+     "health_reply"
+    ]
+   }
+  },
+  "mcp_oauth_callback_url": null,
+  "model_catalog_json": null,
+  "experimental_realtime_ws_base_url": null,
+  "memories": null,
+  "model_providers": {},
+  "notice": null,
+  "tui": null,
+  "agents": {
+   "enabled": false,
+   "max_concurrent_threads_per_session": null,
+   "max_depth": null,
+   "default_subagent_model": null,
+   "default_subagent_reasoning_effort": null,
+   "job_max_runtime_seconds": null,
+   "interrupt_message": null
+  },
+  "js_repl_node_module_dirs": null,
+  "mcp_oauth_credentials_store": "auto",
+  "goals": null,
+  "features": {
+   "code_mode": {
+    "enabled": false
+   },
+   "code_mode_host": false,
+   "multi_agent_v2": false,
+   "network_proxy": null,
+   "apps": false,
+   "browser_use": false,
+   "computer_use": false,
+   "hooks": true,
+   "js_repl": false,
+   "multi_agent": false,
+   "plugins": false,
+   "remote_plugin": false,
+   "request_permissions_tool": false,
+   "shell_tool": false,
+   "skill_mcp_dependency_install": false,
+   "skill_search": false,
+   "standalone_web_search": false,
+   "tool_suggest": false,
+   "unified_exec": false,
+   "api_key_cyber_access_programs": true,
+   "api_key_model_discovery": true,
+   "auth_elicitation": true,
+   "background_paginated_rollout_migration": false,
+   "codex_apps_mcp_2026_07_28": false,
+   "mcp_2026_07_28": false,
+   "mcp_connection_sharing": false,
+   "memories": false,
+   "mentions_v2": true,
+   "remote_control": false,
+   "windows_sandbox_service": false
+  },
+  "ghost_snapshot": null,
+  "experimental_use_unified_exec_tool": null,
+  "model_instructions_file": null,
+  "tool_output_token_limit": null,
+  "include_permissions_instructions": true,
+  "include_environment_context_time": true,
+  "personality": null,
+  "otel": null,
+  "experimental_realtime_ws_startup_context": null,
+  "project_doc_fallback_filenames": [],
+  "history": {
+   "persistence": "save-all",
+   "max_bytes": null
+  },
+  "experimental_realtime_start_instructions": null,
+  "experimental_realtime_ws_model": null,
+  "orchestrator": null,
+  "include_collaboration_mode_instructions": true,
+  "cloud": null,
+  "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+  "plan_mode_reasoning_effort": null,
+  "mcp_optional_startup_grace_ms": null,
+  "shell_environment_policy": {
+   "inherit": null,
+   "ignore_default_excludes": null,
+   "exclude": null,
+   "set": null,
+   "include_only": null,
+   "filters": null,
+   "experimental_use_profile": null
+  },
+  "experimental_thread_store_endpoint": null,
+  "project_root_markers": [
+   ".git"
+  ],
+  "experimental_compact_prompt_file": null,
+  "skills": null,
+  "mcp_enterprise_managed_auth": null,
+  "sqlite_home": null,
+  "model_post_turn_compact_threshold_percent": null,
+  "projects": {
+   "/home/agent-mcp/.agent-pool-qual/work/m2": {
+    "trust_level": "trusted"
+   }
+  },
+  "marketplaces": {},
+  "project_doc_max_bytes": 32768,
+  "profile": null,
+  "allow_symlinked_codex_home": null,
+  "profiles": {},
+  "openai_base_url": null,
+  "check_for_update_on_startup": null,
+  "daybreak": null,
+  "default_permissions": null,
+  "feedback": null,
+  "include_apps_instructions": true,
+  "responses_api_metadata": null,
+  "js_repl_node_path": null,
+  "file_opener": "vscode",
+  "experimental_realtime_webrtc_call_base_url": null,
+  "include_environment_context": true,
+  "show_raw_agent_reasoning": null,
+  "realtime": null,
+  "experimental_realtime_ws_backend_prompt": null,
+  "hooks": {
+   "PreModelRequest": [],
+   "PostModelRequest": [],
+   "PreToolUse": [
+    {
+     "matcher": "mcp__agent-pool__.*",
+     "hooks": [
+      {
+       "type": "command",
+       "command": "/opt/agent-bridge/releases/0.7.0+c12376fe8a89/bin/bridge-hook /home/agent-mcp/.agent-bridge/run/ch/c.sock codex",
+       "commandWindows": null,
+       "timeout": 600,
+       "async": false,
+       "statusMessage": null
+      }
+     ]
+    }
+   ],
+   "PermissionRequest": [
+    {
+     "matcher": "^(?:mcp__agent-pool__|mcp__agent_pool__|mcp__agent_run_worker__)",
+     "hooks": [
+      {
+       "type": "command",
+       "command": "/home/agent-mcp/.local/bin/agent-run _permission-request --allow-mcp agent-pool --allow-mcp agent_run_worker",
+       "commandWindows": null,
+       "timeout": 600,
+       "async": false,
+       "statusMessage": null
+      }
+     ]
+    }
+   ],
+   "PostToolUse": [],
+   "PreCompact": [],
+   "PostCompact": [],
+   "SessionStart": [],
+   "SessionEnd": [],
+   "UserPromptSubmit": [],
+   "SubagentStart": [],
+   "SubagentStop": [],
+   "Stop": [],
+   "Interrupt": [],
+   "state": {
+    "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml:permission_request:0:0": {
+     "trusted_hash": "sha256:cecc02d49f7c6548936c8e29f50c43aecd6aeb9ff6900025b45aff48ab84e36f"
+    },
+    "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml:pre_tool_use:0:0": {
+     "trusted_hash": "sha256:272cfb57e76774f961f2cfc77acd3cd8372d2e26edcecfcc85a1bed5bdaed848"
+    }
+   }
+  },
+  "tool_suggest": null,
+  "audio": null,
+  "notify": null,
+  "plugins": {},
+  "permissions": null,
+  "apps_mcp_product_sku": null,
+  "thread_unload_delay_secs": null,
+  "auto_review": null,
+  "experimental_thread_store": null,
+  "background_terminal_max_timeout": 300000,
+  "log_dir": null,
+  "hide_agent_reasoning": false,
+  "suppress_unstable_features_warning": null,
+  "disable_paste_burst": null,
+  "oss_provider": null
+ },
+ "origins": {
+  "mcp_servers.agent-pool.enabled_tools.12": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.skill_mcp_dependency_install": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.10": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.env_vars.0": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.code_mode_host": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.8": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.9": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.env_vars.0": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.env_vars.4": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.hooks": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.unified_exec": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "model_auto_compact_token_limit": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.2": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.env_vars.1": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.enabled_tools.1": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "agents.enabled": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PreToolUse.0.hooks.0.type": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "projects./home/agent-mcp/.agent-pool-qual/work/m2.trust_level": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.plugins": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.args.2": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "model_context_window": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.11": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.6": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.skill_search": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.state./home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml:pre_tool_use:0:0.trusted_hash": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.remote_plugin": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "model_auto_compact_token_limit_scope": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.4": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.args.1": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.browser_use": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.standalone_web_search": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.env_vars.3": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.apps": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.js_repl": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.7": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PermissionRequest.0.hooks.0.timeout": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.13": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.env_vars.1": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.multi_agent_v2.enabled": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.command": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.3": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PermissionRequest.0.hooks.0.type": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PermissionRequest.0.matcher": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "tools.view_image": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PreToolUse.0.hooks.0.command": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.args.0": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.multi_agent": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.command": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.shell_tool": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.state./home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml:permission_request:0:0.trusted_hash": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.0": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.1": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PermissionRequest.0.hooks.0.command": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.14": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "web_search": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PreToolUse.0.matcher": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.15": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.tool_suggest": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.computer_use": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.env_vars.2": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.enabled_tools.0": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.default_tools_approval_mode": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.code_mode.enabled": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.args.0": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent-pool.enabled_tools.5": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "hooks.PreToolUse.0.hooks.0.timeout": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "mcp_servers.agent_run_worker.default_tools_approval_mode": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  },
+  "features.request_permissions_tool": {
+   "name": {
+    "type": "user",
+    "file": "/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-013114-0cfb3a9d16/config.toml",
+    "profile": null
+   },
+   "version": "sha256:af7fc344495482f0e45502878e1af18d570119b029cc49a2f780d207e3055da3"
+  }
+ }
+}

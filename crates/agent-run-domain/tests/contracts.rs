@@ -256,10 +256,9 @@ fn credential_references_are_typed_storage_locations() {
 
 use agent_run_domain::catalog::{
     AccountId, AccountRecord, AccountStatus, AttemptCredentials, AuthFamily, HarnessId,
-    LegacyRuntime, LimitsSource, NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding,
-    ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderId, ProviderModel,
-    ProviderProtocol, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet,
-    QuotaModelObservation, QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretRef,
+    LegacyRuntime, LimitsSource, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
+    ProviderConnection, ProviderDefinition, ProviderId, ProviderModel, ProviderProtocol,
+    QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, ResolvedLaunchAuthority, SecretRef,
     SelectionIntent, decode_legacy_request, legacy_runtime,
 };
 
@@ -419,6 +418,7 @@ fn codex_appserver_source_requires_a_probeable_native_codex_login() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: false,
+        headers: Default::default(),
     };
     assert!(custom.validate().is_err());
     let mut claude = provider.clone();
@@ -513,6 +513,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
             protocol: ProviderProtocol::Responses,
             auth_header: Default::default(),
             allow_loopback_http: false,
+            headers: Default::default(),
         };
         assert!(provider.validate().is_err(), "{endpoint}");
     }
@@ -521,6 +522,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: false,
+        headers: Default::default(),
     };
     assert!(provider.validate().is_err());
     provider.connection = ProviderConnection::Custom {
@@ -528,6 +530,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: true,
+        headers: Default::default(),
     };
     provider.validate().unwrap();
     provider.connection = ProviderConnection::Custom {
@@ -535,6 +538,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: true,
+        headers: Default::default(),
     };
     provider.validate().unwrap();
     provider.connection = ProviderConnection::Custom {
@@ -542,6 +546,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: true,
+        headers: Default::default(),
     };
     assert!(provider.validate().is_err());
     provider.connection = ProviderConnection::Native;
@@ -613,109 +618,6 @@ fn aliases_and_lease_scope_remain_bound_to_one_account() {
     );
 }
 
-/// Collector observations preserve missing values and reject cross-account
-/// keys, invalid percentages, stale timing, and duplicate model membership.
-#[test]
-fn normalized_quota_snapshot_validates_physical_membership() {
-    let account: AccountId = "acct-codex-native".parse().unwrap();
-    let key = PhysicalQuotaKey::new(&account, "tokens").unwrap();
-    let mut snapshot = NormalizedQuotaSnapshot {
-        account: account.clone(),
-        models: vec![QuotaModelObservation {
-            model: "gpt-5.1".into(),
-            pools: vec![QuotaPoolObservation {
-                key,
-                windows: vec![QuotaWindow {
-                    source: "provider".into(),
-                    name: "5h".into(),
-                    remaining_percent: None,
-                    reset_at: None,
-                    observed_at: 1.0,
-                    valid_until: 2.0,
-                }],
-            }],
-        }],
-    };
-    snapshot.validate().unwrap();
-    snapshot.models[0].pools.push(QuotaPoolObservation {
-        key: PhysicalQuotaKey::new(&account, "requests").unwrap(),
-        windows: vec![],
-    });
-    snapshot.validate().unwrap();
-    snapshot.models[0].pools.push(QuotaPoolObservation {
-        key: PhysicalQuotaKey::new(&"acct-other".parse().unwrap(), "tokens").unwrap(),
-        windows: vec![],
-    });
-    assert!(snapshot.validate().is_err());
-    snapshot.models[0].pools.pop();
-    snapshot.models[0].pools[0].windows[0].remaining_percent = Some(101.0);
-    assert!(snapshot.validate().is_err());
-}
-
-/// Membership is per window: models sharing a physical pool may each observe
-/// only the windows that govern them, and window order is immaterial, but one
-/// physical window repeated under several models must carry the same fact.
-#[test]
-fn shared_quota_pool_observations_agree_across_models() {
-    let account: AccountId = "acct".parse().unwrap();
-    let pool = QuotaPoolObservation {
-        key: PhysicalQuotaKey::new(&account, "shared").unwrap(),
-        windows: vec![
-            QuotaWindow {
-                source: "provider".into(),
-                name: "5h".into(),
-                remaining_percent: Some(90.0),
-                reset_at: None,
-                observed_at: 1.0,
-                valid_until: 2.0,
-            },
-            QuotaWindow {
-                source: "provider".into(),
-                name: "7d".into(),
-                remaining_percent: None,
-                reset_at: Some(5.0),
-                observed_at: 1.0,
-                valid_until: 2.0,
-            },
-        ],
-    };
-    let mut snapshot = NormalizedQuotaSnapshot {
-        account,
-        models: vec![
-            QuotaModelObservation {
-                model: "m1".into(),
-                pools: vec![pool.clone()],
-            },
-            QuotaModelObservation {
-                model: "m2".into(),
-                pools: vec![pool.clone()],
-            },
-        ],
-    };
-    snapshot.models[1].pools[0].windows.reverse();
-    snapshot.validate().unwrap();
-    snapshot.models[1].pools[0].windows[1].remaining_percent = Some(5.0);
-    assert!(snapshot.validate().is_err());
-    // m2 governed by the `5h` window only: a valid per-window membership.
-    snapshot.models[1].pools[0].windows = vec![pool.windows[0].clone()];
-    snapshot.validate().unwrap();
-    // The same physical `5h` window with another value still disagrees.
-    snapshot.models[1].pools[0].windows[0].remaining_percent = Some(10.0);
-    assert!(snapshot.validate().is_err());
-    snapshot.models[1].pools[0].windows = pool.windows.clone();
-    snapshot.models[1].pools[0].windows[1].remaining_percent = Some(1.0);
-    assert!(snapshot.validate().is_err());
-    snapshot.models[1].pools[0].windows = pool.windows.clone();
-    snapshot.models[1].pools[0].windows[0].reset_at = Some(3.0);
-    assert!(snapshot.validate().is_err());
-    snapshot.models[1].pools[0].windows = pool.windows.clone();
-    snapshot.models[1].pools[0].windows[0].observed_at = 1.5;
-    assert!(snapshot.validate().is_err());
-    snapshot.models[1].pools[0].windows = pool.windows.clone();
-    snapshot.models[1].pools[0].windows[0].valid_until = 3.0;
-    assert!(snapshot.validate().is_err());
-}
-
 /// Auto and pinned intents are distinct, persisted with the candidate set, and
 /// a pinned intent must appear among the ordered candidates.
 #[test]
@@ -735,6 +637,7 @@ fn quota_candidate_set_preserves_pinned_and_auto_intent() {
         intent: SelectionIntent::Pinned(account.clone()),
         candidates: vec![candidate],
         capacity_revision: 7,
+        quota_decision: None,
     };
     set.validate().unwrap();
     let wire = serde_json::to_value(&set).unwrap();
@@ -779,6 +682,7 @@ fn quota_candidate_rank_groups_are_ordered() {
             })
             .collect(),
         capacity_revision: 0,
+        quota_decision: None,
     };
     set.validate().unwrap();
     set.candidates[1].rank = 0;

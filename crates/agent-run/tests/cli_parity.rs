@@ -131,6 +131,11 @@ fn python_cli_spec_command_surface_is_present() {
     assert_eq!(rows.len(), 33, "the Python capture has 33 command records");
     for row in rows {
         let path = row["command"].as_str().expect("command name");
+        // The archived Python capture is immutable; collection and its
+        // launchd job moved out of the current Agent Run CLI.
+        if matches!(path, "capacity collect" | "capacity launchd") {
+            continue;
+        }
         let mut command = command_at(&root, path);
         command.build();
         let mut expected_options = row["actions"]
@@ -539,119 +544,30 @@ fn python_hook_transport_is_per_runtime() {
     }
 }
 
-/// Mirrors `test_cli.py::test_capacity_launchd_renders_config_without_state_or_collection`.
+/// Retired capacity worker commands fail at parsing before any local state,
+/// collector executable or launchd job can be created.
 #[test]
-fn python_capacity_launchd_renders_config_without_state_or_collection() {
-    if !cfg!(target_os = "macos") {
-        return;
+fn retired_capacity_worker_commands_refuse_without_touching_home() {
+    let temp = tempdir().expect("temporary parent");
+    let home = temp.path().join("uncreated-home");
+    for args in [
+        vec!["capacity", "collect", "--once"],
+        vec!["capacity", "launchd", "--binary", "/bin/true"],
+    ] {
+        let output = agent_run(&home, &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let error: Value = serde_json::from_slice(&output.stderr).expect("JSON parser error");
+        assert_eq!(error["error"]["type"], "ValidationError", "{args:?}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unrecognized subcommand"),
+            "{args:?}"
+        );
+        assert!(!home.exists(), "{args:?} touched the home");
     }
-    let temp = tempdir().expect("temporary home");
-    let home = resolved_home(&temp);
-    let config = home.join("config.toml");
-    fs::write(
-        &config,
-        "schema_version = 1\n[capacity]\ncollect_interval_seconds = 17\n",
-    )
-    .expect("capacity config writes");
-    let binary = home.join("agent&<run>");
-    let binary_text = binary.to_str().expect("UTF-8 binary path");
-    let args = ["capacity", "launchd", "--binary", binary_text];
-
-    let output = agent_run(&home, &args);
-    let rendered = rendered_descriptor(&home, &output);
-    assert_eq!(
-        rendered
-            .as_object()
-            .expect("descriptor object")
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["argv", "interval_seconds", "label", "plist"])
-    );
-    assert_eq!(rendered["label"], "com.pluto.agent-run.capacity");
-    assert_eq!(rendered["interval_seconds"], 17);
-    assert_eq!(
-        rendered["argv"],
-        serde_json::json!([binary_text, "capacity", "collect", "--once"])
-    );
-    let plist = rendered["plist"].as_str().expect("plist text");
-    assert!(
-        plist.contains(&format!(
-            "<string>{}/agent&amp;&lt;run&gt;</string>",
-            home.display()
-        )),
-        "{plist}"
-    );
-    assert!(
-        plist.contains("<key>StartInterval</key><integer>17</integer>"),
-        "{plist}"
-    );
-    assert!(plist.contains("<key>RunAtLoad</key><false/>"), "{plist}");
-    assert!(!plist.contains("<key>KeepAlive</key>"), "{plist}");
-    assert!(
-        plist.contains("<key>StandardOutPath</key><string>/dev/null</string>"),
-        "{plist}"
-    );
-    assert!(
-        plist.contains(&format!(
-            "<key>StandardErrorPath</key><string>{}</string>",
-            home.join("capacity-worker.err.log").display()
-        )),
-        "{plist}"
-    );
-
-    fs::write(
-        &config,
-        "schema_version = 1\n[capacity]\ncollect_interval_seconds = 19\n",
-    )
-    .expect("capacity config rewrites");
-    let stdout_log = home.join("capacity<&out.log");
-    let stderr_log = home.join("capacity&err.log");
-    let output = agent_run(
-        &home,
-        &[
-            "capacity",
-            "launchd",
-            "--binary",
-            binary_text,
-            "--label",
-            "com.example.<capacity&>",
-            "--stdout-log",
-            stdout_log.to_str().expect("UTF-8 stdout log"),
-            "--stderr-log",
-            stderr_log.to_str().expect("UTF-8 stderr log"),
-        ],
-    );
-    let rendered = rendered_descriptor(&home, &output);
-    assert_eq!(rendered["interval_seconds"], 19);
-    let plist = rendered["plist"].as_str().expect("plist text");
-    assert!(
-        plist.contains("<key>Label</key><string>com.example.&lt;capacity&amp;&gt;</string>"),
-        "{plist}"
-    );
-    assert!(
-        plist.contains(&format!(
-            "<key>StandardOutPath</key><string>{}/capacity&lt;&amp;out.log</string>",
-            home.display()
-        )),
-        "{plist}"
-    );
-    assert!(
-        plist.contains(&format!(
-            "<key>StandardErrorPath</key><string>{}/capacity&amp;err.log</string>",
-            home.display()
-        )),
-        "{plist}"
-    );
-    assert!(!plist.contains("<key>KeepAlive</key>"), "{plist}");
-
-    let relative = agent_run(&home, &["capacity", "launchd", "--binary", "agent-run"]);
-    assert_eq!(relative.status.code(), Some(2));
-    assert!(relative.stdout.is_empty(), "{relative:?}");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&relative.stderr).expect("JSON error envelope")["error"]["type"],
-        "ValidationError"
-    );
 }
 
 /// Mirrors `test_cli.py::test_delivery_launchd_renders_a_durable_bounded_sweeper`.

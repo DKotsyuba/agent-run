@@ -2,7 +2,7 @@
 //! private homes: admissions commit with their receipt and replay by request
 //! identity, delivery and ledger maintenance rows run as bounded batches,
 //! stale unscoped receipts and watermarks are pruned, recovery evidence
-//! reads (never occupies) the original receipt, and capacity, delivery,
+//! reads (never occupies) the original receipt, and delivery,
 //! reconciliation, service and history rows apply only their guarded
 //! transitions.
 mod common;
@@ -13,13 +13,12 @@ use agent_run_domain::{
 };
 use agent_run_store::{
     ops::{
-        AdmitStart, AdmitStartOutput, AppendJournal, CapacitySampleRow, ClaimDelivery,
-        CompleteDelivery, DeliveryCompletion, DeliveryPolicySpec, EnsureServiceGeneration,
-        ExpectedOwnership, ExpireUnboundDeliveries, GateStep, GenerationAction, JournalFragment,
-        LocalEnvelope, LocalOp, MarkLost, MarkServiceReady, MarkServiceUnhealthy, OrphanOutcome,
-        PersistCapacitySamples, PersistRecoveryObservation, PrepareServiceGate,
-        PruneCapacitySamples, PruneHistoryBatch, PruneIncidentLedger, PruneReceipts,
-        ReconcileReapedAgent, RecoveryRecorded, ReleaseOrphanedAttempt, RemoteOp,
+        AdmitStart, AdmitStartOutput, AppendJournal, ClaimDelivery, CompleteDelivery,
+        DeliveryCompletion, DeliveryPolicySpec, EnsureServiceGeneration, ExpectedOwnership,
+        ExpireUnboundDeliveries, GateStep, GenerationAction, JournalFragment, LocalEnvelope,
+        LocalOp, MarkLost, MarkServiceReady, MarkServiceUnhealthy, OrphanOutcome,
+        PersistRecoveryObservation, PrepareServiceGate, PruneHistoryBatch, PruneIncidentLedger,
+        PruneReceipts, ReconcileReapedAgent, RecoveryRecorded, ReleaseOrphanedAttempt, RemoteOp,
         StopServiceGeneration, WriteEnvelope,
     },
     writer::{StoreWriter, WriterLease},
@@ -381,15 +380,6 @@ impl Fixture {
         }
     }
 
-    /// Refuse a wire operation through the same fenced transaction while preserving its durable rejection.
-    fn refuse_remote(&mut self, op: RemoteOp) -> agent_run_domain::storage::StorageRejection {
-        let envelope = self.remote(op);
-        match self.writer.apply(&WriteAuthority::Broker, &envelope) {
-            SubmitResult::Rejected(refusal) => refusal,
-            other => panic!("not refused: {other:?}"),
-        }
-    }
-
     /// Admits one execution and returns its id.
     fn admitted(&self) -> AgentId {
         let mut store = self.home.store();
@@ -412,92 +402,6 @@ impl Fixture {
             .query_row(query, [], |row| row.get(0))
             .unwrap()
     }
-}
-
-/// A valid slice persists its samples and route snapshot and trims to the
-/// retention bound; malformed topology, an unmeasured pool key, duplicate or
-/// cross-runtime samples, an out-of-range percentage and a zero retention
-/// are durable validation refusals with nothing written.
-#[test]
-fn capacity_slices_persist_and_trim() {
-    let mut f = Fixture::new();
-    let sample = |runtime: &str, window: &str, percent: f64| CapacitySampleRow {
-        runtime: runtime.into(),
-        lane: "default".into(),
-        window: window.into(),
-        target: None,
-        source: "native".into(),
-        remaining_percent: Some(percent),
-        reset_at: None,
-        observed_at: 10.0,
-        valid_until: 20.0,
-    };
-    let key = |window: &str| json!({"runtime":"claude","lane":"default","window":window,"target":null,"source":"native"});
-    let topology =
-        json!({"pools":[{"pool_id":"p","keys":[key("five_hour"),key("weekly")]}],"routes":[]})
-            .to_string();
-    let slice = |topology: &str, samples: Vec<CapacitySampleRow>, retention: usize| {
-        RemoteOp::from(PersistCapacitySamples {
-            runtime: "claude".into(),
-            scope_id: "scope".into(),
-            observed_at: 10.0,
-            valid_until: 20.0,
-            topology_json: topology.into(),
-            samples,
-            retention,
-        })
-    };
-    let good = || {
-        vec![
-            sample("claude", "five_hour", 50.0),
-            sample("claude", "weekly", 50.0),
-        ]
-    };
-    let receipt = f.commit_remote(slice(&topology, good(), 1));
-    assert_eq!(receipt.result, json!(2));
-    assert_eq!(f.count("SELECT COUNT(*) FROM capacity_samples"), 1);
-    assert_eq!(f.count("SELECT COUNT(*) FROM capacity_route_snapshots"), 1);
-    let unmeasured =
-        json!({"pools":[{"pool_id":"p","keys":[key("five_hour"),key("monthly")]}],"routes":[]})
-            .to_string();
-    for bad in [
-        slice("not json", good(), 1),
-        slice(&unmeasured, good(), 1),
-        slice(
-            &topology,
-            vec![
-                sample("claude", "five_hour", 50.0),
-                sample("claude", "weekly", 50.0),
-                sample("claude", "five_hour", 40.0),
-            ],
-            1,
-        ),
-        slice(
-            &topology,
-            vec![
-                sample("codex", "five_hour", 50.0),
-                sample("claude", "weekly", 50.0),
-            ],
-            1,
-        ),
-        slice(
-            &topology,
-            vec![
-                sample("claude", "five_hour", 150.0),
-                sample("claude", "weekly", 50.0),
-            ],
-            1,
-        ),
-    ] {
-        let envelope = f.remote(bad);
-        assert!(matches!(
-            f.writer.apply(&WriteAuthority::Broker, &envelope),
-            SubmitResult::Rejected(refusal) if refusal.durable
-        ));
-    }
-    let zero = f.refuse_remote(RemoteOp::from(PruneCapacitySamples { retention: 0 }));
-    assert!(zero.durable);
-    assert_eq!(f.count("SELECT COUNT(*) FROM capacity_samples"), 1);
 }
 
 /// The delivery policy used by these tests.

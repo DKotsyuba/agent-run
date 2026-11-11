@@ -291,6 +291,7 @@ pub fn plan_v1(
     }
     let mut config = ProviderConfig {
         schema_version: 2,
+        managed_attempt_binding: None,
         core: old.core.clone(),
         // The retired CodexBar binary is v1 input only and never carried over.
         capacity: crate::config::Capacity {

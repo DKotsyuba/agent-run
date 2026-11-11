@@ -170,6 +170,8 @@ pub struct Process {
     pub owner: OwnedProcess,
     /// Optional launch-owned reader conduit; only the core event loop may act on its requests.
     pub native_owner: Option<crate::native_owner::Owner>,
+    /// Distinct managed owner-v2 listener; both owner channels share the core lane.
+    pub native_owner_v2: Option<crate::native_owner_v2::Owner>,
     events: mpsc::Receiver<Event>,
     tasks: Vec<JoinHandle<()>>,
     pub backlog: VecDeque<Event>,
@@ -203,7 +205,7 @@ impl Process {
     /// forged locators, and opted-in children receive only their actual endpoint
     /// locator. The core remains the sole engine writer.
     pub fn spawn(plan: &LaunchPlan) -> Result<Self> {
-        Self::spawn_with_stdout(plan, false)
+        Self::spawn_with_stdout(plan, false, None, false)
     }
 
     /// Spawns an owned HTTP server whose stdin is a lifetime lease, not RPC.
@@ -211,14 +213,48 @@ impl Process {
     /// and discarded as native diagnostics. EOF/oversized frames still fail.
     /// All environment, ownership, stderr and reaping behavior equals `spawn`.
     pub fn spawn_lease(plan: &LaunchPlan) -> Result<Self> {
-        Self::spawn_with_stdout(plan, true)
+        Self::spawn_with_stdout(plan, true, None, false)
+    }
+
+    /// Spawn a managed-selected native harness. Ordinary v1 owner is always
+    /// suppressed; only an explicitly configured v2 endpoint can be injected.
+    pub fn spawn_managed(
+        plan: &LaunchPlan,
+        v2: Option<crate::native_owner_v2::Config>,
+    ) -> Result<Self> {
+        Self::spawn_with_stdout(plan, false, v2, true)
     }
 
     /// Owns the common spawn implementation; `lease` tolerates only non-JSON
     /// stdout diagnostics, without retrying, persisting them or changing bounds.
-    fn spawn_with_stdout(plan: &LaunchPlan, lease: bool) -> Result<Self> {
+    fn spawn_with_stdout(
+        plan: &LaunchPlan,
+        lease: bool,
+        v2: Option<crate::native_owner_v2::Config>,
+        managed: bool,
+    ) -> Result<Self> {
         let mut environment = plan.environment.clone();
-        let native_owner = crate::native_owner::Owner::prepare(&mut environment)?;
+        let native_owner = if managed {
+            environment.remove(crate::native_owner::LOCATOR);
+            None
+        } else {
+            crate::native_owner::Owner::prepare(&mut environment)?
+        };
+        let native_owner_v2 = if managed {
+            match v2 {
+                Some(config) => Some(crate::native_owner_v2::Owner::prepare(
+                    &mut environment,
+                    config,
+                )?),
+                None => {
+                    environment.remove(crate::native_owner_v2::LOCATOR);
+                    None
+                }
+            }
+        } else {
+            environment.remove(crate::native_owner_v2::LOCATOR);
+            None
+        };
         let redactor = Redactor::from_environment(&environment);
         let mut command = Command::new(&plan.binary);
         command
@@ -292,6 +328,7 @@ impl Process {
             input,
             owner,
             native_owner,
+            native_owner_v2,
             events,
             tasks: vec![reader, errors],
             backlog: VecDeque::new(),
@@ -1002,5 +1039,44 @@ mod tests {
             );
             process.reap().await;
         }
+    }
+
+    #[tokio::test]
+    async fn v2_missing_no_v1_fallback() {
+        use super::{Event, Process};
+        use crate::LaunchPlan;
+        use std::{collections::BTreeMap, time::Duration};
+        let plan = LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf '{\"v1\":\"%s\",\"v2\":\"%s\"}\\n' \"${BRIDGE_NATIVE_OWNER_SOCKET-unset}\" \"${BRIDGE_NATIVE_OWNER_SOCKET_V2-unset}\"; read stop".into()],
+            cwd: std::env::current_dir().unwrap(),
+            environment: BTreeMap::from([
+                ("BRIDGE_NATIVE_OWNER_CHANNEL".into(), "/invalid/channel".into()),
+                ("BRIDGE_NATIVE_OWNER_DIRECTORY".into(), "/invalid/directory".into()),
+                ("BRIDGE_NATIVE_OWNER_SOCKET".into(), "forged-v1".into()),
+                ("BRIDGE_NATIVE_OWNER_SOCKET_V2".into(), "forged-v2".into()),
+            ]),
+            initial_input: None,
+        };
+        let mut process = Process::spawn_managed(&plan, None).unwrap();
+        assert!(process.native_owner.is_none());
+        assert!(process.native_owner_v2.is_none());
+        let event = tokio::time::timeout(Duration::from_secs(5), process.next())
+            .await
+            .unwrap();
+        let Event::Json(value) = event else {
+            panic!("synthetic harness did not report its environment")
+        };
+        assert_eq!(value["v1"], "unset");
+        assert_eq!(value["v2"], "unset");
+        assert!(
+            process
+                .owner
+                .cleanup(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .confirmed
+        );
+        process.reap().await;
     }
 }

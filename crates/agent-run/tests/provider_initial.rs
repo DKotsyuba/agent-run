@@ -46,6 +46,9 @@ fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 #[path = "provider_initial/sqlite_busy.rs"]
 mod sqlite_busy;
 
+#[path = "provider_initial/quota_synthetic.rs"]
+mod quota_synthetic;
+
 #[path = "support/test_broker.rs"]
 mod test_broker;
 
@@ -1078,6 +1081,7 @@ fn candidates(revision: i64) -> QuotaCandidateSet {
             quota_known: true,
         }],
         capacity_revision: revision,
+        quota_decision: None,
     }
 }
 
@@ -1343,6 +1347,30 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
+}
+
+/// Missing managed-only identity evidence must not fail an ordinary launch.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ordinary_provider_runs_when_managed_incarnation_is_unavailable() {
+    let (_temp, home) = home();
+    fs::write(home.join("fixture-unavailable-incarnation"), "").unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Succeeded);
+    let (state, pid, leader): (String, Option<u32>, Option<String>) = store.conn.query_row(
+        "SELECT l.state,l.pid,t.process_identity FROM attempt_launches l JOIN attempts t ON t.id=l.attempt_id WHERE l.execution_id=?",
+        [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(state, "unknown");
+    assert!(pid.is_none());
+    assert!(leader.is_some());
 }
 
 /// Provider admission records the revision of the skill bytes the configured
@@ -3075,6 +3103,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
             .unwrap()
             .quota_capacity_revision()
             .unwrap(),
+        quota_decision: None,
     };
     // Each case needs its own terminal parent (one child per parent).
     let cases: [SelectorCase<'_>; 3] = [
@@ -3469,6 +3498,7 @@ async fn codex_late_temporary_root_refusal_releases_the_attempt() {
             quota_known: true,
         }],
         capacity_revision: committed(&home),
+        quota_decision: None,
     };
     let admitted = service
         .admit_provider_trusted(
@@ -5275,6 +5305,30 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let root = held.expect("attempt B reached the barrier");
+    #[cfg(target_os = "linux")]
+    {
+        let store = agent_run_store::fixture::open(&home).unwrap();
+        let (launch, pid, boot, ticks): (String, u32, String, u64) = store.conn.query_row(
+            "SELECT launch_id,pid,boot_id,start_ticks FROM attempt_launches WHERE execution_id=? AND state='bound' ORDER BY rowid DESC LIMIT 1",
+            [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        let before = agent_run_platform::process::inspect(pid as i32).unwrap();
+        let incarnation = agent_run_platform::process::kernel_incarnation(&before).unwrap();
+        assert_eq!(
+            (incarnation.boot_id.as_str(), incarnation.start_ticks),
+            (boot.as_str(), ticks)
+        );
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        let values: Vec<_> = environ
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.strip_prefix(b"AGENT_RUN_LAUNCH_ID="))
+            .collect();
+        assert_eq!(values.as_slice(), &[launch.as_bytes()]);
+        assert_eq!(
+            agent_run_platform::process::kernel_incarnation(&before).unwrap(),
+            incarnation
+        );
+    }
     child.kill().await.unwrap();
     let _ = child.wait().await;
     assert_eq!(attempts(&home, &id).len(), 2);
@@ -5745,15 +5799,15 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
     }
 }
 
-/// An authoritative Claude window rejection whose physical pool the
-/// provider's `anthropic_usage` collector mapping establishes (`five_hour` →
-/// `primary`) is latched once under the collector's own physical identity
-/// with the capacity revision advanced, and the ranker then excludes that
-/// account through the pool's recorded model membership; a model-scoped
-/// `seven_day_opus` rejection latches nothing.
+/// Mapped and unmapped native rejections retain their typed event and cleanup
+/// evidence without creating or changing global quota-latch history.
 #[tokio::test]
-async fn mapped_claude_windows_feed_the_exhaustion_latch() {
-    for (task, latched) in [("fixture:quota", true), ("fixture:quota-opus", false)] {
+async fn native_claude_windows_do_not_write_exhaustion_latches() {
+    for (task, window, existing) in [
+        ("fixture:quota", "five_hour", false),
+        ("fixture:quota-opus", "seven_day_opus", false),
+        ("fixture:quota", "five_hour", true),
+    ] {
         let (_temp, home) = home();
         edit_config(&home, |config| {
             let provider = config["providers"]["glm-user"].as_table_mut().unwrap();
@@ -5766,6 +5820,12 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
             collector.insert("exhaustion_windows".into(), toml::Value::Table(windows));
             provider.insert("collector".into(), toml::Value::Table(collector));
         });
+        if existing {
+            agent_run_store::fixture::open(&home).unwrap().conn.execute(
+                "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) VALUES('acct-work','acct-work::primary','native-quota-exhaustion','five_hour',1,NULL)",
+                [],
+            ).unwrap();
+        }
         let service = fixture_service(home.clone()).await;
         let mut request = request(&home);
         request.task = task.into();
@@ -5780,53 +5840,57 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         run_to_end(&home, &id).await;
         let store = agent_run_store::fixture::open(&home).unwrap();
-        let rows: Vec<(String, String, String)> = store
+        let rows: Vec<(String, String, String, f64, Option<f64>)> = store
             .conn
-            .prepare("SELECT quota_key,window_id,source FROM quota_exhaustion")
+            .prepare("SELECT quota_key,window_id,source,observed_at,reset_at FROM quota_exhaustion")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        if latched {
+        if existing {
             assert_eq!(
                 rows,
                 vec![(
                     "acct-work::primary".to_owned(),
                     "five_hour".to_owned(),
-                    "native-quota-exhaustion".to_owned()
+                    "native-quota-exhaustion".to_owned(),
+                    1.0,
+                    None,
                 )],
                 "{task}"
-            );
-            assert!(
-                store.quota_capacity_revision().unwrap() > revision + 1,
-                "{task}"
-            );
-            let (config, _) =
-                agent_run_config::provider_config::ProviderConfig::load(&home).unwrap();
-            let catalog = config
-                .resolve_catalog(store.list_accounts().unwrap())
-                .unwrap();
-            let ranked = agent_run::capacity::provider_ranking::provider_candidates(
-                &store,
-                &catalog,
-                &"glm-user".parse().unwrap(),
-                "fixture",
-                None,
-                &Default::default(),
-            );
-            assert!(
-                ranked
-                    .map(|set| set
-                        .candidates
-                        .iter()
-                        .all(|c| c.account.as_str() != "acct-work"))
-                    .unwrap_or(true),
-                "{task}: the latched account is not a candidate"
             );
         } else {
             assert!(rows.is_empty(), "{task}: {rows:?}");
         }
+        let failure = store.last_event(&id, "native_failure").unwrap().unwrap();
+        assert_eq!(failure["class"], "quota_exhausted", "{task}");
+        assert_eq!(failure["window"], window, "{task}");
+        assert_eq!(failure["account"], "acct-work", "{task}");
+        assert_eq!(failure["provider"], "glm-user", "{task}");
+        assert_eq!(failure["model"], "fixture", "{task}");
+        assert!(failure.get("latched").is_none(), "{task}");
+        assert_eq!(
+            store.last_event(&id, "process_cleanup").unwrap().unwrap()["confirmed"],
+            true,
+            "{task}"
+        );
+        let row = store.get(&id).unwrap();
+        assert_eq!(row.status, Status::Failed, "{task}");
+        assert_eq!(
+            row.failure_kind.as_deref(),
+            Some("quota_exhausted"),
+            "{task}"
+        );
+        assert_eq!(attempts(&home, &id).len(), 1, "{task}");
     }
 }
 
@@ -6098,428 +6162,54 @@ async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
     );
 }
 
-/// Records one normalized first-party collector round for `account`.
-fn record_round(
-    home: &Path,
-    account: &str,
-    runtime: &str,
-    windows: serde_json::Value,
-    retention: usize,
-) {
-    let at = agent_run::domain::now();
-    let scope = agent_run::capacity::quota::CollectorScope {
-        runtime: runtime.into(),
-        source: "anthropic-usage".into(),
-        models: ["fixture".to_owned(), "other-native".to_owned()].into(),
-    };
-    let snapshot = agent_run::capacity::quota::normalize_collector_output(
-        &account.parse().unwrap(),
-        &scope,
-        &serde_json::json!({"version":1,"windows":windows}),
-        at,
-        256,
-        256,
-    )
-    .unwrap();
-    agent_run_store::fixture::open(home)
-        .unwrap()
-        .record_quota_snapshot(runtime, &snapshot, retention, at)
-        .unwrap();
-}
-
-/// Summary of trusted candidates: (account, physical keys) in rank order.
-fn ranked(home: &Path, provider: &str, model: &str) -> Vec<(String, Vec<String>, bool)> {
-    let store = agent_run_store::fixture::open(home).unwrap();
-    let (config, _) = agent_run_config::provider_config::ProviderConfig::load(home).unwrap();
-    let catalog = config
-        .resolve_catalog(store.list_accounts().unwrap())
-        .unwrap();
-    agent_run::capacity::provider_ranking::provider_candidates(
-        &store,
-        &catalog,
-        &provider.parse().unwrap(),
-        model,
-        None,
-        &Default::default(),
-    )
-    .map(|set| {
-        set.candidates
-            .iter()
-            .map(|c| {
-                (
-                    c.account.as_str().to_owned(),
-                    c.physical_keys
-                        .iter()
-                        .map(|k| k.as_str().to_owned())
-                        .collect(),
-                    c.quota_known,
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Producer → store → ranker → views → admission compose through recorded
-/// pool membership, with pool ids that are not model names:
-///
-/// * acct-work: general `primary` pool exhausted → excluded for both models;
-/// * acct-b: `credits` window exhausted but governing only `fixture` →
-///   excluded for `fixture`, available for `other` (its reservation keys name
-///   only the governing `primary` pool);
-/// * acct-c: `primary` positive → the ordinary admission picks it and reserves
-///   `acct-c::primary`; the alias provider sees the same single physical key;
-/// * the latch keeps excluding acct-work after retention pruning and after an
-///   older positive sample; when acct-c's newest membership drops `other`,
-///   the older membership no longer makes acct-c known for it.
+/// Local legacy quota samples and latches do not supply quota to schema-2 Run.
+/// When Quota is unavailable, public views and admission preserve unknown.
 #[tokio::test]
-async fn collector_pool_membership_governs_ranking_views_and_admission() {
-    let extra = "[[providers.glm-user.models]]\nid = \"other\"\nnative_model = \"other-native\"\n\
-                 [[providers.glm-user.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n\
-                 [[providers.glm-user.bindings]]\nlabel = \"c\"\naccount = \"acct-c\"\n\
-                 [providers.glm-alias]\nharness = \"claude-code\"\nconnection = { kind = \"custom\", endpoint = \"https://gateway.example/api\", protocol = \"messages\" }\n\
-                 auth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.glm-alias.models]]\nid = \"fixture\"\n\
-                 [[providers.glm-alias.bindings]]\nlabel = \"shared\"\naccount = \"acct-c\"\n";
-    let (_temp, home) = home_with(extra, &["acct-b", "acct-c"]);
-    let reset = agent_run::domain::now() + 3600.0;
-    let both = serde_json::json!(["fixture", "other-native"]);
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":0.0,"reset_at":reset,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-    record_round(
-        &home,
-        "acct-b",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":70.0,"observed_at":agent_run::domain::now()},
-            {"pool":"credits","window":"monthly_mcp","models":["fixture"],"remaining_percent":0.0,"reset_at":reset,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-    record_round(
-        &home,
-        "acct-c",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":50.0,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-
-    let fixture = ranked(&home, "glm-user", "fixture");
-    assert_eq!(
-        fixture,
-        vec![("acct-c".into(), vec!["acct-c::primary".into()], true)],
-        "{fixture:?}"
-    );
-    let other = ranked(&home, "glm-user", "other");
-    let accounts: Vec<&str> = other.iter().map(|c| c.0.as_str()).collect();
-    assert!(!accounts.contains(&"acct-work"), "{other:?}");
-    let b = other
-        .iter()
-        .find(|c| c.0 == "acct-b")
-        .expect("acct-b serves other");
-    assert_eq!(
-        b.1,
-        vec!["acct-b::primary".to_owned()],
-        "credits does not govern other"
-    );
-    // The alias provider shares acct-c's one physical pool, not a copy.
-    assert_eq!(
-        ranked(&home, "glm-alias", "fixture"),
-        vec![("acct-c".into(), vec!["acct-c::primary".into()], true)]
-    );
-
-    // Public views read the same membership.
+async fn legacy_quota_samples_do_not_drive_new_admission() {
+    let (_temp, home) = home_with("", &[]);
+    let at = agent_run::domain::now();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    store.conn.execute(
+        "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) VALUES('glm-user','primary','five_hour','acct-work','anthropic-usage',0.0,?1,?2,?3,'{\"models\":[\"fixture\"]}','acct-work','acct-work::primary')",
+        rusqlite::params![at + 3600.0, at, at + 900.0],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) VALUES('acct-work','acct-work::primary','anthropic-usage','five_hour',?1,?2)",
+        rusqlite::params![at, at + 3600.0],
+    ).unwrap();
+    let latches: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM quota_exhaustion", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latches, 1);
     let service = fixture_service(home.clone()).await;
     let order = service
         .capacity_order(serde_json::from_value(serde_json::json!({})).unwrap())
+        .await
         .unwrap();
     assert!(order.to_string().contains("glm-user"), "{order}");
     let models = service
         .models(serde_json::from_value(serde_json::json!({"provider":"glm-user"})).unwrap())
         .await
         .unwrap();
-    let text = models.to_string();
-    assert!(text.contains("\"available\""), "{text}");
-
-    // Ordinary admission selects acct-c and reserves its governing pool.
+    assert!(models.to_string().contains("\"unknown\""), "{models}");
+    assert_eq!(models["quota_coverage"]["state"], "unknown");
     let mut request = request(&home);
     request.account = None;
-    request.request_id = Some("membership-admit".into());
+    request.request_id = Some("legacy-membership-unknown".into());
     let admitted = service.admit_provider(request).await.unwrap();
-    let attempt = admitted["attempt_id"].as_str().unwrap().to_owned();
-    let store = agent_run_store::fixture::open(&home).unwrap();
-    let keys: Vec<String> = store
-        .conn
-        .prepare("SELECT quota_key FROM attempt_quota_keys WHERE attempt_id=?")
-        .unwrap()
-        .query_map([&attempt], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(keys, vec!["acct-c::primary".to_owned()]);
-
-    // Retention pruning (keep 1 sample) and an older positive sample never
-    // lift acct-work's latched restriction.
-    for _ in 0..3 {
-        record_round(
-            &home,
-            "acct-b",
-            "glm-user",
-            serde_json::json!([
-                {"pool":"primary","window":"five_hour","models":both,"remaining_percent":60.0,"observed_at":agent_run::domain::now()}
-            ]),
-            1,
-        );
-    }
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":90.0,"observed_at":agent_run::domain::now() - 7200.0}
-        ]),
-        1,
-    );
-    let fixture = ranked(&home, "glm-user", "fixture");
-    assert!(fixture.iter().all(|c| c.0 != "acct-work"), "{fixture:?}");
-
-    // acct-c's newest membership drops `other`: its older membership no
-    // longer makes acct-c known for that model.
-    record_round(
-        &home,
-        "acct-c",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"primary","window":"five_hour","models":["fixture"],"remaining_percent":50.0,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-    let other = ranked(&home, "glm-user", "other");
-    let c = other
-        .iter()
-        .find(|c| c.0 == "acct-c")
-        .expect("acct-c stays eligible");
-    assert!(
-        !c.2 && c.1.is_empty(),
-        "acct-c is unknown for other now: {other:?}"
-    );
-}
-
-/// The real Codex source mapping composes with the ranker: the general
-/// `codex` bucket (not a model name) governs the bound model; an exhausted
-/// general bucket excludes that account and the other is selected with the
-/// `codex` pool as its reservation key.
-#[tokio::test]
-async fn codex_source_buckets_govern_bound_models() {
-    let (_temp, home) = codex_home(["ok", "ok"]);
-    let at = agent_run::domain::now();
-    let models: std::collections::BTreeSet<String> = ["fixture".to_owned()].into();
-    for (account, used) in [("acct-cx-a", 100.0), ("acct-cx-b", 20.0)] {
-        use std::io::Write;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
-        let mut parser = isolated_sync_command("jq")
-            .args(["-e", "-L"])
-            .arg(&root)
-            .args(["--argjson", "ctx"])
-            .arg(serde_json::json!({"models":{"fixture":{}},"now":at}).to_string())
-            .arg("-f")
-            .arg(root.join("codex.jq"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let response = serde_json::json!({"rateLimitsByLimitId":{"codex":{
-            "primary":{"usedPercent":used,"windowDurationMins":300,"resetsAt":at + 3600.0}
-        }}});
-        parser
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(response.to_string().as_bytes())
-            .unwrap();
-        let output = parser.wait_with_output().unwrap();
-        assert!(output.status.success());
-        let scope = agent_run::capacity::quota::CollectorScope {
-            runtime: "codex-user".into(),
-            source: "codex-appserver".into(),
-            models: models.clone(),
-        };
-        let snapshot = agent_run::capacity::quota::normalize_collector_output(
-            &account.parse().unwrap(),
-            &scope,
-            &serde_json::from_slice(&output.stdout).unwrap(),
-            at,
-            256,
-            256,
-        )
-        .unwrap();
-        agent_run_store::fixture::open(&home)
-            .unwrap()
-            .record_quota_snapshot("codex-user", &snapshot, 100, at)
-            .unwrap();
-    }
-    assert_eq!(
-        ranked(&home, "codex-user", "fixture"),
-        vec![("acct-cx-b".into(), vec!["acct-cx-b::codex".into()], true)]
-    );
-}
-
-/// A home whose `glm-user` provider offers `fixture` and `other` (native
-/// `other-native`) through accounts acct-work and acct-b.
-fn two_model_home() -> (tempfile::TempDir, std::path::PathBuf) {
-    let extra = "[[providers.glm-user.models]]\nid = \"other\"\nnative_model = \"other-native\"\n\
-                 [[providers.glm-user.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n";
-    home_with(extra, &["acct-b"])
-}
-
-/// Accounts of the trusted candidates for `model`, in order.
-fn candidate_accounts(home: &Path, model: &str) -> Vec<String> {
-    ranked(home, "glm-user", model)
-        .into_iter()
-        .map(|c| c.0)
-        .collect()
-}
-
-/// (A) One pool with two windows: its exhausted `five_hour` membership
-/// survives retention pruning even when an unrelated newer sample exists and
-/// a stale (older observed, later inserted) row for the same window names
-/// another model. The exhaustion keeps excluding acct-work for `fixture` in
-/// ordinary selection and admission, until a fresh positive releases it.
-#[tokio::test]
-async fn latched_window_membership_survives_pruning_and_stale_rows() {
-    let (_temp, home) = two_model_home();
-    let now = agent_run::domain::now();
-    let reset = now + 3600.0;
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"codex","window":"five_hour","models":["fixture"],"remaining_percent":0.0,"reset_at":reset,"observed_at":now - 10.0},
-            {"pool":"codex","window":"seven_day","models":["fixture"],"remaining_percent":50.0,"observed_at":now - 9.0}
-        ]),
-        100,
-    );
-    // Later inserted, older observed, different binding decision.
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"codex","window":"five_hour","models":["other-native"],"remaining_percent":80.0,"observed_at":now - 7200.0}
-        ]),
-        100,
-    );
-    // An unrelated newest sample, then prune to one row.
-    record_round(
-        &home,
-        "acct-b",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"primary","window":"five_hour","models":["fixture","other-native"],"remaining_percent":40.0,"observed_at":now}
-        ]),
-        1,
-    );
-    assert_eq!(
-        candidate_accounts(&home, "fixture"),
-        vec!["acct-b".to_owned()],
-        "latched five_hour still governs fixture"
-    );
-    let service = fixture_service(home.clone()).await;
-    let mut request = request(&home);
-    request.account = None;
-    request.request_id = Some("window-prune".into());
-    let admitted = service.admit_provider(request).await.unwrap();
-    let chosen: String = agent_run_store::fixture::open(&home)
-        .unwrap()
+    let attempt = admitted["attempt_id"].as_str().unwrap();
+    let keys: i64 = store
         .conn
         .query_row(
-            "SELECT selected_account_id FROM attempts WHERE id=?",
-            [admitted["attempt_id"].as_str().unwrap()],
+            "SELECT COUNT(*) FROM attempt_quota_keys WHERE attempt_id=?",
+            [attempt],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(chosen, "acct-b");
-    // Fresh positive evidence for the same window releases the latch.
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"codex","window":"five_hour","models":["fixture"],"remaining_percent":90.0,"observed_at":agent_run::domain::now()},
-            {"pool":"codex","window":"seven_day","models":["fixture"],"remaining_percent":50.0,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-    assert!(candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
-}
-
-/// (B) Two models share pool `credits`: `five_hour` governs both, the
-/// exhausted narrow `monthly` window governs only `fixture`. An incomplete
-/// later round (the narrow window omitted) must not carry that exhaustion
-/// into `other`: acct-work stays usable for `other` (selection and the
-/// public views), stays excluded for `fixture`, and a fresh positive for the
-/// narrow window releases it.
-#[tokio::test]
-async fn narrow_window_exhaustion_is_not_carried_into_other_models() {
-    let (_temp, home) = two_model_home();
-    let now = agent_run::domain::now();
-    let reset = now + 3600.0;
-    let both = serde_json::json!(["fixture", "other-native"]);
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"credits","window":"five_hour","models":both,"remaining_percent":60.0,"observed_at":now},
-            {"pool":"credits","window":"monthly","models":["fixture"],"remaining_percent":0.0,"reset_at":reset,"observed_at":now}
-        ]),
-        100,
-    );
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"credits","window":"five_hour","models":both,"remaining_percent":55.0,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-    let other = ranked(&home, "glm-user", "other");
-    let work = other
-        .iter()
-        .find(|c| c.0 == "acct-work")
-        .expect("acct-work serves other");
-    assert!(work.2, "acct-work is known-usable for other: {other:?}");
-    assert!(!candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
-    let models = fixture_service(home.clone())
-        .await
-        .models(
-            serde_json::from_value(serde_json::json!({"provider":"glm-user","model":"other"}))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(models.to_string().contains("\"available\""), "{models}");
-    record_round(
-        &home,
-        "acct-work",
-        "glm-user",
-        serde_json::json!([
-            {"pool":"credits","window":"five_hour","models":both,"remaining_percent":55.0,"observed_at":agent_run::domain::now()},
-            {"pool":"credits","window":"monthly","models":["fixture"],"remaining_percent":30.0,"observed_at":agent_run::domain::now()}
-        ]),
-        100,
-    );
-    assert!(candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
+    assert_eq!(keys, 0);
 }
 
 /// Every Claude/GLM launch names the shared store even before anything was
@@ -6756,6 +6446,562 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
             .answer_sha256,
         row.answer_sha256
     );
+}
+
+/// The real supervisor qualifies a managed Claude fixture after discovering
+/// additional Pool tools and computing their exact native deny complement.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_claude_supervisor_qualifies_with_catalog_complement() {
+    use agent_run_config::{
+        config::{Environment, Hook},
+        provider_config::{ManagedAttemptBinding, ManagedAttemptTransport},
+    };
+    use agent_run_domain::{HarnessId, attempt_binding::Route};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let (_temp, home) = home_in(&base, "", &[]);
+    // Owner endpoints are bound at `<owner>/<32 hex>/v2.sock` (and the
+    // discovery probe's `o.sock`); keep the fixture names short so a long
+    // private TMPDIR still fits the 108-byte Unix socket path limit.
+    let ipc = tempfile::Builder::new()
+        .prefix("p3")
+        .tempdir_in(base)
+        .unwrap();
+    fs::set_permissions(ipc.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let channel = ipc.path().join("bridge.sock");
+    let _bridge = std::os::unix::net::UnixListener::bind(&channel).unwrap();
+    fs::set_permissions(&channel, fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = ipc.path().join("o");
+    fs::create_dir(&owner).unwrap();
+    fs::set_permissions(&owner, fs::Permissions::from_mode(0o700)).unwrap();
+    let frontend = home.join("pool-frontend");
+    fs::copy(env!("CARGO_BIN_EXE_agent-run-fixture"), &frontend).unwrap();
+    fs::set_permissions(&frontend, fs::Permissions::from_mode(0o700)).unwrap();
+    let frontend_sha = agent_run_platform::fs::sha256(&fs::read(&frontend).unwrap());
+    let hook = std::fs::canonicalize("/usr/bin/true").unwrap();
+    let hook_sha = agent_run_platform::fs::sha256(&fs::read(&hook).unwrap());
+    let bridge = std::fs::canonicalize("/usr/bin/false").unwrap();
+    let bridge_sha = agent_run_platform::fs::sha256(&fs::read(&bridge).unwrap());
+    let reader = ipc.path().join("reader");
+    fs::write(&reader, "synthetic-reader\n").unwrap();
+    fs::set_permissions(&reader, fs::Permissions::from_mode(0o600)).unwrap();
+    let sid =
+        agent_run_store::store_identity::read(&agent_run_store::fixture::open(&home).unwrap().conn)
+            .unwrap();
+    // SAFETY: geteuid is read-only.
+    let uid = unsafe { libc::geteuid() };
+    let route = |store: &str, id: &str| Route {
+        component_store_id: store.into(),
+        route_id: id.into(),
+        worker_uid: uid,
+    };
+    let mut config = agent_run_config::provider_config::ProviderConfig::load(&home)
+        .unwrap()
+        .0;
+    let harness = config.harnesses.get_mut(&HarnessId::ClaudeCode).unwrap();
+    harness.hooks = vec![Hook {
+        event: "PreToolUse".into(),
+        command: vec![hook.to_string_lossy().into_owned()],
+        matcher: Some("mcp__pool__.*".into()),
+    }];
+    harness.environment = Some("owner-fixture".into());
+    let mut environment = Environment::default();
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+        channel.to_string_lossy().into_owned(),
+    );
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+        owner.to_string_lossy().into_owned(),
+    );
+    config
+        .environments
+        .insert("owner-fixture".into(), environment);
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":frontend,"args":["mcp","--config",home.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "review".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: frontend_sha.clone(),
+        bridge_hook_sha256: hook_sha,
+        host_id: "host".into(),
+        pool_resident_executable: Some(frontend.clone()),
+        pool_resident_sha256: Some(frontend_sha),
+        transport: Some(ManagedAttemptTransport {
+            run_route: route(&sid.to_string(), "run"),
+            pool_route: route("00000000-0000-4000-8000-000000000031", "pool"),
+            bridge_route: route("00000000-0000-4000-8000-000000000032", "bridge"),
+            producer: "pool".into(),
+            pool_socket: ipc.path().join("pool.sock"),
+            bridge_socket: channel,
+            bridge_executable: bridge,
+            bridge_executable_sha256: bridge_sha,
+            bridge_reader_credential_file: reader,
+            bridge_reader_credential_sha256: agent_run_platform::fs::sha256(b"synthetic-reader"),
+        }),
+        codex_code_mode_host_sha256: None,
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    fs::write(home.join("profiles/review.md"),"+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=['pool']\nrequired_constraints=[]\n+++\nManaged fixture.\n").unwrap();
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.explicit_finish = true;
+    request.task = "fixture:worker-finish".into();
+    request.orchestrator = None;
+    request.request_id = None;
+    let mut spec = serde_json::to_value(request).unwrap();
+    spec.as_object_mut().unwrap().remove("request_id");
+    let params = serde_json::json!({"version":1,"expected_store_id":sid,"pool_store_id":"00000000-0000-4000-8000-000000000031","pool_id":"pool","request_id":"p3-managed-claude","mode":"start","jobs":[{"member_id":"member","selector":{"version":1,"role_name":"review"},"spec":spec}],"preconditions":[]});
+    let request_file = ipc.path().join("request.json");
+    let output_file = ipc.path().join("reply.json");
+    fs::write(
+        &request_file,
+        serde_json::to_vec(
+            &serde_json::json!({"id":"start","method":"_managed_start_batch_v1","params":params}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The loaded executable must predate the client process, including ctime.
+    let metadata = fs::metadata(&frontend).unwrap();
+    let newest = metadata.mtime().max(metadata.ctime());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Kernel birth timestamps use a boot-time origin with coarser rounding
+    // than the wall clock; leave a full two-second margin after copy/ctime.
+    if now <= newest + 2 {
+        tokio::time::sleep(Duration::from_secs((newest + 3 - now) as u64)).await;
+    }
+    async fn resident_call(
+        executable: &Path,
+        home: &Path,
+        request: &Path,
+        output: &Path,
+    ) -> serde_json::Value {
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            isolated_command(executable)
+                .env_clear()
+                .env("RUN_P3_FIXTURE", "1")
+                .args(["p3-client", "--socket"])
+                .arg(home.join("attempt.sock"))
+                .arg("--request-file")
+                .arg(request)
+                .arg("--output-file")
+                .arg(output)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "synthetic resident failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice(&fs::read(output).unwrap()).unwrap()
+    }
+    let response = resident_call(&frontend, &home, &request_file, &output_file).await;
+    assert_eq!(response["result"]["state"], "admitted", "{response}");
+    let admitted = response["result"].clone();
+    let id: AgentId = serde_json::from_value(admitted["jobs"][0]["execution_id"].clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        if row.status.terminal() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed Claude fixture did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(
+        row.status,
+        Status::Succeeded,
+        "{:?}: {:?}",
+        row.failure_kind,
+        row.failure_text
+    );
+    let (config_digest,inventory_digest):(String,String) = store.conn.query_row("SELECT q.config_digest,q.inventory_digest FROM attempt_role_qualifications q JOIN attempts t ON t.id=q.attempt_id WHERE t.agent_id=?",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(config_digest.len(), 64);
+    assert_eq!(
+        config_digest,
+        fs::read_to_string(home.join("fixture-managed-config-digest.txt")).unwrap()
+    );
+    assert_eq!(inventory_digest.len(), 64);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT pool_membership_ever FROM agents WHERE id=?",
+                [id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM history_pins WHERE root_agent_id=?",
+                [id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM attempt_launches WHERE execution_id=?",
+                [id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    let allowed = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
+    let catalogs = BTreeMap::from([(
+        "pool".into(),
+        BTreeSet::from([
+            "pool_get".into(),
+            "pool_join".into(),
+            "pool_start_batch".into(),
+            "get_status".into(),
+        ]),
+    )]);
+    let expected =
+        agent_run_adapters::managed_role::claude_disallowed_tools(&allowed, &catalogs).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("fixture-managed-denied.txt")).unwrap(),
+        expected
+    );
+    assert!(expected.contains("mcp__pool__pool_start_batch"));
+    drop(store);
+    let replay = resident_call(&frontend, &home, &request_file, &output_file).await;
+    assert_eq!(replay["result"], admitted);
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM attempt_launches", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(store);
+    broker.kill().await.unwrap();
+}
+
+/// The real resident broker admits a managed Claude member through the P3
+/// resident wire and runs it to its explicit finish. An in-place upgrade then
+/// replaces the Bridge PreToolUse hook and the Bridge daemon executables and
+/// re-pins both digests in the current configuration. `agent-run resume`
+/// through the same broker must launch the resumed execution against the
+/// current builds: its frozen identity keeps the admission pins, and the
+/// launch plan, role selection and owner transport verify the replaced ones.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_resume_after_bridge_upgrade_verifies_current_component_builds() {
+    use agent_run_config::{
+        config::{Environment, Hook},
+        provider_config::{ManagedAttemptBinding, ManagedAttemptTransport},
+    };
+    use agent_run_domain::{HarnessId, attempt_binding::Route};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let (_temp, home) = home_in(&base, "", &[]);
+    let ipc = tempfile::Builder::new()
+        .prefix("p3")
+        .tempdir_in(base)
+        .unwrap();
+    fs::set_permissions(ipc.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = ipc.path().canonicalize().unwrap();
+    let channel = dir.join("bridge.sock");
+    let _bridge = std::os::unix::net::UnixListener::bind(&channel).unwrap();
+    fs::set_permissions(&channel, fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = dir.join("o");
+    fs::create_dir(&owner).unwrap();
+    fs::set_permissions(&owner, fs::Permissions::from_mode(0o700)).unwrap();
+    // A real upgrade installs a new inode at the same path.
+    let install = |path: &Path, bytes: &[u8]| {
+        let staged = path.with_extension("new");
+        fs::write(&staged, bytes).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(staged, path).unwrap();
+        agent_run_platform::fs::sha256(bytes)
+    };
+    let build = |source: &str, tag: &[u8]| {
+        let mut bytes = fs::read(source).unwrap();
+        bytes.extend_from_slice(tag);
+        bytes
+    };
+    let frontend = home.join("pool-frontend");
+    fs::copy(env!("CARGO_BIN_EXE_agent-run-fixture"), &frontend).unwrap();
+    fs::set_permissions(&frontend, fs::Permissions::from_mode(0o700)).unwrap();
+    let frontend_sha = agent_run_platform::fs::sha256(&fs::read(&frontend).unwrap());
+    let hook = dir.join("bridge-hook");
+    let hook_a = install(&hook, &build("/usr/bin/true", b""));
+    let bridge = dir.join("bridge-native-daemon");
+    let bridge_a = install(&bridge, &build("/usr/bin/false", b""));
+    let reader = dir.join("reader");
+    fs::write(&reader, "synthetic-reader\n").unwrap();
+    fs::set_permissions(&reader, fs::Permissions::from_mode(0o600)).unwrap();
+    let sid =
+        agent_run_store::store_identity::read(&agent_run_store::fixture::open(&home).unwrap().conn)
+            .unwrap();
+    // SAFETY: geteuid is read-only.
+    let uid = unsafe { libc::geteuid() };
+    let route = |store: &str, id: &str| Route {
+        component_store_id: store.into(),
+        route_id: id.into(),
+        worker_uid: uid,
+    };
+    let mut config = agent_run_config::provider_config::ProviderConfig::load(&home)
+        .unwrap()
+        .0;
+    let harness = config.harnesses.get_mut(&HarnessId::ClaudeCode).unwrap();
+    harness.hooks = vec![Hook {
+        event: "PreToolUse".into(),
+        command: vec![hook.to_string_lossy().into_owned()],
+        matcher: Some("mcp__pool__.*".into()),
+    }];
+    harness.environment = Some("owner-fixture".into());
+    let mut environment = Environment::default();
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+        channel.to_string_lossy().into_owned(),
+    );
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+        owner.to_string_lossy().into_owned(),
+    );
+    config
+        .environments
+        .insert("owner-fixture".into(), environment);
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":frontend,"args":["mcp","--config",home.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "review".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: frontend_sha.clone(),
+        bridge_hook_sha256: hook_a.clone(),
+        host_id: "host".into(),
+        pool_resident_executable: Some(frontend.clone()),
+        pool_resident_sha256: Some(frontend_sha),
+        transport: Some(ManagedAttemptTransport {
+            run_route: route(&sid.to_string(), "run"),
+            pool_route: route("00000000-0000-4000-8000-000000000031", "pool"),
+            bridge_route: route("00000000-0000-4000-8000-000000000032", "bridge"),
+            producer: "pool".into(),
+            pool_socket: dir.join("pool.sock"),
+            bridge_socket: channel,
+            bridge_executable: bridge.clone(),
+            bridge_executable_sha256: bridge_a.clone(),
+            bridge_reader_credential_file: reader,
+            bridge_reader_credential_sha256: agent_run_platform::fs::sha256(b"synthetic-reader"),
+        }),
+        codex_code_mode_host_sha256: None,
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    fs::write(home.join("profiles/review.md"),"+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=['pool']\nrequired_constraints=[]\n+++\nManaged fixture.\n").unwrap();
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.explicit_finish = true;
+    request.task = "fixture:worker-finish".into();
+    request.orchestrator = None;
+    request.request_id = None;
+    let mut spec = serde_json::to_value(request).unwrap();
+    spec.as_object_mut().unwrap().remove("request_id");
+    let params = serde_json::json!({"version":1,"expected_store_id":sid,"pool_store_id":"00000000-0000-4000-8000-000000000031","pool_id":"pool","request_id":"p3-managed-upgrade","mode":"start","jobs":[{"member_id":"member","selector":{"version":1,"role_name":"review"},"spec":spec}],"preconditions":[]});
+    let request_file = dir.join("request.json");
+    let output_file = dir.join("reply.json");
+    fs::write(
+        &request_file,
+        serde_json::to_vec(
+            &serde_json::json!({"id":"start","method":"_managed_start_batch_v1","params":params}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The loaded executable must predate the client process, including ctime.
+    let metadata = fs::metadata(&frontend).unwrap();
+    let newest = metadata.mtime().max(metadata.ctime());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    if now <= newest + 2 {
+        tokio::time::sleep(Duration::from_secs((newest + 3 - now) as u64)).await;
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        isolated_command(&frontend)
+            .env_clear()
+            .env("RUN_P3_FIXTURE", "1")
+            .args(["p3-client", "--socket"])
+            .arg(home.join("attempt.sock"))
+            .arg("--request-file")
+            .arg(&request_file)
+            .arg("--output-file")
+            .arg(&output_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "synthetic resident failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&fs::read(&output_file).unwrap()).unwrap();
+    assert_eq!(response["result"]["state"], "admitted", "{response}");
+    let id: AgentId =
+        serde_json::from_value(response["result"]["jobs"][0]["execution_id"].clone()).unwrap();
+    let terminal = async |id: &AgentId| {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let row = agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(id)
+                .unwrap();
+            if row.status.terminal() {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "managed Claude fixture did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let parent = terminal(&id).await;
+    assert_eq!(
+        parent.status,
+        Status::Succeeded,
+        "{:?}: {:?}",
+        parent.failure_kind,
+        parent.failure_text
+    );
+    // In-place upgrade of every Bridge executable Run pins; the current
+    // configuration follows, the frozen identity does not.
+    let hook_b = install(&hook, &build("/usr/bin/true", b"\nbridge-hook-B\n"));
+    let bridge_b = install(&bridge, &build("/usr/bin/false", b"\nbridge-daemon-B\n"));
+    assert_ne!(hook_a, hook_b);
+    assert_ne!(bridge_a, bridge_b);
+    let settings = config.managed_attempt_binding.as_mut().unwrap();
+    settings.bridge_hook_sha256 = hook_b.clone();
+    settings
+        .transport
+        .as_mut()
+        .unwrap()
+        .bridge_executable_sha256 = bridge_b.clone();
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(30),
+        isolated_command(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(&home)
+            .args(["resume", id.as_str(), "--task", "fixture:worker-finish"])
+            .args(["--request-id", "resume-after-upgrade"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        resumed.status.success(),
+        "resume refused: {} {}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let admitted: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(admitted["created"], true, "{admitted}");
+    // The public identity is the lineage; its new execution is the child.
+    assert_eq!(admitted["agent_id"], id.as_str());
+    let child_id: AgentId = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT id FROM agents WHERE parent_agent_id=?",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let child = terminal(&child_id).await;
+    assert_eq!(
+        child.status,
+        Status::Succeeded,
+        "{:?}: {:?}",
+        child.failure_kind,
+        child.failure_text
+    );
+    assert_eq!((&child.root_agent_id, child.sequence), (&id, 2));
+    // Role semantics and the admission snapshot stay frozen in the identity.
+    let frozen = &child.identity.as_ref().unwrap()["provider_config"]["managed_attempt_binding"];
+    assert_eq!(frozen["bridge_hook_sha256"], hook_a.as_str());
+    assert_eq!(
+        frozen["transport"]["bridge_executable_sha256"],
+        bridge_a.as_str()
+    );
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM attempt_role_qualifications q JOIN attempts t ON t.id=q.attempt_id WHERE t.agent_id=?",
+                [child_id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(store);
+    broker.kill().await.unwrap();
 }
 
 /// A managed Claude home relocates into the shared store and launches its

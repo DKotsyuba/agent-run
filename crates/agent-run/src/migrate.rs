@@ -206,7 +206,6 @@ fn content_digest(conn: &Connection) -> Result<String> {
         let columns = conn
             .prepare(&format!("SELECT * FROM {}", identifier(&table)))?
             .column_names()
-            .into_iter()
             .map(identifier)
             .collect::<Vec<_>>()
             .join(",");
@@ -561,7 +560,11 @@ fn migrate_input(
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     write_new(&dir.join("config.v1.toml"), &config_bytes)?;
     write_new(&dir.join("mapping.toml"), &mapping_bytes)?;
-    source.backup(rusqlite::MAIN_DB, dir.join("state.db"), None)?;
+    source.backup(
+        rusqlite::MAIN_DB,
+        dir.join("state.db"),
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
     std::fs::set_permissions(dir.join("state.db"), std::fs::Permissions::from_mode(0o400))?;
     let backup = read_only_at(&dir.join("state.db"))?;
     let backup_version: i64 = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;

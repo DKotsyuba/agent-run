@@ -19,8 +19,10 @@ pub const CONTEXT_HARD_LIMIT_CHARS: usize = 2500;
 pub const ACTIVE_BLOCK_MAX_CHARS: usize = 600;
 /// End-to-end cooperative budget for optional context, including SQL and persistence.
 const HOOK_BUDGET: Duration = Duration::from_millis(750);
-/// SQL work stops early enough to leave the existing write budget available.
+/// The Quota fetch and SQL work share this allowance before persistence.
 const READ_BUDGET: Duration = Duration::from_millis(250);
+/// Preserve part of the read allowance for local agent and provider state.
+const LOCAL_READ_RESERVE: Duration = Duration::from_millis(100);
 /// Existing maximum wait for the writer acknowledgement.
 const WRITE_BUDGET: Duration = Duration::from_millis(500);
 const MAX_LISTED_AGENTS: usize = 5;
@@ -55,9 +57,10 @@ pub async fn build(
 }
 
 /// Builds optional host context without losing a prepared snapshot when its
-/// deduplication write fails or becomes unknown. Reads share one read-only
-/// snapshot and a 250 ms SQL deadline; persistence uses the remainder of the
-/// 750 ms call budget, never more than 500 ms. No background read is detached.
+/// deduplication write fails or becomes unknown. The Quota fetch and local SQL
+/// share a 250 ms read deadline; persistence uses the remainder of the 750 ms
+/// call budget, never more than 500 ms. No SQL transaction spans an await;
+/// bounded Quota metadata and parsing jobs can finish after a fetch timeout.
 ///
 /// Available components survive an independent component read failure. Failures
 /// before any context can be prepared propagate for the CLI's nonblocking hook
@@ -92,8 +95,9 @@ pub fn log_failure(error: &Error, stored_schema: Option<i64>) {
 }
 
 /// Shared strict/advisory implementation. Only the advisory caller may retain
-/// read components after errors and bypass a failed deduplication write. All
-/// store handles are dropped before awaiting the authenticated writer operation.
+/// read components after errors and bypass a failed deduplication write.
+/// Quota is fetched before opening the local snapshot, and store handles are
+/// dropped before awaiting the authenticated writer operation.
 async fn build_inner(
     home: &Path,
     reference: &OrchestratorRef,
@@ -119,8 +123,7 @@ async fn build_inner(
                 .context_max_chars
         }
     };
-    let now = at.unwrap_or_else(now);
-    if !now.is_finite() || now < 0.0 {
+    if at.is_some_and(|at| !at.is_finite() || at < 0.0) {
         return Err(invalid("now must be a finite nonnegative number"));
     }
     let budget = max_chars.min(CONTEXT_HARD_LIMIT_CHARS);
@@ -133,12 +136,36 @@ async fn build_inner(
         });
     }
     let read_deadline = started + READ_BUDGET;
+    let quota = if budget > 0 {
+        if let Some((config, _)) = &providers {
+            let allowance = read_deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(LOCAL_READ_RESERVE);
+            if allowance.is_zero() {
+                None
+            } else {
+                tokio::time::timeout(
+                    allowance,
+                    capacity::quota_adapter::fetch(config.capacity.quota.as_ref()),
+                )
+                .await
+                .unwrap_or(None)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // A service evaluation can occur during the fetch, so sample the clock after it.
+    let now = at.unwrap_or_else(now);
     let store = if advisory {
         let remaining = read_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(Error::Runtime("context read budget exhausted".into()));
         }
-        let store = agent_run_store::writer::StoreReader::open_with(home, remaining)?.into_inner();
+        let mut store =
+            agent_run_store::writer::StoreReader::open_with(home, remaining)?.into_inner();
         store
             .conn
             .progress_handler(1000, Some(move || Instant::now() >= read_deadline))?;
@@ -172,8 +199,10 @@ async fn build_inner(
                 .busy_timeout(read_deadline.saturating_duration_since(Instant::now()))?;
         }
         match &providers {
-            Some((config, revision)) => provider_block(&store, config, revision),
-            None => capacity_block(&store, legacy.as_ref().expect("loaded legacy config")),
+            Some((config, revision)) => {
+                provider_block(&store, config, revision, quota.as_ref(), now)
+            }
+            None => Ok("Capacity order unavailable for schema_version 1; migrate configuration to schema_version 2.".into()),
         }
     };
     let capacity_text = match capacity {
@@ -268,19 +297,27 @@ async fn build_inner(
 }
 
 /// Renders the schema-2 provider-only capacity order: one line per provider
-/// with each offered model's cached status, never an account or credential.
+/// with each offered model's Quota status, never an account or credential.
 /// It is read-only standing, not a choice; the caller picks provider/model.
 fn provider_block(
     store: &Store,
     config: &agent_run_config::provider_config::ProviderConfig,
     revision: &str,
+    quota: Option<&crate::quota_client::Snapshot>,
+    at: f64,
 ) -> Result<String> {
-    let order =
-        capacity::provider_catalog::order_from_store(store, config, revision, &Default::default())?;
+    let order = capacity::quota_projection::order_at(
+        store,
+        config,
+        revision,
+        &Default::default(),
+        quota,
+        at,
+    )?;
     let providers = order["providers"]
         .as_array()
         .ok_or_else(|| invalid("provider order has invalid providers"))?;
-    let mut lines = vec!["Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; use models for roles, recommendations and evidence. unknown = no current sample (missing or stale), not a health claim.".to_owned()];
+    let mut lines = vec!["Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; use models for roles, recommendations and evidence. unknown = quota cannot be determined from available data, not a health claim.".to_owned()];
     if providers.is_empty() {
         lines.push("No configured providers.".into());
     }
@@ -306,60 +343,6 @@ fn provider_block(
         ));
     }
     Ok(lines.join("\n"))
-}
-
-/// Renders the ordered capacity routes without exposing measurements or credentials.
-fn capacity_block(store: &Store, config: &Config) -> Result<String> {
-    let order = capacity::order_from_store(config, store, crate::domain::now())?;
-    let routes = order
-        .get("routes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid("capacity order has invalid routes"))?;
-    let mut lines = vec!["Runtime priorities (highest first). Choose the first compatible subagent using the role/model table. A route applies only to a model belonging to its quota lane; if incompatible, skip the entire entry. account=null means omit the account selector. Do not recheck raw limits.".into()];
-    if routes.is_empty() {
-        lines.push("No currently available routes.".into());
-    }
-    for (index, route) in routes.iter().enumerate() {
-        let runtime = route
-            .get("runtime")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("capacity route runtime is invalid"))?;
-        let priority = route
-            .get("priority")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| invalid("capacity route priority is invalid"))?;
-        let aliases = route
-            .get("aliases")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("capacity route aliases are invalid"))?;
-        let selectors = aliases
-            .iter()
-            .map(selector)
-            .collect::<Result<Vec<_>>>()?
-            .join(",");
-        lines.push(format!(
-            "{}. runtime={}; selectors=[{}]; priority={priority:.3}",
-            index + 1,
-            json_ascii(runtime),
-            selectors
-        ));
-    }
-    Ok(lines.join("\n"))
-}
-
-/// Renders one compact JSON-safe selector from a ranked route alias.
-fn selector(alias: &Value) -> Result<String> {
-    let lane = alias
-        .get("quota_lane")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("capacity alias quota lane is invalid"))?;
-    let account = match alias.get("account") {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(value)) => format!(",\"account\":{}", json_ascii(value)),
-        Some(_) => return Err(invalid("capacity alias account is invalid")),
-    };
-    Ok(format!("{{\"quota_lane\":{}{account}}}", json_ascii(lane)))
 }
 
 /// Encodes a JSON string with Python-compatible ASCII-only escaping.

@@ -452,9 +452,9 @@ fn shared_scope() -> String {
 pub fn compact(home: &Path, apply: bool) -> Result<Value> {
     migrate::require_current_store(home)?;
     if !apply {
-        let reader = StoreReader::open(home)?;
+        let mut reader = StoreReader::open(home)?;
         let plan = survey(home, &reader)?;
-        let collection = storage_gc::preview(&reader, home)?;
+        let collection = storage_gc::preview(reader.store_mut(), home)?;
         return Ok(json!({
             "applied": false,
             "plan": plan.report,

@@ -45,6 +45,11 @@ pub fn now() -> f64 {
 #[serde(transparent)]
 pub struct AgentId(String);
 impl AgentId {
+    /// Codec-only fixture constructor; published vectors use placeholder IDs.
+    #[cfg(test)]
+    pub(crate) fn vector_placeholder(value: &str) -> Self {
+        Self(value.into())
+    }
     pub fn new() -> Self {
         Self(format!(
             "ag-{}-{}",

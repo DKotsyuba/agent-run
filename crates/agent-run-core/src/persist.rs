@@ -23,7 +23,7 @@ use crate::{
     },
 };
 use agent_run_domain::{
-    error::PersistenceOperation,
+    error::{PersistenceOperation, invalid},
     storage::{
         MonoDeadline, NotEnqueuedReason, OperationId, PayloadDigest, ProducerId, ProducerKind,
         RejectStage, SubmitResult,
@@ -478,6 +478,14 @@ struct Recovery {
 /// File name of the private append-only recovery log inside the execution's
 /// own directory.
 const RECOVERY_LOG: &str = "recovery-observations.jsonl";
+
+impl Persist {
+    /// Mutable read-only store handle for bounded reads that need a progress
+    /// handler; the connection stays `query_only`.
+    pub(crate) fn reader_mut(&mut self) -> &mut agent_run_store::Store<'static> {
+        self.reader.store_mut()
+    }
+}
 
 impl Deref for Persist {
     /// The read-only store handle every read goes through.
@@ -973,6 +981,114 @@ impl Persist {
     }
 
     /// Claims the provider attempt's spawn; false when a cancel is pending.
+    pub async fn prepare_attempt_launch(&mut self, id: &AgentId, attempt: &str) -> Result<String> {
+        self.own(id)?;
+        self.critical(ops::PrepareAttemptLaunch {
+            target: target(id, attempt),
+        })
+        .await
+    }
+
+    /// The owning supervisor records managed role qualification after native
+    /// checks; the writer ties it to the exact bound R1 leader and launch.
+    pub async fn qualify_attempt_role(
+        &mut self,
+        id: &AgentId,
+        attempt: &str,
+        qualification: agent_run_domain::attempt_binding::RoleQualification,
+    ) -> Result<()> {
+        self.own(id)?;
+        self.critical(ops::QualifyAttemptRole {
+            target: target(id, attempt),
+            qualification,
+        })
+        .await
+    }
+
+    /// Reserve a payload-free managed effect on the owning supervisor lane.
+    pub async fn reserve_owner_effect(
+        &mut self,
+        request: &agent_run_domain::owner_v2::RequestV2,
+        enabled: bool,
+    ) -> Result<agent_run_store::owner_v2::Reservation> {
+        let attempt = self
+            .attempt
+            .clone()
+            .ok_or_else(|| invalid("owner attempt unavailable"))?;
+        self.critical(ops::ReserveOwnerEffect {
+            target: target(&self.execution, &attempt),
+            store: request
+                .outbox_intent
+                .target_binding
+                .attempt
+                .run_store_id
+                .clone(),
+            outbox: Box::new(request.outbox_intent.clone()),
+            effect_digest: request.effect_digest.clone(),
+            enabled,
+        })
+        .await
+    }
+    /// Commit the no-resend fence before any possible native write.
+    pub async fn invoke_owner_effect(
+        &mut self,
+        request: &agent_run_domain::owner_v2::RequestV2,
+        token: &str,
+    ) -> Result<()> {
+        let attempt = self
+            .attempt
+            .clone()
+            .ok_or_else(|| invalid("owner attempt unavailable"))?;
+        self.critical(ops::InvokeOwnerEffect {
+            target: target(&self.execution, &attempt),
+            store: request
+                .outbox_intent
+                .target_binding
+                .attempt
+                .run_store_id
+                .clone(),
+            producer_scope: request.outbox_intent.producer_scope.clone(),
+            effect_id: request.outbox_intent.effect_id.clone(),
+            effect_digest: request.effect_digest.clone(),
+            dispatch_token: token.into(),
+        })
+        .await
+    }
+    /// Persist the native handoff outcome before returning it to Bridge.
+    pub async fn finish_owner_effect(
+        &mut self,
+        request: &agent_run_domain::owner_v2::RequestV2,
+        token: &str,
+        state: &str,
+        protocol: Option<&str>,
+        native_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<agent_run_store::owner_v2::EffectView> {
+        let attempt = self
+            .attempt
+            .clone()
+            .ok_or_else(|| invalid("owner attempt unavailable"))?;
+        self.critical(ops::FinishOwnerEffect {
+            target: target(&self.execution, &attempt),
+            store: request
+                .outbox_intent
+                .target_binding
+                .attempt
+                .run_store_id
+                .clone(),
+            producer_scope: request.outbox_intent.producer_scope.clone(),
+            effect_id: request.outbox_intent.effect_id.clone(),
+            effect_digest: request.effect_digest.clone(),
+            dispatch_token: token.into(),
+            state: state.into(),
+            protocol: protocol.map(str::to_owned),
+            native_id: native_id.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+        })
+        .await
+    }
+
+    /// Claims the provider attempt's spawn; false when a cancel is pending.
     pub async fn provider_spawning(&mut self, id: &AgentId, attempt: &str) -> Result<bool> {
         self.own(id)?;
         self.critical(ops::ProviderSpawning {
@@ -998,12 +1114,14 @@ impl Persist {
         attempt: &str,
         leader: &agent_run_platform::process::Identity,
         integration: Option<agent_run_domain::integration::NativeIntegration>,
+        incarnation: Option<agent_run_platform::process::KernelIncarnation>,
     ) -> Result<()> {
         self.own(id)?;
         self.critical(ops::ProviderProcess {
             target: target(id, attempt),
             leader: leader.clone(),
             integration,
+            incarnation,
         })
         .await
     }
@@ -1474,13 +1592,6 @@ impl Persist {
         .await
     }
 
-    /// Latches native quota exhaustion for the bound account.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn latch_native_exhaustion(&mut self, op: ops::LatchNativeExhaustion) -> Result<i64> {
-        self.own(&op.execution)?;
-        self.critical(op).await
-    }
-
     /// Allocates the next attempt after an account switch.
     pub async fn allocate_next_attempt(
         &mut self,
@@ -1684,16 +1795,6 @@ pub fn cli_hello() -> Hello {
 /// and never fall back to a local writable database when the broker is absent.
 pub fn operator_producer(home: &Path) -> Producer {
     Producer::connect(&home.join("writer.sock"), cli_hello(), cli_producer_id())
-}
-
-/// Build the metadata collector's authenticated writer client, without opening SQL.
-/// Its authority only permits collector operations, never ownership or completion.
-pub fn collector_producer(home: &Path) -> Producer {
-    let mut hello = cli_hello();
-    hello.role = "collector".into();
-    let mut id = cli_producer_id();
-    id.kind = ProducerKind::Collector;
-    Producer::connect(&home.join("writer.sock"), hello, id)
 }
 
 /// Whether `execution` owns an attempt that was prepared but never spawned a

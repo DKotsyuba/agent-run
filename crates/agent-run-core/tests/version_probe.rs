@@ -41,6 +41,20 @@ fn isolated(home: &Path) -> BTreeMap<String, String> {
     ])
 }
 
+/// Creates an executable fixture outside the test process's descriptor table.
+/// Concurrent forked probes therefore cannot inherit its open write descriptor.
+fn write_probe_fixture(path: &Path, body: &str) {
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture-writer"])
+        .arg(path)
+        .arg(body)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("fixture writer starts");
+    assert!(output.status.success(), "fixture writer failed: {output:?}");
+}
+
 /// Mirrors `tests/test_adapter_versions.py::test_version_is_fresh_and_not_cached`
 #[tokio::test]
 async fn version_is_fresh_and_not_cached() {
@@ -188,7 +202,7 @@ async fn native_spawn_refusals_do_not_execute_the_file() {
     let environment = isolated(root.path());
     let executable = root.path().join("runtime");
     let marker = root.path().join("executed");
-    std::fs::write(&executable, "printf ran > \"$HOME/executed\"\n").unwrap();
+    write_probe_fixture(&executable, "printf ran > \"$HOME/executed\"\n");
     for (path, mode, expected) in [
         (root.path().join("missing"), None, libc::ENOENT),
         (executable.clone(), Some(0o600), libc::EACCES),
@@ -224,7 +238,7 @@ async fn no_shebang_behavior_matches_the_original_command() {
 
     let root = tempfile::tempdir().expect("temporary root");
     let path = root.path().join("plain-probe");
-    std::fs::write(&path, "printf 'plain:%s' \"$1\"\n").unwrap();
+    write_probe_fixture(&path, "printf 'plain:%s' \"$1\"\n");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let args = ["literal $HOME".into()];
     let environment = isolated(root.path());
@@ -243,7 +257,8 @@ async fn no_shebang_behavior_matches_the_original_command() {
             assert_eq!(observed.unwrap(), output.stdout);
         }
         Err(expected) => assert!(
-            matches!(observed, Err(agent_run_core::Error::Io(error)) if error.raw_os_error() == expected.raw_os_error())
+            matches!(&observed, Err(agent_run_core::Error::Io(error)) if error.raw_os_error() == expected.raw_os_error()),
+            "original command returned {expected:?}, probe returned {observed:?}"
         ),
     }
 }
@@ -255,7 +270,7 @@ async fn bare_name_no_shebang_matches_the_original_command() {
 
     let root = tempfile::tempdir().expect("temporary root");
     let path = root.path().join("plain-probe");
-    std::fs::write(&path, "printf 'plain:%s' \"$1\"\n").unwrap();
+    write_probe_fixture(&path, "printf 'plain:%s' \"$1\"\n");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let args = ["literal $HOME".into()];
     let mut environment = isolated(root.path());
@@ -275,7 +290,8 @@ async fn bare_name_no_shebang_matches_the_original_command() {
             assert_eq!(observed.unwrap(), output.stdout);
         }
         Err(expected) => assert!(
-            matches!(observed, Err(agent_run_core::Error::Io(error)) if error.raw_os_error() == expected.raw_os_error())
+            matches!(&observed, Err(agent_run_core::Error::Io(error)) if error.raw_os_error() == expected.raw_os_error()),
+            "original command returned {expected:?}, probe returned {observed:?}"
         ),
     }
 }
@@ -290,7 +306,7 @@ async fn bare_name_path_search_and_denial() {
     std::fs::create_dir(&second).unwrap();
     for (directory, mode) in [(&first, 0o600), (&second, 0o700)] {
         let file = directory.join("path-probe");
-        std::fs::write(&file, "#!/bin/sh\nprintf found-path\n").unwrap();
+        write_probe_fixture(&file, "#!/bin/sh\nprintf found-path\n");
         std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
     }
     let mut environment = isolated(root.path());

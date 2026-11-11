@@ -11,12 +11,12 @@
 use agent_run_config::config::Config;
 use agent_run_domain::{
     catalog::{
-        AccountId, AccountRecord, ProviderCatalog, QuotaCandidateSet, ResolvedLaunchAuthority,
+        AccountId, AccountRecord, PhysicalQuotaKey, ProviderCatalog, QuotaCandidateSet,
+        ResolvedLaunchAuthority,
     },
     domain::{AgentId, OrchestratorRef, Outcome, StartRequest},
     pool::{AcceptanceCriterion, PoolDenial, PoolId, PoolMessage, PoolPropose, PoolVote},
     provider_start::ProviderStartRequest,
-    quota_snapshot::NormalizedQuotaSnapshot,
     storage::{OperationId, PayloadDigest},
     worker::{FinishGuard, FinishRequest, NotifyRequest, WorkerCatalogProof},
 };
@@ -170,6 +170,127 @@ pub struct AdmitProvider {
     pub catalog: ProviderCatalog,
     /// Admission inputs.
     pub inputs: AdmissionSpec,
+}
+
+/// One pre-minted independent job and its trusted provider inputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchMemberSpec {
+    /// Stable public identity minted by the broker.
+    pub id: AgentId,
+    /// Frozen ordinary provider admission facts.
+    pub inputs: AdmissionSpec,
+}
+
+/// Admit all independent jobs and their permanent receipt in one transaction.
+#[derive(Clone, Serialize)]
+pub struct AdmitBatch {
+    /// Permanent batch key in this Run home.
+    pub request_id: String,
+    /// Versioned digest of normalized ordered client intent.
+    pub fingerprint: String,
+    /// Whether each new lineage receives a durable retention pin.
+    pub retain_history: bool,
+    /// Database identity the writer must verify before replay or mutation.
+    pub expected_store_id: Option<agent_run_domain::StoreId>,
+    /// Ordered prerequisites enforced in the admission transaction.
+    pub preconditions: Option<Vec<agent_run_domain::batch::BatchPrecondition>>,
+    /// One frozen catalog for the whole request.
+    pub catalog: ProviderCatalog,
+    /// Prepared jobs in the caller's order.
+    pub jobs: Vec<BatchMemberSpec>,
+}
+
+/// Prepare the exact Pool request before any external admission I/O.
+#[derive(Clone, Serialize)]
+pub struct PrepareManagedEnrollment {
+    pub key: agent_run_domain::enrollment::Key,
+    pub grant: crate::managed_enrollment::Grant,
+    pub request: Value,
+}
+/// Fence an unadmitted Pool request, serialized with its admission.
+#[derive(Clone, Serialize)]
+pub struct AbortManagedEnrollment {
+    pub key: agent_run_domain::enrollment::Key,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+}
+/// Commit one prepared external enrollment together with ordinary admissions.
+#[derive(Clone, Serialize)]
+pub struct AdmitManagedEnrollment {
+    pub key: agent_run_domain::enrollment::Key,
+    pub grant: crate::managed_enrollment::Grant,
+    pub config_revision: String,
+    pub role_digests: Vec<String>,
+    pub batch: AdmitBatch,
+}
+
+/// Idempotently release one exact permanent history pin.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseHistoryPin {
+    /// Opaque pin key; never grants worker authority.
+    pub pin_id: agent_run_domain::batch::PinId,
+    /// Optional database identity checked in the same release transaction.
+    pub expected_store_id: Option<agent_run_domain::StoreId>,
+}
+
+/// Atomically hold the exact successful lineage tails under broker authority.
+#[derive(Clone, Serialize)]
+pub struct AcquireLineageHold {
+    /// Ordered acquisition intent; the Store validates every prerequisite.
+    pub acquire: agent_run_domain::lineage_hold::LineageHoldAcquire,
+}
+
+/// Broker-local release proof, retained only in memory and in the payload digest.
+/// A new public invocation must create a new envelope so even a released hold
+/// authenticates again. Exact internal envelope retries retain their receipt.
+#[derive(Clone, Serialize)]
+pub struct ReleaseLineageHold {
+    /// Exact permanent hold identity; it grants no release authority alone.
+    pub hold_id: agent_run_domain::lineage_hold::HoldId,
+    /// Store scope checked before looking up or releasing the hold.
+    pub expected_store_id: agent_run_domain::StoreId,
+    /// Serialized only while computing the local envelope's digest and size.
+    #[serde(serialize_with = "serialize_release_signature")]
+    signature: [u8; 64],
+}
+
+impl ReleaseLineageHold {
+    /// Retains a fixed-size proof for transactional verification, without logging it.
+    pub fn new(
+        hold_id: agent_run_domain::lineage_hold::HoldId,
+        expected_store_id: agent_run_domain::StoreId,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            hold_id,
+            expected_store_id,
+            signature,
+        }
+    }
+
+    /// Borrows the proof only for the Store's signature verifier.
+    pub(super) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+}
+
+impl std::fmt::Debug for ReleaseLineageHold {
+    /// Identifies the operation without exposing its release capability.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReleaseLineageHold")
+            .field("hold_id", &self.hold_id)
+            .field("expected_store_id", &self.expected_store_id)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Includes all proof bytes in the transient digest input; none enter receipts.
+fn serialize_release_signature<S: serde::Serializer>(
+    signature: &[u8; 64],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    signature.as_slice().serialize(serializer)
 }
 
 /// 3 — admit one explicit provider resume of a terminal parent.
@@ -464,6 +585,157 @@ pub struct ProviderSpawning {
     pub target: AttemptTarget,
 }
 
+/// Prepare durable per-attempt launch correlation before an OS spawn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareAttemptLaunch {
+    /// Attempt owned by the supervisor.
+    pub target: AttemptTarget,
+}
+/// Owning supervisor records managed native role/config/inventory verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualifyAttemptRole {
+    pub target: AttemptTarget,
+    pub qualification: agent_run_domain::attempt_binding::RoleQualification,
+}
+/// Reserve one frozen owner-v2 effect on the owning supervisor lane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveOwnerEffect {
+    pub target: AttemptTarget,
+    pub store: agent_run_domain::StoreId,
+    pub outbox: Box<agent_run_domain::owner_v2::OutboxIntent>,
+    pub effect_digest: String,
+    pub enabled: bool,
+}
+/// Commit the invoking fence before any native owner write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvokeOwnerEffect {
+    pub target: AttemptTarget,
+    pub store: agent_run_domain::StoreId,
+    pub producer_scope: String,
+    pub effect_id: String,
+    pub effect_digest: String,
+    pub dispatch_token: String,
+}
+/// Persist the original native outcome; no model payload is included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinishOwnerEffect {
+    pub target: AttemptTarget,
+    pub store: agent_run_domain::StoreId,
+    pub producer_scope: String,
+    pub effect_id: String,
+    pub effect_digest: String,
+    pub dispatch_token: String,
+    pub state: String,
+    pub protocol: Option<String>,
+    pub native_id: Option<String>,
+    pub reason: Option<String>,
+}
+/// Bridge-authorized broker abort, serialized against supervisor reservation.
+#[derive(Debug, Clone, Serialize)]
+pub struct AbortOwnerEffect {
+    pub store: agent_run_domain::StoreId,
+    pub producer_scope: String,
+    pub effect_id: String,
+    pub effect_digest: String,
+    pub route: crate::owner_v2::EffectRoute,
+}
+
+/// Freeze the current launch before an authenticated Bridge actor lookup.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeginAttemptEgress {
+    pub request: agent_run_domain::attempt_binding::EgressCurrent,
+    pub enabled: bool,
+}
+/// Commit a Bridge actor only after the original launch still matches.
+#[derive(Debug, Clone, Serialize)]
+pub struct FinishAttemptEgress {
+    pub request: agent_run_domain::attempt_binding::EgressCurrent,
+    pub candidate: crate::attempt_binding::EgressCandidate,
+    pub actor: agent_run_domain::attempt_binding::Actor,
+    pub inspected: agent_run_domain::attempt_binding::Incarnation,
+    pub enabled: bool,
+}
+
+/// Reserve one immutable admission lookup before Bridge I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeginAttemptAdmission {
+    pub request: agent_run_domain::attempt_binding::AdmissionRequest,
+    pub enabled: bool,
+}
+/// Commit one authenticated original Bridge observation.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmitAttempt {
+    pub request: agent_run_domain::attempt_binding::AdmissionRequest,
+    pub receipt: agent_run_domain::attempt_binding::ConsumeReceipt,
+    pub inspected: agent_run_domain::attempt_binding::Incarnation,
+    pub enabled: bool,
+}
+/// Install a permanent pre-admission rejecting tombstone.
+#[derive(Debug, Clone, Serialize)]
+pub struct AbortAttemptAdmission {
+    pub store: agent_run_domain::StoreId,
+    pub intent_id: String,
+    pub security_digest: String,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+    pub requested_outcome_digest: Option<String>,
+}
+/// Journal an authenticated terminal Pool result for one admission.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettleAttemptAdmission {
+    pub store: agent_run_domain::StoreId,
+    pub admission_id: String,
+    pub intent_id: String,
+    pub security_digest: String,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+    pub state: String,
+    pub outcome_digest: String,
+}
+/// Fence a historical producer/issuer before Pool and Bridge I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct FenceAttemptNamespace {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub current_issuer: String,
+}
+/// Persist the original retirement route before any outbound lookup.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrepareAttemptRetirement {
+    pub request: crate::attempt_binding::NamespaceRequest,
+}
+/// Record an authenticated sealed Pool namespace before Bridge I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvokeAttemptRetirement {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub seal: crate::attempt_binding::PoolSeal,
+}
+/// Pin the authenticated Pool seal ID even while that namespace drains.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObserveAttemptPoolSeal {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub seal: crate::attempt_binding::PoolSeal,
+}
+/// Persist an authenticated exact Bridge retirement response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompleteAttemptRetirement {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub pool_seal_id: String,
+    pub retired_count: u64,
+}
+/// Bind an authenticated original ingress observation to a current receipt.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordAttemptIngress {
+    pub request: agent_run_domain::attempt_binding::IngressCurrent,
+    pub observation: agent_run_domain::attempt_binding::Observation,
+    pub inspected: agent_run_domain::attempt_binding::Incarnation,
+    pub enabled: bool,
+}
+/// Freeze the authenticated Bridge launch before committing currentness.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeginAttemptCurrent {
+    pub request: agent_run_domain::attempt_binding::IngressCurrent,
+    pub launch_id: String,
+    pub enabled: bool,
+}
+
 /// 20 — provider attempt never spawned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSpawnFailed {
@@ -482,6 +754,9 @@ pub struct ProviderProcess {
     /// Session must remain absent until the adapter observes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<agent_run_domain::integration::NativeIntegration>,
+    /// Exact kernel incarnation for a journaled Linux launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<agent_run_platform::process::KernelIncarnation>,
 }
 
 /// 22 — provider attempt cleanup proof recorded.
@@ -602,7 +877,7 @@ pub struct RecordResumeUsageBaseline {
     pub execution: AgentId,
 }
 
-/// 31 — latch an observed native quota exhaustion.
+/// 31 — retired native quota latch, retained for decoding historical requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatchNativeExhaustion {
     /// Execution whose attempt observed it.
@@ -1379,7 +1654,7 @@ pub struct ClaimServiceProcessIdentity {
     pub identity: Identity,
 }
 
-/// One capacity sample row.
+/// Retired capacity sample row, retained for decoding historical requests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapacitySampleRow {
     /// Runtime.
@@ -1402,7 +1677,7 @@ pub struct CapacitySampleRow {
     pub valid_until: f64,
 }
 
-/// 76 — persist one validated capacity slice atomically.
+/// 76 — retired capacity slice request, retained for receipt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistCapacitySamples {
     /// Runtime.
@@ -1421,27 +1696,71 @@ pub struct PersistCapacitySamples {
     pub retention: usize,
 }
 
-/// 77 — trim capacity history.
+/// 77 — retired capacity retention request, retained for receipt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneCapacitySamples {
     /// Retention row bound.
     pub retention: usize,
 }
 
-/// 78 — persist one normalized quota snapshot.
+/// Retired quota window, retained only for decoding historical requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaWindow {
+    /// Collector source identity.
+    pub source: String,
+    /// Provider-native window name.
+    pub name: String,
+    /// Remaining percentage, if known.
+    pub remaining_percent: Option<f64>,
+    /// Provider-reported Unix reset time, if known.
+    pub reset_at: Option<f64>,
+    /// Observation time in Unix seconds.
+    pub observed_at: f64,
+    /// Expiry time in Unix seconds.
+    pub valid_until: f64,
+}
+
+/// Retired physical pool observation in a historical request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaPool {
+    /// Account and quota lane.
+    pub key: PhysicalQuotaKey,
+    /// Provider-reported windows.
+    pub windows: Vec<RetiredQuotaWindow>,
+}
+
+/// Retired model observation in a historical request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaModel {
+    /// Catalog model identifier.
+    pub model: String,
+    /// Physical pools associated with the model.
+    pub pools: Vec<RetiredQuotaPool>,
+}
+
+/// Retired account observation, retained only for decoding historical requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaSnapshot {
+    /// Account that owned the observation.
+    pub account: AccountId,
+    /// Observed model memberships.
+    pub models: Vec<RetiredQuotaModel>,
+}
+
+/// 78 — retired quota snapshot request, retained for receipt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordQuotaSnapshot {
     /// Runtime.
     pub runtime: String,
     /// Snapshot.
-    pub snapshot: NormalizedQuotaSnapshot,
+    pub snapshot: RetiredQuotaSnapshot,
     /// Retention row bound.
     pub retention: usize,
     /// Evaluation time.
     pub at: f64,
 }
 
-/// 79 — exhaustion retention; an internal unit of row 78, refused standalone.
+/// 79 — retired internal quota retention unit, refused standalone.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetainExhausted {
     /// Account.

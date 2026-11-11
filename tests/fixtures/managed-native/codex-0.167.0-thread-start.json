@@ -1,0 +1,39 @@
+{
+ "params": {
+  "approvalPolicy": "never",
+  "cwd": "/home/agent-mcp/.agent-pool-qual/work/m2",
+  "developerInstructions": "<Run explicit-finish contract>",
+  "environments": [],
+  "model": "gpt-6-luna",
+  "permissions": ":read-only",
+  "runtimeWorkspaceRoots": []
+ },
+ "result": {
+  "activePermissionProfile": {
+   "extends": null,
+   "id": ":read-only"
+  },
+  "approvalPolicy": "never",
+  "approvalsReviewer": "user",
+  "cwd": "/home/agent-mcp/.agent-pool-qual/work/m2",
+  "disabledPluginIds": [],
+  "instructionSources": [],
+  "model": "gpt-6-luna",
+  "modelProvider": "openai",
+  "multiAgentMode": "explicitRequestOnly",
+  "reasoningEffort": null,
+  "runtimeWorkspaceRoots": [],
+  "sandbox": {
+   "networkAccess": false,
+   "type": "readOnly"
+  },
+  "serviceTier": null,
+  "thread": {
+   "environments": [],
+   "id": "00000000-0000-7000-8000-000000000001",
+   "status": {
+    "type": "idle"
+   }
+  }
+ }
+}

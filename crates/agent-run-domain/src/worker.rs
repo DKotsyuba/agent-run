@@ -31,6 +31,14 @@ pub const RESEARCH_ENV: &str = "AGENT_RUN_WORKER_RESEARCH";
 /// broker checks frozen admission and capability independently of this flag.
 pub const FINISH_ENV: &str = "AGENT_RUN_WORKER_FINISH";
 
+/// Nonsecret supervisor-selected managed-role marker. With explicit finish it
+/// narrows the worker surface to exactly `finish` and `health_reply`; the
+/// broker's authority checks are unchanged and the marker grants nothing.
+pub const MANAGED_ENV: &str = "AGENT_RUN_WORKER_MANAGED";
+
+/// The private worker tools of the managed role, in served order.
+pub const MANAGED_TOOLS: [&str; 2] = ["health_reply", "finish"];
+
 /// The broker's pre-SQL verdict on one finish summary against the transient
 /// launch-secret context its verified supervisor installed for that exact
 /// attempt. Only a clean verdict may create a first finish intent; an exact
@@ -200,6 +208,34 @@ pub fn finish_tools_json(research: bool) -> Vec<Value> {
 /// Fingerprint the real mode/role-bound completion catalog, excluding secrets.
 pub fn finish_catalog_digest(research: bool) -> String {
     crate::canonical::sha256_hex(&serde_json::json!(finish_tools_json(research)), true)
+}
+
+/// The managed-role explicit catalog: the current completion definitions of
+/// `health_reply` and `finish` only. A no-shell managed participant reaches
+/// its Pool through the pinned Pool server, never through worker pool tools.
+pub fn managed_tools_json() -> Vec<Value> {
+    finish_tools_json(false)
+        .into_iter()
+        .filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| MANAGED_TOOLS.contains(&name))
+        })
+        .collect()
+}
+
+/// Fingerprints the managed-role catalog, excluding secrets.
+pub fn managed_catalog_digest() -> String {
+    crate::canonical::sha256_hex(&serde_json::json!(managed_tools_json()), true)
+}
+
+/// Every catalog a worker may register: the reviewed pool-capable catalogs
+/// and the managed completion catalog. The managed catalog has no pool tools,
+/// so it never satisfies [`known_pool_catalog`] or legacy pool enrollment;
+/// it is health-capable at [`FINISH_CATALOG_VERSION`].
+pub fn known_worker_catalog(version: u32, digest: &str) -> bool {
+    known_pool_catalog(version, digest)
+        || (version == FINISH_CATALOG_VERSION && digest == managed_catalog_digest())
 }
 
 /// The research surface retains safe completion/pool messages and adds only a
@@ -647,5 +683,35 @@ mod completion_catalog_history_tests {
                 false
             );
         }
+    }
+
+    /// The managed catalog is exactly health_reply and finish, registers as a
+    /// health-capable worker catalog and never as a pool-capable one.
+    #[test]
+    fn managed_catalog_is_completion_only_and_not_pool_capable() {
+        let names: Vec<_> = managed_tools_json()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, MANAGED_TOOLS);
+        let full = finish_tools_json(false);
+        for tool in managed_tools_json() {
+            assert!(full.contains(&tool));
+        }
+        let digest = managed_catalog_digest();
+        assert!(known_worker_catalog(FINISH_CATALOG_VERSION, &digest));
+        assert!(!known_pool_catalog(FINISH_CATALOG_VERSION, &digest));
+        assert!(!known_worker_catalog(POOL_CATALOG_VERSION, &digest));
+        assert!(!known_worker_catalog(3, &digest));
+        for research in [false, true] {
+            assert!(known_worker_catalog(
+                FINISH_CATALOG_VERSION,
+                &finish_catalog_digest(research)
+            ));
+        }
+        assert!(!known_worker_catalog(
+            FINISH_CATALOG_VERSION,
+            &"0".repeat(64)
+        ));
     }
 }

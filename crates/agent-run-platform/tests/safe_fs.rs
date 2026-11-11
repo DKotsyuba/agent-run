@@ -7,7 +7,10 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("agent-run-safe-fs-")
-        .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
+        .tempdir_in(
+            std::env::var_os("AGENT_RUN_TEST_TMP")
+                .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+        )
         .expect("tempdir")
 }
 

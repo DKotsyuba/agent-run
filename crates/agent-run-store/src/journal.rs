@@ -141,7 +141,7 @@ fn message_storage_with_access(
 }
 
 impl Store<'_> {
-    /// Creates the next numbered adapter attempt for an existing agent and returns its durable id.
+    /// Creates the next numbered adapter attempt for an existing unheld lineage, or conflicts.
     pub fn create_attempt(
         &mut self,
         id: &AgentId,
@@ -152,6 +152,7 @@ impl Store<'_> {
             return Err(invalid("attempt state must be a nonblank string"));
         }
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        crate::lineage_holds::require_unheld(&tx, id)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
             [id.as_str()],

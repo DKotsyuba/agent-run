@@ -140,6 +140,185 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
     }
 }
 
+/// Historical attempts gain no manufactured launch or kernel identity.
+#[test]
+fn v37_launch_migration_preserves_historical_attempts_unqualified() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 37);
+    let before: String = conn.query_row("SELECT json_group_array(json_array(id,agent_id,process_identity,phase)) FROM (SELECT * FROM attempts ORDER BY id)", [], |r| r.get(0)).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let migrated = open_ro(&path);
+    let after: String = migrated.query_row("SELECT json_group_array(json_array(id,agent_id,process_identity,phase)) FROM (SELECT * FROM attempts ORDER BY id)", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        migrated
+            .query_row("SELECT count(*) FROM attempt_launches", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+/// R2 upgrades a bound R1 launch without manufacturing an admission or receipt.
+#[test]
+fn v38_attempt_migration_preserves_launch_and_starts_authority_empty() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 38);
+    conn.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) VALUES('fixture-key','fixture-execution',1,'fixture-attempt','00000000-0000-4000-8000-000000000001','bound','00000000-0000-4000-8000-000000000002',11,1000,123,456)", []).unwrap();
+    let before:String=conn.query_row("SELECT json_array(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) FROM attempt_launches WHERE spawn_key='fixture-key'",[],|r|r.get(0)).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = open_ro(&path);
+    let after:String=conn.query_row("SELECT json_array(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) FROM attempt_launches WHERE spawn_key='fixture-key'",[],|r|r.get(0)).unwrap();
+    assert_eq!(before, after);
+    for table in [
+        "attempt_pending_checks",
+        "attempt_pending_current",
+        "attempt_role_qualifications",
+        "attempt_admissions",
+        "attempt_current_receipts",
+        "attempt_namespace_retirements",
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+/// R3 never invents old native effects when upgrading an R2 store.
+#[test]
+fn v39_owner_effect_migration_preserves_r2_receipts() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 39);
+    conn.execute("INSERT INTO attempt_admissions(intent_id,security_digest,pool_route_json,state) VALUES('old-intent',?,'{}','aborted_before_admit')",["a".repeat(64)]).unwrap();
+    let before:String=conn.query_row("SELECT json_array(intent_id,security_digest,pool_route_json,state) FROM attempt_admissions WHERE intent_id='old-intent'",[],|r|r.get(0)).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = open_ro(&path);
+    let after:String=conn.query_row("SELECT json_array(intent_id,security_digest,pool_route_json,state) FROM attempt_admissions WHERE intent_id='old-intent'",[],|r|r.get(0)).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM owner_effects", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    for trigger in [
+        "attempt_launches_no_delete",
+        "attempt_role_qualifications_no_delete",
+        "attempt_pending_checks_no_delete",
+        "attempt_admissions_no_delete",
+        "attempt_pending_current_no_delete",
+        "attempt_current_receipts_no_delete",
+        "attempt_namespace_retirements_no_delete",
+        "owner_effects_no_delete",
+    ] {
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?)",
+                [trigger],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+            "{trigger}"
+        );
+    }
+}
+
+/// V37 adds hold storage without rewriting existing identity, pins, receipts or agent history.
+#[test]
+fn v36_hold_migration_preserves_identity_pins_receipts_and_history() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 36);
+    agent_run_store::fixture::fenced(&conn).unwrap();
+    let root: String = conn
+        .query_row("SELECT id FROM agents ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    for (digit, released) in [('1', 0), ('2', 1)] {
+        conn.execute(
+            "INSERT INTO history_pins(pin_id,root_agent_id,released) VALUES(?,?,?)",
+            params![
+                format!("pin_{}", digit.to_string().repeat(32)),
+                root,
+                released
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+        params!["fixture-batch", "a".repeat(64), r#"{"fixture":true}"#],
+    )
+    .unwrap();
+    let identity: String = conn
+        .query_row(
+            "SELECT store_id FROM store_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let pins_sql = "SELECT json_group_array(json_array(pin_id,root_agent_id,released)) FROM (SELECT * FROM history_pins ORDER BY pin_id)";
+    let receipts_sql = "SELECT json_group_array(json_array(request_id,fingerprint_version,fingerprint,receipt_json)) FROM (SELECT * FROM start_batch_receipts ORDER BY request_id)";
+    let pins: String = conn.query_row(pins_sql, [], |row| row.get(0)).unwrap();
+    let receipts: String = conn.query_row(receipts_sql, [], |row| row.get(0)).unwrap();
+    assert_ne!(pins, "[]");
+    assert_ne!(receipts, "[]");
+    let agents = agent_count(&conn);
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let migrated = open_ro(&path);
+    assert_eq!(
+        migrated
+            .query_row(
+                "SELECT store_id FROM store_identity WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        identity
+    );
+    assert_eq!(
+        migrated
+            .query_row(pins_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        pins
+    );
+    assert_eq!(
+        migrated
+            .query_row(receipts_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        receipts
+    );
+    assert_eq!(agent_count(&migrated), agents);
+    assert_eq!(
+        migrated
+            .query_row("SELECT count(*) FROM lineage_holds", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        migrated
+            .query_row("SELECT count(*) FROM lineage_hold_targets", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    assert_eq!(schema_objects(&migrated), fresh_schema_objects());
+}
+
 /// Empty v34 maintenance tables can be removed without altering delivery history.
 #[test]
 fn v34_empty_maintenance_upgrades_and_preserves_deliveries() {
@@ -155,9 +334,9 @@ fn v34_empty_maintenance_upgrades_and_preserves_deliveries() {
     let agents = agent_count(&conn);
     drop(conn);
 
-    assert_eq!(migrations::migrate(&path).unwrap(), 35);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(user_version(&conn), 35);
+    assert_eq!(user_version(&conn), VERSION);
     assert_eq!(agent_count(&conn), agents);
     assert_eq!(
         conn.query_row(deliveries_sql, [], |row| row.get::<_, String>(0))
@@ -397,6 +576,191 @@ fn current_binary_fixture_matches_fresh_schema() {
             .unwrap(),
         0
     );
+}
+
+/// P3 keys upgrade without changing historical rows and cannot be deleted or
+/// rewritten; newer schemas are never treated as a downgrade opportunity.
+#[test]
+fn p3_historical_migration_and_permanent_enrollment_fence() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let old = build_fixture(&path, 40);
+    let old_agents = agent_count(&old);
+    assert!(
+        !schema_objects(&old)
+            .iter()
+            .any(|(_, name, _)| name == "managed_enrollments")
+    );
+    drop(old);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(agent_count(&conn), old_agents);
+    assert_eq!(schema_objects(&conn), fresh_schema_objects());
+    conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state) VALUES('{}','pool','key',1,?,'aborted')", ["a".repeat(64)]).unwrap();
+    assert!(conn.execute("DELETE FROM managed_enrollments", []).is_err());
+    assert!(
+        conn.execute(
+            "UPDATE managed_enrollments SET fingerprint=?",
+            ["b".repeat(64)]
+        )
+        .is_err()
+    );
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", VERSION + 1)
+        .unwrap();
+    drop(conn);
+    assert!(migrations::migrate(&path).is_err());
+    assert_eq!(user_version(&open_ro(&path)), VERSION + 1);
+}
+
+/// v41 terminal enrollment keys lose only their retained start request body;
+/// fingerprints, pins, receipts, tombstones and ownership rows are unchanged,
+/// and the new transition may clear the body only on its terminal update.
+#[test]
+fn p3_v41_to_v42_discards_terminal_request_bodies() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let old = build_fixture(&path, 41);
+    assert_eq!(user_version(&old), 41);
+    let insert = "INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json,receipt_id,receipt_json) VALUES('{}','pool',?,1,?,?,?,?,?,?)";
+    let task = r#"{"jobs":[{"spec":{"task":"secret task text"}}]}"#;
+    for (id, state, request, grant, receipt) in [
+        (
+            "admitted",
+            "admitted",
+            Some(task),
+            Some("{}"),
+            Some("receipt"),
+        ),
+        ("prepared", "prepared", Some(task), Some("{}"), None),
+        ("aborted-prepared", "aborted", Some(task), Some("{}"), None),
+        ("aborted-absent", "aborted", None, None, None),
+    ] {
+        old.execute(
+            insert,
+            rusqlite::params![
+                id,
+                "a".repeat(64),
+                state,
+                request,
+                grant,
+                receipt,
+                receipt.map(|_| r#"{"receipt":"kept"}"#)
+            ],
+        )
+        .unwrap();
+    }
+    old.execute("INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index) VALUES('root','{}','pool','pool','admitted','member',0)", []).unwrap();
+    drop(old);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(schema_objects(&conn), fresh_schema_objects());
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = conn
+        .prepare("SELECT request_id,state,fingerprint,request_json,grant_json,receipt_json FROM managed_enrollments ORDER BY request_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let kept = Some(r#"{"receipt":"kept"}"#.to_owned());
+    let pin = Some("{}".to_owned());
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "aborted-absent".into(),
+                "aborted".into(),
+                "a".repeat(64),
+                None,
+                None,
+                None
+            ),
+            (
+                "aborted-prepared".into(),
+                "aborted".into(),
+                "a".repeat(64),
+                None,
+                pin.clone(),
+                None
+            ),
+            (
+                "admitted".into(),
+                "admitted".into(),
+                "a".repeat(64),
+                None,
+                pin.clone(),
+                kept
+            ),
+            (
+                "prepared".into(),
+                "prepared".into(),
+                "a".repeat(64),
+                Some(task.into()),
+                pin,
+                None
+            ),
+        ]
+    );
+    let member: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM managed_enrollment_members WHERE request_id='admitted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(member, 1);
+    // A terminal transition that retains the body, or a later rewrite, is refused.
+    assert!(conn.execute("UPDATE managed_enrollments SET state='admitted',receipt_id='r2',receipt_json='{}' WHERE request_id='prepared'", []).is_err());
+    assert!(
+        conn.execute(
+            "UPDATE managed_enrollments SET request_json='{}' WHERE request_id='admitted'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "DELETE FROM managed_enrollments WHERE request_id='aborted-absent'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(
+        conn.execute("UPDATE managed_enrollments SET state='aborted',request_json=NULL WHERE request_id='prepared'", []).unwrap(),
+        1
+    );
+}
+
+/// Separate legacy databases receive independent stable IDs on migration.
+#[test]
+fn migration_assigns_independent_persistent_store_ids() {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        drop(build_fixture(&path, 35));
+        assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+        let conn = open_ro(&path);
+        let id = agent_run_store::store_identity::read(&conn).unwrap();
+        drop(conn);
+        assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+        assert_eq!(
+            agent_run_store::store_identity::read(&open_ro(&path)).unwrap(),
+            id
+        );
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
 }
 
 /// Physical preparation may survive a failed schema step; rows/version/backup stay recoverable.
@@ -645,7 +1009,12 @@ fn migration_commit_boundaries_leave_consistent_recovery_state() {
     let conn = build_fixture(&before_path, 1);
     insert_v1_agents(&conn);
     let before_backup = migrations::backup_path(&before_path, 2);
-    conn.backup(MAIN_DB, &before_backup, None).unwrap();
+    conn.backup(
+        MAIN_DB,
+        &before_backup,
+        None::<fn(rusqlite::backup::Progress)>,
+    )
+    .unwrap();
     conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE crash_before_commit(value TEXT)")
         .unwrap();
     drop(conn);
@@ -699,7 +1068,13 @@ fn migration_commit_boundaries_leave_consistent_recovery_state() {
     assert_eq!(migrations::migrate(&after_path).unwrap(), VERSION);
     let after_backup = migrations::backup_path(&after_path, VERSION);
     let current = Connection::open(&after_path).unwrap();
-    current.backup(MAIN_DB, &after_backup, None).unwrap();
+    current
+        .backup(
+            MAIN_DB,
+            &after_backup,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .unwrap();
     drop(current);
     assert_eq!(migrations::migrate(&after_path).unwrap(), VERSION);
     assert_eq!(user_version(&open_ro(&after_path)), VERSION);

@@ -2,8 +2,10 @@
 pub mod accounts;
 /// Atomic durable admission, replay, and active-capacity reservation.
 pub mod admission;
-/// Capacity sample persistence units of the sole writer.
-pub mod capacity;
+/// Durable attempt-binding admissions and recovery fences; private to the broker.
+pub mod attempt_binding;
+/// Permanent, atomic receipts for generic batch admission.
+pub mod batch_admission;
 /// Durable delivery outbox rows, binding, expiry, and evidence verdicts.
 pub mod delivery;
 /// Read-only diagnostic and active-context snapshots.
@@ -13,17 +15,27 @@ pub mod diagnostics;
 pub mod fixture;
 /// Attempt-owned liveness and bounded model recovery probes.
 pub mod health;
+/// Durable operator-managed lineage history pins.
+pub mod history_pins;
+mod hold_crypto;
 /// Bounded, content-free incident phases independent of expirable history.
 pub mod incidents;
+pub mod initial_task;
 /// Durable append-only journal operations and bounded transcript spooling.
 pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
 pub mod lineage;
+/// Durable atomic success holds and signature-authorized release tombstones.
+pub mod lineage_holds;
+/// Pool-resident durable identity enrollment and ownership fences.
+pub mod managed_enrollment;
 /// Managed service generation, lease, gate and probe units of the sole writer.
 pub mod managed_services;
 pub mod migrations;
 /// Closed storage operation inventory, envelopes and authority matrix.
 pub mod ops;
+/// Durable one-effect owner-v2 reservation and recovery journal.
+pub mod owner_v2;
 pub mod pool_admission;
 /// Exact-attempt enrollment of active independent workers into one pool.
 pub mod pool_enrollment;
@@ -35,8 +47,6 @@ pub mod process_ownership;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
 pub mod provider_admission;
-/// Account-bound quota observation persistence and the exhaustion latch.
-pub mod quota;
 /// Proof-gated reconciliation units of the sole writer.
 pub mod reconcile;
 /// Bounded fourteen-day history expiry and SQLite space reclamation.
@@ -46,12 +56,17 @@ pub mod run_stats;
 /// Durable physical storage-layout registry for shared runtime assets.
 pub mod runtime_storage;
 pub mod service_restart;
+/// Snapshot-scoped database-only lineage and cleanup proofs.
+pub mod status;
+/// Persistent database identity and optional request scope checks.
+pub mod store_identity;
 /// Supervisor bootstrap, ownership and service-executor identity units.
 mod supervisor_units;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
 /// Indexed bounded transcript blocks and native tool evidence views.
 pub mod transcript;
+pub mod transcript_exact;
 /// Authenticated, bounded worker reports and their durable outbox rows.
 pub mod worker;
 pub mod worker_finish;
@@ -560,7 +575,11 @@ impl Store<'_> {
         if destination.exists() {
             return Err(invalid("backup destination already exists"));
         }
-        self.conn.backup(rusqlite::MAIN_DB, destination, None)?;
+        self.conn.backup(
+            rusqlite::MAIN_DB,
+            destination,
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
@@ -954,8 +973,10 @@ impl Store<'_> {
         }
         Ok(())
     }
+    /// Marks an unheld execution running and records its first legacy attempt if needed.
     pub fn running(&mut self, id: &AgentId, pgid: i32) -> Result<()> {
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        crate::lineage_holds::require_unheld(&tx, id)?;
         let s: String =
             tx.query_row("SELECT status FROM agents WHERE id=?", [id.as_str()], |r| {
                 r.get(0)
@@ -993,14 +1014,14 @@ impl Store<'_> {
         tx.commit()?;
         Ok(())
     }
-    /// Returns the committed global revision of the entire quota snapshot.
+    /// Returns the committed revision of local account and reservation state.
     ///
-    /// Admission reads this inside `BEGIN IMMEDIATE` and compares it with
-    /// the producer's candidate revision. The store never scores candidates.
+    /// Admission compares this inside `BEGIN IMMEDIATE` with the local
+    /// revision used to build the candidate set. The store never scores it.
     pub fn quota_capacity_revision(&self) -> Result<i64> {
         Self::quota_capacity_revision_in(&self.conn)
     }
-    /// Reads the same singleton inside a producer or admission transaction.
+    /// Reads the same singleton inside an account or admission transaction.
     pub fn quota_capacity_revision_in(conn: &Connection) -> Result<i64> {
         Ok(conn.query_row(
             "SELECT revision FROM quota_capacity_revision WHERE id=1",
@@ -1008,10 +1029,10 @@ impl Store<'_> {
             |row| row.get(0),
         )?)
     }
-    /// Advances the global snapshot revision inside the caller's transaction.
+    /// Advances the local admission revision inside the caller's transaction.
     ///
-    /// Collectors must write every relevant quota fact and call this once
-    /// before committing that same transaction, preserving snapshot atomicity.
+    /// Account and reservation changes call this before committing so a
+    /// stale candidate set cannot be admitted.
     pub fn advance_quota_capacity_revision(tx: &rusqlite::Connection) -> Result<i64> {
         let changed = tx.execute(
             "UPDATE quota_capacity_revision SET revision=revision+1,updated_at=? \

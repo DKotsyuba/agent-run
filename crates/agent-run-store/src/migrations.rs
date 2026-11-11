@@ -179,6 +179,34 @@ const PENDING_FILES: &[(i64, &str)] = &[
         35,
         include_str!("../../../sql/migrations/035_service_restart.sql"),
     ),
+    (
+        36,
+        include_str!("../../../sql/migrations/036_batch_receipts.sql"),
+    ),
+    (
+        37,
+        include_str!("../../../sql/migrations/037_lineage_holds.sql"),
+    ),
+    (
+        38,
+        include_str!("../../../sql/migrations/038_attempt_launch.sql"),
+    ),
+    (
+        39,
+        include_str!("../../../sql/migrations/039_attempt_admission.sql"),
+    ),
+    (
+        40,
+        include_str!("../../../sql/migrations/040_owner_effects.sql"),
+    ),
+    (
+        41,
+        include_str!("../../../sql/migrations/041_managed_enrollment.sql"),
+    ),
+    (
+        42,
+        include_str!("../../../sql/migrations/042_enrollment_request_retention.sql"),
+    ),
 ];
 
 /// Every migration file, ordered by the version it produces.
@@ -297,7 +325,7 @@ impl Drop for SchemaLock {
 fn snapshot(conn: &Connection, path: &Path, target: i64) -> Result<PathBuf> {
     let backup = backup_path(path, target);
     let _ = std::fs::remove_file(&backup);
-    conn.backup(MAIN_DB, &backup, None)?;
+    conn.backup(MAIN_DB, &backup, None::<fn(rusqlite::backup::Progress)>)?;
     std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
     Ok(backup)
 }

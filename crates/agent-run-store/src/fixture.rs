@@ -4,16 +4,20 @@
 //! writer service and offline writes through
 //! [`crate::writer::OfflineWriterGuard`]. Tests that seed or inspect a
 //! disposable private home with raw SQL use these helpers so their
-//! connections carry the writer fence function and pass the mutation-fence
-//! triggers exactly like the authorized writer connection.
+//! connections carry the same compatibility marker as the authorized writer.
+//! Direct SQL access is trusted and is not authorized by that marker.
 
 use crate::Store;
 use agent_run_domain::Result;
 use rusqlite::Connection;
 use std::path::Path;
 
-/// Registers the writer fence function on a raw test connection, so its DML
-/// passes the mutation-fence triggers.
+/// Causes one provider owner inspection to fail after `successful` probes on this thread.
+pub fn fail_owner_inspection_after(successful: usize) {
+    crate::provider_admission::fixture_fail_owner_after(successful);
+}
+
+/// Registers the writer's compatibility marker on a raw test connection.
 pub fn fenced(conn: &Connection) -> Result<()> {
     crate::writer::register_fence(conn)
 }

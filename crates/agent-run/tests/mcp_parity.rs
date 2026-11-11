@@ -25,7 +25,8 @@ struct Harness {
 impl Harness {
     /// Create a mode-appropriate empty home using the caller's short socket base.
     fn new() -> Self {
-        let base = std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into());
+        let base = std::env::var_os("AGENT_RUN_TEST_TMP")
+            .unwrap_or_else(|| std::env::temp_dir().into_os_string());
         let temp = tempfile::Builder::new()
             .prefix("ar-")
             .tempdir_in(base)
@@ -220,9 +221,15 @@ fn additive_wires() -> Vec<Value> {
         "pool_replace",
         "pool",
         "list_pools",
+        "start_batch",
+        "batch_receipt",
+        "history_pins",
+        "status",
         "agent_integration",
         "capabilities",
         "answer_chunk",
+        "transcript_exact",
+        "initial_task",
     ]
     .into_iter()
     .map(|name| {

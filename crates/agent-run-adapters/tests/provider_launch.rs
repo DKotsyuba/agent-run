@@ -734,6 +734,9 @@ fn native_provider_keeps_login_and_model_alias() {
             ("AGENT_RUN_WORKER_TOKEN".into(), "stale-capability".into()),
             (agent_run_domain::worker::FINISH_ENV.into(), "1".into()),
             (agent_run_domain::worker::RESEARCH_ENV.into(), "1".into()),
+            (agent_run_domain::worker::MANAGED_ENV.into(), "1".into()),
+            ("AGENT_RUN_WORKER_FUTURE".into(), "stale".into()),
+            ("AGENT_RUN_LAUNCH_ID".into(), "foreign".into()),
         ]),
         &FakeReader,
         "task",
@@ -768,9 +771,17 @@ fn native_provider_keeps_login_and_model_alias() {
     for name in agent_run_domain::worker::ENV_NAMES.into_iter().chain([
         agent_run_domain::worker::FINISH_ENV,
         agent_run_domain::worker::RESEARCH_ENV,
+        agent_run_domain::worker::MANAGED_ENV,
     ]) {
         assert!(!plan.launch.environment.contains_key(name));
     }
+    assert!(
+        !plan
+            .launch
+            .environment
+            .contains_key("AGENT_RUN_WORKER_FUTURE")
+    );
+    assert!(!plan.launch.environment.contains_key("AGENT_RUN_LAUNCH_ID"));
     assert!(
         !fs::read_to_string(run_home.join("config.toml"))
             .unwrap()
@@ -798,6 +809,7 @@ fn native_provider_keeps_login_and_model_alias() {
         agent_run_adapters::provider::LaunchOptions {
             fast: true,
             output_schema: None,
+            managed_builds: None,
         },
         None,
     )
@@ -946,6 +958,7 @@ fn native_provider_keeps_login_and_model_alias() {
         agent_run_adapters::provider::LaunchOptions {
             fast: false,
             output_schema: schema.as_object(),
+            managed_builds: None,
         },
         None,
     )
@@ -1032,6 +1045,94 @@ fn custom_claude_auth_clears_conflicting_host_credentials() {
             }
         }
     }
+}
+
+/// Plans the custom Claude gateway with `headers` sealed into its connection
+/// and a host that already carries a stale `ANTHROPIC_CUSTOM_HEADERS`.
+fn plan_custom_headers(
+    headers: &[(&str, &str)],
+) -> agent_run_adapters::provider::ProviderLaunchPlan {
+    use agent_run_domain::catalog::ProviderConnection;
+
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let mut config = config(root, &fake_engine(root));
+    let provider: ProviderId = "glm-any".parse().unwrap();
+    let ProviderConnection::Custom {
+        headers: configured,
+        ..
+    } = &mut config.providers.get_mut(&provider).unwrap().connection
+    else {
+        panic!("fixture must use a custom connection");
+    };
+    *configured = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    let catalog = catalog(&config);
+    let role = role(root, false);
+    let account = "acct-glm".parse().unwrap();
+    let run_home = root.join("gateway-run");
+    let (_, digest) = materialize_selected(
+        &config, &catalog, &provider, "glm", &account, &role, root, &run_home, root,
+    )
+    .unwrap();
+    let authority = make_authority(&catalog, &provider, "glm", &role, root, digest, "acct-glm");
+    let host = BTreeMap::from([
+        ("HOME".into(), root.to_string_lossy().into_owned()),
+        (
+            "ANTHROPIC_CUSTOM_HEADERS".into(),
+            "x-host-leak: stale".into(),
+        ),
+    ]);
+    plan_selected(
+        &config,
+        &catalog,
+        &authority,
+        &account,
+        &run_home,
+        root,
+        &host,
+        &FakeReader,
+        "task",
+        None,
+    )
+    .unwrap()
+}
+
+/// Fixed custom headers are rendered sorted with a per-launch `{launch}` id;
+/// without them a host-provided header variable is removed, never inherited.
+#[test]
+fn custom_claude_headers_render_per_launch_and_absence_removes_host_value() {
+    let configured = [
+        ("x-opencode-session", "{launch}"),
+        ("x-client", "agent-run/{launch}"),
+    ];
+    let first = plan_custom_headers(&configured);
+    let second = plan_custom_headers(&configured);
+    let render = |plan: &agent_run_adapters::provider::ProviderLaunchPlan| {
+        plan.launch.environment["ANTHROPIC_CUSTOM_HEADERS"].clone()
+    };
+    let (a, b) = (render(&first), render(&second));
+    assert_ne!(a, b, "{{launch}} must differ per launch");
+    for rendered in [&a, &b] {
+        assert!(!rendered.contains('{') && !rendered.contains("x-host-leak"));
+        let lines: Vec<_> = rendered.split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        let (name, id) = lines[1].split_once(": ").unwrap();
+        assert_eq!(name, "x-opencode-session");
+        assert_eq!(id.len(), 32);
+        assert_eq!(lines[0], format!("x-client: agent-run/{id}"));
+    }
+    assert!(!a.contains("synthetic-secret"));
+
+    let none = plan_custom_headers(&[]);
+    assert!(
+        !none
+            .launch
+            .environment
+            .contains_key("ANTHROPIC_CUSTOM_HEADERS")
+    );
 }
 
 /// Arbitrary custom providers use configured models and gateways; drift in
@@ -1805,4 +1906,418 @@ fn research_profiles_keep_catalog_skill_sources() {
             .len(),
         1
     );
+}
+
+/// The opt-in selector seals only the pinned no-shell role for both harnesses.
+#[test]
+fn managed_selector_is_opt_in_and_materializes_both_profiles() {
+    use agent_run_config::provider_config::ManagedAttemptBinding;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    fs::create_dir_all(root.join("accounts/codex/work")).unwrap();
+    fs::write(root.join("accounts/codex/work/auth.json"), "{}\n").unwrap();
+    let pool = root.join("pool-frontend");
+    let hook = root.join("bridge-hook");
+    fs::copy("/usr/bin/true", &pool).unwrap();
+    fs::copy("/usr/bin/false", &hook).unwrap();
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":pool,"args":["mcp","--config",root.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    for harness in config.harnesses.values_mut() {
+        harness.hooks = vec![agent_run_config::config::Hook {
+            event: "PreToolUse".into(),
+            command: vec![hook.to_string_lossy().into_owned()],
+            matcher: Some("mcp__pool__.*".into()),
+        }];
+    }
+    let profile = Profile {
+        name: "managed".into(),
+        body: "fixture".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec!["pool".into()],
+        mcp_tools: BTreeMap::new(),
+        required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+    };
+    let role = resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, true)
+            .unwrap()
+            .is_none()
+    );
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "managed".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: agent_run_platform::fs::sha256(&fs::read(&pool).unwrap()),
+        bridge_hook_sha256: agent_run_platform::fs::sha256(&fs::read(&hook).unwrap()),
+        host_id: "host".into(),
+        pool_resident_executable: None,
+        pool_resident_sha256: None,
+        transport: None,
+        codex_code_mode_host_sha256: None,
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, false).is_err()
+    );
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::OpenCode, &role, true)
+            .is_err()
+    );
+    let mut widened = role.clone();
+    widened.write = true;
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &widened, true)
+            .is_err()
+    );
+    let mut unsafe_tool = role.clone();
+    unsafe_tool.mcp[0]
+        .allowed_tools
+        .as_mut()
+        .unwrap()
+        .push("pool_start_agent".into());
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &unsafe_tool, true)
+            .is_err()
+    );
+    let catalog = catalog(&config);
+    for (provider, model, account) in [
+        ("codex-plus", "gpt", "acct-native"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let home = root.join(format!("managed-{provider}"));
+        let provider: ProviderId = provider.parse().unwrap();
+        let account_id = account.parse().unwrap();
+        let (_, digest) = materialize_selected(
+            &config,
+            &catalog,
+            &provider,
+            model,
+            &account_id,
+            &role,
+            &root,
+            &home,
+            &root,
+        )
+        .unwrap();
+        let authority = make_authority(&catalog, &provider, model, &role, &root, digest, account);
+        let plan = plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &account_id,
+            &home,
+            &root,
+            &BTreeMap::from([("HOME".into(), root.display().to_string())]),
+            &FakeReader,
+            "fixture",
+            None,
+        )
+        .unwrap();
+        if provider.as_str() == "codex-plus" {
+            let native: toml::Value =
+                toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+            assert_eq!(native["features"]["hooks"].as_bool(), Some(true));
+            assert_eq!(
+                native["features"]["code_mode"]["enabled"].as_bool(),
+                Some(false)
+            );
+            assert!(native["hooks"].get("PreToolUse").is_some());
+            assert!(native["hooks"].get("PermissionRequest").is_some());
+            assert_eq!(
+                native["mcp_servers"]["pool"]["enabled_tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["pool_get"]
+            );
+            assert_eq!(
+                native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]["enabled_tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["finish", "health_reply"]
+            );
+            assert!(
+                native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]["env_vars"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&toml::Value::String(
+                        agent_run_domain::worker::MANAGED_ENV.into()
+                    ))
+            );
+            let selected =
+                agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, true)
+                    .unwrap()
+                    .unwrap();
+            let status = serde_json::json!({"data":[{"name":"pool","runtimeStatus":"connected","tools":{"pool_get":{}}},{"name":agent_run_domain::worker::SERVER_NAME,"runtimeStatus":"connected","tools":{"finish":{},"health_reply":{}}}],"nextCursor":null});
+            agent_run_adapters::managed_role::verify_inventory(&status, &selected.inventory)
+                .unwrap();
+            let mut widened = status;
+            widened["data"][0]["tools"]["pool_start_batch"] = serde_json::json!({});
+            assert!(
+                agent_run_adapters::managed_role::verify_inventory(&widened, &selected.inventory)
+                    .is_err()
+            );
+        } else {
+            let position = plan
+                .launch
+                .args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .unwrap();
+            assert_eq!(plan.launch.args[position + 1], "Bash,Agent,Task,Skill");
+            assert!(!plan.launch.args.iter().any(|arg| arg == "--plugin-dir"));
+        }
+    }
+}
+
+/// A managed Codex role names its Pool server by Codex's normalized tool
+/// name and, only with a pinned host from the harness's own package, writes
+/// the constrained Code Mode settings.
+#[test]
+fn managed_codex_code_mode_requires_the_pinned_package_host() {
+    use agent_run_adapters::managed_role::{launch_build_pins, select};
+    use agent_run_config::provider_config::ManagedAttemptBinding;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let package = root.join("codex-package");
+    fs::create_dir_all(package.join("bin")).unwrap();
+    fs::write(package.join("codex-package.json"), "{}\n").unwrap();
+    let codex = package.join("bin/codex");
+    fs::copy(fake_engine(&root), &codex).unwrap();
+    let host = package.join("bin/codex-code-mode-host");
+    fs::copy("/usr/bin/true", &host).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+    let host_sha256 = agent_run_platform::fs::sha256(&fs::read(&host).unwrap());
+    let pool = root.join("pool-frontend");
+    let hook = root.join("bridge-hook");
+    fs::copy("/usr/bin/true", &pool).unwrap();
+    fs::copy("/usr/bin/false", &hook).unwrap();
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(root.join("accounts/codex/work")).unwrap();
+    fs::write(root.join("accounts/codex/work/auth.json"), "{}\n").unwrap();
+    let setup = |server: &str, pin: Option<&str>| {
+        let mut config = config(&root, codex.to_str().unwrap());
+        config.mcp.insert(server.into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":pool,"args":["mcp","--config",root.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+        for harness in config.harnesses.values_mut() {
+            harness.hooks = vec![agent_run_config::config::Hook {
+                event: "PreToolUse".into(),
+                command: vec![hook.to_string_lossy().into_owned()],
+                matcher: Some(format!("mcp__{server}__.*")),
+            }];
+        }
+        config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+            enabled: true,
+            role_name: "managed".into(),
+            pool_server: server.into(),
+            pool_executable_sha256: agent_run_platform::fs::sha256(&fs::read(&pool).unwrap()),
+            bridge_hook_sha256: agent_run_platform::fs::sha256(&fs::read(&hook).unwrap()),
+            host_id: "host".into(),
+            pool_resident_executable: None,
+            pool_resident_sha256: None,
+            transport: None,
+            codex_code_mode_host_sha256: pin.map(str::to_owned),
+            bridge_receipt_readers: vec![],
+            bridge_custody_readers: vec![],
+        }));
+        let profile = Profile {
+            name: "managed".into(),
+            body: "fixture".into(),
+            write: false,
+            network: false,
+            revision: "1".into(),
+            canonical: true,
+            allow_external_read_roots: false,
+            read_roots: vec![],
+            skills: vec![],
+            mcp: vec![server.into()],
+            mcp_tools: BTreeMap::new(),
+            required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+        };
+        let role =
+            resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+        (config, role)
+    };
+    let materialize = |config: &ProviderConfig, role, name: &str| {
+        let home = root.join(name);
+        materialize_selected(
+            config,
+            &catalog(config),
+            &"codex-plus".parse().unwrap(),
+            "gpt",
+            &"acct-native".parse().unwrap(),
+            role,
+            &root,
+            &home,
+            &root,
+        )
+        .unwrap();
+        let native: toml::Value =
+            toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        serde_json::to_value(native).unwrap()
+    };
+
+    let (pinned, role) = setup("agent-pool", Some(&host_sha256));
+    let selected = select(&pinned, HarnessId::Codex, &role, true)
+        .unwrap()
+        .unwrap();
+    let codex_selection = selected.codex.clone().unwrap();
+    assert_eq!(codex_selection.pool_server, "agent-pool");
+    assert_eq!(codex_selection.pool_namespace, "agent_pool");
+    assert_eq!(
+        codex_selection.code_mode_host.as_deref(),
+        Some(host.as_path())
+    );
+    assert!(
+        select(&pinned, HarnessId::ClaudeCode, &role, true)
+            .unwrap()
+            .unwrap()
+            .codex
+            .is_none()
+    );
+    let native = materialize(&pinned, &role, "managed-code-mode");
+    assert!(agent_run_adapters::managed_role::codex_config_code_mode(&native).unwrap());
+    assert_eq!(
+        native["features"]["code_mode"],
+        serde_json::json!({"enabled":false,"excluded_tool_namespaces":["clock","functions"]})
+    );
+    for feature in ["goals", "sleep_tool", "shell_tool", "unified_exec"] {
+        assert_eq!(
+            native["features"][feature],
+            serde_json::json!(false),
+            "{feature}"
+        );
+    }
+    for tool in ["experimental_request_user_input", "update_plan"] {
+        assert_eq!(
+            native["tools"][tool],
+            serde_json::json!({"enabled":false}),
+            "{tool}"
+        );
+    }
+    agent_run_adapters::managed_role::verify_codex_pre_tool_use(
+        &native["hooks"]["PreToolUse"],
+        &codex_selection,
+    )
+    .unwrap();
+    // The trust receipt binds the written (normalized) matcher.
+    assert!(
+        native["hooks"]["state"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|key| key.ends_with(":pre_tool_use:0:0"))
+    );
+
+    // Without a pin the same role keeps Code Mode disabled.
+    let (unpinned, role) = setup("agent-pool", None);
+    let selected = select(&unpinned, HarnessId::Codex, &role, true)
+        .unwrap()
+        .unwrap();
+    assert!(selected.codex.as_ref().unwrap().code_mode_host.is_none());
+    let native = materialize(&unpinned, &role, "managed-no-code-mode");
+    assert!(!agent_run_adapters::managed_role::codex_config_code_mode(&native).unwrap());
+    assert_eq!(
+        native["hooks"]["PreToolUse"][0]["matcher"],
+        serde_json::json!("mcp__agent_pool__.*")
+    );
+    // The host pin is a build pin: a new launch takes the current one.
+    let launch = launch_build_pins(&unpinned, &pinned, HarnessId::Codex).unwrap();
+    assert_eq!(
+        launch
+            .managed_attempt_binding
+            .as_ref()
+            .unwrap()
+            .codex_code_mode_host_sha256
+            .as_deref(),
+        Some(host_sha256.as_str())
+    );
+
+    // A wrong pin, a missing or unsafe host, or a foreign layout refuses.
+    let (wrong, role) = setup("agent-pool", Some(&"0".repeat(64)));
+    assert!(select(&wrong, HarnessId::Codex, &role, true).is_err());
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o722)).unwrap();
+    assert!(select(&pinned, HarnessId::Codex, &role, true).is_err());
+    fs::remove_file(&host).unwrap();
+    assert!(select(&pinned, HarnessId::Codex, &role, true).is_err());
+    fs::copy("/usr/bin/true", &host).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+    select(&pinned, HarnessId::Codex, &role, true).unwrap();
+    fs::remove_file(package.join("codex-package.json")).unwrap();
+    assert!(select(&pinned, HarnessId::Codex, &role, true).is_err());
+    fs::write(package.join("codex-package.json"), "{}\n").unwrap();
+
+    // A Pool id Codex would name like the worker is ambiguous.
+    let (ambiguous, role) = setup("agent.run.worker", None);
+    assert!(select(&ambiguous, HarnessId::Codex, &role, true).is_err());
+}
+
+/// Third-party MCPs cannot inherit private worker or system capability names,
+/// even when a programmatic configuration bypasses the normal parser.
+#[test]
+fn third_party_mcp_private_environment_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    let mcp = agent_run_config::config::Mcp {
+        transport: "stdio".into(),
+        command: "/usr/bin/true".into(),
+        args: vec![],
+        env_from: vec!["AGENT_RUN_WORKER_TOKEN".into()],
+        approval_mode: "auto".into(),
+        global: false,
+        allowed_tools: None,
+    };
+    config.mcp.insert("foreign".into(), mcp);
+    assert!(config.clone().validate(&root).is_err());
+    let mut system = config.clone();
+    system.mcp.get_mut("foreign").unwrap().env_from = vec!["AGENT_RUN_SYSTEM_SOCKET".into()];
+    assert!(system.validate(&root).is_err());
+    let profile = Profile {
+        name: "review".into(),
+        body: "fixture".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec!["foreign".into()],
+        mcp_tools: BTreeMap::new(),
+        required_constraints: BTreeSet::new(),
+    };
+    let role = resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+    let catalog = catalog(&config);
+    for (provider, model, account) in [
+        ("codex-plus", "gpt", "acct-native"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let result = materialize_selected(
+            &config,
+            &catalog,
+            &provider.parse().unwrap(),
+            model,
+            &account.parse().unwrap(),
+            &role,
+            &root,
+            &root.join(format!("unsafe-{provider}")),
+            &root,
+        );
+        assert!(result.is_err(), "{provider}");
+    }
 }

@@ -500,7 +500,7 @@ pub fn materialize(
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
-        config, runtime, request, profile, home, app_home, None, None,
+        config, runtime, request, profile, home, app_home, None, None, None,
     )
 }
 
@@ -524,6 +524,7 @@ pub fn materialize_provider(
     native_model: &str,
     config_sha256: &str,
     admitted_skills: &[ResolvedSkill],
+    managed: Option<&super::managed_role::Selection>,
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
         config,
@@ -534,6 +535,7 @@ pub fn materialize_provider(
         app_home,
         Some((provider, native_model, config_sha256)),
         Some(admitted_skills),
+        managed,
     )
 }
 
@@ -670,7 +672,9 @@ fn materialize_with_provider(
     app_home: &Path,
     provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
     admitted_skills: Option<&[ResolvedSkill]>,
+    managed_selection: Option<&super::managed_role::Selection>,
 ) -> Result<(Snapshot, String)> {
+    let managed = managed_selection.is_some();
     crate::validate_role(runtime, profile)?;
     let research = profile.research_tools_only();
     let mut restricted = runtime.clone();
@@ -754,6 +758,27 @@ fn materialize_with_provider(
     let mut mcp = serde_json::Map::new();
     for name in &profile.mcp {
         let server = &config.mcp[name];
+        if name != agent_run_domain::worker::SERVER_NAME
+            && server
+                .env_from
+                .iter()
+                .any(|name| name.starts_with("AGENT_RUN_"))
+        {
+            return Err(invalid(
+                "MCP env_from cannot forward private agent-run variables",
+            ));
+        }
+        if name == agent_run_domain::worker::SERVER_NAME
+            && (server.command != std::env::current_exe()?
+                || server.args != ["_worker-mcp"]
+                || server.env_from
+                    != agent_run_domain::worker::ENV_NAMES
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect::<Vec<_>>())
+        {
+            return Err(invalid("worker MCP declaration is not built in"));
+        }
         let env: serde_json::Map<String, Value> = server
             .env_from
             .iter()
@@ -780,6 +805,22 @@ fn materialize_with_provider(
                 "matcher": matcher,
                 "hooks": [{"type":"command", "command":shell_command(&command), "timeout":600}],
             }]);
+        }
+        if let Some(codex) = managed_selection.and_then(|selection| selection.codex.as_ref()) {
+            // Codex names the Pool server's tools by its normalized id; the
+            // declared raw matcher is written as that name so the Bridge hook
+            // gates every Pool call, direct or from Code Mode.
+            let declared = format!("mcp__{}__.*", codex.pool_server);
+            for group in hooks
+                .get_mut("PreToolUse")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if group.get("matcher").and_then(Value::as_str) == Some(declared.as_str()) {
+                    group["matcher"] = json!(codex.pre_tool_use_matcher());
+                }
+            }
         }
     }
     let native: Value = serde_json::to_value(&runtime.native_settings)?;
@@ -843,6 +884,11 @@ fn materialize_with_provider(
                 if name == agent_run_domain::worker::SERVER_NAME {
                     forwarded.push(agent_run_domain::worker::FINISH_ENV.into());
                 }
+                if managed && name == agent_run_domain::worker::SERVER_NAME {
+                    // Select the managed completion-only catalog inside
+                    // Codex's separately filtered MCP child.
+                    forwarded.push(agent_run_domain::worker::MANAGED_ENV.into());
+                }
                 if research && name == agent_run_domain::worker::SERVER_NAME {
                     // Select the six-tool catalog inside Codex's separately
                     // filtered MCP child; broker authority remains independent.
@@ -880,6 +926,15 @@ fn materialize_with_provider(
                         toml::Value::Array(
                             tools.iter().cloned().map(toml::Value::String).collect(),
                         ),
+                    );
+                }
+                if managed && name == agent_run_domain::worker::SERVER_NAME {
+                    t.insert(
+                        "enabled_tools".into(),
+                        toml::Value::Array(vec![
+                            toml::Value::String("finish".into()),
+                            toml::Value::String("health_reply".into()),
+                        ]),
                     );
                 }
                 servers.insert(name.clone(), toml::Value::Table(t));
@@ -948,6 +1003,15 @@ fn materialize_with_provider(
                 // Native controls override only this frozen research snapshot.
                 let controls: toml::Table =
                     serde_json::from_value(super::codex::research_settings())?;
+                doc.extend(controls);
+            }
+            if let Some(selection) = managed_selection {
+                let code_mode = selection
+                    .codex
+                    .as_ref()
+                    .is_some_and(|codex| codex.code_mode_host.is_some());
+                let controls: toml::Table =
+                    serde_json::from_value(super::managed_role::codex_settings(code_mode))?;
                 doc.extend(controls);
             }
             let text = toml::to_string_pretty(&doc)

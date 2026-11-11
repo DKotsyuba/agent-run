@@ -13,7 +13,10 @@ use agent_run_config::role_plan::ResolvedMcp;
 use agent_run_domain::{Error, Result};
 use agent_run_platform::process::OwnershipSnapshot;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 /// Maximum discovery time per server, excluding bounded process teardown.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -73,7 +76,10 @@ fn literal_name(name: &str) -> bool {
 /// MCP connections remain direct; hot catalog additions require another launch.
 /// `observer` must durably persist each root/member snapshot for recovery after
 /// supervisor death; observer failures reject discovery and clean the child.
-pub async fn apply_claude_tool_filters<F>(plan: &mut ProviderLaunchPlan, observer: F) -> Result<()>
+pub async fn apply_claude_tool_filters<F>(
+    plan: &mut ProviderLaunchPlan,
+    observer: F,
+) -> Result<BTreeMap<String, BTreeSet<String>>>
 where
     F: Fn(OwnershipSnapshot) -> PersistFuture + Send + Sync + Clone + 'static,
 {
@@ -84,7 +90,10 @@ where
 
 /// Builds a complete native complement under the caller's aggregate deadline.
 /// Arguments change only after every server and size check succeeds.
-async fn apply_filters<F>(plan: &mut ProviderLaunchPlan, observer: F) -> Result<()>
+async fn apply_filters<F>(
+    plan: &mut ProviderLaunchPlan,
+    observer: F,
+) -> Result<BTreeMap<String, BTreeSet<String>>>
 where
     F: Fn(OwnershipSnapshot) -> PersistFuture + Send + Sync + Clone + 'static,
 {
@@ -94,7 +103,7 @@ where
         .iter()
         .any(|server| server.allowed_tools.is_some())
     {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     // Reject ambiguous server/tool separators even on unrestricted peers: native
     // permission strings do not carry separate structured server and tool fields.
@@ -114,6 +123,7 @@ where
         return Err(failure("native deny argument is unavailable"));
     }
     let mut denied = BTreeSet::new();
+    let mut catalogs = BTreeMap::new();
     for server in &plan.role.mcp {
         let Some(allowed) = &server.allowed_tools else {
             continue;
@@ -131,11 +141,12 @@ where
                 "configured allowed tool is absent from the catalog",
             ));
         }
-        for tool in catalog {
-            if !allowed.contains(&tool) {
+        for tool in &catalog {
+            if !allowed.contains(tool) {
                 denied.insert(format!("mcp__{}__{tool}", server.id));
             }
         }
+        catalogs.insert(server.id.clone(), catalog);
         if denied.len() > MAX_TOOLS
             || denied.iter().map(|s| s.len() + 1).sum::<usize>() > MAX_RULE_BYTES
         {
@@ -156,7 +167,7 @@ where
         return Err(failure("native deny rules exceed the size limit"));
     }
     plan.launch.args[positions[0]] = argument;
-    Ok(())
+    Ok(catalogs)
 }
 
 /// Runs one direct, temporary stdio connection with frozen launch credentials and a deadline.
@@ -203,7 +214,10 @@ where
         initial_input: None,
     };
     let mut child = CatalogChild {
-        process: Process::spawn(&probe).map_err(|_| failure("server could not be started"))?,
+        // Discovery is not a native harness and must never install owner
+        // sockets (including a managed launch's suppressed v1 endpoint).
+        process: Process::spawn_managed(&probe, None)
+            .map_err(|_| failure("server could not be started"))?,
         armed: true,
     };
     child
@@ -405,6 +419,8 @@ if [ "$MODE" = hang ]; then
   /bin/sleep 8 &
   printf '%s\n' "$!" >> "$PID_FILE"
 fi
+[ -z "${BRIDGE_NATIVE_OWNER_SOCKET+x}" ] || exit 19
+[ -z "${BRIDGE_NATIVE_OWNER_SOCKET_V2+x}" ] || exit 20
 initialized=0
 pages=0
 while [ "$SECONDS" -lt 10 ] && IFS= read -r -t 8 line; do
@@ -510,6 +526,22 @@ done
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let mut plan = fixture(&root, "ping");
+        // If discovery installs the ordinary owner socket this invalid
+        // directory makes the spawn fail before the fixture handshake.
+        plan.launch.environment.insert(
+            "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+            "/invalid/channel".into(),
+        );
+        plan.launch.environment.insert(
+            "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+            "/invalid/directory".into(),
+        );
+        plan.launch
+            .environment
+            .insert("BRIDGE_NATIVE_OWNER_SOCKET".into(), "forged-v1".into());
+        plan.launch
+            .environment
+            .insert("BRIDGE_NATIVE_OWNER_SOCKET_V2".into(), "forged-v2".into());
         apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
             Box::pin(async { Ok(()) })
         })

@@ -1,0 +1,5 @@
+{
+ "hook_event_name": "PreToolUse",
+ "tool_input": {},
+ "tool_name": "mcp__agent_pool__pool_get"
+}

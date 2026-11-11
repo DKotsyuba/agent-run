@@ -143,6 +143,70 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
+            "start_batch" => &[
+                MachineCode::BatchOutcomeUnknown,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::PreconditionFailed,
+                MachineCode::ValidationError,
+                MachineCode::PathEscapeError,
+                MachineCode::RequestConflict,
+                MachineCode::SelectionBusy,
+                MachineCode::NoEligibleAccount,
+                MachineCode::QuotaExhausted,
+                MachineCode::BindingCooldown,
+                MachineCode::CapacityExhausted,
+                MachineCode::StateTransitionError,
+                MachineCode::BrokerUnavailable,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "batch_receipt" => &[
+                MachineCode::ValidationError,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::RequestConflict,
+                MachineCode::Unsupported,
+                MachineCode::AnswerIntegrityError,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "history_pins" => &[
+                MachineCode::ValidationError,
+                MachineCode::PinNotFound,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::BrokerUnavailable,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "transcript_exact" => &[
+                MachineCode::ValidationError,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::TranscriptExportAborted,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "initial_task" => &[
+                MachineCode::ValidationError,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "status" => &[
+                MachineCode::ValidationError,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::AnswerIntegrityError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
             "resume" => &[
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,
@@ -180,7 +244,13 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
-            "capabilities" => &[MachineCode::ValidationError],
+            "capabilities" => &[
+                MachineCode::ValidationError,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
             "list_pools" => &[
                 MachineCode::ValidationError,
                 MachineCode::IOError,
@@ -319,7 +389,19 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         }
         ("list_pools", "state") => Some(ArgumentDefault::Null),
         ("list_pools", "limit") => Some(ArgumentDefault::Integer(50)),
-        ("answer_chunk", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
+        ("history_pins", "limit") => Some(ArgumentDefault::Integer(100)),
+        ("history_pins", "after_pin_id") => Some(ArgumentDefault::Null),
+        ("history_pins" | "start_batch" | "status", "expected_store_id") => {
+            Some(ArgumentDefault::Null)
+        }
+        ("status", "include_view") => Some(ArgumentDefault::Bool(false)),
+        ("start_batch" | "batch_receipt", "retain_history") => Some(ArgumentDefault::Bool(false)),
+        ("capabilities", "include_store_id") => Some(ArgumentDefault::Bool(false)),
+        ("capabilities", "include_lineage_holds" | "include_initial_task") => {
+            Some(ArgumentDefault::Bool(false))
+        }
+        ("answer_chunk" | "initial_task", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
+        ("initial_task", "offset") => Some(ArgumentDefault::Integer(0)),
         ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
             Some(ArgumentDefault::Integer(0))
         }

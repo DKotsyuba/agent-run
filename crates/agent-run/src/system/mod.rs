@@ -125,7 +125,7 @@ async fn account_retention_pass(
             .ok_or_else(|| crate::error::invalid("runtime protection is unavailable"))?,
     )?;
     tokio::task::spawn_blocking(move || {
-        let store = crate::state::Store::open(&home)?;
+        let mut store = crate::state::Store::open(&home)?;
         // SAFETY: geteuid only reads the effective process identity.
         let uid = unsafe { libc::geteuid() };
         let mut removed = 0;
@@ -139,7 +139,7 @@ async fn account_retention_pass(
             removed += agent_run_core::housekeeping::sweep_account_runtime(
                 &root,
                 crate::domain::now(),
-                &store,
+                &mut store,
                 &protected,
             )?;
         }

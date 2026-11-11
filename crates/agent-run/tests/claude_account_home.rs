@@ -1,22 +1,18 @@
 //! One labelled Claude login directory across `auth login`, run
-//! materialization, and quota credential resolution.
+//! and run materialization.
 //!
 //! A fake Claude CLI "logs in" by writing a private fake credential into the
 //! `CLAUDE_CONFIG_DIR` that `agent-run login` hands it; the same label must
 //! then resolve to that exact directory for a run environment and for the
-//! quota reader. No live login or protected store is touched.
+//! fixture credentials. No live login or protected store is touched.
 
-use agent_run_adapters::authorized_request::CredentialReader;
 use agent_run_config::{config::Config, profiles::Profile};
-use agent_run_core::capacity::quota_auth::QuotaCredentialReader;
-use agent_run_domain::CredentialRef;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
-    str::FromStr,
 };
 use tempfile::tempdir;
 
@@ -91,22 +87,11 @@ fn run_config_dir(home: &Path) -> agent_run_domain::Result<String> {
     Ok(env["CLAUDE_CONFIG_DIR"].clone())
 }
 
-/// Reads the `named:claude-code:personal` token through the quota reader.
-fn quota_token(home: &Path, runtime_home: &Path) -> agent_run_domain::Result<String> {
-    QuotaCredentialReader::new(
-        home.to_path_buf(),
-        runtime_home.to_path_buf(),
-        home.join("no-native"),
-        true,
-    )
-    .read(&CredentialRef::from_str("named:claude-code:personal").unwrap())
-}
-
-/// A fresh login, a run, and quota collection all use the canonical home.
+/// A fresh login and run use the same canonical account home.
 #[test]
-fn fresh_login_is_the_directory_runs_and_quota_read() {
+fn fresh_login_is_the_directory_runs_use() {
     let temp = tempdir().unwrap();
-    let (home, runtime_home) = claude_home(temp.path(), "fresh-token");
+    let (home, _) = claude_home(temp.path(), "fresh-token");
     let output = login(&home);
     assert!(output.status.success(), "{output:?}");
     let canonical = home.join("accounts/claude/personal/claude-config");
@@ -115,7 +100,11 @@ fn fresh_login_is_the_directory_runs_and_quota_read() {
         run_config_dir(&home).unwrap(),
         canonical.display().to_string()
     );
-    assert_eq!(quota_token(&home, &runtime_home).unwrap(), "fresh-token");
+    assert!(
+        fs::read_to_string(canonical.join(".credentials.json"))
+            .unwrap()
+            .contains("fresh-token")
+    );
 }
 
 /// An existing legacy login stays usable in place, and re-login refreshes it
@@ -123,23 +112,21 @@ fn fresh_login_is_the_directory_runs_and_quota_read() {
 #[test]
 fn legacy_login_is_reused_and_ambiguity_fails_everywhere() {
     let temp = tempdir().unwrap();
-    let (home, runtime_home) = claude_home(temp.path(), "relogin-token");
+    let (home, _) = claude_home(temp.path(), "relogin-token");
     let legacy = home.join("runtime-claude@personal/claude-config");
     fs::create_dir_all(&legacy).unwrap();
     let file = legacy.join(".credentials.json");
     fs::write(&file, r#"{"claudeAiOauth":{"accessToken":"legacy-token"}}"#).unwrap();
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(run_config_dir(&home).unwrap(), legacy.display().to_string());
-    assert_eq!(quota_token(&home, &runtime_home).unwrap(), "legacy-token");
+    assert!(fs::read_to_string(&file).unwrap().contains("legacy-token"));
     let output = login(&home);
     assert!(output.status.success(), "{output:?}");
     assert!(!home.join("accounts/claude/personal").exists());
-    assert_eq!(quota_token(&home, &runtime_home).unwrap(), "relogin-token");
+    assert!(fs::read_to_string(&file).unwrap().contains("relogin-token"));
 
     fs::create_dir_all(home.join("accounts/claude/personal/claude-config")).unwrap();
     assert!(run_config_dir(&home).is_err());
-    let quota = quota_token(&home, &runtime_home).unwrap_err().to_string();
-    assert!(!quota.contains("relogin-token"));
     let output = login(&home);
     assert!(!output.status.success(), "{output:?}");
 }

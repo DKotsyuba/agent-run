@@ -33,7 +33,7 @@ test('retired verdict operations stay absent with stable reserved numeric slots'
 
 test('Bridge remains pinned and live configuration cannot re-enable a queue executable',()=>{
   const manifest=fs.readFileSync(path.join(root,'Cargo.toml'),'utf8');
-  assert.match(manifest,/bridge-sdk\s*=.*rev\s*=\s*"ae32d1c3c012cc1e40c6d60c9adcad7005298688"/);
+  assert.match(manifest,/bridge-sdk\s*=.*rev\s*=\s*"c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f"/);
   const config=fs.readFileSync(path.join(root,'crates/agent-run-config/src/config.rs'),'utf8');
   assert.doesNotMatch(config,/pub\s+codex_queue_bin\s*:/);
 });

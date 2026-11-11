@@ -881,6 +881,7 @@ fn operator_refusals_are_strict_for_unsupported_commands() {
         ],
         vec!["api", "serve"],
         vec!["capacity", "collect", "--once"],
+        vec!["capacity", "launchd", "--binary", "/bin/true"],
         vec!["delivery", "status", AGENT_ID],
         vec!["login", "codex"],
         vec!["accounts", "list"],
@@ -899,8 +900,13 @@ fn operator_refusals_are_strict_for_unsupported_commands() {
             "stdout for {args:?}: {:?}",
             output.stdout
         );
+        let expected = if args[0] == "capacity" {
+            "unrecognized subcommand"
+        } else {
+            "unavailable in operator mode"
+        };
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("unavailable in operator mode"),
+            String::from_utf8_lossy(&output.stderr).contains(expected),
             "stderr for {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );

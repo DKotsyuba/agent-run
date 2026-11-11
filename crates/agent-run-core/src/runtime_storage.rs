@@ -69,6 +69,10 @@ pub trait LayoutBackend {
     /// Read view of the registry (committed state of the store).
     fn reader(&self) -> &state::Store<'_>;
 
+    /// Registry-derived storage protection proof. It takes `&mut self` because
+    /// bounding the read installs a SQLite progress handler on the connection.
+    fn storage_protection(&mut self) -> Result<state::retention::StorageProtection>;
+
     /// Prepares the registry row of `layout_json` (token-bound, idempotent for
     /// the same layout) and returns it.
     async fn prepare(
@@ -94,6 +98,11 @@ impl LayoutBackend for state::Store<'_> {
     /// The raw store is its own read view.
     fn reader(&self) -> &state::Store<'_> {
         self
+    }
+
+    /// Bounded protection snapshot over the raw store connection.
+    fn storage_protection(&mut self) -> Result<state::retention::StorageProtection> {
+        self.storage_protection_snapshot()
     }
 
     /// Direct registry prepare under the caller's offline authority.
@@ -126,6 +135,11 @@ impl LayoutBackend for crate::persist::Persist {
     /// Reads go through the supervisor's read-only handle.
     fn reader(&self) -> &state::Store<'_> {
         self
+    }
+
+    /// Bounded protection snapshot over the supervisor's read-only handle.
+    fn storage_protection(&mut self) -> Result<state::retention::StorageProtection> {
+        self.reader_mut().storage_protection_snapshot()
     }
 
     /// Prepares through the writer, then reads the committed row back.
@@ -186,6 +200,11 @@ impl LayoutBackend for BrokerLayout {
         &self.reader
     }
 
+    /// Bounded protection snapshot over the read-only handle.
+    fn storage_protection(&mut self) -> Result<state::retention::StorageProtection> {
+        self.reader.store_mut().storage_protection_snapshot()
+    }
+
     /// Prepares through the broker lane, then reads the committed row back.
     async fn prepare(
         &mut self,
@@ -242,12 +261,17 @@ impl LayoutBackend for BrokerLayout {
 
 /// A read-only registry view that refuses every mutation; used by previews so
 /// they can share the one traversal without any write authority.
-pub struct ReadOnlyLayout<'a>(pub &'a state::Store<'a>);
+pub struct ReadOnlyLayout<'a, 'connection>(pub &'a mut state::Store<'connection>);
 
-impl LayoutBackend for ReadOnlyLayout<'_> {
+impl LayoutBackend for ReadOnlyLayout<'_, '_> {
     /// The wrapped read view.
     fn reader(&self) -> &state::Store<'_> {
         self.0
+    }
+
+    /// Bounded protection snapshot over the wrapped view.
+    fn storage_protection(&mut self) -> Result<state::retention::StorageProtection> {
+        self.0.storage_protection_snapshot()
     }
 
     /// Refused: a preview never prepares rows.
