@@ -419,10 +419,36 @@ Claude Code 2.1.311 emits `system/init` only after its first user input. Before
 that input, Run sends bare `initialize` and `mcp_status` control requests and
 requires no slash commands and exactly the configured connected MCP servers.
 The declarative agents list is digested; `--tools ""` disables native tools.
-MCP status may omit per-server tool inventories; Run therefore also checks the
-subsequent `system/init` tool list as a mandatory tripwire before
-durable qualification or v2 owner handoff. Mismatch closes stdin and fails the
-run. Actual provider and hook qualification still requires the approved dobi run.
+MCP status may omit per-server tool inventories. When present, a server's list
+is its raw `tools/list` result before deny rules apply: 2.1.311 reports the
+whole Pool catalog, including the tools Run denies. A Pool server's list is
+accepted when it equals the allowlist or exactly the catalog Run discovered for
+this launch, whose digest is recorded in the config digest, which contains the
+allowlist, and whose complement is exactly the `--disallowedTools` argument.
+Unknown servers, tools outside that catalog, missing allowed tools and a catalog
+digest mismatch are refused; the worker server stays exact. Run then checks the
+subsequent `system/init` tool list, which 2.1.311 reports after deny rules, as a
+mandatory exact tripwire before durable qualification or v2 owner handoff.
+Mismatch closes stdin and fails the run. The accepted shape per server
+(`allowlist`, `catalog` or `omitted`) is bound into the inventory digest and
+journaled as `managed_native_drift_v1`.
+
+Managed Codex launches (only) also write `api_key_cyber_access_programs`,
+`api_key_model_discovery`, `auth_elicitation`, `mentions_v2` and `view_image`
+as disabled features: codex-cli 0.167.0 reports the first four enabled by
+default in `config/read` and ignores the historical `tools.view_image`.
+`config/read` must report every pinned feature exactly; any other reported
+feature is accepted only while false, null or `{enabled = false}`, and
+`view_image` must be reported false through `tools.view_image` or
+`features.view_image` (at least one, neither true). 0.167.0 lists every hook
+event: events other than `PreToolUse`, `PermissionRequest` and `state` are
+accepted only with no handler groups. The two pinned hook groups must match
+every configured field; the echoed handler fields `commandWindows`, `async`
+and `statusMessage` are accepted only at `null`, `false` and `null`. The
+accepted feature values and empty hook events are bound into the config digest
+and journaled as `managed_native_drift_v1`. Ordinary Codex launches are
+unchanged. Actual provider and hook qualification still requires the approved
+dobi run.
 
 ### Upgrading Bridge
 

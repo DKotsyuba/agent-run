@@ -651,6 +651,7 @@ pub(crate) async fn run_managed(
     config_digest: &str,
     launch_args: &[String],
     catalogs: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    catalog_sha256: &str,
 ) -> Result<EngineResult> {
     run_inner(
         process,
@@ -658,7 +659,13 @@ pub(crate) async fn run_managed(
         record,
         logical_record,
         initial_input,
-        Some((selection, config_digest, launch_args, catalogs)),
+        Some((
+            selection,
+            config_digest,
+            launch_args,
+            catalogs,
+            catalog_sha256,
+        )),
     )
     .await
 }
@@ -697,11 +704,12 @@ async fn managed_initial_inventory(
 }
 
 /// Pin the exact no-tool controls and the native session selected at exec.
+/// Returns the native session and the verified deny argument.
 fn managed_claude_session(
     args: &[String],
     selection: &agent_run_adapters::managed_role::Selection,
     catalogs: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let invalid_args = || invalid("native managed launch controls did not verify");
     let value = |flag: &str| -> Result<&str> {
         let mut matches = args
@@ -771,7 +779,7 @@ fn managed_claude_session(
         selected
     };
     agent_run_domain::attempt_binding::validate_id(session)?;
-    Ok(session.to_owned())
+    Ok((session.to_owned(), denied))
 }
 
 /// Bare control frames do not submit a model prompt or alter native hooks.
@@ -821,6 +829,7 @@ type ManagedClaudeInputs<'a> = (
     &'a str,
     &'a [String],
     &'a std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    &'a str,
 );
 
 async fn run_inner(
@@ -837,22 +846,31 @@ async fn run_inner(
     {
         return Err(invalid("native input and logical authority do not match"));
     }
-    let managed_preflight = if let Some((selection, config_digest, args, catalogs)) = managed {
+    let managed_preflight = if let Some((
+        selection,
+        config_digest,
+        args,
+        catalogs,
+        catalog_sha256,
+    )) = managed
+    {
         let preflight = async {
             if initial_input.is_none() { return Err(invalid("native managed input unavailable")); }
-            let expected_session = managed_claude_session(args,selection,catalogs)?;
+            let (expected_session, disallowed) = managed_claude_session(args,selection,catalogs)?;
             if record.resume_of_runtime_session_id.as_ref().is_some_and(|id| id != &expected_session) {
                 return Err(invalid("native managed session did not verify"));
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let initialize = managed_claude_control(process,"initialize",deadline).await?;
             let status = managed_claude_control(process,"mcp_status",deadline).await?;
-            agent_run_adapters::managed_role::verify_claude_control_inventory(&initialize,&status,&selection.inventory)?;
+            let reported = agent_run_adapters::managed_role::verify_claude_control_inventory(&initialize,&status,&selection.inventory,catalogs,catalog_sha256,&disallowed)?;
             let evidence = json!({
                 "initialize_sha256":agent_run_domain::canonical::sha256_hex(&initialize,true),
                 "mcp_status_sha256":agent_run_domain::canonical::sha256_hex(&status,true),
                 "agents_sha256":agent_run_domain::canonical::sha256_hex(&initialize["response"]["response"]["agents"],true),
                 "native_tools":"empty",
+                "mcp_catalog_sha256":catalog_sha256,
+                "mcp_status_tools":reported,
             });
             Ok::<_,crate::Error>((selection,config_digest,expected_session,evidence))
         }.await;
@@ -934,6 +952,14 @@ async fn run_inner(
         evidence["system_init_sha256"] =
             json!(agent_run_domain::canonical::sha256_hex(frame, true));
         let inventory_digest = agent_run_domain::canonical::sha256_hex(&evidence, true);
+        // Names only: which accepted shape each server's raw list had.
+        process
+            .observing(store.event(
+                &record.id,
+                "managed_native_drift_v1",
+                &json!({"harness":"claude-code","mcp_catalog_sha256":evidence["mcp_catalog_sha256"],"mcp_status_tools":evidence["mcp_status_tools"]}),
+            ))
+            .await?;
         crate::managed_qualification::record(
             process,
             store,
@@ -1979,8 +2005,15 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             let status = super::managed_claude_control(&mut process, "mcp_status", deadline)
                 .await
                 .unwrap();
+            let catalogs = allowed.clone();
             agent_run_adapters::managed_role::verify_claude_control_inventory(
-                &init, &status, &allowed,
+                &init,
+                &status,
+                &allowed,
+                &catalogs,
+                &agent_run_adapters::managed_role::claude_catalog_digest(&catalogs).unwrap(),
+                &agent_run_adapters::managed_role::claude_disallowed_tools(&allowed, &catalogs)
+                    .unwrap(),
             )
             .unwrap();
             assert!(!dir.path().join("received").exists());
@@ -2052,7 +2085,7 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             .position(|arg| arg == "--disallowedTools")
             .unwrap()
             + 1;
-        args[index] = denied;
+        args[index] = denied.clone();
         args.extend([
             "--setting-sources".into(),
             "".into(),
@@ -2063,7 +2096,7 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
         ]);
         assert_eq!(
             super::managed_claude_session(&args, &selection, &catalogs).unwrap(),
-            "native-session"
+            ("native-session".to_owned(), denied)
         );
         let mut unsafe_args = args.clone();
         unsafe_args.push("--tools=Bash".into());
@@ -2083,7 +2116,14 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
     async fn managed_claude_runner_qualifies_only_after_control_and_init_tripwire() {
         use agent_run_domain::{attempt_binding::Incarnation, domain::AgentId};
         use std::collections::{BTreeMap, BTreeSet};
-        for mode in ["ok", "bad-status", "bad-init"] {
+        for mode in [
+            "ok",
+            "catalog",
+            "bad-status",
+            "bad-init",
+            "bad-extra",
+            "bad-digest",
+        ] {
             let home = tempfile::tempdir().unwrap();
             let root = home.path().canonicalize().unwrap();
             let script = r#"import json,sys,time
@@ -2091,6 +2131,9 @@ mode=sys.argv[1]
 for name in ['initialize','mcp_status']:
     req=json.loads(sys.stdin.readline())
     body={'commands':[],'agents':[{'name':'Explore'}]} if name=='initialize' else {'mcpServers':[{'name':'pool','status':'failed' if mode=='bad-status' else 'connected'}]}
+    if name=='mcp_status' and mode in ('catalog','bad-extra','bad-digest'):
+        tools=['pool_get','pool_start_batch']+(['pool_start_agent'] if mode=='bad-extra' else [])
+        body['mcpServers'][0]['tools']=[{'name':tool} for tool in tools]
     print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':req['request_id'],'response':body}}),flush=True)
 line=sys.stdin.readline()
 if line:
@@ -2105,12 +2148,31 @@ if line:
                 role_digest: "b".repeat(64),
                 inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
             };
-            let catalogs = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
-            let mut args = vec!["-u".into(), "-c".into(), script.into(), mode.into()];
+            // As discovered from a real Pool: the deny complement is not empty.
+            let catalogs = BTreeMap::from([(
+                "pool".into(),
+                BTreeSet::from(["pool_get".into(), "pool_start_batch".into()]),
+            )]);
+            let digest = if mode == "bad-digest" {
+                "0".repeat(64)
+            } else {
+                agent_run_adapters::managed_role::claude_catalog_digest(&catalogs).unwrap()
+            };
+            let mut args: Vec<String> = vec!["-u".into(), "-c".into(), script.into(), mode.into()];
             args.extend(
                 agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory)
                     .unwrap(),
             );
+            let deny = args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .unwrap()
+                + 1;
+            args[deny] = agent_run_adapters::managed_role::claude_disallowed_tools(
+                &selection.inventory,
+                &catalogs,
+            )
+            .unwrap();
             args.extend([
                 "--setting-sources".into(),
                 "".into(),
@@ -2166,14 +2228,29 @@ if line:
                     &"c".repeat(64),
                     &args,
                     &catalogs,
+                    &digest,
                 ),
             )
             .await
             .unwrap();
-            assert_eq!(result.is_ok(), mode == "ok", "{mode}");
+            let accepted = matches!(mode, "ok" | "catalog");
+            assert_eq!(result.is_ok(), accepted, "{mode}");
             assert_eq!(
                 root.join("model-input").exists(),
-                mode != "bad-status",
+                accepted || mode == "bad-init",
+                "{mode}"
+            );
+            let drift: Option<String> = persist
+                .conn
+                .query_row(
+                    "SELECT data_json FROM events WHERE agent_id=? AND kind='managed_native_drift_v1'",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )
+                .ok();
+            assert_eq!(
+                drift.map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap()["mcp_status_tools"]["pool"].clone()),
+                accepted.then(|| json!(if mode == "ok" { "omitted" } else { "catalog" })),
                 "{mode}"
             );
             let qualified: bool = persist
@@ -2184,8 +2261,8 @@ if line:
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(qualified, mode == "ok", "{mode}");
-            if mode != "ok" {
+            assert_eq!(qualified, accepted, "{mode}");
+            if !accepted {
                 assert!(process.input.is_none());
             }
             let _ = process

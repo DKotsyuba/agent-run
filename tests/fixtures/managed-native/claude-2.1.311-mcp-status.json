@@ -1,0 +1,209 @@
+{
+ "type": "control_response",
+ "response": {
+  "subtype": "success",
+  "request_id": "mcp_status",
+  "response": {
+   "mcpServers": [
+    {
+     "name": "agent-pool",
+     "status": "connected",
+     "serverInfo": {
+      "name": "agent-pool",
+      "version": "0.1.0"
+     },
+     "config": {
+      "type": "stdio",
+      "command": "/home/agent-mcp/.local/bin/agent-pool",
+      "args": [
+       "mcp",
+       "--config",
+       "/home/agent-mcp/.agent-pool/config.toml"
+      ]
+     },
+     "transport": "stdio",
+     "scope": "dynamic",
+     "source": "dynamic",
+     "tools": [
+      {
+       "name": "get_status",
+       "annotations": {
+        "readOnly": true
+       }
+      },
+      {
+       "name": "pool_create",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_list",
+       "annotations": {
+        "readOnly": true
+       }
+      },
+      {
+       "name": "pool_get",
+       "annotations": {
+        "readOnly": true
+       }
+      },
+      {
+       "name": "pool_update",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_close",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_add",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_start_agent",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_start_batch",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_replace",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_cancel_replacement",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_member_update",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_remove",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_release_history",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_enrollment_get",
+       "annotations": {
+        "readOnly": true
+       }
+      },
+      {
+       "name": "pool_enrollment_resolve",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_join",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_post",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_send_member",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_notify_owner",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_propose",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      },
+      {
+       "name": "pool_vote",
+       "annotations": {
+        "destructive": true,
+        "openWorld": true
+       }
+      }
+     ]
+    },
+    {
+     "name": "agent_run_worker",
+     "status": "connected",
+     "serverInfo": {
+      "name": "agent_run_worker",
+      "version": "fixture"
+     },
+     "config": {
+      "type": "stdio",
+      "command": "/home/agent-mcp/.local/bin/agent-run",
+      "args": [
+       "_worker-mcp"
+      ]
+     },
+     "transport": "stdio",
+     "scope": "dynamic",
+     "source": "dynamic",
+     "tools": [
+      {
+       "name": "finish"
+      },
+      {
+       "name": "health_reply"
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

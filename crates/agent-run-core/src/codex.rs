@@ -800,17 +800,23 @@ async fn verify_live_managed_config(
     process: &mut Process,
     cwd: &Path,
     managed: &ManagedCodexRole<'_>,
-) -> Result<String> {
+) -> Result<(String, Value)> {
     let config = process
         .rpc("config/read", json!({"cwd":cwd}), Duration::from_secs(30))
         .await?;
-    agent_run_adapters::managed_role::verify_managed_config(
+    let accepted = agent_run_adapters::managed_role::verify_managed_config(
         &config,
         managed.pre_tool_use,
         managed.permission_request,
         managed.hook_state,
     )?;
-    Ok(agent_run_domain::canonical::sha256_hex(&config, true))
+    // The accepted native drift is bound into the qualification digest
+    // beside the whole reply, and journaled by name so drift stays visible.
+    let digest = agent_run_domain::canonical::sha256_hex(
+        &json!({"config_sha256":agent_run_domain::canonical::sha256_hex(&config, true),"accepted":accepted}),
+        true,
+    );
+    Ok((digest, accepted))
 }
 
 /// Managed Codex entry point, selected only after trusted component checks.
@@ -863,7 +869,16 @@ async fn run_inner(
     }
     initialize(process).await?;
     let managed_config_digest = if let Some(managed) = managed {
-        Some(verify_live_managed_config(process, &record.request.workdir, managed).await?)
+        let (digest, accepted) =
+            verify_live_managed_config(process, &record.request.workdir, managed).await?;
+        process
+            .observing(store.event(
+                &record.id,
+                "managed_native_drift_v1",
+                &json!({"harness":"codex","config":accepted}),
+            ))
+            .await?;
+        Some(digest)
     } else {
         None
     };

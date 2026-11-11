@@ -2235,8 +2235,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     if settings.len() > 1024 * 1024 {
                         return Err(invalid("managed config unavailable"));
                     }
+                    let catalog_sha256 = adapters::managed_role::claude_catalog_digest(catalogs)?;
                     let config_digest = agent_run_domain::canonical::sha256_hex(
-                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args,"disallowed_tools":disallowed,"mcp_catalog_sha256":agent_run_domain::canonical::sha256_hex(&serde_json::to_value(catalogs)?,true)}),
+                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args,"disallowed_tools":disallowed,"mcp_catalog_sha256":catalog_sha256}),
                         true,
                     );
                     crate::stream::run_managed(
@@ -2249,6 +2250,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         &config_digest,
                         &planned.launch.args,
                         catalogs,
+                        &catalog_sha256,
                     )
                     .await
                 } else {

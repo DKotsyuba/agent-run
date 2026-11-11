@@ -283,27 +283,115 @@ pub const CODEX_DISABLED_FEATURES: &[&str] = &[
     "tool_suggest",
 ];
 
+/// Default-on native features that codex-cli 0.167.0 reports in `config/read`
+/// without granting a model tool. Only managed launches write them disabled,
+/// so the generic rule below (an unrecognized feature must be disabled) holds;
+/// an older build that does not report them still verifies.
+pub const CODEX_MANAGED_DISABLED_IF_KNOWN: &[&str] = &[
+    "api_key_cyber_access_programs",
+    "api_key_model_discovery",
+    "auth_elicitation",
+    "mentions_v2",
+    "view_image",
+];
+
+/// Native feature values the managed role requires exactly.
+fn codex_required_features() -> serde_json::Map<String, Value> {
+    let mut features = serde_json::Map::new();
+    features.insert("hooks".into(), json!(true));
+    features.insert("code_mode".into(), json!({"enabled":false}));
+    for feature in CODEX_DISABLED_FEATURES {
+        features.insert((*feature).into(), json!(false));
+    }
+    features
+}
+
 /// Native settings for the dedicated managed Codex role. These settings are
 /// separate from research; hooks remain enabled while execution surfaces close.
+/// `view_image` is written both as the historical `tools.view_image` and as
+/// the 0.167.0 feature, which ignores the former.
 pub fn codex_settings() -> Value {
-    let mut settings = json!({"agents":{"enabled":false},"tools":{"view_image":false},"web_search":"disabled","features":{"hooks":true,"code_mode":{"enabled":false}}});
-    for feature in CODEX_DISABLED_FEATURES {
+    let mut settings = json!({"agents":{"enabled":false},"tools":{"view_image":false},"web_search":"disabled","features":codex_required_features()});
+    for feature in CODEX_MANAGED_DISABLED_IF_KNOWN {
         settings["features"][*feature] = json!(false);
     }
     settings
 }
 
+/// An unrecognized native value that grants nothing: false, null or a table
+/// whose only entry is `enabled = false`.
+fn codex_disabled(value: &Value) -> bool {
+    match value {
+        Value::Bool(false) | Value::Null => true,
+        Value::Object(table) => table.len() == 1 && table.get("enabled") == Some(&json!(false)),
+        _ => false,
+    }
+}
+
+/// Compare one live hook event with the pinned declaration. Every pinned
+/// group and handler field must be equal, in order. codex-cli 0.167.0 echoes
+/// each handler with `commandWindows`, `async` and `statusMessage`; only their
+/// inert defaults are accepted, so an asynchronous (non-gating) or otherwise
+/// widened handler is refused.
+fn codex_hook_groups_match(live: &Value, pinned: &Value) -> bool {
+    let (Some(live), Some(pinned)) = (live.as_array(), pinned.as_array()) else {
+        return false;
+    };
+    let object_matches = |live: &Value, pinned: &Value, inert: &[(&str, Value)]| {
+        let (Some(live), Some(pinned)) = (live.as_object(), pinned.as_object()) else {
+            return false;
+        };
+        pinned
+            .iter()
+            .all(|(key, value)| live.get(key) == Some(value))
+            && live.iter().all(|(key, value)| {
+                pinned.contains_key(key)
+                    || inert
+                        .iter()
+                        .any(|(name, default)| key == name && value == default)
+            })
+    };
+    let inert = [
+        ("commandWindows", Value::Null),
+        ("async", json!(false)),
+        ("statusMessage", Value::Null),
+    ];
+    !pinned.is_empty()
+        && live.len() == pinned.len()
+        && live.iter().zip(pinned).all(|(live, pinned)| {
+            let (Some(live_handlers), Some(pinned_handlers)) = (
+                live.get("hooks").and_then(Value::as_array),
+                pinned.get("hooks").and_then(Value::as_array),
+            ) else {
+                return false;
+            };
+            let mut live_group = live.clone();
+            let mut pinned_group = pinned.clone();
+            live_group["hooks"] = Value::Null;
+            pinned_group["hooks"] = Value::Null;
+            !pinned_handlers.is_empty()
+                && live_group == pinned_group
+                && live_handlers.len() == pinned_handlers.len()
+                && live_handlers
+                    .iter()
+                    .zip(pinned_handlers)
+                    .all(|(live, pinned)| object_matches(live, pinned, &inert))
+        })
+}
+
 /// Verify a live config/read result against the exact trusted hook groups.
 /// The caller supplies the already authenticated hook declarations; an empty,
-/// missing or widened group is never accepted.
+/// missing or widened group is never accepted. Returns the accepted native
+/// drift (unrecognized disabled features and empty hook events) for the
+/// caller's qualification evidence.
 pub fn verify_managed_config(
     response: &Value,
     pre_tool_use: &Value,
     permission_request: &Value,
     trusted_state: &Value,
-) -> Result<()> {
-    let expected = codex_settings();
-    for (name, value) in expected["features"].as_object().expect("static object") {
+) -> Result<Value> {
+    let required = codex_required_features();
+    for (name, value) in &required {
         if response.pointer(&format!("/config/features/{name}")) != Some(value) {
             return Err(invalid("native managed feature controls did not verify"));
         }
@@ -312,17 +400,31 @@ pub fn verify_managed_config(
         .pointer("/config/features")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid("native managed feature controls did not verify"))?;
-    if features.iter().any(|(name, value)| {
-        !expected["features"]
-            .as_object()
-            .expect("static object")
-            .contains_key(name)
-            && !(name == "fast_mode" && value.is_boolean())
-    }) {
-        return Err(invalid("unknown native managed feature"));
+    // Codex reports a version-dependent subset of its features. A feature Run
+    // does not pin is accepted only while disabled; `fast_mode` is a reviewed
+    // service-tier choice.
+    let mut unknown_features = serde_json::Map::new();
+    for (name, value) in features {
+        if required.contains_key(name) || (name == "fast_mode" && value.is_boolean()) {
+            continue;
+        }
+        if !codex_disabled(value) {
+            return Err(invalid("unknown native managed feature"));
+        }
+        unknown_features.insert(name.clone(), value.clone());
     }
+    // 0.167.0 ignores `tools.view_image` and reports `features.view_image`.
+    // Either report must be false, and at least one must be present.
+    let view_image = [
+        response.pointer("/config/tools/view_image"),
+        response.pointer("/config/features/view_image"),
+    ];
     if response.pointer("/config/agents/enabled") != Some(&json!(false))
-        || response.pointer("/config/tools/view_image") != Some(&json!(false))
+        || view_image
+            .iter()
+            .flatten()
+            .any(|value| *value != &json!(false))
+        || view_image.iter().all(Option::is_none)
         || response.pointer("/config/web_search") != Some(&json!("disabled"))
     {
         return Err(invalid("native managed agent controls did not verify"));
@@ -331,8 +433,9 @@ pub fn verify_managed_config(
         ("PreToolUse", pre_tool_use),
         ("PermissionRequest", permission_request),
     ] {
-        if !pinned.as_array().is_some_and(|groups| !groups.is_empty())
-            || response.pointer(&format!("/config/hooks/{event}")) != Some(pinned)
+        if !response
+            .pointer(&format!("/config/hooks/{event}"))
+            .is_some_and(|live| codex_hook_groups_match(live, pinned))
         {
             return Err(invalid("native managed hooks did not verify"));
         }
@@ -341,11 +444,17 @@ pub fn verify_managed_config(
         .pointer("/config/hooks")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid("native managed hooks did not verify"))?;
-    if hooks
-        .keys()
-        .any(|key| !matches!(key.as_str(), "PreToolUse" | "PermissionRequest" | "state"))
-    {
-        return Err(invalid("native managed hooks did not verify"));
+    // 0.167.0 lists every hook event. Another event is accepted only while it
+    // has no handler group; any configured handler there is refused.
+    let mut empty_hook_events = BTreeSet::new();
+    for (event, groups) in hooks {
+        if matches!(event.as_str(), "PreToolUse" | "PermissionRequest" | "state") {
+            continue;
+        }
+        if !(groups.is_null() || groups.as_array().is_some_and(Vec::is_empty)) {
+            return Err(invalid("native managed hooks did not verify"));
+        }
+        empty_hook_events.insert(event.clone());
     }
     if !trusted_state
         .as_object()
@@ -361,7 +470,10 @@ pub fn verify_managed_config(
             "native managed hook trust or plugins did not verify",
         ));
     }
-    Ok(())
+    Ok(json!({
+        "unknown_features": unknown_features,
+        "empty_hook_events": empty_hook_events,
+    }))
 }
 
 /// Apply the same no-environment setting to both thread/start and thread/resume.
@@ -500,6 +612,8 @@ pub fn claude_tool_arguments(allowed: &BTreeMap<String, BTreeSet<String>>) -> Re
 }
 
 /// Check Claude's native init inventory as the post-input qualification tripwire.
+/// Unlike `mcp_status`, `system/init` lists the model-visible tools after the
+/// deny rules apply (2.1.311 omits the denied Pool tools), so it stays exact.
 pub fn verify_claude_inventory(
     frame: &Value,
     allowed: &BTreeMap<String, BTreeSet<String>>,
@@ -523,14 +637,43 @@ pub fn verify_claude_inventory(
     Ok(())
 }
 
+/// Digest of the discovered Pool catalogs from which the managed deny
+/// complement was computed; the supervisor records it in the config digest.
+pub fn claude_catalog_digest(catalogs: &BTreeMap<String, BTreeSet<String>>) -> Result<String> {
+    Ok(agent_run_domain::canonical::sha256_hex(
+        &serde_json::to_value(catalogs)?,
+        true,
+    ))
+}
+
 /// Check the pre-model control replies. Claude 2.1.311 reports declarative
 /// built-in agents even when their tools are disabled; their exact list is
 /// digested by the caller, while commands must be disabled and servers exact.
+///
+/// `mcp_status` lists each server's raw `tools/list` result, before Claude
+/// applies `--allowedTools`/`--disallowedTools`: 2.1.311 reports the whole
+/// Pool catalog, including the tools Run denies. A Pool server's list is
+/// therefore accepted when it equals either its allowlist or exactly the
+/// catalog discovered for this launch, and only when that catalog has the
+/// recorded digest, contains the allowlist, and its complement is exactly the
+/// `disallowed` argument passed to the harness. A tool outside the discovered
+/// catalog, a missing allowed tool or an unknown server is refused. The
+/// model-visible list is pinned separately by the post-input `system/init`
+/// tripwire, which must equal the allowlist exactly. Returns, per server,
+/// whether the reported list was the allowlist or the catalog.
 pub fn verify_claude_control_inventory(
     initialize: &Value,
     status: &Value,
     allowed: &BTreeMap<String, BTreeSet<String>>,
-) -> Result<()> {
+    catalogs: &BTreeMap<String, BTreeSet<String>>,
+    catalog_sha256: &str,
+    disallowed: &str,
+) -> Result<Value> {
+    if claude_catalog_digest(catalogs)? != catalog_sha256
+        || claude_disallowed_tools(allowed, catalogs)? != disallowed
+    {
+        return Err(invalid("native managed MCP catalog did not verify"));
+    }
     let init = initialize
         .pointer("/response/response")
         .and_then(Value::as_object)
@@ -562,6 +705,7 @@ pub fn verify_claude_control_inventory(
         return Err(invalid("native managed MCP status did not verify"));
     }
     let mut seen = BTreeSet::new();
+    let mut reported = serde_json::Map::new();
     for server in servers {
         let name = server
             .get("name")
@@ -575,6 +719,7 @@ pub fn verify_claude_control_inventory(
         }
         // Some native versions omit per-server tools here. The caller has
         // separately pinned --tools "" and the later system/init tripwire.
+        let mut kind = "omitted";
         if let Some(value) = server.get("tools") {
             let list = value
                 .as_array()
@@ -589,12 +734,18 @@ pub fn verify_claude_control_inventory(
                     return Err(invalid("native managed MCP status did not verify"));
                 }
             }
-            if &found != tools {
+            // The worker server has no discovered catalog and stays exact.
+            kind = if &found == tools {
+                "allowlist"
+            } else if catalogs.get(name) == Some(&found) {
+                "catalog"
+            } else {
                 return Err(invalid("native managed MCP status did not verify"));
-            }
+            };
         }
+        reported.insert(name.to_owned(), json!(kind));
     }
-    Ok(())
+    Ok(Value::Object(reported))
 }
 
 #[cfg(test)]
@@ -640,12 +791,84 @@ mod tests {
         let mut extra_default = response.clone();
         extra_default["config"]["features"]["fast_mode"] = json!(true);
         assert!(verify_managed_config(&extra_default, pre, permission, trust).is_ok());
-        extra_default["config"]["features"]["unknown_future"] = json!(false);
-        assert!(verify_managed_config(&extra_default, pre, permission, trust).is_err());
+        for disabled in [json!(false), json!(null), json!({"enabled":false})] {
+            extra_default["config"]["features"]["unknown_future"] = disabled.clone();
+            let accepted = verify_managed_config(&extra_default, pre, permission, trust).unwrap();
+            assert_eq!(accepted["unknown_features"]["unknown_future"], disabled);
+        }
+        for enabled in [json!(true), json!("on"), json!({"enabled":true}), json!(1)] {
+            extra_default["config"]["features"]["unknown_future"] = enabled;
+            assert!(verify_managed_config(&extra_default, pre, permission, trust).is_err());
+        }
+        for feature in CODEX_MANAGED_DISABLED_IF_KNOWN {
+            let mut enabled = response.clone();
+            enabled["config"]["features"][*feature] = json!(true);
+            assert!(
+                verify_managed_config(&enabled, pre, permission, trust).is_err(),
+                "{feature}"
+            );
+            enabled["config"]["features"]
+                .as_object_mut()
+                .unwrap()
+                .remove(*feature);
+            verify_managed_config(&enabled, pre, permission, trust).unwrap();
+        }
+        // view_image: either report false, at least one present, none true.
+        let mut view = response.clone();
+        view["config"]["tools"]
+            .as_object_mut()
+            .unwrap()
+            .remove("view_image");
+        verify_managed_config(&view, pre, permission, trust).unwrap();
+        view["config"]["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("view_image");
+        assert!(verify_managed_config(&view, pre, permission, trust).is_err());
+        view["config"]["tools"]["view_image"] = json!(false);
+        verify_managed_config(&view, pre, permission, trust).unwrap();
+        view["config"]["features"]["view_image"] = json!(true);
+        assert!(verify_managed_config(&view, pre, permission, trust).is_err());
         for pointer in ["PreToolUse", "PermissionRequest"] {
             let mut changed = response.clone();
             changed["config"]["hooks"][pointer][0]["hooks"][0]["command"] = json!("/foreign");
             assert!(verify_managed_config(&changed, pre, permission, trust).is_err());
+            // Echoed handler defaults are inert; any other value or field is not.
+            let mut echoed = response.clone();
+            let handler = &mut echoed["config"]["hooks"][pointer][0]["hooks"][0];
+            handler["commandWindows"] = json!(null);
+            handler["async"] = json!(false);
+            handler["statusMessage"] = json!(null);
+            verify_managed_config(&echoed, pre, permission, trust).unwrap();
+            for (field, value) in [
+                ("async", json!(true)),
+                ("commandWindows", json!("C:\\foreign.exe")),
+                ("statusMessage", json!("x")),
+                ("env", json!({})),
+            ] {
+                let mut widened = echoed.clone();
+                widened["config"]["hooks"][pointer][0]["hooks"][0][field] = value;
+                assert!(
+                    verify_managed_config(&widened, pre, permission, trust).is_err(),
+                    "{field}"
+                );
+            }
+            let mut removed = response.clone();
+            removed["config"]["hooks"][pointer][0]["hooks"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("timeout");
+            assert!(verify_managed_config(&removed, pre, permission, trust).is_err());
+            let mut doubled = response.clone();
+            let group = doubled["config"]["hooks"][pointer][0].clone();
+            doubled["config"]["hooks"][pointer]
+                .as_array_mut()
+                .unwrap()
+                .push(group);
+            assert!(verify_managed_config(&doubled, pre, permission, trust).is_err());
+            let mut matcher = response.clone();
+            matcher["config"]["hooks"][pointer][0]["matcher"] = json!(".*");
+            assert!(verify_managed_config(&matcher, pre, permission, trust).is_err());
             let mut missing = response.clone();
             missing["config"]["hooks"]
                 .as_object_mut()
@@ -659,9 +882,24 @@ mod tests {
         let mut missing = response.clone();
         missing["config"].as_object_mut().unwrap().remove("agents");
         assert!(verify_managed_config(&missing, pre, permission, trust).is_err());
-        let mut widened = response.clone();
-        widened["config"]["hooks"]["PostToolUse"] = json!([]);
-        assert!(verify_managed_config(&widened, pre, permission, trust).is_err());
+        let mut empty = response.clone();
+        empty["config"]["hooks"]["PostToolUse"] = json!([]);
+        empty["config"]["hooks"]["Stop"] = json!(null);
+        let accepted = verify_managed_config(&empty, pre, permission, trust).unwrap();
+        assert_eq!(
+            accepted["empty_hook_events"],
+            json!(["PostToolUse", "Stop"])
+        );
+        for groups in [
+            json!([{"hooks":[{"type":"command","command":"/foreign"}]}]),
+            json!([{}]),
+            json!({}),
+            json!(false),
+        ] {
+            let mut widened = response.clone();
+            widened["config"]["hooks"]["PostToolUse"] = groups;
+            assert!(verify_managed_config(&widened, pre, permission, trust).is_err());
+        }
         let mut widened = response.clone();
         widened["config"]["hooks"]["state"]["bridge"]["trusted_hash"] = json!("foreign");
         assert!(verify_managed_config(&widened, pre, permission, trust).is_err());
@@ -709,19 +947,77 @@ mod tests {
     #[test]
     fn claude_controls_require_no_commands_and_exact_connected_servers() {
         let allowed = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
+        let catalogs = BTreeMap::from([(
+            "pool".into(),
+            BTreeSet::from(["pool_get".into(), "pool_start_batch".into()]),
+        )]);
+        let digest = claude_catalog_digest(&catalogs).unwrap();
+        let denied = claude_disallowed_tools(&allowed, &catalogs).unwrap();
+        let verify = |init: &Value, status: &Value| {
+            verify_claude_control_inventory(init, status, &allowed, &catalogs, &digest, &denied)
+        };
         let init = json!({"type":"control_response","response":{"subtype":"success","request_id":"i","response":{"commands":[],"agents":[{"name":"Explore"}]}}});
         let status = json!({"type":"control_response","response":{"subtype":"success","request_id":"s","response":{"mcpServers":[{"name":"pool","status":"connected"}]}}});
-        verify_claude_control_inventory(&init, &status, &allowed).unwrap();
+        assert_eq!(verify(&init, &status).unwrap(), json!({"pool":"omitted"}));
         let mut bad = init.clone();
         bad["response"]["response"]["commands"] = json!([{"name":"command"}]);
-        assert!(verify_claude_control_inventory(&bad, &status, &allowed).is_err());
+        assert!(verify(&bad, &status).is_err());
         let mut bad = status.clone();
         bad["response"]["response"]["mcpServers"][0]["status"] = json!("failed");
-        assert!(verify_claude_control_inventory(&init, &bad, &allowed).is_err());
+        assert!(verify(&init, &bad).is_err());
         bad = status.clone();
         bad["response"]["response"]["mcpServers"][0]["tools"] = json!(["foreign"]);
-        assert!(verify_claude_control_inventory(&init, &bad, &allowed).is_err());
+        assert!(verify(&init, &bad).is_err());
         bad["response"]["response"]["mcpServers"][0]["tools"] = json!(["pool_get"]);
-        verify_claude_control_inventory(&init, &bad, &allowed).unwrap();
+        assert_eq!(verify(&init, &bad).unwrap(), json!({"pool":"allowlist"}));
+        // The raw server list may be the whole discovered catalog, never more,
+        // fewer or different tools.
+        bad["response"]["response"]["mcpServers"][0]["tools"] =
+            json!([{"name":"pool_start_batch"}, {"name":"pool_get"}]);
+        assert_eq!(verify(&init, &bad).unwrap(), json!({"pool":"catalog"}));
+        for tools in [
+            json!(["pool_get", "pool_start_batch", "pool_start_agent"]),
+            json!(["pool_start_batch"]),
+            json!(["pool_get", "pool_get", "pool_start_batch"]),
+        ] {
+            bad["response"]["response"]["mcpServers"][0]["tools"] = tools;
+            assert!(verify(&init, &bad).is_err());
+        }
+        bad["response"]["response"]["mcpServers"][0]["tools"] =
+            json!(["pool_get", "pool_start_batch"]);
+        // The catalog must be the recorded one and its complement the passed deny argument.
+        let other = BTreeMap::from([(
+            "pool".into(),
+            BTreeSet::from(["pool_get".into(), "pool_start_agent".into()]),
+        )]);
+        assert!(
+            verify_claude_control_inventory(
+                &init,
+                &bad,
+                &allowed,
+                &catalogs,
+                &"0".repeat(64),
+                &denied
+            )
+            .is_err()
+        );
+        assert!(
+            verify_claude_control_inventory(&init, &bad, &allowed, &other, &digest, &denied)
+                .is_err()
+        );
+        assert!(
+            verify_claude_control_inventory(
+                &init,
+                &bad,
+                &allowed,
+                &catalogs,
+                &digest,
+                CLAUDE_DISALLOWED_TOOLS
+            )
+            .is_err()
+        );
+        let mut foreign = bad.clone();
+        foreign["response"]["response"]["mcpServers"][0]["name"] = json!("foreign");
+        assert!(verify(&init, &foreign).is_err());
     }
 }

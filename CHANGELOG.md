@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(adapters): qualify managed roles on Claude Code 2.1.311 and codex-cli
+  0.167.0. Claude `mcp_status` may list the exact discovered Pool catalog
+  whose complement Run denies; the post-input `system/init` stays exact. Codex
+  managed launches disable four default-on features and `features.view_image`;
+  other reported features must be disabled, other hook events empty, and echoed
+  hook handler fields inert. Accepted drift is digested and journaled.
+
 ## 0.31.0
 
 Released 2026-11-10.
