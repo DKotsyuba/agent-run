@@ -734,6 +734,7 @@ fn native_provider_keeps_login_and_model_alias() {
             ("AGENT_RUN_WORKER_TOKEN".into(), "stale-capability".into()),
             (agent_run_domain::worker::FINISH_ENV.into(), "1".into()),
             (agent_run_domain::worker::RESEARCH_ENV.into(), "1".into()),
+            (agent_run_domain::worker::MANAGED_ENV.into(), "1".into()),
             ("AGENT_RUN_WORKER_FUTURE".into(), "stale".into()),
             ("AGENT_RUN_LAUNCH_ID".into(), "foreign".into()),
         ]),
@@ -770,6 +771,7 @@ fn native_provider_keeps_login_and_model_alias() {
     for name in agent_run_domain::worker::ENV_NAMES.into_iter().chain([
         agent_run_domain::worker::FINISH_ENV,
         agent_run_domain::worker::RESEARCH_ENV,
+        agent_run_domain::worker::MANAGED_ENV,
     ]) {
         assert!(!plan.launch.environment.contains_key(name));
     }
@@ -2046,6 +2048,14 @@ fn managed_selector_is_opt_in_and_materializes_both_profiles() {
                     .map(|value| value.as_str().unwrap())
                     .collect::<Vec<_>>(),
                 vec!["finish", "health_reply"]
+            );
+            assert!(
+                native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]["env_vars"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&toml::Value::String(
+                        agent_run_domain::worker::MANAGED_ENV.into()
+                    ))
             );
             let selected =
                 agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, true)

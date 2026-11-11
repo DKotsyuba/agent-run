@@ -13,11 +13,30 @@ frame whose API request could not leave the host. codex-cli 0.167.0 ran
 (no turn) and `mcpServerStatus/list`.
 
 Normalized: temporary homes and work directories are replaced with the failed
-attempts' runtime paths, and request, session and message ids are fixed. No
-credential appears in any capture. The supervisor-owned `agent_run_worker` MCP
-needs per-attempt credentials and could not start offline; its entries
-(`finish`, `health_reply`) are synthetic in `claude-2.1.311-mcp-status.json`,
-`claude-2.1.311-system-init.json` and `codex-0.167.0-mcp-server-status.json`.
+attempts' runtime paths, and request, session, thread and message ids are
+fixed. No credential appears in any capture.
+
+`claude-2.1.311-mcp-status.json`, `claude-2.1.311-system-init.json`,
+`claude-2.1.311-input-lifecycle.json`, `codex-0.167.0-thread-start.json` and
+`codex-0.167.0-mcp-server-status.json` were recaptured on 2026-11-11 by the
+ignored live probes `stream::tests::live_managed_claude_qualifies_before_model_input`
+and `codex::tests::live_managed_codex_qualifies_before_any_turn` (agent-run-core),
+run as `agent-mcp` against the failed attempts ag-20261111-033955-98bc33fa67
+(Claude) and ag-20261111-033955-077019ad6d (Codex). They run Run's own
+selection, discovery, preflight and verification code against the installed
+harnesses. The `agent_run_worker` entries are real: the worker MCP of this
+build ran in managed mode with a dummy capability whose broker endpoint does
+not exist, so its catalog registration failed closed while `tools/list` served
+exactly `health_reply` and `finish`. Claude's user frame went to a refused
+loopback port; Codex never received a turn.
+
+- `claude-2.1.311-input-lifecycle.json`: the `command_lifecycle` frames
+  (`queued`, `started`) Claude emits for an input frame carrying a `uuid`,
+  before `system/init`.
+- `codex-0.167.0-thread-start.json`: Run's managed thread/start parameters
+  (developer instructions elided) and codex's reply (thread reduced to id,
+  environments and status): `environments: []` yields
+  `runtimeWorkspaceRoots: []`.
 
 - `codex-0.167.0-run-config.toml`: the failed attempt's Run-generated
   `config.toml` (environment variable names only), the source of the pinned

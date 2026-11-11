@@ -9,7 +9,7 @@ use crate::{
 pub use agent_run_domain::tools::{is_tool, tool, tools_json};
 use agent_run_domain::{
     storage::WriteAuthority,
-    worker::{WorkerCatalogProof, known_pool_catalog},
+    worker::{WorkerCatalogProof, known_worker_catalog},
 };
 use agent_run_store::{
     ops::{
@@ -1104,7 +1104,7 @@ fn worker_authority(run: &AgentId, attempt: &str) -> WriteAuthority {
 /// already-registered cases with local values; only a first registration
 /// reaches the writer, so a repeat never writes and never fabricates a receipt.
 async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Result<Value> {
-    if !known_pool_catalog(proof.version, &proof.digest) {
+    if !known_worker_catalog(proof.version, &proof.digest) {
         return Err(crate::Error::Unsupported(
             "worker pool catalog is not supported".into(),
         ));

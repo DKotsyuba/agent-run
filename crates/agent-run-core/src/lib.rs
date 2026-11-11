@@ -31,6 +31,9 @@ pub mod lifecycle;
 /// Generic writer-backed lineage holds and read-only recovery.
 pub mod lineage_holds;
 pub mod logging;
+/// Setup for the ignored live probes of the real managed launch path.
+#[cfg(test)]
+mod managed_live_probe;
 mod managed_qualification;
 pub mod managed_services;
 /// Single-instance storage of Codex's unindexed native metadata caches.

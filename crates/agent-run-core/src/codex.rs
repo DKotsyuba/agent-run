@@ -419,6 +419,16 @@ impl Grant {
             permission_profile: profile,
         })
     }
+    /// The grant of a thread started with no native environment
+    /// (`environments: []`), as the managed role requires. Like research, it
+    /// then has no runtime workspace roots: codex-cli 0.167.0 echoes
+    /// `runtimeWorkspaceRoots: []` and exposes no filesystem, shell or patch
+    /// tool, so requesting the workdir root would be both ineffective and an
+    /// echo mismatch. cwd, sandbox, approval and network stay as admitted.
+    pub fn without_environments(mut self) -> Self {
+        self.roots.clear();
+        self
+    }
     /// Builds thread-start/resume fields from the already admitted grant.
     /// Named and built-in profiles replace legacy sandbox fields; only the
     /// existing unnamed network path retains its native network override.
@@ -913,7 +923,10 @@ async fn run_inner(
     {
         return Err(invalid("effort is not offered by selected account/model"));
     }
-    let grant = Grant::new(runtime, &record.request, role, home)?;
+    let mut grant = Grant::new(runtime, &record.request, role, home)?;
+    if managed.is_some() {
+        grant = grant.without_environments();
+    }
     let mut params = grant.request();
     if record.request.explicit_finish {
         // Runtime turn semantics belong above task/user text. Preserve the
@@ -973,13 +986,7 @@ async fn run_inner(
         finish_inventory_ready(process, &tid, role.research_tools_only()).await?;
     }
     if let Some(managed) = managed {
-        let inventory = process
-            .rpc(
-                "mcpServerStatus/list",
-                json!({"threadId":tid,"limit":1000}),
-                Duration::from_secs(30),
-            )
-            .await?;
+        let inventory = managed_inventory_settled(process, &tid).await?;
         agent_run_adapters::managed_role::verify_inventory(&inventory, managed.inventory)?;
         let inventory_digest = agent_run_domain::canonical::sha256_hex(&inventory, true);
         crate::managed_qualification::record(
@@ -2160,6 +2167,36 @@ async fn finish_inventory_ready(process: &mut Process, thread: &str, research: b
     }
 }
 
+/// codex-cli 0.167.0 starts thread MCP servers asynchronously after
+/// thread/start. Re-read the native status until every server is connected or
+/// one has failed, within the same 30-second setup allowance, and return that
+/// reply for the caller's single exact verification. Nothing is accepted here.
+async fn managed_inventory_settled(process: &mut Process, thread: &str) -> Result<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(invalid("native managed inventory did not become ready"));
+        }
+        let status = process
+            .rpc(
+                "mcpServerStatus/list",
+                json!({"threadId":thread,"limit":1000}),
+                left,
+            )
+            .await?;
+        let settled = status["data"].as_array().is_none_or(|servers| {
+            !servers.is_empty()
+                && (servers.iter().all(|s| s["runtimeStatus"] == "connected")
+                    || servers.iter().any(|s| s["runtimeStatus"] == "failed"))
+        });
+        if settled {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Ownership captured from a matching active-turn started item.
 struct PendingNativeJob {
     /// Originating native turn, retained across later model turns.
@@ -2925,6 +2962,223 @@ mod tests {
             assert_eq!(result.is_ok(), !widened);
             assert_eq!(process.reap().await, Some(0));
         }
+    }
+
+    /// Live probe of the real managed Codex launch (see `managed_live_probe`):
+    /// the attempt's Run-generated `config.toml` (paths moved to scratch, the
+    /// worker command set to the build under test and its managed marker
+    /// forwarded, as the planner now writes it), then exactly the runner's
+    /// steps up to qualification: initialize, live `config/read` verification,
+    /// the admitted grant and thread/start parameters, `Grant::verify` and the
+    /// exact MCP inventory. No turn is ever started.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live harness probe; requires AGENT_RUN_LIVE_MANAGED_PROBE"]
+    async fn live_managed_codex_qualifies_before_any_turn() {
+        use serde_json::{Value, json};
+        use std::{collections::BTreeMap, time::Duration};
+        let Some(live) = crate::managed_live_probe::load("codex") else {
+            return;
+        };
+        let (launch_dir, scratch) = (live.path("launch_dir"), live.path("scratch"));
+        let (home, work) = (scratch.join("codex-home"), scratch.join("work"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let launch: Value = serde_json::from_slice(
+            &std::fs::read(launch_dir.join("provider-launch.json")).unwrap(),
+        )
+        .unwrap();
+        let model = launch["native_model"].as_str().unwrap().to_owned();
+        let source = launch_dir.join("config.toml");
+        let text = std::fs::read_to_string(&source)
+            .unwrap()
+            .replace(
+                source.to_str().unwrap(),
+                home.join("config.toml").to_str().unwrap(),
+            )
+            .replace(
+                live.request.workdir.to_str().unwrap(),
+                work.to_str().unwrap(),
+            );
+        let mut native: toml::Table = toml::from_str(&text).unwrap();
+        let worker = native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]
+            .as_table_mut()
+            .unwrap();
+        worker.insert(
+            "command".into(),
+            toml::Value::String(live.section["worker"].as_str().unwrap().into()),
+        );
+        let forwarded = worker["env_vars"].as_array_mut().unwrap();
+        let marker = toml::Value::String(agent_run_domain::worker::MANAGED_ENV.into());
+        if !forwarded.contains(&marker) {
+            forwarded.push(marker);
+        }
+        let text = toml::to_string(&native).unwrap();
+        std::fs::write(home.join("config.toml"), &text).unwrap();
+        // The supervisor's pinned hook declarations, read from that file.
+        let pinned = serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap();
+        let hooks = &pinned["hooks"];
+        let mut environment = BTreeMap::from([
+            ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
+            ("HOME".into(), home.to_string_lossy().into()),
+            ("CODEX_HOME".into(), home.to_string_lossy().into()),
+            ("OPENAI_BASE_URL".into(), "http://127.0.0.1:9/v1".into()),
+        ]);
+        environment.extend(live.worker_environment());
+        let harness = live.identity.authority.harness;
+        let plan = agent_run_adapters::LaunchPlan {
+            binary: live.config.harnesses[&harness].binary.clone(),
+            args: vec!["app-server".into()],
+            cwd: work.clone(),
+            environment,
+            initial_input: None,
+        };
+        let runtime = agent_run_adapters::provider::runtime(&live.config, harness, &model).unwrap();
+        let profile = agent_run_adapters::provider::profile(&live.role);
+        let mut request = live.request.clone();
+        request.model = model.clone();
+        request.workdir = work.clone();
+        let managed = super::ManagedCodexRole {
+            pre_tool_use: &hooks["PreToolUse"],
+            permission_request: &hooks["PermissionRequest"],
+            hook_state: &hooks["state"],
+            inventory: &live.selection.inventory,
+            selection: &live.selection,
+        };
+        let mut process = super::Process::spawn(&plan).unwrap();
+        let mut evidence = json!({"harness":"codex","agent_id":live.section["agent_id"],
+            "selection_inventory":live.selection.inventory,"role_digest":live.selection.role_digest});
+        let outcome: crate::Result<()> = async {
+            super::initialize(&mut process).await?;
+            let config = super::verify_live_managed_config(&mut process, &work, &managed).await;
+            evidence["config_read_accepted"] = json!(config.as_ref().ok().map(|(_, v)| v));
+            evidence["config_read_error"] = json!(config.as_ref().err().map(|e| e.to_string()));
+            config?;
+            let admitted = super::Grant::new(&runtime, &request, &profile, &home)?;
+            let grant = admitted.clone().without_environments();
+            let mut params = grant.request();
+            let configured = process
+                .rpc("config/read", json!({"cwd":work}), Duration::from_secs(30))
+                .await?;
+            params["developerInstructions"] =
+                json!(super::finish_developer_instructions(&configured)?);
+            agent_run_adapters::managed_role::codex_thread_parameters(&mut params)?;
+            let mut shown = params.clone();
+            shown["developerInstructions"] = json!("<Run explicit-finish contract>");
+            evidence["thread_start_params"] = shown;
+            let thread = process
+                .rpc("thread/start", params, Duration::from_secs(30))
+                .await?;
+            let mut echo = thread.clone();
+            if let Some(thread) = echo.get_mut("thread") {
+                *thread = json!({"id":thread["id"],"environments":thread["environments"],"status":thread["status"]});
+            }
+            evidence["thread_start_echo"] = echo;
+            evidence["previous_grant_verify_error"] =
+                json!(admitted.verify(&thread).err().map(|e| e.to_string()));
+            let verified = grant.verify(&thread);
+            evidence["grant_verify_error"] = json!(verified.as_ref().err().map(|e| e.to_string()));
+            verified?;
+            let tid = thread
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| crate::error::invalid("thread start did not return an id"))?
+                .to_owned();
+            let inventory = super::managed_inventory_settled(&mut process, &tid).await?;
+            evidence["mcp_server_status"] = inventory.clone();
+            let checked =
+                agent_run_adapters::managed_role::verify_inventory(&inventory, managed.inventory);
+            evidence["inventory_error"] = json!(checked.as_ref().err().map(|e| e.to_string()));
+            checked
+        }
+        .await;
+        evidence["outcome_error"] = json!(outcome.as_ref().err().map(|e| e.to_string()));
+        evidence["turn_started"] = json!(false);
+        process.input.take();
+        let _ = process.owner.cleanup(Duration::from_secs(2)).await;
+        process.reap().await;
+        live.write_evidence(&evidence);
+        outcome.unwrap();
+    }
+
+    /// A managed status still reporting a starting server is read again; the
+    /// settled reply is returned unverified, and a failed server ends the wait.
+    #[tokio::test]
+    async fn managed_codex_inventory_waits_for_starting_servers() {
+        use std::collections::BTreeMap;
+        let script = r#"import json,sys
+statuses=sys.argv[1].split(',')
+for status in statuses:
+    request=json.loads(sys.stdin.readline())
+    assert request['method']=='mcpServerStatus/list' and request['params']['threadId']=='thread'
+    print(json.dumps({'id':request['id'],'result':{'data':[{'name':'pool','runtimeStatus':status,'tools':{}}],'nextCursor':None}}),flush=True)
+"#;
+        for (statuses, last) in [
+            ("starting,starting,connected", "connected"),
+            ("starting,failed", "failed"),
+            ("connected", "connected"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/usr/bin/python3".into(),
+                args: vec!["-u".into(), "-c".into(), script.into(), statuses.into()],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let status = super::managed_inventory_settled(&mut process, "thread")
+                .await
+                .unwrap();
+            assert_eq!(status["data"][0]["runtimeStatus"], last, "{statuses}");
+            process.input.take();
+            assert_eq!(process.reap().await, Some(0));
+        }
+    }
+
+    /// A managed thread has no native environment and so no runtime roots:
+    /// the request asks for none and codex-cli 0.167.0's echo verifies.
+    #[test]
+    fn managed_grant_requests_and_verifies_no_runtime_roots() {
+        use serde_json::json;
+        let grant = super::Grant {
+            model: "gpt-6-luna".into(),
+            cwd: "/work".into(),
+            roots: vec!["/work".into()],
+            writable_roots: vec![],
+            sandbox: "read-only".into(),
+            approval_policy: "never".into(),
+            reviewer: None,
+            network_access: false,
+            permission_profile: Some(":read-only".into()),
+        };
+        // codex-cli 0.167.0's real reply to Run's managed thread/start.
+        let captured: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/managed-native/codex-0.167.0-thread-start.json"
+        ))
+        .unwrap();
+        let mut echo = captured["result"].clone();
+        echo["cwd"] = json!("/work");
+        assert!(grant.verify(&echo).is_err());
+        let managed = grant.without_environments();
+        let mut params = managed.request();
+        agent_run_adapters::managed_role::codex_thread_parameters(&mut params).unwrap();
+        for key in [
+            "runtimeWorkspaceRoots",
+            "permissions",
+            "approvalPolicy",
+            "environments",
+        ] {
+            assert_eq!(params[key], captured["params"][key], "{key}");
+        }
+        managed.verify(&echo).unwrap();
+        let mut widened = echo.clone();
+        widened["runtimeWorkspaceRoots"] = json!(["/work"]);
+        assert!(managed.verify(&widened).is_err());
+        widened = echo;
+        widened["sandbox"] =
+            json!({"type":"workspaceWrite","writableRoots":["/tmp"],"networkAccess":false});
+        assert!(managed.verify(&widened).is_err());
     }
 
     /// The shared output budget never splits UTF-8 and reports omitted data.

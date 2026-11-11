@@ -338,4 +338,48 @@ fn codex_0_167_0_inventory_is_exactly_the_enabled_tools() {
         .unwrap()
         .remove("pool_vote");
     assert!(verify_inventory(&missing, &allowed).is_err());
+    // The real managed worker served exactly the domain's completion catalog.
+    let worker = status["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["name"] == WORKER)
+        .unwrap();
+    let catalog = agent_run_domain::worker::managed_tools_json();
+    assert_eq!(worker["tools"].as_object().unwrap().len(), catalog.len());
+    for tool in catalog {
+        let served = &worker["tools"][tool["name"].as_str().unwrap()];
+        assert_eq!(served["inputSchema"], tool["inputSchema"]);
+        assert_eq!(served["description"], tool["description"]);
+    }
+}
+
+#[test]
+fn claude_2_1_311_worker_reports_only_the_managed_catalog() {
+    let status = json_fixture("claude-2.1.311-mcp-status.json");
+    let served: Vec<_> = status["response"]["response"]["mcpServers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["name"] == WORKER)
+        .unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(served, agent_run_domain::worker::MANAGED_TOOLS);
+    let init = json_fixture("claude-2.1.311-system-init.json");
+    let visible: BTreeSet<&str> = init["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool.as_str()?.strip_prefix("mcp__agent_run_worker__"))
+        .collect();
+    assert_eq!(
+        visible,
+        agent_run_domain::worker::MANAGED_TOOLS
+            .into_iter()
+            .collect()
+    );
 }

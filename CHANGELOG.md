@@ -10,6 +10,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   managed launches disable four default-on features and `features.view_image`;
   other reported features must be disabled, other hook events empty, and echoed
   hook handler fields inert. Accepted drift is digested and journaled.
+- fix(core): pass real managed qualification on Claude Code 2.1.311 and
+  codex-cli 0.167.0. The worker MCP of a managed role serves exactly
+  `health_reply` and `finish` (new `AGENT_RUN_WORKER_MANAGED` marker and a
+  completion-only catalog that is never pool-capable). Claude's `mcp_status`
+  is repeated while a server is `pending`, and the identified input's
+  `command_lifecycle` acknowledgements may precede `system/init`. A managed
+  Codex thread (`environments: []`) requests and verifies no runtime
+  workspace roots, and its MCP inventory is read once servers settle.
+  Execution failure diagnostics keep a validation error's static reason.
 
 ## 0.31.0
 

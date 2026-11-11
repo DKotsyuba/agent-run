@@ -867,6 +867,11 @@ fn materialize_with_provider(
                 if name == agent_run_domain::worker::SERVER_NAME {
                     forwarded.push(agent_run_domain::worker::FINISH_ENV.into());
                 }
+                if managed && name == agent_run_domain::worker::SERVER_NAME {
+                    // Select the managed completion-only catalog inside
+                    // Codex's separately filtered MCP child.
+                    forwarded.push(agent_run_domain::worker::MANAGED_ENV.into());
+                }
                 if research && name == agent_run_domain::worker::SERVER_NAME {
                     // Select the six-tool catalog inside Codex's separately
                     // filtered MCP child; broker authority remains independent.

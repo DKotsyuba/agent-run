@@ -352,7 +352,15 @@ The selector refuses plugins, skills, non-stdio or unrestricted MCP servers,
 unapproved component binaries, non-explicit completion, research and broader
 roles. The selected Pool command must be the pinned binary with exactly
 `mcp --config <absolute-path>` and an explicit safe tool subset; the private
-worker surface is limited to `finish` and `health_reply`. Codex live configuration
+worker surface is limited to `finish` and `health_reply`: the supervisor sets
+`AGENT_RUN_WORKER_MANAGED=1` and the worker MCP then serves only those two
+tools and registers a completion-only catalog, which is health-capable but
+never satisfies Pool enrollment. A managed Codex thread runs with
+`environments: []` and therefore requests and verifies no runtime workspace
+roots (codex-cli 0.167.0 echoes `runtimeWorkspaceRoots: []`); cwd, the
+read-only profile, approval and network stay as admitted. Its MCP status is
+re-read until every server is connected or one failed, within 30 seconds,
+then verified exactly once. Codex live configuration
 and native inventory are checked before input;
 their digests and exact bound launch/kernel identity are recorded by the owning
 supervisor. This switch does not itself enable a Pool-managed command or claim
@@ -418,6 +426,8 @@ ledger reaches 90% of its capacity; it does not silently evict those effects.
 Claude Code 2.1.311 emits `system/init` only after its first user input. Before
 that input, Run sends bare `initialize` and `mcp_status` control requests and
 requires no slash commands and exactly the configured connected MCP servers.
+2.1.311 connects MCP servers asynchronously, so `mcp_status` is repeated
+within the same 30-second deadline while any server is `pending`.
 The declarative agents list is digested; `--tools ""` disables native tools.
 MCP status may omit per-server tool inventories. When present, a server's list
 is its raw `tools/list` result before deny rules apply: 2.1.311 reports the
@@ -429,6 +439,8 @@ Unknown servers, tools outside that catalog, missing allowed tools and a catalog
 digest mismatch are refused; the worker server stays exact. Run then checks the
 subsequent `system/init` tool list, which 2.1.311 reports after deny rules, as a
 mandatory exact tripwire before durable qualification or v2 owner handoff.
+Only the `command_lifecycle` acknowledgements of exactly that input and
+session, `queued` then `started`, may precede `system/init`.
 Mismatch closes stdin and fails the run. The accepted shape per server
 (`allowlist`, `catalog` or `omitted`) is bound into the inventory digest and
 journaled as `managed_native_drift_v1`.

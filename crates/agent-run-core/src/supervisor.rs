@@ -587,12 +587,38 @@ fn retain_cleanup_evidence(
     candidate.map(|_| ())
 }
 
+/// A contract rejection's reason when it is one of Run's static phrases:
+/// ASCII letters, spaces and `/ - , ( )` only, short words, bounded length,
+/// and `/`/`-` only inside a word. Text that could carry configured or native
+/// content (digits, underscores, quotes, paths, long tokens, other bytes) is
+/// withheld, never echoed.
+fn static_reason(message: &str) -> Option<&str> {
+    let joined = |word: &str| {
+        !word.starts_with(['/', '-'])
+            && !word.ends_with(['/', '-'])
+            && word.split(['/', '-']).all(|part| part.len() <= 24)
+    };
+    (!message.trim().is_empty()
+        && message.len() <= 160
+        && message.bytes().all(|b| {
+            b.is_ascii_alphabetic() || matches!(b, b' ' | b'/' | b'-' | b',' | b'(' | b')')
+        })
+        && message.split(' ').all(joined))
+    .then_some(message)
+}
+
 /// Returns closed, content-free categories for an execution error. Original
 /// messages, SQL text, paths, JSON contents and credential/environment values
-/// never enter diagnostics. Native numeric errno/SQLite codes remain nullable.
+/// never enter diagnostics; a validation or unsupported error adds only its
+/// [`static_reason`]. Native numeric errno/SQLite codes remain nullable.
 pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
+        Error::Validation(message) | Error::Unsupported(message) => {
+            if let Some(reason) = static_reason(message) {
+                data["reason"] = json!(reason);
+            }
+        }
         Error::OwnershipCheckpoint { stage, source } => {
             data = execution_error_metadata(source);
             data["stage"] = json!(stage);
@@ -1804,6 +1830,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             planned.launch.environment.insert(
                 agent_run_domain::worker::FINISH_ENV.into(),
                 if row.request.explicit_finish {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            );
+            // The selected managed role's worker surface is exactly its
+            // qualified allowlist: `health_reply` and `finish`.
+            planned.launch.environment.insert(
+                agent_run_domain::worker::MANAGED_ENV.into(),
+                if managed_selection.is_some() {
                     "1"
                 } else {
                     "0"
@@ -3205,6 +3242,42 @@ mod tests {
         }
         let data = execution_error_metadata(&errors[1]);
         assert_eq!(data["sqlite_code"], "DatabaseBusy");
+        // A static contract reason is kept for operators; anything that could
+        // carry configured or native content is withheld.
+        let error = Error::Validation("native managed MCP status did not verify".into());
+        assert_eq!(
+            execution_error_metadata(&error)["reason"],
+            "native managed MCP status did not verify"
+        );
+        assert!(
+            failed_result(&error)
+                .outcome
+                .failure_text
+                .unwrap()
+                .contains("native managed MCP status did not verify")
+        );
+        assert_eq!(
+            execution_error_metadata(&Error::Validation(
+                "Codex effective readable/writable roots differ from admitted grant".into()
+            ))["reason"],
+            "Codex effective readable/writable roots differ from admitted grant"
+        );
+        for withheld in [
+            "writable root /home/user/work does not resolve",
+            "token abc123 rejected",
+            "value \"quoted\" rejected",
+            "key sk-ant-api03-abcdefghijklmnopqrstuvwxyz rejected",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "",
+        ] {
+            let data = execution_error_metadata(&Error::Validation(withheld.into()));
+            assert!(data.get("reason").is_none(), "{withheld}");
+        }
+        assert!(
+            execution_error_metadata(&Error::Runtime("plain words".into()))
+                .get("reason")
+                .is_none()
+        );
         assert_eq!(data["sqlite_extended_code"], 5);
         assert_eq!(
             execution_error_metadata(&errors[0])["io_kind"],

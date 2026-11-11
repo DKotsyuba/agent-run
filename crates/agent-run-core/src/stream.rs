@@ -671,34 +671,51 @@ pub(crate) async fn run_managed(
 }
 
 /// Await the first native init after initial input but before qualification or
-/// owner handoff. A mismatch closes stdin and refuses the managed run.
+/// owner handoff. Claude Code 2.1.311 first acknowledges the identified input
+/// with `command_lifecycle` frames, `queued` then `started`; only those, for
+/// exactly this input and session, may precede `system/init`. They carry no
+/// tool or authority and the main loop ignores them. Any other frame or
+/// mismatch closes stdin and refuses the managed run.
 async fn managed_initial_inventory(
     process: &mut Process,
     allowed: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     expected_session: &str,
+    input_id: &str,
 ) -> Result<Event> {
-    let event = tokio::time::timeout(Duration::from_secs(30), process.next()).await;
-    match event {
-        Ok(Event::Json(frame)) => {
-            if frame.get("session_id").and_then(Value::as_str) != Some(expected_session) {
-                process.input.take();
-                return Err(invalid("native managed session did not verify"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut acknowledgements = ["queued", "started"].into_iter().peekable();
+    loop {
+        let event = tokio::time::timeout_at(deadline, process.next()).await;
+        match event {
+            Ok(Event::Json(frame)) => {
+                if frame.get("session_id").and_then(Value::as_str) != Some(expected_session) {
+                    process.input.take();
+                    return Err(invalid("native managed session did not verify"));
+                }
+                if frame.get("type").and_then(Value::as_str) == Some("command_lifecycle")
+                    && frame.get("command_uuid").and_then(Value::as_str) == Some(input_id)
+                    && acknowledgements
+                        .next_if(|state| frame.get("state").and_then(Value::as_str) == Some(state))
+                        .is_some()
+                {
+                    continue;
+                }
+                if let Err(error) =
+                    agent_run_adapters::managed_role::verify_claude_inventory(&frame, allowed)
+                {
+                    process.input.take();
+                    return Err(error);
+                }
+                return Ok(Event::Json(frame));
             }
-            if let Err(error) =
-                agent_run_adapters::managed_role::verify_claude_inventory(&frame, allowed)
-            {
+            Ok(Event::OwnershipFailure(error)) => {
                 process.input.take();
                 return Err(error);
             }
-            Ok(Event::Json(frame))
-        }
-        Ok(Event::OwnershipFailure(error)) => {
-            process.input.take();
-            Err(error)
-        }
-        _ => {
-            process.input.take();
-            Err(invalid("native managed inventory did not verify"))
+            _ => {
+                process.input.take();
+                return Err(invalid("native managed inventory did not verify"));
+            }
         }
     }
 }
@@ -824,6 +841,31 @@ async fn managed_claude_control(
     }
 }
 
+/// Claude Code 2.1.311 connects MCP servers asynchronously: an `mcp_status`
+/// sent right after `initialize` reports them `pending`. Repeat the bare
+/// control within the same setup deadline until no server is pending, and
+/// return that reply for the caller's single exact verification.
+async fn managed_claude_status_settled(
+    process: &mut Process,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    loop {
+        let status = managed_claude_control(process, "mcp_status", deadline).await?;
+        let pending = status
+            .pointer("/response/response/mcpServers")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| servers.iter().any(|s| s["status"] == "pending"));
+        if !pending {
+            return Ok(status);
+        }
+        if tokio::time::Instant::now() + Duration::from_millis(250) >= deadline {
+            process.input.take();
+            return Err(invalid("native managed MCP servers did not connect"));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 type ManagedClaudeInputs<'a> = (
     &'a agent_run_adapters::managed_role::Selection,
     &'a str,
@@ -862,7 +904,7 @@ async fn run_inner(
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let initialize = managed_claude_control(process,"initialize",deadline).await?;
-            let status = managed_claude_control(process,"mcp_status",deadline).await?;
+            let status = managed_claude_status_settled(process,deadline).await?;
             let reported = agent_run_adapters::managed_role::verify_claude_control_inventory(&initialize,&status,&selection.inventory,catalogs,catalog_sha256,&disallowed)?;
             let evidence = json!({
                 "initialize_sha256":agent_run_domain::canonical::sha256_hex(&initialize,true),
@@ -944,8 +986,13 @@ async fn run_inner(
         process.input.take();
     }
     if let Some((selection, config_digest, expected_session, mut evidence)) = managed_preflight {
+        let Some(input_id) = initial_input_id.as_deref() else {
+            process.input.take();
+            return Err(invalid("native managed input unavailable"));
+        };
         let event =
-            managed_initial_inventory(process, &selection.inventory, &expected_session).await?;
+            managed_initial_inventory(process, &selection.inventory, &expected_session, input_id)
+                .await?;
         let Event::Json(frame) = &event else {
             unreachable!("managed inventory is JSON")
         };
@@ -1976,7 +2023,18 @@ mod tests {
     async fn managed_claude_controls_precede_input_and_init_tripwire() {
         use std::collections::{BTreeMap, BTreeSet};
         let allowed = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
-        for (tool, accepted) in [("mcp__pool__pool_get", true), ("Bash", false)] {
+        // Claude 2.1.311 acknowledges the identified input before init; only
+        // this input's ordered queued/started frames may precede it.
+        for (tool, lifecycle, accepted) in [
+            ("mcp__pool__pool_get", "", true),
+            ("mcp__pool__pool_get", "input:queued,input:started", true),
+            ("mcp__pool__pool_get", "input:started", false),
+            ("mcp__pool__pool_get", "foreign:queued", false),
+            ("mcp__pool__pool_get", "input:started,input:queued", false),
+            ("mcp__pool__pool_get", "input:queued,input:queued", false),
+            ("mcp__pool__pool_get", "input:completed", false),
+            ("Bash", "", false),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let script = format!(
                 r#"import json,sys
@@ -1987,6 +2045,9 @@ for expected in ['initialize','mcp_status']:
     print(json.dumps({{'type':'control_response','response':{{'subtype':'success','request_id':request['request_id'],'response':body}}}}),flush=True)
 assert json.loads(sys.stdin.readline())['type']=='user'
 open('received','w').write('input')
+for item in [x for x in '{lifecycle}'.split(',') if x]:
+    command,state=item.split(':')
+    print(json.dumps({{'type':'command_lifecycle','command_uuid':command,'state':state,'session_id':'session'}}),flush=True)
 print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tools':['{tool}']}}),flush=True)
 "#
             );
@@ -2017,15 +2078,277 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             )
             .unwrap();
             assert!(!dir.path().join("received").exists());
-            process.text("{\"type\":\"user\"}\n").await.unwrap();
-            let result = super::managed_initial_inventory(&mut process, &allowed, "session").await;
-            assert_eq!(result.is_ok(), accepted);
+            process
+                .text("{\"type\":\"user\",\"uuid\":\"input\"}\n")
+                .await
+                .unwrap();
+            let result =
+                super::managed_initial_inventory(&mut process, &allowed, "session", "input").await;
+            assert_eq!(result.is_ok(), accepted, "{tool} {lifecycle}");
             assert!(dir.path().join("received").exists());
             if !accepted {
                 assert!(process.input.is_none());
             }
             process.input.take();
             assert_eq!(process.reap().await, Some(0));
+        }
+    }
+
+    /// Live probe of the real managed Claude launch (see `managed_live_probe`):
+    /// Run's argv shape for the frozen role, the real Pool catalog discovery and
+    /// deny check, then exactly the runner's pre-input preflight and the
+    /// `system/init` tripwire against the installed harness. The one user frame
+    /// cannot leave the host: `ANTHROPIC_BASE_URL` is a refused loopback port.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live harness probe; requires AGENT_RUN_LIVE_MANAGED_PROBE"]
+    async fn live_managed_claude_qualifies_before_model_input() {
+        use agent_run_adapters::managed_role as managed;
+        use std::collections::BTreeMap;
+        let Some(live) = crate::managed_live_probe::load("claude") else {
+            return;
+        };
+        let (launch_dir, scratch) = (live.path("launch_dir"), live.path("scratch"));
+        let launch: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(launch_dir.join("provider-launch.json")).unwrap(),
+        )
+        .unwrap();
+        let model = launch["native_model"].as_str().unwrap().to_owned();
+        // Run's generated MCP config and settings; only the worker command is
+        // replaced by the build under test.
+        let mut mcp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(launch_dir.join("mcp/mcp-config.json")).unwrap())
+                .unwrap();
+        mcp["mcpServers"][agent_run_domain::worker::SERVER_NAME]["command"] =
+            live.section["worker"].clone();
+        for dir in ["mcp", "config", "work"] {
+            std::fs::create_dir_all(scratch.join(dir)).unwrap();
+        }
+        std::fs::write(
+            scratch.join("mcp/mcp-config.json"),
+            serde_json::to_vec(&mcp).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            launch_dir.join("settings.json"),
+            scratch.join("settings.json"),
+        )
+        .unwrap();
+        // The managed shape of `provider::claude_args`.
+        let mut args: Vec<String> = [
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--replay-user-messages",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            &model,
+            "--permission-mode",
+            "default",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--settings",
+            scratch.join("settings.json").to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        args.extend(
+            managed::claude_tool_arguments(&live.selection.inventory)
+                .unwrap()
+                .into_iter()
+                .filter(|arg| arg != "--strict-mcp-config"),
+        );
+        args.extend([
+            "--mcp-config".into(),
+            scratch.join("mcp/mcp-config.json").to_string_lossy().into(),
+        ]);
+        if let Some(effort) = &live.request.effort {
+            args.extend(["--effort".into(), effort.clone()]);
+        }
+        args.extend([
+            "--append-system-prompt".into(),
+            live.role.prompt.clone(),
+            "--session-id".into(),
+            uuid::Uuid::new_v4().to_string(),
+        ]);
+        let mut environment = BTreeMap::from([
+            ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
+            ("HOME".into(), scratch.to_string_lossy().into()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                scratch.join("config").to_string_lossy().into(),
+            ),
+            ("ANTHROPIC_BASE_URL".into(), "http://127.0.0.1:9".into()),
+            (
+                "ANTHROPIC_API_KEY".into(),
+                "live-probe-no-model-call".into(),
+            ),
+            ("DISABLE_TELEMETRY".into(), "1".into()),
+            ("DISABLE_AUTOUPDATER".into(), "1".into()),
+            (
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
+                "1".into(),
+            ),
+        ]);
+        environment.extend(live.worker_environment());
+        let harness = live.identity.authority.harness;
+        let mut plan = agent_run_adapters::provider::ProviderLaunchPlan {
+            launch: agent_run_adapters::LaunchPlan {
+                binary: live.config.harnesses[&harness].binary.clone(),
+                args,
+                cwd: scratch.join("work"),
+                environment,
+                initial_input: None,
+            },
+            native_model: model.clone(),
+            role: live.role.clone(),
+            runtime: agent_run_adapters::provider::runtime(&live.config, harness, &model).unwrap(),
+            profile: agent_run_adapters::provider::profile(&live.role),
+        };
+        // The supervisor's discovery and deny check.
+        let catalogs = agent_run_adapters::mcp_catalog::apply_claude_tool_filters(
+            &mut plan,
+            |_| -> agent_run_adapters::io::PersistFuture { Box::pin(async { Ok(()) }) },
+        )
+        .await
+        .unwrap();
+        let expected = managed::claude_disallowed_tools(&live.selection.inventory, &catalogs);
+        let deny = plan
+            .launch
+            .args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .map(|index| plan.launch.args[index + 1].clone());
+        let catalog_sha256 = managed::claude_catalog_digest(&catalogs).unwrap();
+        // The runner's preflight, in order.
+        let mut process = agent_run_adapters::io::Process::spawn(&plan.launch).unwrap();
+        let session = super::managed_claude_session(&plan.launch.args, &live.selection, &catalogs);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let initialize = super::managed_claude_control(&mut process, "initialize", deadline).await;
+        let status = super::managed_claude_status_settled(&mut process, deadline).await;
+        let reported = match (&initialize, &status, &session) {
+            (Ok(initialize), Ok(status), Ok((_, disallowed))) => {
+                Some(managed::verify_claude_control_inventory(
+                    initialize,
+                    status,
+                    &live.selection.inventory,
+                    &catalogs,
+                    &catalog_sha256,
+                    disallowed,
+                ))
+            }
+            _ => None,
+        };
+        let mut init = None;
+        if let (Some(Ok(_)), Ok((session, _))) = (&reported, &session) {
+            let input = json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":[{"type":"text","text":"live probe"}]}});
+            process.text(&format!("{input}\n")).await.unwrap();
+            init = Some(
+                super::managed_initial_inventory(
+                    &mut process,
+                    &live.selection.inventory,
+                    session,
+                    input["uuid"].as_str().unwrap(),
+                )
+                .await,
+            );
+        }
+        process.input.take();
+        let _ = process
+            .owner
+            .cleanup(std::time::Duration::from_secs(2))
+            .await;
+        process.reap().await;
+        fn error<T>(result: &Result<T, crate::Error>) -> Option<String> {
+            result.as_ref().err().map(|e| e.to_string())
+        }
+        let init_frame = init.as_ref().and_then(|result| match result {
+            Ok(super::Event::Json(frame)) => Some(frame.clone()),
+            _ => None,
+        });
+        live.write_evidence(&json!({
+            "harness": "claude-code",
+            "agent_id": live.section["agent_id"],
+            "selection_inventory": live.selection.inventory,
+            "role_digest": live.selection.role_digest,
+            "discovered_catalogs": catalogs,
+            "catalog_sha256": catalog_sha256,
+            "argv": plan.launch.args,
+            "deny_argument_matches_supervisor": expected.as_ref().ok() == deny.as_ref(),
+            "session": error(&session),
+            "initialize": initialize.as_ref().ok(),
+            "initialize_error": error(&initialize),
+            "mcp_status": status.as_ref().ok(),
+            "mcp_status_error": error(&status),
+            "control_inventory": reported.as_ref().map(|r| r.as_ref().ok().cloned()),
+            "control_inventory_error": reported.as_ref().and_then(|r| r.as_ref().err().map(|e| e.to_string())),
+            "system_init": init_frame,
+            "system_init_error": init.as_ref().and_then(|r| r.as_ref().err().map(|e| e.to_string())),
+        }));
+        assert_eq!(expected.ok(), deny, "supervisor deny check");
+        session.unwrap();
+        initialize.unwrap();
+        status.unwrap();
+        reported.expect("control inventory verified").unwrap();
+        init.expect("system/init tripwire reached").unwrap();
+    }
+
+    /// The real Claude 2.1.311 frames after an identified input (captured by
+    /// the live probe) pass the tripwire; another input's frames do not.
+    #[tokio::test]
+    async fn managed_claude_tripwire_accepts_real_input_acknowledgements() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let lifecycle: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/managed-native/claude-2.1.311-input-lifecycle.json"
+        ))
+        .unwrap();
+        let init: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/managed-native/claude-2.1.311-system-init.json"
+        ))
+        .unwrap();
+        let mut allowed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for tool in init["tools"].as_array().unwrap() {
+            let (server, name) = tool
+                .as_str()
+                .unwrap()
+                .strip_prefix("mcp__")
+                .unwrap()
+                .split_once("__")
+                .unwrap();
+            allowed
+                .entry(server.into())
+                .or_default()
+                .insert(name.into());
+        }
+        let session = init["session_id"].as_str().unwrap();
+        let input = lifecycle[0]["command_uuid"].as_str().unwrap();
+        for (input_id, accepted) in [(input, true), ("another-input", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let lines: Vec<String> = lifecycle
+                .iter()
+                .chain([&init])
+                .map(|frame| frame.to_string())
+                .collect();
+            std::fs::write(dir.path().join("frames"), lines.join("\n") + "\n").unwrap();
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/bin/sh".into(),
+                args: vec!["-c".into(), "read line; cat frames; read line".into()],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            process.text("{\"type\":\"user\"}\n").await.unwrap();
+            let result =
+                super::managed_initial_inventory(&mut process, &allowed, session, input_id).await;
+            assert_eq!(result.is_ok(), accepted);
+            process.input.take();
+            process.reap().await;
         }
     }
 
@@ -2118,6 +2441,9 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
         use std::collections::{BTreeMap, BTreeSet};
         for mode in [
             "ok",
+            "pending",
+            "lifecycle",
+            "bad-lifecycle",
             "catalog",
             "bad-status",
             "bad-init",
@@ -2128,9 +2454,11 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             let root = home.path().canonicalize().unwrap();
             let script = r#"import json,sys,time
 mode=sys.argv[1]
-for name in ['initialize','mcp_status']:
+names=['initialize']+['mcp_status']*(3 if mode=='pending' else 1)
+for index,name in enumerate(names):
     req=json.loads(sys.stdin.readline())
-    body={'commands':[],'agents':[{'name':'Explore'}]} if name=='initialize' else {'mcpServers':[{'name':'pool','status':'failed' if mode=='bad-status' else 'connected'}]}
+    status='failed' if mode=='bad-status' else 'pending' if index<len(names)-1 else 'connected'
+    body={'commands':[],'agents':[{'name':'Explore'}]} if name=='initialize' else {'mcpServers':[{'name':'pool','status':status}]}
     if name=='mcp_status' and mode in ('catalog','bad-extra','bad-digest'):
         tools=['pool_get','pool_start_batch']+(['pool_start_agent'] if mode=='bad-extra' else [])
         body['mcpServers'][0]['tools']=[{'name':tool} for tool in tools]
@@ -2138,6 +2466,10 @@ for name in ['initialize','mcp_status']:
 line=sys.stdin.readline()
 if line:
     open('model-input','w').write('received')
+    if mode in ('lifecycle','bad-lifecycle'):
+        command=json.loads(line)['uuid'] if mode=='lifecycle' else 'foreign'
+        for state in ['queued','started']:
+            print(json.dumps({'type':'command_lifecycle','command_uuid':command,'state':state,'session_id':'native'}),flush=True)
     tool='Bash' if mode=='bad-init' else 'mcp__pool__pool_get'
     print(json.dumps({'type':'system','subtype':'init','session_id':'native','tools':[tool]}),flush=True)
     print(json.dumps({'type':'result','subtype':'error_during_execution','is_error':True,'session_id':'native','result':'synthetic'}),flush=True)
@@ -2233,11 +2565,11 @@ if line:
             )
             .await
             .unwrap();
-            let accepted = matches!(mode, "ok" | "catalog");
+            let accepted = matches!(mode, "ok" | "pending" | "lifecycle" | "catalog");
             assert_eq!(result.is_ok(), accepted, "{mode}");
             assert_eq!(
                 root.join("model-input").exists(),
-                accepted || mode == "bad-init",
+                accepted || matches!(mode, "bad-init" | "bad-lifecycle"),
                 "{mode}"
             );
             let drift: Option<String> = persist
@@ -2250,7 +2582,7 @@ if line:
                 .ok();
             assert_eq!(
                 drift.map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap()["mcp_status_tools"]["pool"].clone()),
-                accepted.then(|| json!(if mode == "ok" { "omitted" } else { "catalog" })),
+                accepted.then(|| json!(if mode == "catalog" { "catalog" } else { "omitted" })),
                 "{mode}"
             );
             let qualified: bool = persist

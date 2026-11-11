@@ -1,209 +1,211 @@
 {
- "type": "control_response",
  "response": {
-  "subtype": "success",
   "request_id": "mcp_status",
   "response": {
    "mcpServers": [
     {
-     "name": "agent-pool",
-     "status": "connected",
-     "serverInfo": {
-      "name": "agent-pool",
-      "version": "0.1.0"
-     },
      "config": {
-      "type": "stdio",
-      "command": "/home/agent-mcp/.local/bin/agent-pool",
       "args": [
        "mcp",
        "--config",
        "/home/agent-mcp/.agent-pool/config.toml"
-      ]
+      ],
+      "command": "/home/agent-mcp/.local/bin/agent-pool",
+      "type": "stdio"
      },
-     "transport": "stdio",
+     "name": "agent-pool",
      "scope": "dynamic",
+     "serverInfo": {
+      "name": "agent-pool",
+      "version": "0.1.0"
+     },
      "source": "dynamic",
+     "status": "connected",
      "tools": [
       {
-       "name": "get_status",
        "annotations": {
         "readOnly": true
-       }
+       },
+       "name": "get_status"
       },
       {
-       "name": "pool_create",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_create"
       },
       {
-       "name": "pool_list",
        "annotations": {
         "readOnly": true
-       }
+       },
+       "name": "pool_list"
       },
       {
-       "name": "pool_get",
        "annotations": {
         "readOnly": true
-       }
+       },
+       "name": "pool_get"
       },
       {
-       "name": "pool_update",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_update"
       },
       {
-       "name": "pool_close",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_close"
       },
       {
-       "name": "pool_add",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_add"
       },
       {
-       "name": "pool_start_agent",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_start_agent"
       },
       {
-       "name": "pool_start_batch",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_start_batch"
       },
       {
-       "name": "pool_replace",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_replace"
       },
       {
-       "name": "pool_cancel_replacement",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_cancel_replacement"
       },
       {
-       "name": "pool_member_update",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_member_update"
       },
       {
-       "name": "pool_remove",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_remove"
       },
       {
-       "name": "pool_release_history",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_release_history"
       },
       {
-       "name": "pool_enrollment_get",
        "annotations": {
         "readOnly": true
-       }
+       },
+       "name": "pool_enrollment_get"
       },
       {
-       "name": "pool_enrollment_resolve",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_enrollment_resolve"
       },
       {
-       "name": "pool_join",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_join"
       },
       {
-       "name": "pool_post",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_post"
       },
       {
-       "name": "pool_send_member",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_send_member"
       },
       {
-       "name": "pool_notify_owner",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_notify_owner"
       },
       {
-       "name": "pool_propose",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_propose"
       },
       {
-       "name": "pool_vote",
        "annotations": {
         "destructive": true,
         "openWorld": true
-       }
+       },
+       "name": "pool_vote"
       }
-     ]
+     ],
+     "transport": "stdio"
     },
     {
-     "name": "agent_run_worker",
-     "status": "connected",
-     "serverInfo": {
-      "name": "agent_run_worker",
-      "version": "fixture"
-     },
      "config": {
-      "type": "stdio",
-      "command": "/home/agent-mcp/.local/bin/agent-run",
       "args": [
        "_worker-mcp"
-      ]
+      ],
+      "command": "/home/agent-mcp/.local/bin/agent-run",
+      "type": "stdio"
      },
-     "transport": "stdio",
+     "name": "agent_run_worker",
      "scope": "dynamic",
+     "serverInfo": {
+      "name": "agent-run-worker",
+      "version": "0.31.0"
+     },
      "source": "dynamic",
+     "status": "connected",
      "tools": [
       {
-       "name": "finish"
+       "annotations": {},
+       "name": "health_reply"
       },
       {
-       "name": "health_reply"
+       "annotations": {},
+       "name": "finish"
       }
-     ]
+     ],
+     "transport": "stdio"
     }
    ]
-  }
- }
+  },
+  "subtype": "success"
+ },
+ "type": "control_response"
 }
