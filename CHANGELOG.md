@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.0
+
+Released 2026-11-11.
+
 - fix(adapters): qualify managed roles on Claude Code 2.1.311 and codex-cli
   0.167.0. Claude `mcp_status` may list the exact discovered Pool catalog
   whose complement Run denies; the post-input `system/init` stays exact. Codex
@@ -30,11 +34,6 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   refused before any thread. The Bridge `PreToolUse` matcher uses Codex's
   normalized server name (`agent-pool` becomes `agent_pool`), which the
   selector proves unambiguous. Doctor reports the host.
-
-## 0.31.0
-
-Released 2026-11-10.
-
 - feat(release): report CI job progress while observing an exact release.
 - feat(core): add attempt-bound managed launches and the `initial_task` read.
 - feat(core): add managed enrollment for Pool members (P3) and report egress
@@ -56,6 +55,24 @@ Released 2026-11-10.
   rusqlite to 0.41.1 with bundled SQLite from libsqlite3-sys 0.39.1
   (RUSTSEC-2026-0459). tokio-rusqlite 0.8.0 is vendored in `vendor/tokio-rusqlite`
   on rusqlite 0.41 until upstream releases it.
+- fix(config): index installed interpreters once, bound the scan per root
+  (flat bin directories, `/opt` to five levels, `~/.nvm` to four, `/usr/lib` to
+  three) and build the index outside the five-second peer-verification
+  deadline; the broker warms it at start. Hosted runners with hundreds of
+  thousands of entries under `/opt` no longer refuse legitimate managed peers.
+- fix(platform): build the managed-attempt code on macOS, and build the live
+  managed probe setup on Linux only.
+- fix(build): optimize the digest crates in the dev profile so peer
+  verification of a large pinned test executable stays inside its budget on
+  loaded CI runners; release builds are unchanged.
+- fix(ci): accept the agent/kind event index in the unresolved-cleanup probe
+  and resolve clippy findings on macOS.
+- docs(api): mirror 0.31.0 in the capabilities example.
+- Qualification on dobi (2026-11-10/11): ordinary Claude and Codex fresh and
+  resume runs passed on 2026-11-10; the managed Pool run 6c passed on
+  2026-11-11 with Agent Run e17fdf9 (runtime-identical to this release; later
+  commits change only test configuration and the dev profile), Agent Bridge
+  0.7.1 and Agent Pool 0.1.0 RC.
 
 ## 0.30.0
 
