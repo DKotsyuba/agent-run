@@ -2391,6 +2391,7 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             host_id: "host".into(),
             role_digest: "a".repeat(64),
             inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+            codex: None,
         };
         let mut args =
             agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory).unwrap();
@@ -2479,6 +2480,7 @@ if line:
                 host_id: "host".into(),
                 role_digest: "b".repeat(64),
                 inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+                codex: None,
             };
             // As discovered from a real Pool: the deny complement is not empty.
             let catalogs = BTreeMap::from([(

@@ -1,0 +1,45 @@
+{
+ "client_version": "0.167.0",
+ "models": [
+  {
+   "slug": "gpt-6.1-sol",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-6-astra",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-6.1-terra",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-6-sol",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-reserve",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-6-luna",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-5.6-sol",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-5.6-terra",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "gpt-5.6-luna",
+   "tool_mode": "code_mode_only"
+  },
+  {
+   "slug": "codex-auto-review",
+   "tool_mode": "code_mode_only"
+  }
+ ]
+}

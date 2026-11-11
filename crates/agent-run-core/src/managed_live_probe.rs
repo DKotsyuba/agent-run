@@ -4,7 +4,8 @@
 //! read only) and per-harness sections `claude`/`codex` with `agent_id` (an
 //! admitted managed attempt), `launch_dir` (its Run-generated runtime home),
 //! `worker` (the `agent-run` build serving the worker MCP), `scratch` (an
-//! empty private directory) and `evidence` (output file). The frozen identity
+//! empty private directory) and `evidence` (output file); Codex may name a
+//! `models_cache` (the harness's own nonsecret model catalog) to seed. The frozen identity
 //! and request come from the Run store, the role selection from the actual
 //! selector, so the probes verify exactly what a supervisor would launch. No
 //! credential is read; the worker capability is a dummy that never reaches a
@@ -16,6 +17,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 /// One frozen managed attempt and its live selection.
 pub(crate) struct LiveManaged {
+    pub run_home: PathBuf,
     pub section: Value,
     pub identity: crate::service::ProviderLaunchIdentity,
     pub request: crate::domain::StartRequest,
@@ -48,6 +50,46 @@ impl LiveManaged {
         environment.insert(agent_run_domain::worker::RESEARCH_ENV.into(), "0".into());
         environment.insert(agent_run_domain::worker::MANAGED_ENV.into(), "1".into());
         environment
+    }
+
+    /// Materialize this attempt's native home into `home` with the build
+    /// under test, exactly as a first launch does (`materialize_selected`),
+    /// for the frozen role, the launch configuration and the account the
+    /// attempt was admitted with. `app_home` receives any account link; the
+    /// caller removes credentials before a harness reads the home.
+    pub fn materialize(
+        &self,
+        home: &std::path::Path,
+        work: &std::path::Path,
+        app_home: &std::path::Path,
+    ) {
+        let db = rusqlite::Connection::open_with_flags(
+            self.run_home.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let accounts = agent_run_store::accounts::list_at(&db).unwrap();
+        let account: String = db
+            .query_row(
+                "SELECT selected_account_id FROM attempts WHERE agent_id=? ORDER BY rowid DESC LIMIT 1",
+                [self.section["agent_id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(db);
+        let catalog = self.config.resolve_catalog(accounts).unwrap();
+        agent_run_adapters::provider::materialize_selected(
+            &self.config,
+            &catalog,
+            &self.identity.authority.provider,
+            &self.identity.authority.model,
+            &account.parse().unwrap(),
+            &self.role,
+            work,
+            home,
+            app_home,
+        )
+        .unwrap();
     }
 
     /// Persist the probe's raw captures and verdicts before any assertion.
@@ -100,6 +142,7 @@ pub(crate) fn load(harness: &str) -> Option<LiveManaged> {
     .unwrap()
     .expect("the probed attempt is a managed role");
     Some(LiveManaged {
+        run_home: home,
         section,
         identity,
         request,

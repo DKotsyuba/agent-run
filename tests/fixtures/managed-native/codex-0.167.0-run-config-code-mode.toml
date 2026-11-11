@@ -1,0 +1,88 @@
+model_auto_compact_token_limit = 780000
+model_auto_compact_token_limit_scope = "total"
+model_context_window = 1000000
+web_search = "disabled"
+
+[agents]
+enabled = false
+
+[features]
+api_key_cyber_access_programs = false
+api_key_model_discovery = false
+apps = false
+auth_elicitation = false
+browser_use = false
+computer_use = false
+goals = false
+hooks = true
+js_repl = false
+mentions_v2 = false
+multi_agent = false
+multi_agent_v2 = false
+plugins = false
+remote_plugin = false
+request_permissions_tool = false
+shell_tool = false
+skill_mcp_dependency_install = false
+skill_search = false
+sleep_tool = false
+standalone_web_search = false
+tool_suggest = false
+unified_exec = false
+view_image = false
+
+[features.code_mode]
+enabled = false
+excluded_tool_namespaces = ["clock", "functions"]
+
+[features.code_mode_host]
+disable_in_process_fallback = true
+enabled = true
+
+[[hooks.PermissionRequest]]
+matcher = "^(?:mcp__agent-pool__|mcp__agent_pool__|mcp__agent_run_worker__)"
+
+[[hooks.PermissionRequest.hooks]]
+command = "/home/agent-mcp/.local/bin/agent-run _permission-request --allow-mcp agent-pool --allow-mcp agent_run_worker"
+timeout = 600
+type = "command"
+
+[[hooks.PreToolUse]]
+matcher = "mcp__agent_pool__.*"
+
+[[hooks.PreToolUse.hooks]]
+command = "/opt/agent-bridge/releases/0.7.0+c12376fe8a89/bin/bridge-hook /home/agent-mcp/.agent-bridge/run/ch/c.sock codex"
+timeout = 600
+type = "command"
+
+[hooks.state."/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-050243-2b4fd2ac0b/config.toml:permission_request:0:0"]
+trusted_hash = "sha256:416d29e40f7590290e4795e93c1e3144b7221e920845c846e2c6fed0a5070f49"
+
+[hooks.state."/home/agent-mcp/.agent-run/service-runtime/codex/runs/ag-20261111-050243-2b4fd2ac0b/config.toml:pre_tool_use:0:0"]
+trusted_hash = "sha256:d07b24764ad9eca7e784760798866b50af8d7db3c1f07089f7f87cd5c0b0f6f8"
+
+[mcp_servers.agent-pool]
+args = ["mcp", "--config", "/home/agent-mcp/.agent-pool/config.toml"]
+command = "/home/agent-mcp/.local/bin/agent-pool"
+default_tools_approval_mode = "approve"
+enabled_tools = ["pool_add", "pool_cancel_replacement", "pool_close", "pool_create", "pool_get", "pool_join", "pool_list", "pool_member_update", "pool_notify_owner", "pool_post", "pool_propose", "pool_release_history", "pool_remove", "pool_send_member", "pool_update", "pool_vote"]
+env_vars = ["RUSTUP_HOME", "CARGO_HOME"]
+
+[mcp_servers.agent_run_worker]
+args = ["_worker-mcp"]
+command = "/home/agent-mcp/.local/bin/agent-run"
+default_tools_approval_mode = "approve"
+enabled_tools = ["finish", "health_reply"]
+env_vars = ["AGENT_RUN_WORKER_HOME", "AGENT_RUN_WORKER_RUN_ID", "AGENT_RUN_WORKER_ATTEMPT_ID", "AGENT_RUN_WORKER_TOKEN", "AGENT_RUN_WORKER_FINISH", "AGENT_RUN_WORKER_MANAGED"]
+
+[projects."/home/agent-mcp/.agent-pool-qual/work/m2"]
+trust_level = "trusted"
+
+[tools]
+view_image = false
+
+[tools.experimental_request_user_input]
+enabled = false
+
+[tools.update_plan]
+enabled = false

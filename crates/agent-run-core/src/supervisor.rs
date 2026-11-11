@@ -2224,6 +2224,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         hook_state: &hooks["state"],
                         inventory: &selection.inventory,
                         selection,
+                        code_mode: adapters::managed_role::codex_config_code_mode(&native)?,
                     };
                     crate::codex::run_managed(
                         &mut process,

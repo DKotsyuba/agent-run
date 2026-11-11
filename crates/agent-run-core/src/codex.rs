@@ -804,6 +804,9 @@ pub(crate) struct ManagedCodexRole<'a> {
     pub hook_state: &'a Value,
     pub inventory: &'a BTreeMap<String, BTreeSet<String>>,
     pub selection: &'a agent_run_adapters::managed_role::Selection,
+    /// Whether the launch's generated configuration enables the Code Mode
+    /// host; it then requires the selection's verified host.
+    pub code_mode: bool,
 }
 
 async fn verify_live_managed_config(
@@ -811,15 +814,29 @@ async fn verify_live_managed_config(
     cwd: &Path,
     managed: &ManagedCodexRole<'_>,
 ) -> Result<(String, Value)> {
+    let codex = managed
+        .selection
+        .codex
+        .as_ref()
+        .ok_or_else(|| invalid("managed Codex selection unavailable"))?;
+    if managed.code_mode && codex.code_mode_host.is_none() {
+        return Err(invalid("managed Codex code-mode host is not pinned"));
+    }
+    agent_run_adapters::managed_role::verify_codex_pre_tool_use(managed.pre_tool_use, codex)?;
     let config = process
         .rpc("config/read", json!({"cwd":cwd}), Duration::from_secs(30))
         .await?;
-    let accepted = agent_run_adapters::managed_role::verify_managed_config(
+    let mut accepted = agent_run_adapters::managed_role::verify_managed_config(
         &config,
         managed.pre_tool_use,
         managed.permission_request,
         managed.hook_state,
+        managed.code_mode,
     )?;
+    // Codex's own name for the Pool server's tools, which the Bridge hook
+    // matcher selects, and the verified host model code runs in.
+    accepted["pool_tool_prefix"] = json!(format!("mcp__{}__", codex.pool_namespace));
+    accepted["code_mode_host"] = json!(codex.code_mode_host.as_ref().filter(|_| managed.code_mode));
     // The accepted native drift is bound into the qualification digest
     // beside the whole reply, and journaled by name so drift stays visible.
     let digest = agent_run_domain::canonical::sha256_hex(
@@ -878,7 +895,7 @@ async fn run_inner(
         return Err(invalid("native managed role assets did not verify"));
     }
     initialize(process).await?;
-    let managed_config_digest = if let Some(managed) = managed {
+    let mut managed_config_digest = if let Some(managed) = managed {
         let (digest, accepted) =
             verify_live_managed_config(process, &record.request.workdir, managed).await?;
         process
@@ -922,6 +939,30 @@ async fn run_inner(
         && !model.efforts.iter().any(|choice| choice == effort)
     {
         return Err(invalid("effort is not offered by selected account/model"));
+    }
+    if let Some(managed) = managed {
+        // Codex recorded its catalog while listing models. A model that needs
+        // Code Mode is refused here, before any thread, unless the pinned host
+        // is enabled; the mode is bound into the qualification digest.
+        let tool_mode =
+            agent_run_adapters::managed_role::codex_model_tool_mode(home, &record.request.model);
+        agent_run_adapters::managed_role::verify_codex_tool_mode(
+            tool_mode.as_deref(),
+            managed.code_mode,
+        )?;
+        process
+            .observing(store.event(
+                &record.id,
+                "managed_native_tool_mode_v1",
+                &json!({"harness":"codex","tool_mode":tool_mode,"code_mode":managed.code_mode}),
+            ))
+            .await?;
+        managed_config_digest = managed_config_digest.map(|digest| {
+            agent_run_domain::canonical::sha256_hex(
+                &json!({"config":digest,"tool_mode":tool_mode}),
+                true,
+            )
+        });
     }
     let mut grant = Grant::new(runtime, &record.request, role, home)?;
     if managed.is_some() {
@@ -2924,31 +2965,50 @@ mod tests {
     async fn managed_codex_config_read_refuses_native_override() {
         use serde_json::json;
         use std::collections::BTreeMap;
-        let pre = json!([{"hooks":[{"type":"command","command":"/fixture/bridge"}]}]);
+        let pre = json!([{"matcher":"mcp__agent_pool__.*","hooks":[{"type":"command","command":"/fixture/bridge"}]}]);
         let permission = json!([{"hooks":[{"type":"command","command":"/fixture/run"}]}]);
         let state = json!({"pre":{"trusted_hash":"a"},"permission":{"trusted_hash":"b"}});
+        let layer = json!({"name":{"type":"user","file":"/home/config.toml","profile":null}});
+        let origins = json!({"features.hooks":layer,"tools.experimental_request_user_input.enabled":layer,"tools.update_plan.enabled":layer});
         let inventory = BTreeMap::new();
-        let selection = agent_run_adapters::managed_role::Selection {
+        let selection = |host: bool| agent_run_adapters::managed_role::Selection {
             host_id: "host".into(),
             role_digest: "a".repeat(64),
             inventory: BTreeMap::new(),
+            codex: Some(agent_run_adapters::managed_role::CodexSelection {
+                pool_server: "agent-pool".into(),
+                pool_namespace: "agent_pool".into(),
+                code_mode_host: host.then(|| "/fixture/codex-code-mode-host".into()),
+            }),
         };
-        let role = super::ManagedCodexRole {
-            pre_tool_use: &pre,
-            permission_request: &permission,
-            hook_state: &state,
-            inventory: &inventory,
-            selection: &selection,
-        };
-        for widened in [false, true] {
+        let hyphenated = json!([{"matcher":"mcp__agent-pool__.*","hooks":pre[0]["hooks"]}]);
+        // (written code mode, pinned host, PreToolUse, widened, accepted)
+        for (code_mode, host, pinned, widened, accepted) in [
+            (false, false, &pre, false, true),
+            (false, false, &pre, true, false),
+            (true, true, &pre, false, true),
+            (true, true, &pre, true, false),
+            (true, false, &pre, false, false),
+            (false, true, &pre, false, true),
+            (false, false, &hyphenated, false, false),
+        ] {
+            let selection = selection(host);
+            let role = super::ManagedCodexRole {
+                pre_tool_use: pinned,
+                permission_request: &permission,
+                hook_state: &state,
+                inventory: &inventory,
+                selection: &selection,
+                code_mode,
+            };
             let dir = tempfile::tempdir().unwrap();
-            let mut config = agent_run_adapters::managed_role::codex_settings();
+            let mut config = agent_run_adapters::managed_role::codex_settings(code_mode);
             config["hooks"] =
-                json!({"PreToolUse":pre,"PermissionRequest":permission,"state":state});
+                json!({"PreToolUse":pinned,"PermissionRequest":permission,"state":state});
             if widened {
                 config["features"]["shell_tool"] = json!(true);
             }
-            let reply = json!({"id":1,"result":{"config":config}}).to_string();
+            let reply = json!({"id":1,"result":{"config":config,"origins":origins}}).to_string();
             let script = format!("IFS= read -r request\nprintf '%s\\n' '{}'", reply);
             let plan = agent_run_adapters::LaunchPlan {
                 binary: "/bin/sh".into(),
@@ -2959,16 +3019,28 @@ mod tests {
             };
             let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
             let result = super::verify_live_managed_config(&mut process, dir.path(), &role).await;
-            assert_eq!(result.is_ok(), !widened);
-            assert_eq!(process.reap().await, Some(0));
+            assert_eq!(result.is_ok(), accepted, "{code_mode} {host} {widened}");
+            if let Ok((_, accepted)) = result {
+                assert_eq!(accepted["pool_tool_prefix"], "mcp__agent_pool__");
+                assert_eq!(accepted["code_mode"], code_mode);
+                assert_eq!(accepted["code_mode_host"].is_string(), code_mode);
+            }
+            process.input.take();
+            let _ = process
+                .owner
+                .cleanup(std::time::Duration::from_secs(2))
+                .await;
+            process.reap().await;
         }
     }
 
     /// Live probe of the real managed Codex launch (see `managed_live_probe`):
-    /// the attempt's Run-generated `config.toml` (paths moved to scratch, the
-    /// worker command set to the build under test and its managed marker
-    /// forwarded, as the planner now writes it), then exactly the runner's
-    /// steps up to qualification: initialize, live `config/read` verification,
+    /// the attempt's native home materialized afresh by this build for its
+    /// frozen role and request under the launch configuration (scratch home
+    /// and workdir, credential link removed, the worker command set to the
+    /// build under test, the provider pointed at a refused loopback port),
+    /// then exactly the runner's steps up to qualification: initialize, live
+    /// `config/read` verification, the model list and tool-mode admission,
     /// the admitted grant and thread/start parameters, `Grant::verify` and the
     /// exact MCP inventory. No turn is ever started.
     #[cfg(target_os = "linux")]
@@ -2980,27 +3052,24 @@ mod tests {
         let Some(live) = crate::managed_live_probe::load("codex") else {
             return;
         };
-        let (launch_dir, scratch) = (live.path("launch_dir"), live.path("scratch"));
-        let (home, work) = (scratch.join("codex-home"), scratch.join("work"));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
-        let launch: Value = serde_json::from_slice(
-            &std::fs::read(launch_dir.join("provider-launch.json")).unwrap(),
-        )
-        .unwrap();
+        let scratch = live.path("scratch");
+        let (home, work, app_home) = (
+            scratch.join("codex-home"),
+            scratch.join("work"),
+            scratch.join("app-home"),
+        );
+        for dir in [&home, &work, &app_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        live.materialize(&home, &work, &app_home);
+        let launch: Value =
+            serde_json::from_slice(&std::fs::read(home.join("provider-launch.json")).unwrap())
+                .unwrap();
         let model = launch["native_model"].as_str().unwrap().to_owned();
-        let source = launch_dir.join("config.toml");
-        let text = std::fs::read_to_string(&source)
-            .unwrap()
-            .replace(
-                source.to_str().unwrap(),
-                home.join("config.toml").to_str().unwrap(),
-            )
-            .replace(
-                live.request.workdir.to_str().unwrap(),
-                work.to_str().unwrap(),
-            );
-        let mut native: toml::Table = toml::from_str(&text).unwrap();
+        // No credential: the account link is removed before Codex starts.
+        let _ = std::fs::remove_file(home.join("auth.json"));
+        let mut native: toml::Table =
+            toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
         let worker = native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]
             .as_table_mut()
             .unwrap();
@@ -3008,13 +3077,15 @@ mod tests {
             "command".into(),
             toml::Value::String(live.section["worker"].as_str().unwrap().into()),
         );
-        let forwarded = worker["env_vars"].as_array_mut().unwrap();
-        let marker = toml::Value::String(agent_run_domain::worker::MANAGED_ENV.into());
-        if !forwarded.contains(&marker) {
-            forwarded.push(marker);
-        }
+        native.insert(
+            "openai_base_url".into(),
+            toml::Value::String("http://127.0.0.1:9/v1".into()),
+        );
         let text = toml::to_string(&native).unwrap();
         std::fs::write(home.join("config.toml"), &text).unwrap();
+        if let Some(cache) = live.section["models_cache"].as_str() {
+            std::fs::copy(cache, home.join("models_cache.json")).unwrap();
+        }
         // The supervisor's pinned hook declarations, read from that file.
         let pinned = serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap();
         let hooks = &pinned["hooks"];
@@ -3022,7 +3093,6 @@ mod tests {
             ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
             ("HOME".into(), home.to_string_lossy().into()),
             ("CODEX_HOME".into(), home.to_string_lossy().into()),
-            ("OPENAI_BASE_URL".into(), "http://127.0.0.1:9/v1".into()),
         ]);
         environment.extend(live.worker_environment());
         let harness = live.identity.authority.harness;
@@ -3038,24 +3108,42 @@ mod tests {
         let mut request = live.request.clone();
         request.model = model.clone();
         request.workdir = work.clone();
+        let code_mode = agent_run_adapters::managed_role::codex_config_code_mode(&pinned).unwrap();
         let managed = super::ManagedCodexRole {
             pre_tool_use: &hooks["PreToolUse"],
             permission_request: &hooks["PermissionRequest"],
             hook_state: &hooks["state"],
             inventory: &live.selection.inventory,
             selection: &live.selection,
+            code_mode,
         };
         let mut process = super::Process::spawn(&plan).unwrap();
         let mut evidence = json!({"harness":"codex","agent_id":live.section["agent_id"],
-            "selection_inventory":live.selection.inventory,"role_digest":live.selection.role_digest});
+            "selection_inventory":live.selection.inventory,"role_digest":live.selection.role_digest,
+            "codex_selection":format!("{:?}", live.selection.codex),"code_mode":code_mode,
+            "generated_config":text});
         let outcome: crate::Result<()> = async {
             super::initialize(&mut process).await?;
             let config = super::verify_live_managed_config(&mut process, &work, &managed).await;
             evidence["config_read_accepted"] = json!(config.as_ref().ok().map(|(_, v)| v));
             evidence["config_read_error"] = json!(config.as_ref().err().map(|e| e.to_string()));
             config?;
-            let admitted = super::Grant::new(&runtime, &request, &profile, &home)?;
-            let grant = admitted.clone().without_environments();
+            let raw = process
+                .rpc("config/read", json!({"cwd":work}), Duration::from_secs(30))
+                .await?;
+            evidence["config_read"] = raw;
+            let roster = super::models(&mut process).await?;
+            evidence["model_listed"] =
+                json!(roster.iter().any(|entry| entry.get("id") == Some(&json!(model))));
+            let tool_mode = agent_run_adapters::managed_role::codex_model_tool_mode(&home, &model);
+            evidence["tool_mode"] = json!(tool_mode);
+            let admitted = agent_run_adapters::managed_role::verify_codex_tool_mode(
+                tool_mode.as_deref(),
+                code_mode,
+            );
+            evidence["tool_mode_error"] = json!(admitted.as_ref().err().map(|e| e.to_string()));
+            admitted?;
+            let grant = super::Grant::new(&runtime, &request, &profile, &home)?.without_environments();
             let mut params = grant.request();
             let configured = process
                 .rpc("config/read", json!({"cwd":work}), Duration::from_secs(30))
@@ -3074,8 +3162,6 @@ mod tests {
                 *thread = json!({"id":thread["id"],"environments":thread["environments"],"status":thread["status"]});
             }
             evidence["thread_start_echo"] = echo;
-            evidence["previous_grant_verify_error"] =
-                json!(admitted.verify(&thread).err().map(|e| e.to_string()));
             let verified = grant.verify(&thread);
             evidence["grant_verify_error"] = json!(verified.as_ref().err().map(|e| e.to_string()));
             verified?;

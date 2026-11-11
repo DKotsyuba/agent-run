@@ -670,6 +670,7 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     }
     if let Some(config) = &provider_config {
         provider_bindings(config, &report.home, &mut report.findings);
+        managed_codex_code_mode(config, &mut report.findings);
         managed_services(
             config,
             &report.home,
@@ -813,6 +814,53 @@ fn managed_services(
             "services",
             "service state could not be read",
         );
+    }
+}
+
+/// Checks the managed Codex Code Mode host the harness would spawn against
+/// its pin. Without a pin, managed Codex models that require Code Mode are
+/// refused at launch, which is reported as a warning.
+fn managed_codex_code_mode(
+    config: &agent_run_config::provider_config::ProviderConfig,
+    findings: &mut Vec<Finding>,
+) {
+    let (Some(settings), Some(codex)) = (
+        config
+            .managed_attempt_binding
+            .as_ref()
+            .filter(|settings| settings.enabled),
+        config
+            .harnesses
+            .get(&agent_run_domain::catalog::HarnessId::Codex),
+    ) else {
+        return;
+    };
+    match &settings.codex_code_mode_host_sha256 {
+        None => add(
+            findings,
+            "managed_codex_code_mode_unpinned",
+            "warning",
+            "harness:codex",
+            "managed Codex members cannot use models that require Code Mode; pin the code-mode host",
+        ),
+        Some(digest) => {
+            match agent_run_adapters::managed_role::codex_code_mode_host(&codex.binary, digest) {
+                Ok(_) => add(
+                    findings,
+                    "managed_codex_code_mode_host",
+                    "info",
+                    "harness:codex",
+                    "the pinned Codex code-mode host verified",
+                ),
+                Err(_) => add(
+                    findings,
+                    "managed_codex_code_mode_host_invalid",
+                    "error",
+                    "harness:codex",
+                    "the Codex code-mode host is missing, unsafe or not the pinned build",
+                ),
+            }
+        }
     }
 }
 
@@ -2266,6 +2314,55 @@ mod tests {
     }
 
     /// Cold services are normal, missing ownership is an error, and diagnostics never expose commands or write state.
+    #[cfg(unix)]
+    #[test]
+    fn managed_codex_code_mode_host_is_reported_against_its_pin() {
+        let home = tempfile::tempdir().unwrap();
+        let package = home.path().canonicalize().unwrap().join("package");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(package.join("codex-package.json"), "{}").unwrap();
+        std::fs::write(package.join("bin/codex"), b"\x7fELF codex").unwrap();
+        std::fs::write(package.join("bin/codex-code-mode-host"), b"\x7fELF host").unwrap();
+        let digest = agent_run_platform::fs::sha256(b"\x7fELF host");
+        let codes = |pin: Option<&str>| {
+            let pin = pin.map_or(String::new(), |pin| {
+                format!("codex_code_mode_host_sha256='{pin}'\n")
+            });
+            let config = agent_run_config::provider_config::ProviderConfig::parse(
+                &format!(
+                    "schema_version=2\n[managed_attempt_binding]\nenabled=true\nrole_name='managed'\npool_server='agent-pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\n{pin}[harnesses.codex]\nbinary='{}'\nhome='{root}/codex'\n[harnesses.claude-code]\nbinary='/bin/true'\nhome='{root}/claude'\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='gpt'\n[[providers.codex.bindings]]\nlabel='global'\naccount='acct'\n",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    package.join("bin/codex").display(),
+                    root = home.path().display(),
+                ),
+                home.path(),
+            )
+            .unwrap();
+            let mut findings = Vec::new();
+            managed_codex_code_mode(&config, &mut findings);
+            findings
+                .into_iter()
+                .map(|finding| (finding.code, finding.severity))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            codes(None),
+            [("managed_codex_code_mode_unpinned".into(), "warning".into())]
+        );
+        assert_eq!(
+            codes(Some(&digest)),
+            [("managed_codex_code_mode_host".into(), "info".into())]
+        );
+        assert_eq!(
+            codes(Some(&"0".repeat(64))),
+            [(
+                "managed_codex_code_mode_host_invalid".into(),
+                "error".into()
+            )]
+        );
+    }
+
     #[test]
     fn service_diagnostics_are_read_only_and_secret_safe() {
         let home = tempfile::tempdir().unwrap();

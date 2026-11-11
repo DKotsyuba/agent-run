@@ -1961,6 +1961,7 @@ fn managed_selector_is_opt_in_and_materializes_both_profiles() {
         pool_resident_executable: None,
         pool_resident_sha256: None,
         transport: None,
+        codex_code_mode_host_sha256: None,
         bridge_receipt_readers: vec![],
         bridge_custody_readers: vec![],
     }));
@@ -2081,6 +2082,188 @@ fn managed_selector_is_opt_in_and_materializes_both_profiles() {
             assert!(!plan.launch.args.iter().any(|arg| arg == "--plugin-dir"));
         }
     }
+}
+
+/// A managed Codex role names its Pool server by Codex's normalized tool
+/// name and, only with a pinned host from the harness's own package, writes
+/// the constrained Code Mode settings.
+#[test]
+fn managed_codex_code_mode_requires_the_pinned_package_host() {
+    use agent_run_adapters::managed_role::{launch_build_pins, select};
+    use agent_run_config::provider_config::ManagedAttemptBinding;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let package = root.join("codex-package");
+    fs::create_dir_all(package.join("bin")).unwrap();
+    fs::write(package.join("codex-package.json"), "{}\n").unwrap();
+    let codex = package.join("bin/codex");
+    fs::copy(fake_engine(&root), &codex).unwrap();
+    let host = package.join("bin/codex-code-mode-host");
+    fs::copy("/usr/bin/true", &host).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+    let host_sha256 = agent_run_platform::fs::sha256(&fs::read(&host).unwrap());
+    let pool = root.join("pool-frontend");
+    let hook = root.join("bridge-hook");
+    fs::copy("/usr/bin/true", &pool).unwrap();
+    fs::copy("/usr/bin/false", &hook).unwrap();
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(root.join("accounts/codex/work")).unwrap();
+    fs::write(root.join("accounts/codex/work/auth.json"), "{}\n").unwrap();
+    let setup = |server: &str, pin: Option<&str>| {
+        let mut config = config(&root, codex.to_str().unwrap());
+        config.mcp.insert(server.into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":pool,"args":["mcp","--config",root.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+        for harness in config.harnesses.values_mut() {
+            harness.hooks = vec![agent_run_config::config::Hook {
+                event: "PreToolUse".into(),
+                command: vec![hook.to_string_lossy().into_owned()],
+                matcher: Some(format!("mcp__{server}__.*")),
+            }];
+        }
+        config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+            enabled: true,
+            role_name: "managed".into(),
+            pool_server: server.into(),
+            pool_executable_sha256: agent_run_platform::fs::sha256(&fs::read(&pool).unwrap()),
+            bridge_hook_sha256: agent_run_platform::fs::sha256(&fs::read(&hook).unwrap()),
+            host_id: "host".into(),
+            pool_resident_executable: None,
+            pool_resident_sha256: None,
+            transport: None,
+            codex_code_mode_host_sha256: pin.map(str::to_owned),
+            bridge_receipt_readers: vec![],
+            bridge_custody_readers: vec![],
+        }));
+        let profile = Profile {
+            name: "managed".into(),
+            body: "fixture".into(),
+            write: false,
+            network: false,
+            revision: "1".into(),
+            canonical: true,
+            allow_external_read_roots: false,
+            read_roots: vec![],
+            skills: vec![],
+            mcp: vec![server.into()],
+            mcp_tools: BTreeMap::new(),
+            required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+        };
+        let role =
+            resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+        (config, role)
+    };
+    let materialize = |config: &ProviderConfig, role, name: &str| {
+        let home = root.join(name);
+        materialize_selected(
+            config,
+            &catalog(config),
+            &"codex-plus".parse().unwrap(),
+            "gpt",
+            &"acct-native".parse().unwrap(),
+            role,
+            &root,
+            &home,
+            &root,
+        )
+        .unwrap();
+        let native: toml::Value =
+            toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        serde_json::to_value(native).unwrap()
+    };
+
+    let (pinned, role) = setup("agent-pool", Some(&host_sha256));
+    let selected = select(&pinned, HarnessId::Codex, &role, true)
+        .unwrap()
+        .unwrap();
+    let codex_selection = selected.codex.clone().unwrap();
+    assert_eq!(codex_selection.pool_server, "agent-pool");
+    assert_eq!(codex_selection.pool_namespace, "agent_pool");
+    assert_eq!(
+        codex_selection.code_mode_host.as_deref(),
+        Some(host.as_path())
+    );
+    assert!(
+        select(&pinned, HarnessId::ClaudeCode, &role, true)
+            .unwrap()
+            .unwrap()
+            .codex
+            .is_none()
+    );
+    let native = materialize(&pinned, &role, "managed-code-mode");
+    assert!(agent_run_adapters::managed_role::codex_config_code_mode(&native).unwrap());
+    assert_eq!(
+        native["features"]["code_mode"],
+        serde_json::json!({"enabled":false,"excluded_tool_namespaces":["clock","functions"]})
+    );
+    for feature in ["goals", "sleep_tool", "shell_tool", "unified_exec"] {
+        assert_eq!(
+            native["features"][feature],
+            serde_json::json!(false),
+            "{feature}"
+        );
+    }
+    for tool in ["experimental_request_user_input", "update_plan"] {
+        assert_eq!(
+            native["tools"][tool],
+            serde_json::json!({"enabled":false}),
+            "{tool}"
+        );
+    }
+    agent_run_adapters::managed_role::verify_codex_pre_tool_use(
+        &native["hooks"]["PreToolUse"],
+        &codex_selection,
+    )
+    .unwrap();
+    // The trust receipt binds the written (normalized) matcher.
+    assert!(
+        native["hooks"]["state"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|key| key.ends_with(":pre_tool_use:0:0"))
+    );
+
+    // Without a pin the same role keeps Code Mode disabled.
+    let (unpinned, role) = setup("agent-pool", None);
+    let selected = select(&unpinned, HarnessId::Codex, &role, true)
+        .unwrap()
+        .unwrap();
+    assert!(selected.codex.as_ref().unwrap().code_mode_host.is_none());
+    let native = materialize(&unpinned, &role, "managed-no-code-mode");
+    assert!(!agent_run_adapters::managed_role::codex_config_code_mode(&native).unwrap());
+    assert_eq!(
+        native["hooks"]["PreToolUse"][0]["matcher"],
+        serde_json::json!("mcp__agent_pool__.*")
+    );
+    // The host pin is a build pin: a new launch takes the current one.
+    let launch = launch_build_pins(&unpinned, &pinned, HarnessId::Codex).unwrap();
+    assert_eq!(
+        launch
+            .managed_attempt_binding
+            .as_ref()
+            .unwrap()
+            .codex_code_mode_host_sha256
+            .as_deref(),
+        Some(host_sha256.as_str())
+    );
+
+    // A wrong pin, a missing or unsafe host, or a foreign layout refuses.
+    let (wrong, role) = setup("agent-pool", Some(&"0".repeat(64)));
+    assert!(select(&wrong, HarnessId::Codex, &role, true).is_err());
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o722)).unwrap();
+    assert!(select(&pinned, HarnessId::Codex, &role, true).is_err());
+    fs::remove_file(&host).unwrap();
+    assert!(select(&pinned, HarnessId::Codex, &role, true).is_err());
+    fs::copy("/usr/bin/true", &host).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+    select(&pinned, HarnessId::Codex, &role, true).unwrap();
+    fs::remove_file(package.join("codex-package.json")).unwrap();
+    assert!(select(&pinned, HarnessId::Codex, &role, true).is_err());
+    fs::write(package.join("codex-package.json"), "{}\n").unwrap();
+
+    // A Pool id Codex would name like the worker is ambiguous.
+    let (ambiguous, role) = setup("agent.run.worker", None);
+    assert!(select(&ambiguous, HarnessId::Codex, &role, true).is_err());
 }
 
 /// Third-party MCPs cannot inherit private worker or system capability names,

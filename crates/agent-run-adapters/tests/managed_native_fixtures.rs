@@ -3,9 +3,10 @@
 //! (`tests/fixtures/managed-native/README.md`).
 
 use agent_run_adapters::managed_role::{
-    CLAUDE_DISALLOWED_TOOLS, CODEX_MANAGED_DISABLED_IF_KNOWN, claude_catalog_digest,
-    claude_disallowed_tools, codex_settings, verify_claude_control_inventory,
-    verify_claude_inventory, verify_inventory, verify_managed_config,
+    CLAUDE_DISALLOWED_TOOLS, CODEX_MANAGED_DISABLED_IF_KNOWN, CodexSelection,
+    claude_catalog_digest, claude_disallowed_tools, codex_config_code_mode, codex_hook_tool_name,
+    codex_mcp_namespace, codex_settings, verify_claude_control_inventory, verify_claude_inventory,
+    verify_codex_pre_tool_use, verify_codex_tool_mode, verify_inventory, verify_managed_config,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -198,11 +199,25 @@ fn claude_2_1_311_reports_the_whole_discovered_catalog_before_input() {
     assert!(verify_claude_inventory(&narrowed, &allowed).is_err());
 }
 
+/// A Run-generated `config.toml` as the supervisor reads it.
+fn native_config(name: &str) -> Value {
+    let native: toml::Value = toml::from_str(&fixture(name)).unwrap();
+    serde_json::to_value(native).unwrap()
+}
+
 /// Pinned hook declarations as the supervisor reads them from the
-/// Run-generated `config.toml`.
+/// Run-generated `config.toml`. This build writes the same hooks with and
+/// without Code Mode.
 fn pinned_hooks() -> Value {
-    let native: toml::Value = toml::from_str(&fixture("codex-0.167.0-run-config.toml")).unwrap();
-    serde_json::to_value(native).unwrap()["hooks"].clone()
+    native_config("codex-0.167.0-run-config-code-mode.toml")["hooks"].clone()
+}
+
+fn codex_selection() -> CodexSelection {
+    CodexSelection {
+        pool_server: POOL.into(),
+        pool_namespace: codex_mcp_namespace(POOL).unwrap(),
+        code_mode_host: None,
+    }
 }
 
 #[test]
@@ -213,7 +228,22 @@ fn codex_0_167_0_config_read_accepts_only_disabled_drift() {
         &hooks["PermissionRequest"],
         &hooks["state"],
     );
-    let verify = |response: &Value| verify_managed_config(response, pre, permission, state);
+    let verify = |response: &Value| verify_managed_config(response, pre, permission, state, false);
+    // The b0b65a1 generation reported no disabled tool switches and pinned
+    // the raw Pool id, which no Codex tool name matches: both refuse.
+    let previous = native_config("codex-0.167.0-run-config.toml")["hooks"].clone();
+    assert!(
+        verify_managed_config(
+            &json_fixture("codex-0.167.0-config-read-managed.json"),
+            &previous["PreToolUse"],
+            &previous["PermissionRequest"],
+            &previous["state"],
+            false,
+        )
+        .is_err()
+    );
+    assert!(verify_codex_pre_tool_use(&previous["PreToolUse"], &codex_selection()).is_err());
+    verify_codex_pre_tool_use(pre, &codex_selection()).unwrap();
 
     // The failed attempt's configuration: four default-on features and the
     // ignored `tools.view_image` keep it refused.
@@ -231,9 +261,11 @@ fn codex_0_167_0_config_read_accepts_only_disabled_drift() {
 
     // Run now writes those features disabled for managed launches only.
     for feature in CODEX_MANAGED_DISABLED_IF_KNOWN {
-        assert_eq!(codex_settings()["features"][*feature], json!(false));
+        assert_eq!(codex_settings(false)["features"][*feature], json!(false));
     }
-    let managed = json_fixture("codex-0.167.0-config-read-managed.json");
+    let managed = json_fixture("codex-0.167.0-config-read-managed-v2.json");
+    assert!(!codex_config_code_mode(&managed["config"]).unwrap());
+    assert!(verify_managed_config(&managed, pre, permission, state, true).is_err());
     let accepted = verify(&managed).unwrap();
     let unknown: BTreeSet<_> = accepted["unknown_features"]
         .as_object()
@@ -249,12 +281,14 @@ fn codex_0_167_0_config_read_accepts_only_disabled_drift() {
             "auth_elicitation",
             "background_paginated_rollout_migration",
             "codex_apps_mcp_2026_07_28",
+            "goals",
             "mcp_2026_07_28",
             "mcp_connection_sharing",
             "memories",
             "mentions_v2",
             "network_proxy",
             "remote_control",
+            "sleep_tool",
             "view_image",
             "windows_sandbox_service",
         ])
@@ -321,6 +355,134 @@ fn codex_0_167_0_config_read_accepts_only_disabled_drift() {
         let mut widened = managed.clone();
         *widened.pointer_mut(pointer).unwrap() = value;
         assert!(verify(&widened).is_err(), "{pointer}");
+    }
+}
+
+#[test]
+fn codex_0_167_0_code_mode_config_read_is_exact() {
+    let hooks = pinned_hooks();
+    let (pre, permission, state) = (
+        &hooks["PreToolUse"],
+        &hooks["PermissionRequest"],
+        &hooks["state"],
+    );
+    let generated = native_config("codex-0.167.0-run-config-code-mode.toml");
+    assert!(codex_config_code_mode(&generated).unwrap());
+    let response = json_fixture("codex-0.167.0-config-read-code-mode.json");
+    let accepted = verify_managed_config(&response, pre, permission, state, true).unwrap();
+    assert_eq!(accepted["code_mode"], json!(true));
+    assert!(verify_managed_config(&response, pre, permission, state, false).is_err());
+    assert_eq!(
+        response["config"]["features"]["code_mode"],
+        json!({"enabled":false,"excluded_tool_namespaces":["clock","functions"]})
+    );
+    // The live reply reports what Run wrote; any widening is refused.
+    for (feature, value) in [
+        (
+            "code_mode",
+            json!({"enabled":false,"excluded_tool_namespaces":["functions"]}),
+        ),
+        (
+            "code_mode",
+            json!({"enabled":true,"excluded_tool_namespaces":["clock","functions"]}),
+        ),
+        ("code_mode_host", json!({"enabled":true})),
+        ("sleep_tool", json!(true)),
+        ("goals", json!(true)),
+    ] {
+        let mut widened = response.clone();
+        widened["config"]["features"][feature] = value;
+        assert!(
+            verify_managed_config(&widened, pre, permission, state, true).is_err(),
+            "{feature}"
+        );
+    }
+    for tool in ["experimental_request_user_input", "update_plan"] {
+        let mut overridden = response.clone();
+        overridden["origins"][format!("tools.{tool}.enabled")]["name"] =
+            json!({"type":"project","file":"/work/.codex/config.toml","profile":null});
+        assert!(verify_managed_config(&overridden, pre, permission, state, true).is_err());
+    }
+}
+
+#[test]
+fn codex_0_167_0_code_mode_surface_is_exactly_the_allowlist() {
+    let surface = json_fixture("codex-0.167.0-code-mode-surface.json");
+    let run = &surface["run_code_mode"];
+    // The model sees only the Code Mode entry points.
+    assert_eq!(
+        run["top_level"],
+        json!(["functions.exec", "functions.wait"])
+    );
+    // Model code can reach exactly the allowed Pool tools and the worker's
+    // completion tools, under Codex's names.
+    let pool = codex_mcp_namespace(POOL).unwrap();
+    let worker = codex_mcp_namespace(WORKER).unwrap();
+    let mut expected: Vec<String> = ALLOWED
+        .iter()
+        .map(|tool| codex_hook_tool_name(&pool, tool).unwrap())
+        .chain(
+            ["finish", "health_reply"]
+                .iter()
+                .map(|tool| codex_hook_tool_name(&worker, tool).unwrap()),
+        )
+        .collect();
+    expected.sort();
+    for key in ["names", "keys"] {
+        let mut found: Vec<String> = run["exec_result"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, expected, "{key}");
+    }
+    for (name, error) in run["exec_result"]["forbidden"].as_object().unwrap() {
+        assert_eq!(error, "TypeError: tools[name] is not a function", "{name}");
+    }
+    // Without the pinned exclusions, built-in tools reach model code.
+    let open = &surface["unconstrained_code_mode"];
+    for tool in [
+        "apply_patch",
+        "read_mcp_resource",
+        "create_goal",
+        "clock__curr_time",
+    ] {
+        assert!(
+            open["exec_result"]["names"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(tool)),
+            "{tool}"
+        );
+    }
+    assert!(
+        open["top_level"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("clock.sleep"))
+    );
+}
+
+#[test]
+fn codex_0_167_0_pool_hook_name_is_normalized() {
+    let hook = json_fixture("codex-0.167.0-code-mode-pre-tool-use.json");
+    let name = codex_hook_tool_name(&codex_mcp_namespace(POOL).unwrap(), "pool_get").unwrap();
+    assert_eq!(hook["tool_name"], json!(name));
+    let matches = |matcher: &str| regex::Regex::new(matcher).unwrap().is_match(&name);
+    assert!(matches(&codex_selection().pre_tool_use_matcher()));
+    assert!(!matches(&format!("mcp__{POOL}__.*")));
+}
+
+#[test]
+fn codex_0_167_0_models_require_code_mode() {
+    let cache = json_fixture("codex-0.167.0-models-cache-tool-modes.json");
+    for model in cache["models"].as_array().unwrap() {
+        let mode = model["tool_mode"].as_str();
+        assert_eq!(mode, Some("code_mode_only"));
+        assert!(verify_codex_tool_mode(mode, false).is_err());
+        verify_codex_tool_mode(mode, true).unwrap();
     }
 }
 

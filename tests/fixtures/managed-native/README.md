@@ -45,4 +45,34 @@ loopback port; Codex never received a turn.
 - `codex-0.167.0-config-read-managed.json`: the same configuration with the
   managed default-on features (`api_key_cyber_access_programs`,
   `api_key_model_discovery`, `auth_elicitation`, `mentions_v2`, `view_image`)
-  written `false`, as Run now generates it.
+  written `false`, as the b0b65a1 build generated it. It lacks the disabled
+  tool switches and pairs with the raw-id Bridge matcher, so it is now refused.
+
+Code Mode captures, 2026-11-11, codex-cli 0.167.0 (package
+`0.167.0-x86_64-unknown-linux-musl`, `codex-code-mode-host` SHA-256
+`83f3e174c2da2f1ca8655cce686e302509640d34c0f4407c1155056f64536e0f`), as
+`agent-mcp`. The ignored probe `codex::tests::live_managed_codex_qualifies_before_any_turn`
+materialized the failed attempt ag-20261111-050243-2b4fd2ac0b's home afresh
+with this build (frozen role and request, scratch copies of the Run
+configuration with and without `codex_code_mode_host_sha256`, credential link
+removed, provider endpoint a refused loopback port) and stopped before any turn.
+The surface captures used a local mock Responses endpoint instead of a model:
+its first reply was a fixed `exec` call enumerating the nested tools, its second
+a plain message. No credential was present and no model ran. Paths are
+normalized to the failed attempt's runtime home, workdir and `agent-run`, and
+the probe-only `openai_base_url` is removed.
+
+- `codex-0.167.0-run-config-code-mode.toml`: the generated `config.toml` with
+  the host pinned (normalized `mcp__agent_pool__.*` Bridge matcher).
+- `codex-0.167.0-config-read-code-mode.json` and
+  `codex-0.167.0-config-read-managed-v2.json`: `config/read` of the generated
+  configuration with and without the pin.
+- `codex-0.167.0-code-mode-surface.json`: the model-visible top-level tools and
+  the `exec` result (`ALL_TOOLS` names, `tools` keys and calls to built-in
+  names) for the Run-generated home (`run_code_mode`) and for Code Mode
+  enabled without the exclusions (`unconstrained_code_mode`).
+- `codex-0.167.0-code-mode-pre-tool-use.json`: the `PreToolUse` input of a
+  nested `pool_get` call (a probe hook with matcher `mcp__agent_pool__.*`
+  blocked it; one with `mcp__agent-pool__.*` did not fire).
+- `codex-0.167.0-models-cache-tool-modes.json`: `slug` and `tool_mode` of the
+  account's model catalog that Codex cached in the failed attempt's home.

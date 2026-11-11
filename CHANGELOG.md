@@ -19,6 +19,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   Codex thread (`environments: []`) requests and verifies no runtime
   workspace roots, and its MCP inventory is read once servers settle.
   Execution failure diagnostics keep a validation error's static reason.
+- feat(adapters): constrained Code Mode for managed Codex members on
+  codex-cli 0.167.0, whose models are all `code_mode_only`. The optional
+  `managed_attempt_binding.codex_code_mode_host_sha256` pins the
+  `codex-code-mode-host` Codex resolves from its own package; with it, managed
+  launches enable the host fail-closed and exclude the `clock` and `functions`
+  namespaces from Code Mode, so model code reaches exactly the allowed Pool
+  tools and `finish`/`health_reply`. `goals`, `sleep_tool`, user-input and plan
+  tools are written disabled. Without the pin a `code_mode_only` model is
+  refused before any thread. The Bridge `PreToolUse` matcher uses Codex's
+  normalized server name (`agent-pool` becomes `agent_pool`), which the
+  selector proves unambiguous. Doctor reports the host.
 
 ## 0.31.0
 

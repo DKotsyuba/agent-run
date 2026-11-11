@@ -381,6 +381,12 @@ pub struct ManagedAttemptBinding {
     pub pool_resident_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<ManagedAttemptTransport>,
+    /// Digest of the `codex-code-mode-host` that the managed Codex harness
+    /// resolves from its own package. Present: managed Codex launches enable
+    /// the constrained Code Mode host. Absent: Code Mode stays disabled and a
+    /// model that requires it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_code_mode_host_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bridge_receipt_readers: Vec<BridgeReceiptReader>,
     /// Separately scoped Bridge principals permitted effect recovery only.
@@ -593,6 +599,10 @@ impl ProviderConfig {
                     .bridge_hook_sha256
                     .parse::<agent_run_domain::Sha256Digest>()
                     .is_err()
+                || managed
+                    .codex_code_mode_host_sha256
+                    .as_ref()
+                    .is_some_and(|digest| digest.parse::<agent_run_domain::Sha256Digest>().is_err())
             {
                 return Err(invalid("invalid managed attempt selector"));
             }

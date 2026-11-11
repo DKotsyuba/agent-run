@@ -6545,6 +6545,7 @@ async fn managed_claude_supervisor_qualifies_with_catalog_complement() {
             bridge_reader_credential_file: reader,
             bridge_reader_credential_sha256: agent_run_platform::fs::sha256(b"synthetic-reader"),
         }),
+        codex_code_mode_host_sha256: None,
         bridge_receipt_readers: vec![],
         bridge_custody_readers: vec![],
     }));
@@ -6832,6 +6833,7 @@ async fn managed_resume_after_bridge_upgrade_verifies_current_component_builds()
             bridge_reader_credential_file: reader,
             bridge_reader_credential_sha256: agent_run_platform::fs::sha256(b"synthetic-reader"),
         }),
+        codex_code_mode_host_sha256: None,
         bridge_receipt_readers: vec![],
         bridge_custody_readers: vec![],
     }));

@@ -500,7 +500,7 @@ pub fn materialize(
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
-        config, runtime, request, profile, home, app_home, None, None, false,
+        config, runtime, request, profile, home, app_home, None, None, None,
     )
 }
 
@@ -524,7 +524,7 @@ pub fn materialize_provider(
     native_model: &str,
     config_sha256: &str,
     admitted_skills: &[ResolvedSkill],
-    managed: bool,
+    managed: Option<&super::managed_role::Selection>,
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
         config,
@@ -672,8 +672,9 @@ fn materialize_with_provider(
     app_home: &Path,
     provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
     admitted_skills: Option<&[ResolvedSkill]>,
-    managed: bool,
+    managed_selection: Option<&super::managed_role::Selection>,
 ) -> Result<(Snapshot, String)> {
+    let managed = managed_selection.is_some();
     crate::validate_role(runtime, profile)?;
     let research = profile.research_tools_only();
     let mut restricted = runtime.clone();
@@ -804,6 +805,22 @@ fn materialize_with_provider(
                 "matcher": matcher,
                 "hooks": [{"type":"command", "command":shell_command(&command), "timeout":600}],
             }]);
+        }
+        if let Some(codex) = managed_selection.and_then(|selection| selection.codex.as_ref()) {
+            // Codex names the Pool server's tools by its normalized id; the
+            // declared raw matcher is written as that name so the Bridge hook
+            // gates every Pool call, direct or from Code Mode.
+            let declared = format!("mcp__{}__.*", codex.pool_server);
+            for group in hooks
+                .get_mut("PreToolUse")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if group.get("matcher").and_then(Value::as_str) == Some(declared.as_str()) {
+                    group["matcher"] = json!(codex.pre_tool_use_matcher());
+                }
+            }
         }
     }
     let native: Value = serde_json::to_value(&runtime.native_settings)?;
@@ -988,9 +1005,13 @@ fn materialize_with_provider(
                     serde_json::from_value(super::codex::research_settings())?;
                 doc.extend(controls);
             }
-            if managed {
+            if let Some(selection) = managed_selection {
+                let code_mode = selection
+                    .codex
+                    .as_ref()
+                    .is_some_and(|codex| codex.code_mode_host.is_some());
                 let controls: toml::Table =
-                    serde_json::from_value(super::managed_role::codex_settings())?;
+                    serde_json::from_value(super::managed_role::codex_settings(code_mode))?;
                 doc.extend(controls);
             }
             let text = toml::to_string_pretty(&doc)

@@ -327,8 +327,7 @@ pub fn materialize_selected(
     }
     let role_profile = profile(&role);
     let mut runtime = runtime(config, definition.harness, model)?;
-    let managed =
-        crate::managed_role::select(config, definition.harness, &role, role.worker_mcp)?.is_some();
+    let managed = crate::managed_role::select(config, definition.harness, &role, role.worker_mcp)?;
     crate::validate_executable(&runtime)?;
     crate::validate_role(&runtime, &role_profile)?;
     if definition.harness == HarnessId::ClaudeCode {
@@ -376,7 +375,7 @@ pub fn materialize_selected(
         native_model,
         &config_sha256,
         &role.skills,
-        managed,
+        managed.as_ref(),
     )?;
     Ok((snapshot, Sha256Digest::from_str(&digest)?))
 }

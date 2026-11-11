@@ -347,7 +347,8 @@ existing bounded transport and transcript limits.
 The `managed_attempt_binding` table is absent by default. An explicit table
 selects only the named dedicated role when `enabled = true`; ordinary roles
 remain ordinary. It requires `role_name`, `pool_server`, `host_id`, and the
-lowercase SHA-256 values `pool_executable_sha256` and `bridge_hook_sha256`.
+lowercase SHA-256 values `pool_executable_sha256` and `bridge_hook_sha256`;
+`codex_code_mode_host_sha256` is optional (see Codex Code Mode below).
 The selector refuses plugins, skills, non-stdio or unrestricted MCP servers,
 unapproved component binaries, non-explicit completion, research and broader
 roles. The selected Pool command must be the pinned binary with exactly
@@ -461,6 +462,84 @@ accepted feature values and empty hook events are bound into the config digest
 and journaled as `managed_native_drift_v1`. Ordinary Codex launches are
 unchanged. Actual provider and hook qualification still requires the approved
 dobi run.
+
+Managed Codex launches also write `goals` and `sleep_tool` disabled (they grant
+the goal tools and `clock.sleep`) and `tools.experimental_request_user_input`
+and `tools.update_plan` as `{enabled = false}`. 0.167.0 reports no value for
+these two tool switches, so `config/read` must report each one's origin as the
+same `user` layer as `features.hooks`, the Run-generated file.
+
+#### Codex tool names
+
+codex-cli 0.167.0 names an MCP server's tools `mcp__<segment>__<tool>`, where
+`<segment>` is the server id with every character outside `[A-Za-z0-9_]`
+replaced by `_` (`agent-pool` becomes `agent_pool`). This name is what model
+code calls, what `PreToolUse` hooks receive as `tool_name`, and what their
+matcher is tested against. For a managed Codex launch Run writes the declared
+Bridge matcher `mcp__<pool_server>__.*` as `mcp__<segment>__.*` and verifies the
+pinned group carries exactly that matcher; the declaration in this file keeps
+the raw id. The selector refuses an id Codex would rewrite further or that is
+not uniquely parseable (anything outside ASCII `[A-Za-z0-9_.-]`, longer than
+64 bytes, or whose segment is empty, starts or ends with `_` or contains `__`),
+a Pool segment equal to the worker's (`agent_run_worker`), and allowed tool
+names that are not already `[A-Za-z0-9_]`, start with `_`, or exceed Codex's
+128-byte name bound (beyond which it substitutes a hashed name). The
+normalized prefix is journaled in `managed_native_drift_v1` as
+`pool_tool_prefix` and bound into the config digest. A Bridge that maps the
+raw id must accept the normalized name for Codex calls.
+
+#### Codex Code Mode
+
+Every codex-cli 0.167.0 model reports `tool_mode = "code_mode_only"`: MCP tools
+reach the model only through Code Mode's `exec`, which runs model-written
+JavaScript in a V8 isolate inside the separate `codex-code-mode-host` process
+and dispatches its nested tool calls back through Codex's normal tool path,
+including `PreToolUse` hooks and approvals. The isolate has no filesystem,
+network, process, `console`, WebAssembly or module import; nested calls are
+its only effect. Without a host a `code_mode_only` model has no callable tool.
+
+`codex_code_mode_host_sha256` (optional, lowercase SHA-256) enables Code Mode
+for managed Codex launches. The host is the one Codex itself spawns: for the
+standalone package layout `<package>/bin/codex` beside
+`<package>/codex-package.json`, `<package>/codex-resources/codex-code-mode-host`
+if it exists, otherwise `<package>/bin/codex-code-mode-host`. The configured
+Codex binary may be a link to that `bin/codex`. Selection refuses any other
+layout and a host that is a link, not a regular file owned by Run's user or
+root, group/world-writable, larger than 256 MiB or not the pinned build; it is
+re-verified at every launch and the verified path is journaled as
+`code_mode_host`. The digest is a component build pin like the Bridge hook:
+each new launch takes the current value. A Codex upgrade replaces the host, so
+update the pin with it; until then new managed Codex launches are refused. `agent-run doctor` reports the host
+(`managed_codex_code_mode_host`, or `_invalid`) and warns
+(`managed_codex_code_mode_unpinned`) when no host is pinned.
+
+With the pin, the generated configuration and the verified `config/read`
+report exactly:
+
+```toml
+[features.code_mode]
+enabled = false
+excluded_tool_namespaces = ["clock", "functions"]
+
+[features.code_mode_host]
+enabled = true
+disable_in_process_fallback = true
+```
+
+Every built-in 0.167.0 tool lives in the `functions` namespace (patch, MCP
+resources, goals, plan, user input) or `clock`; excluded tools are neither
+nested nor directly visible to a `code_mode_only` model. Model code can
+therefore call exactly the enabled Pool tools and `finish`/`health_reply`, and
+the model sees only `exec` and `wait`. `code_mode.enabled` stays false, so only
+a model whose catalog requires Code Mode uses it. Without the pin Code Mode
+stays disabled (`code_mode_host = false`, `code_mode = {enabled = false}`).
+
+After `model/list`, Run reads the selected model's `tool_mode` from Codex's
+`models_cache.json` in the runtime home. Without an enabled host, a
+`code_mode_only` model or an unreadable mode is refused before any thread
+starts (`managed Codex model requires Code Mode; pin the Codex code-mode
+host`). The mode is journaled as `managed_native_tool_mode_v1` and bound into
+the qualification digest. An unrecognized mode is refused.
 
 ### Upgrading Bridge
 
