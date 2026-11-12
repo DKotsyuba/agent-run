@@ -17,17 +17,24 @@ const CUSTOM_HARNESS: &[(&str, &str)] = &[("agent-run-platform", "launch_fd6")];
 /// In-process test locks and the one-thread nextest group listing their users.
 /// nextest runs each test in its own process, so the lock alone no longer
 /// serializes them.
-const LOCK_GROUPS: &[(&str, &str)] = &[("crates/agent-run/tests/cli_seam.rs", "FOLLOW_TESTS")];
+const LOCK_GROUPS: &[(&str, &str, &str)] = &[(
+    "crates/agent-run/tests/cli_seam.rs",
+    "FOLLOW_TESTS",
+    "follow",
+)];
 
 /// Runs the structural test checks, then every test configuration of the gate.
+/// Every test command runs even after an earlier one failed, so one gate run
+/// reports all failing configurations.
 ///
 /// # Errors
-/// A structural violation or the first failed test command.
+/// A structural violation, or the list of failed test commands.
 pub fn run_tests(root: &Path) -> Result<(), String> {
     integration_tests_included(root)?;
     lock_users_grouped(root)?;
     let scratch = TestScratch::create();
     let threads = test_threads();
+    let mut failed = Vec::new();
     for features in [Some("--all-features"), None] {
         let mut nextest = vec![
             "nextest",
@@ -41,7 +48,7 @@ pub fn run_tests(root: &Path) -> Result<(), String> {
         if let Some(threads) = threads.as_deref() {
             nextest.extend(["--test-threads", threads]);
         }
-        scratch.cargo(root, &nextest)?;
+        failed.extend(scratch.cargo(root, &nextest).err());
         for (package, target) in CUSTOM_HARNESS {
             let mut custom = vec![
                 "test",
@@ -53,7 +60,7 @@ pub fn run_tests(root: &Path) -> Result<(), String> {
                 target,
             ];
             custom.extend(features);
-            scratch.cargo(root, &custom)?;
+            failed.extend(scratch.cargo(root, &custom).err());
         }
         let mut doctests = vec![
             "test",
@@ -64,9 +71,13 @@ pub fn run_tests(root: &Path) -> Result<(), String> {
             "--no-fail-fast",
         ];
         doctests.extend(features);
-        scratch.cargo(root, &doctests)?;
+        failed.extend(scratch.cargo(root, &doctests).err());
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
 }
 
 /// The operator's `RUST_TEST_THREADS` (for example `1` in release acceptance),
@@ -117,12 +128,20 @@ fn integration_tests_included(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Every test taking a lock from [`LOCK_GROUPS`] must be listed in a nextest
-/// one-thread group in `.config/nextest.toml`.
+/// Every test taking a lock from [`LOCK_GROUPS`] must be listed in the filter of
+/// the `.config/nextest.toml` override that assigns its one-thread group.
 fn lock_users_grouped(root: &Path) -> Result<(), String> {
     let config = fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|error| format!(".config/nextest.toml: {error}"))?;
-    for (file, lock) in LOCK_GROUPS {
+    for (file, lock, group) in LOCK_GROUPS {
+        let assignment = format!("test-group = \"{group}\"");
+        let end = config
+            .find(&assignment)
+            .ok_or_else(|| format!("no override assigns nextest group {group}"))?;
+        let start = config[..end]
+            .rfind("[[profile.default.overrides]]")
+            .ok_or_else(|| format!("nextest group {group} is assigned outside an override"))?;
+        let filter = &config[start..end];
         let source =
             fs::read_to_string(root.join(file)).map_err(|error| format!("{file}: {error}"))?;
         for (at, _) in source.match_indices(&format!("{lock}.")) {
@@ -130,9 +149,9 @@ fn lock_users_grouped(root: &Path) -> Result<(), String> {
                 .rfind("fn ")
                 .and_then(|start| source[start + 3..].split(['(', '<']).next())
                 .ok_or_else(|| format!("{lock} used outside a function in {file}"))?;
-            if !config.contains(&format!("::{name})")) {
+            if !filter.contains(&format!("::{name})")) {
                 return Err(format!(
-                    "{name} takes {lock} but is not in its nextest group"
+                    "{name} takes {lock} but is not in nextest group {group}"
                 ));
             }
         }
@@ -190,10 +209,7 @@ impl TestScratch {
         if status.success() {
             Ok(())
         } else {
-            Err(format!(
-                "cargo {} failed",
-                args.first().copied().unwrap_or_default()
-            ))
+            Err(format!("cargo {} failed", args.join(" ")))
         }
     }
 }

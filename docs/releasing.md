@@ -35,7 +35,12 @@ directories beneath `RUNNER_TEMP`, and set `TMPDIR`, `TMP`, `TEMP` and
 `AGENT_RUN_TEST_TMP` accordingly. On Linux a newly created protected `/run`
 directory is used for `AGENT_RUN_TEST_SOCKET_TMP`, because operator-socket tests
 also require protected ancestors without ACLs. The native no-symlink checks
-remain mandatory.
+remain mandatory. `cargo xtask check` additionally points test `TMPDIR`, `TMP`
+and `TEMP` at a fresh private `0700` directory on tmpfs (`/dev/shm`) when it can
+execute files and has at least 1 GiB free, and removes it afterwards; elsewhere,
+or with `XTASK_TEST_TMPFS=0`, tests keep the `TMPDIR` set here. Release
+acceptance should run the gate with `RUST_TEST_THREADS=3`, which the gate passes
+to cargo-nextest as `--test-threads`.
 
 Run the release gates on both macOS arm64 and Linux x86-64. Each native
 producer builds and smoke-tests its own payload; a failed Linux job blocks
