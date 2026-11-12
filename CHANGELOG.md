@@ -6,6 +6,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ### Changed
 
+- Shared worker instructions ask delegated agents for brief working notes to themselves instead of complete silence between tool calls, and add common work rules: stay in scope, commit checkpoints only on the worker's own branch or worktree, ask the orchestrator instead of inventing business rules, verify proportionately, and clean up task-owned scratch. Applies to newly resolved roles; existing and resumed sessions keep their frozen prompt.
 - Gate test scratch directories are named with the PID namespace and a random suffix, and stale cleanup only removes directories of exited processes from the same namespace.
 - The integration-test check ignores commented-out module lines and requires `autotests = false`.
 - `cargo xtask check` follows the Rust gate standard: tests run under

@@ -19,8 +19,10 @@ contains no credential bytes.
 
 New canonical roles prepend the shared worker instructions from
 `assets/worker_instructions.md` to the profile body. They identify the agent as
-an orchestrator's executor, suppress routine narration, preserve approval and
-verification obligations, and request a compact final report. These are model
+an orchestrator's executor, ask for brief self-directed working notes instead of
+narration, set shared work rules (scope, checkpoint commits on the worker's own
+branch, no invented business rules, verification, cleanup), and request a
+compact final report. These are model
 instructions, not output filtering or a guarantee of silence. The composed text
 is frozen and hashed in `ResolvedRolePlan.prompt`; resume restores it unchanged,
 and historical sessions retain their original prompt. Claude/GLM receive it via
