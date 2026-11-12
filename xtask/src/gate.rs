@@ -94,7 +94,8 @@ fn test_threads() -> Option<String> {
 
 /// With `autotests = false` a `tests/*.rs` file that is neither a module of its
 /// crate's `tests/it/main.rs` nor a `harness = false` target would silently
-/// never build; reject that.
+/// never build; reject that, a commented-out module line, and a package with an
+/// `it` binary whose manifest lets Cargo build each file separately again.
 fn integration_tests_included(root: &Path) -> Result<(), String> {
     let crates = fs::read_dir(root.join("crates")).map_err(|error| format!("crates: {error}"))?;
     let packages = crates
@@ -107,6 +108,20 @@ fn integration_tests_included(root: &Path) -> Result<(), String> {
             continue;
         };
         let manifest = fs::read_to_string(package.join("Cargo.toml")).unwrap_or_default();
+        if !manifest
+            .lines()
+            .any(|line| line.trim() == "autotests = false")
+        {
+            return Err(format!(
+                "{} must set `autotests = false` for its single `it` test binary",
+                package.join("Cargo.toml").display()
+            ));
+        }
+        let modules: Vec<&str> = index
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("#[path = \"../"))
+            .collect();
         let files =
             fs::read_dir(&tests).map_err(|error| format!("{}: {error}", tests.display()))?;
         for file in files.flatten() {
@@ -115,7 +130,7 @@ fn integration_tests_included(root: &Path) -> Result<(), String> {
                 continue;
             };
             if path.extension().is_some_and(|extension| extension == "rs")
-                && !index.contains(&format!("\"../{name}\""))
+                && !modules.contains(&format!("#[path = \"../{name}\"]").as_str())
                 && !manifest.contains(&format!("path = \"tests/{name}\""))
             {
                 return Err(format!(
@@ -163,7 +178,7 @@ fn lock_users_grouped(root: &Path) -> Result<(), String> {
 /// filesystem-heavy tests avoid slow disk sync. Tests keep the inherited `TMPDIR`
 /// when tmpfs is absent, cannot execute files, has less than 1 GiB free, or
 /// `XTASK_TEST_TMPFS=0` is set. The directory is removed on drop; directories
-/// left by interrupted runs are removed on the next start.
+/// left by exited runs of the same PID namespace are removed on the next start.
 struct TestScratch(Option<PathBuf>);
 
 impl TestScratch {
@@ -177,11 +192,13 @@ impl TestScratch {
             use std::os::unix::fs::DirBuilderExt;
             let base = Path::new("/dev/shm");
             if base.is_dir() {
-                remove_stale_scratch(base);
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.subsec_nanos());
-                let dir = base.join(format!("xtask-{}-{nanos:09}", std::process::id()));
+                let namespace = pid_namespace();
+                remove_stale_scratch(base, &namespace);
+                let dir = base.join(format!(
+                    "xtask-{}-{namespace}-{}",
+                    std::process::id(),
+                    random_suffix()
+                ));
                 if fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
                     if scratch_usable(&dir) {
                         return Self(Some(dir));
@@ -256,9 +273,41 @@ fn scratch_usable(dir: &Path) -> bool {
     executes && free_kib.is_some_and(|kib| kib >= 1024 * 1024)
 }
 
-/// Removes this user's scratch directories whose creating process has exited.
+/// The inode of this process's PID namespace (`/proc/self/ns/pid`), or `0`
+/// when unavailable, so stale cleanup never judges another namespace's PIDs.
 #[cfg(unix)]
-fn remove_stale_scratch(base: &Path) {
+fn pid_namespace() -> String {
+    fs::read_link("/proc/self/ns/pid")
+        .ok()
+        .and_then(|link| {
+            link.to_str()?
+                .strip_prefix("pid:[")?
+                .strip_suffix(']')
+                .map(str::to_owned)
+        })
+        .filter(|inode| !inode.is_empty() && inode.bytes().all(|byte| byte.is_ascii_digit()))
+        .unwrap_or_else(|| "0".to_owned())
+}
+
+/// Sixteen hex digits from `/dev/urandom`, falling back to the clock.
+#[cfg(unix)]
+fn random_suffix() -> String {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 8];
+    let random = fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if random.is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        bytes = (nanos as u64).to_le_bytes();
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Removes this user's scratch directories from the same PID namespace whose
+/// creating process has exited.
+#[cfg(unix)]
+fn remove_stale_scratch(base: &Path, namespace: &str) {
     use std::os::unix::fs::MetadataExt;
     let Ok(me) = fs::metadata("/proc/self") else {
         return;
@@ -268,14 +317,22 @@ fn remove_stale_scratch(base: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name
+        let mut parts = name
             .to_str()
             .and_then(|name| name.strip_prefix("xtask-"))
-            .and_then(|rest| rest.split('-').next())
-            .filter(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
-        else {
+            .unwrap_or_default()
+            .split('-');
+        let (Some(pid), Some(owner_namespace)) = (parts.next(), parts.next()) else {
             continue;
         };
+        // Only a canonical decimal PID names a process; `0` means the namespace
+        // is unknown, so nothing can be judged stale.
+        if pid.parse::<u32>().map(|value| value.to_string()).as_deref() != Ok(pid)
+            || namespace == "0"
+            || owner_namespace != namespace
+        {
+            continue;
+        }
         let owned = entry
             .metadata()
             .is_ok_and(|meta| meta.is_dir() && meta.uid() == me.uid());
