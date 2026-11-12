@@ -606,9 +606,12 @@ pub fn plan_selected_with(
         host,
     )?;
     // Only the supervisor may install this attempt's worker capability and
-    // launch correlation. Never forward an upstream worker's environment.
-    environment
-        .retain(|name, _| !name.starts_with("AGENT_RUN_WORKER_") && name != "AGENT_RUN_LAUNCH_ID");
+    // launch correlation. Never forward an upstream worker's environment, and
+    // never the supervisor's own system writer/operator sockets: no harness
+    // or tool process uses them (the worker endpoint is its own variable).
+    environment.retain(|name, _| {
+        !crate::worker_scope::is_private_launch_name(name) && name != "AGENT_RUN_LAUNCH_ID"
+    });
     if definition.ordered_accounts
         && sealed.harness == HarnessId::ClaudeCode
         && matches!(connection, ProviderConnection::Native)

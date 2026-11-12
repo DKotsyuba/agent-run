@@ -239,9 +239,37 @@ async fn worker_mcp_queues_a_report_without_ending_the_run() {
     let receipt = std::fs::read_to_string(h.home.join("worker-receipt.json")).unwrap();
     assert!(receipt.contains("Queue acknowledgement only"));
     assert!(!receipt.contains("AGENT_RUN_WORKER_TOKEN"));
+    // The worker MCP above authenticated with the capability, yet an ordinary
+    // tool command the Claude harness runs inherits none of it. The launch
+    // marker stays: Bridge and Run ancestry checks read it from the harness.
+    let tool = std::fs::read_to_string(h.home.join("tool-environment.txt")).unwrap();
+    let names: Vec<&str> = tool.lines().collect();
+    assert!(
+        names
+            .iter()
+            .all(|name| !name.starts_with("AGENT_RUN_WORKER_")
+                && !name.starts_with("AGENT_RUN_SYSTEM_")),
+        "tool command inherited a private launch variable: {names:?}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(names.contains(&"AGENT_RUN_LAUNCH_ID"));
+    let scoped = std::fs::read_dir(h.home.join("claude/runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("worker-mcp/mcp-config.json"))
+        .find(|path| path.exists())
+        .expect("per-attempt worker MCP config");
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!(
+        std::fs::metadata(&scoped).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     std::fs::write(h.home.join("worker-continue"), "").unwrap();
     let answer = h.terminal(&id).await;
     assert_eq!(answer["status"], "succeeded");
+    assert!(
+        !scoped.exists(),
+        "per-attempt worker MCP config outlived its attempt"
+    );
     assert_eq!(
         store
             .conn
