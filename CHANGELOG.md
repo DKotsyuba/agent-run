@@ -4,6 +4,19 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Security
+
+- Agent tool processes no longer inherit Agent Run's private launch variables
+  by accident. Generated Codex configs always exclude `AGENT_RUN_*` from tool
+  shells, and MCP servers still receive their declared `env_vars`. Claude Code
+  launches move `AGENT_RUN_WORKER_*` out of the harness environment into the
+  worker MCP entry of a private per-attempt `--mcp-config`, which is removed
+  after the attempt. The supervisor's `AGENT_RUN_SYSTEM_*` sockets no longer
+  reach any harness. `AGENT_RUN_LAUNCH_ID` stays in the harness as Bridge's
+  launch-correlation and ancestry marker. OpenCode MCP servers still inherit the
+  capability. This does not stop a same-UID agent from reading it deliberately.
+  See [provider materialization](docs/provider-materialization.md#private-launch-variables-and-tool-processes).
+
 ## 0.31.2
 
 Released 2026-11-12.
