@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude resumes no longer fail with `continuation_unavailable: history_unverifiable` because Claude Code 2.1.311+ request snapshots replay a `Bash` call as `cd <record cwd> && <command>` or omit an `Edit` call's default `replace_all: false`. The cleanup seal accepts exactly those two rewrites; every other snapshot difference still refuses. Executions that already finished without a seal stay non-resumable.
+- Codex resumes request `excludeTurns`, so a long thread no longer returns a hydrated reply above the 8 MiB engine frame and fails as `runtime_transport_failed` before any work.
+- A refused system resume preflight logs its content-free cause in the account worker, and a changed sealed history reports whether it grew after an intact sealed prefix or was rewritten, with both byte lengths.
+
 ## 0.31.2
 
 Released 2026-11-12.

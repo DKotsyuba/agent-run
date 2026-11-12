@@ -155,10 +155,34 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
     }
     let bytes = read(&seal.root, &seal.relative)?;
     if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
-        return Err(unavailable("native history changed since it was sealed"));
+        return Err(changed(seal, &bytes));
     }
     check(harness, &bytes, session)?;
     Ok(())
+}
+
+/// Builds the refusal for history whose bytes no longer match its seal.
+///
+/// The reason stays content-free but says whether the sealed bytes are still
+/// an intact prefix (something appended to the session after cleanup) or were
+/// rewritten (truncated, compacted or edited), with both byte lengths. Either
+/// way the continuation is refused; this only makes the cause diagnosable.
+fn changed(seal: &HistorySeal, bytes: &[u8]) -> Error {
+    let now = bytes.len();
+    let prefix = usize::try_from(seal.bytes)
+        .ok()
+        .and_then(|sealed| bytes.get(..sealed));
+    if now as u64 > seal.bytes && prefix.is_some_and(|prefix| fs::sha256(prefix) == seal.sha256) {
+        unavailable(format!(
+            "native history changed since it was sealed: grew from {} to {now} bytes after the intact sealed prefix",
+            seal.bytes
+        ))
+    } else {
+        unavailable(format!(
+            "native history changed since it was sealed: rewritten ({} sealed bytes, {now} now)",
+            seal.bytes
+        ))
+    }
 }
 
 /// Reads the private main database and optional WAL through anchored no-follow
@@ -350,7 +374,7 @@ pub fn admitted_turn_recorded(seal: &HistorySeal, turn: &str, input_sha256: &str
     }
     let bytes = read(&seal.root, &seal.relative)?;
     if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
-        return Err(unavailable("native history changed since it was sealed"));
+        return Err(changed(seal, &bytes));
     }
     let text =
         std::str::from_utf8(&bytes).map_err(|_| unavailable("native history is not UTF-8"))?;
@@ -1175,17 +1199,22 @@ mod tests {
         let sealed = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
         assert!(super::verify(&sealed, HarnessId::Codex, "s1").is_ok());
         assert!(super::verify(&sealed, HarnessId::Codex, "s2").is_err());
-        for body in [
-            meta.to_owned(),
-            format!("{meta}{}", turn.replace("nonce-1", "nonce-2")),
-            format!("{meta}{turn}{turn}"),
+        for (body, cause) in [
+            (meta.to_owned(), "rewritten"),
+            (
+                format!("{meta}{}", turn.replace("nonce-1", "nonce-2")),
+                "rewritten",
+            ),
+            (format!("{turn}{meta}{turn}"), "rewritten"),
+            (format!("{meta}{turn}{turn}"), "grew from"),
         ] {
             fs::write(&path, &body).unwrap();
-            let error = super::verify(&sealed, HarnessId::Codex, "s1").unwrap_err();
-            assert!(
-                error.to_string().contains("changed since it was sealed"),
-                "{error}"
-            );
+            let error = super::verify(&sealed, HarnessId::Codex, "s1")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("changed since it was sealed"), "{error}");
+            // The diagnostic names the cause but never history content.
+            assert!(error.contains(cause) && !error.contains("nonce"), "{error}");
         }
     }
 
