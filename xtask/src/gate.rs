@@ -325,8 +325,10 @@ fn remove_stale_scratch(base: &Path, namespace: &str) {
         let (Some(pid), Some(owner_namespace)) = (parts.next(), parts.next()) else {
             continue;
         };
-        if pid.is_empty()
-            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        // Only a canonical decimal PID names a process; `0` means the namespace
+        // is unknown, so nothing can be judged stale.
+        if pid.parse::<u32>().map(|value| value.to_string()).as_deref() != Ok(pid)
+            || namespace == "0"
             || owner_namespace != namespace
         {
             continue;

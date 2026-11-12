@@ -28,11 +28,17 @@ test(=cli_seam::test_transcript_follow_polls_without_duplicates_until_terminal_a
 """
 test-group = "follow"
 
-# Timing-sensitive tests (sub-second windows, short deadlines) run alone so
-# load from other test processes cannot starve them.
+# Timing-sensitive tests (sub-second windows, short deadlines, latency
+# percentiles) run alone so load from other test processes cannot starve them.
+# Thresholds stay unchanged; only concurrency with other tests is removed.
 [[profile.default.overrides]]
 filter = """
 test(=process::tests::cleanup_signals_captured_descendant_after_group_exit)
 | test(=release_wait::stalled_leaves_and_cancelled_verification_keep_terminal_kind)
+| test(=provider_public_boundary::fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified)
+| test(=lifecycle_reconcile::wait_honors_its_own_bound_without_using_the_legacy_run_timeout)
+| test(=sqlite_busy::idle_command_poll_does_not_acquire_the_wal_writer)
+| test(=socket_api_planned::python_capacity_order_and_durable_cancel_use_independent_paths)
+| test(=codex_session::python_test_codex_app_server_closed_error_does_not_wait_unboundedly)
 """
 threads-required = "num-test-threads"
