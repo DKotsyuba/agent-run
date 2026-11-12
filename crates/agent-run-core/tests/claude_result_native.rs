@@ -1,7 +1,7 @@
 //! Finite control-write regression and opted-in native Claude correlation smoke.
 //! The native test starts no tools/MCP or source edits; auth uses normal HOME.
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{domain::Status, stream};

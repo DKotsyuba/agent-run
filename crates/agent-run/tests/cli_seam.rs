@@ -1076,7 +1076,13 @@ impl ChildGuard {
     /// the child's isolated environment.
     fn exact(test: &str, envs: &[(&str, &str)]) -> Self {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
-        command.args(["--exact", test, "--test-threads", "1", "--nocapture"]);
+        command.args([
+            "--exact",
+            exact_test(test).as_str(),
+            "--test-threads",
+            "1",
+            "--nocapture",
+        ]);
         for (name, value) in envs {
             command.env(name, value);
         }
@@ -2217,4 +2223,13 @@ async fn agents_follow_stops_promptly_on_closed_output() {
         2,
         "no further request follows a failed write"
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

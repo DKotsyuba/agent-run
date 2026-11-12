@@ -1,6 +1,6 @@
 //! Disposable-home checks for bounded filesystem retention.
 
-mod common;
+use crate::common;
 
 use agent_run_core::housekeeping::sweep;
 use agent_run_platform::fs;

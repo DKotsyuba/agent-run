@@ -1,6 +1,6 @@
 //! Runner-level Codex app-server coverage using a shell-hosted fake server.
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_config::{config::Runtime, profiles::Profile};

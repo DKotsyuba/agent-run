@@ -2,7 +2,7 @@
 //! the closed inventory and authority matrix, envelope wire integrity, the
 //! writer lease, read-only handles and schema fences. Unimplemented writer
 //! paths must answer typed `Unsupported`, never a committed receipt.
-mod common;
+use crate::common;
 
 use agent_run_domain::storage::{
     MonoDeadline, OperationId, ProducerId, ProducerKind, RejectCode, SubmitResult, WriteAuthority,

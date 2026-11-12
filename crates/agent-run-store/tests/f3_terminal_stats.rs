@@ -1,7 +1,7 @@
 //! F3 on disposable private homes: the terminal commit writes no statistics
 //! row and reads no usage history; the reader projection plus the separate
 //! persist unit produce exactly the row the legacy path recorded.
-mod common;
+use crate::common;
 
 use agent_run_domain::domain::{Outcome, Status};
 use agent_run_store::{run_stats, terminal, writer::StoreReader};

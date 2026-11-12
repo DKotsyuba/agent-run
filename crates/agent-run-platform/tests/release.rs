@@ -162,7 +162,11 @@ fn fifo_child_entry() {
 fn bounded_verify(release: &Path) -> Option<String> {
     use std::io::Read;
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "fifo_child_entry", "--nocapture"])
+        .args([
+            "--exact",
+            exact_test("fifo_child_entry").as_str(),
+            "--nocapture",
+        ])
         .env("AGENT_RUN_FIFO_RELEASE", release)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -225,4 +229,13 @@ fn fifo_complete_is_refused_without_blocking() {
 #[test]
 fn fifo_manifest_is_refused_without_blocking() {
     assert_fifo_seal_refused("SHA256SUMS");
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

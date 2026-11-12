@@ -2,7 +2,7 @@
 //! engine double: a successful stdin write is `written` only, and an error
 //! after the engine closed stdin is `unknown`, never "not delivered".
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{domain::Status, stream};

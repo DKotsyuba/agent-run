@@ -1,5 +1,5 @@
 //! Application adapter acceptance on isolated fixture databases; no native engine is run.
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::AgentId,

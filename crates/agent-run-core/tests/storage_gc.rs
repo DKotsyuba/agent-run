@@ -784,7 +784,7 @@ fn partial_reference_census_permits_no_deletion() {
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "partial_reference_census_permits_no_deletion",
+                exact_test("partial_reference_census_permits_no_deletion").as_str(),
                 "--test-threads",
                 "1",
                 "--nocapture",
@@ -1634,4 +1634,13 @@ fn completed_scan_forgets_trees_missing_since_previous_pass() {
     converge(&mut store, &app_home, Mode::Apply);
     assert!(names(&shared, "blobs").is_empty());
     permit_tree(&shared);
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

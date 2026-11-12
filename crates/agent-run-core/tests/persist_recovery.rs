@@ -2,7 +2,7 @@
 //! material exists before any failable storage wait after the effect, is kept
 //! in a private owned file, and is settled as storage evidence only, never as
 //! a repeated native action.
-mod common;
+use crate::common;
 use agent_run_core::persist::Persist;
 use agent_run_domain::domain::AgentId;
 use agent_run_store::ops::JournalFragment;

@@ -1,5 +1,5 @@
 //! Synthetic Quota-v2 admission tests using the real client and writer.
-mod common;
+use crate::common;
 
 use agent_run_core::service::Service;
 use agent_run_domain::{

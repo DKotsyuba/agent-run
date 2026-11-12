@@ -1,8 +1,7 @@
 //! Real-process advisory context regressions for both native client envelopes.
 //! `AGENT_RUN_CONTEXT_TEST_BINARY` optionally selects the exact sealed candidate;
 //! ordinary CI uses Cargo's binary. Every home, socket and payload is synthetic.
-#[path = "support/test_broker.rs"]
-mod test_broker;
+use crate::test_broker;
 
 use agent_run::{config::Config, domain::OrchestratorRef};
 use agent_run_core::{
@@ -470,8 +469,7 @@ async fn sqlite_busy_preserves_context_and_the_explicit_context_command_stays_st
     }
 }
 
-#[path = "../../agent-run-core/tests/common/bridge.rs"]
-mod bridge;
+use crate::bridge_fixture as bridge;
 
 /// Finishes one synthetic fixture without launching an engine. Its notice is
 /// explicitly labelled as a transport control, never as a real task result.

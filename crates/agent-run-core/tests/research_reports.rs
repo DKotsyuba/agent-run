@@ -1,5 +1,5 @@
 //! Real shared dispatcher and filesystem boundary checks; no engine or model runs.
-mod common;
+use crate::common;
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{
     catalog::{AccountRecord, AccountStatus},

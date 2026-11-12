@@ -1,6 +1,6 @@
 //! Stable public references preserve exact run history and delayed hook binding.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{agent_identity, dispatch, hooks::bind, journal, service::Service};
 use agent_run_domain::{Error, domain::AgentId, domain::Outcome};

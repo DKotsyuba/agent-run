@@ -27,8 +27,7 @@ use std::{
 };
 use tokio::time::Instant;
 
-#[path = "support/test_broker.rs"]
-mod test_broker;
+use crate::test_broker;
 
 /// Builds a fixture home with the explicitly provisioned profile Python init omits.
 fn home() -> (tempfile::TempDir, PathBuf) {

@@ -6,7 +6,7 @@
 //! leaders included) and authority births must equal the authenticated
 //! principal.
 //! Legitimate pinned, repinned and replayed submissions keep working.
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::AgentId,

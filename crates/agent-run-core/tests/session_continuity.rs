@@ -13,7 +13,7 @@
 //! See `docs/session-continuity.md` for the missing cross-account seam and
 //! the pending real A→B proof.
 
-mod common;
+use crate::common;
 
 use agent_run_core::service::{LaunchIdentity, Service};
 use agent_run_core::{policy, profiles};

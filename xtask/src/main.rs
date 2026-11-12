@@ -77,8 +77,8 @@ fn main() {
         );
         std::process::exit(2);
     }
-    // Workspace test-fixtures features exist: default and all-feature Clippy/tests
-    // each protect a supported configuration; a default compile alone is insufficient.
+    // Workspace test-fixtures features exist: default and all-feature Clippy and
+    // tests each protect a supported configuration.
     for arguments in [
         vec!["fmt", "--all", "--check"],
         vec![
@@ -102,14 +102,6 @@ fn main() {
             "-D",
             "warnings",
         ],
-        vec![
-            "test",
-            "--offline",
-            "--locked",
-            "--workspace",
-            "--all-features",
-        ],
-        vec!["test", "--offline", "--locked", "--workspace"],
     ] {
         let status = Command::new("cargo")
             .args(arguments)
@@ -119,20 +111,12 @@ fn main() {
             std::process::exit(status.code().unwrap_or(1));
         }
     }
-    // The supported default-feature configuration must also compile; the
-    // all-features passes above do not prove the minimal build stays valid.
-    let status = Command::new("cargo")
-        .args([
-            "check",
-            "--offline",
-            "--locked",
-            "--workspace",
-            "--all-targets",
-        ])
-        .status()
-        .expect("cargo must be executable");
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    // The default-feature Clippy pass above already compiles every target of the
+    // minimal configuration, so no separate `cargo check` is needed.
+    let root = env::current_dir().expect("current directory must be readable");
+    if let Err(error) = xtask::gate::run_tests(&root) {
+        eprintln!("test gate: {error}");
+        std::process::exit(1);
     }
     // Documentation is part of the public contract: rustdoc warnings fail the
     // gate the same way compiler warnings do.
@@ -144,7 +128,6 @@ fn main() {
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
-    let root = env::current_dir().expect("current directory must be readable");
     if let Err(error) =
         xtask::family::contract(&root, false).and_then(|()| xtask::family::check(&root))
     {

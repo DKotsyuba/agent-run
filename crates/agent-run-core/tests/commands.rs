@@ -2,7 +2,7 @@
 //!
 //! These tests use SQLite temporary homes only; none require Unix sockets.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{commands, domain::Outcome};
 use serde_json::json;

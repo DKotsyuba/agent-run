@@ -1,6 +1,6 @@
 //! Durable transcript coverage for adapter-provided redaction.
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::redact::Redactor;
 use agent_run_adapters::{LaunchPlan, io::Process};

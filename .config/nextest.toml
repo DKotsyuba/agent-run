@@ -1,0 +1,38 @@
+# nextest settings for `cargo xtask check`. Doctests and the custom-harness
+# `launch_fd6` target run separately via `cargo test`.
+[profile.default]
+# Report every failing test in one run instead of stopping at the first one.
+fail-fast = false
+# Mark tests slower than 60 s; terminate a test after 10 periods (10 minutes).
+slow-timeout = { period = "60s", terminate-after = 10 }
+# `harness = false` binary that cannot answer `--list`.
+default-filter = "not binary(launch_fd6)"
+
+# nextest runs every test in its own process, so in-process test locks no longer
+# serialize tests. Every user of `FOLLOW_TESTS` (cli_seam) must be listed here;
+# `cargo xtask check` rejects a missing one.
+[test-groups]
+follow = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = """
+test(=cli_seam::test_transcript_follow_polls_without_duplicates_until_terminal_and_drained)
+| test(=cli_seam::test_transcript_text_follow_drains_without_duplicates)
+| test(=cli_seam::test_transcript_viewer_interrupt_leaves_the_agent_running)
+| test(=cli_seam::test_transcript_text_streams_fragments_across_pages)
+| test(=cli_seam::test_transcript_text_renders_two_claude_messages_distinctly)
+| test(=cli_seam::test_transcript_text_consumes_escape_splits_across_pages)
+| test(=cli_seam::test_transcript_text_bytes_are_visible_before_the_stream_completes)
+| test(=cli_seam::test_transcript_text_pipe_receives_fragments_before_the_agent_finishes)
+| test(=cli_seam::agents_follow_interrupt_ends_only_the_viewer)
+"""
+test-group = "follow"
+
+# Timing-sensitive tests (sub-second windows, short deadlines) run alone so
+# load from other test processes cannot starve them.
+[[profile.default.overrides]]
+filter = """
+test(=process::tests::cleanup_signals_captured_descendant_after_group_exit)
+| test(=release_wait::stalled_leaves_and_cancelled_verification_keep_terminal_kind)
+"""
+threads-required = "num-test-threads"

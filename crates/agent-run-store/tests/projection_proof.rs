@@ -5,7 +5,7 @@
 //! mutation, keeps required evidence from ledger pruning in the same
 //! transaction and drains large histories over fresh batches; migration 030
 //! rebuilds a populated ledger exactly and only the proof row refreshes.
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::AgentId,

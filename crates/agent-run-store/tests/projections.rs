@@ -2,7 +2,7 @@ use agent_run_domain::domain::AgentId;
 use agent_run_store::Store;
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 /// Admits one fresh test agent through the shared fixture home.
 fn agent(store: &mut Store, home: &common::Home) -> AgentId {

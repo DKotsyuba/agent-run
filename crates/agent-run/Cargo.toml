@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Durable local coding-agent supervisor"
 repository = "https://github.com/DKotsyuba/agent-run"
 publish.workspace = true
+autotests = false
 
 [dependencies]
 agent-run-adapters = { path = "../agent-run-adapters" }
@@ -50,3 +51,8 @@ required-features = ["test-fixtures"]
 
 [lints]
 workspace = true
+
+# All other integration tests build into one binary; see tests/it/main.rs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

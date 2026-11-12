@@ -1,7 +1,7 @@
 //! Initial Claude submission provenance through the real writer and finite
 //! shell engines. No provider, credentials or native Claude process is used.
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::{EngineResult, LaunchPlan, io::Process};
 use agent_run_core::{Result, domain::Status, stream};

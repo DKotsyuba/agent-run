@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-mod common;
+use crate::common;
 
 /// Synthetic authenticated delivery-only capability response; no native qualification.
 fn bridge_capabilities(allowed: bool) -> bridge_sdk::bridge_protocol::Capabilities {

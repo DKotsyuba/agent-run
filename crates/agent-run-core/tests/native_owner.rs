@@ -1,5 +1,5 @@
 //! Real native-loop, private-writer and kernel owner controls without models or production configuration.
-mod common;
+use crate::common;
 use agent_run_adapters::{
     LaunchPlan,
     io::Process,

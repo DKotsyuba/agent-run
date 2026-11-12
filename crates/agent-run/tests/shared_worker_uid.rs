@@ -468,7 +468,12 @@ async fn real_uid_shared_worker() {
     fs::set_permissions(&work, fs::Permissions::from_mode(0o755)).unwrap();
     let mut setup = user_command(1000, true, &broker_tmp, &harness);
     setup
-        .args(["--ignored", "--exact", "prepare_state", "--nocapture"])
+        .args([
+            "--ignored",
+            "--exact",
+            exact_test("prepare_state").as_str(),
+            "--nocapture",
+        ])
         .env("AR_UID_STATE", &state)
         .env("AR_UID_PRIVATE", &private)
         .env(
@@ -623,7 +628,12 @@ async fn real_uid_shared_worker() {
     let id_file = client_tmp.join("id");
     let mut client_command = user_command(client_uid, true, &client_tmp, &harness);
     client_command
-        .args(["--ignored", "--exact", "group_client", "--nocapture"])
+        .args([
+            "--ignored",
+            "--exact",
+            exact_test("group_client").as_str(),
+            "--nocapture",
+        ])
         .env("AR_UID_API", &api)
         // The fake engine confines its resumed history to its test workdir;
         // this disposable root contains both the work and worker-private home.
@@ -685,4 +695,13 @@ async fn real_uid_shared_worker() {
         fs::remove_file(path).unwrap();
     }
     fs::remove_dir(executable_dir).unwrap();
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

@@ -2,8 +2,7 @@
 //! Account writes test authenticated transport, durable receipts, retries and
 //! neighbour progress; native streaming is covered by provider_initial tests.
 
-#[path = "support/test_broker.rs"]
-mod test_broker;
+use crate::test_broker;
 
 use agent_run_core::{
     persist,
@@ -353,7 +352,7 @@ fn child(home: &Path, worker: usize, seconds: u64, rounds: usize) -> tokio::proc
     command
         .args([
             "--exact",
-            "load_producer_child",
+            exact_test("load_producer_child").as_str(),
             "--nocapture",
             "--test-threads=1",
         ])
@@ -715,4 +714,13 @@ async fn lock_release_and_long_refusal_preserve_neighbour_progress() {
     assert_eq!(receipts, 3);
     drop(reader);
     broker.stop().await;
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

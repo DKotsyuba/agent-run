@@ -2,7 +2,7 @@
 //! committed rows still in the WAL, and incident projections keep the closed
 //! persistence operation, wait and attempts, bounded, after their source
 //! events are deleted.
-mod common;
+use crate::common;
 
 use agent_run_store::{diagnostics::diagnostic_snapshot, writer::StoreReader};
 use rusqlite::params;

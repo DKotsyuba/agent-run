@@ -329,7 +329,11 @@ fn supervisor_crash_during_owner_write_remains_unknown_no_resend() {
         .unwrap();
     drop(store);
     let mut supervisor = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crashing_supervisor_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            exact_test("crashing_supervisor_fixture").as_str(),
+            "--nocapture",
+        ])
         .env_clear()
         .env("RUN_R3_FIXTURE_HOME", dir.path())
         .env("TMPDIR", dir.path())
@@ -437,4 +441,13 @@ fn crashing_supervisor_fixture() {
     assert!(native.wait().unwrap().success());
     std::fs::write(home.join("native-received"), b"ok").unwrap();
     std::thread::park();
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

@@ -1,6 +1,6 @@
 //! Ports the remaining durable-store behaviors from the Python state-store suite.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     Error,

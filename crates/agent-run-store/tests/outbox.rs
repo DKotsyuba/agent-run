@@ -1,6 +1,6 @@
 //! Direct ports of the remaining Python completion-outbox contracts.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::domain::{OrchestratorRef, Outcome};
 use agent_run_platform::{fs, verify};

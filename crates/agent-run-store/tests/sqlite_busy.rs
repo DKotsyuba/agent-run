@@ -1,5 +1,5 @@
 //! Contention and commit-boundary evidence on disposable WAL databases only.
-mod common;
+use crate::common;
 use agent_run_domain::{Error, domain::Outcome, error::PersistenceOperation};
 use agent_run_platform::process::{Identity, OwnershipSnapshot};
 use serde_json::json;

@@ -1,7 +1,7 @@
 //! Ports `tests/test_profiles.py` and `tests/test_effective_policy.py`
 //! (profile parsing/write decisions and effective-policy admission), plus
 //! the `required_constraints` union regression (see `docs/api.md`).
-mod common;
+use crate::common;
 
 use agent_run_config::{
     policy::{self, Constraint, DeclaredCapability, Enforcement},

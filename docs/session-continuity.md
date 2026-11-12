@@ -72,7 +72,7 @@ or ambiguous submitted turn cannot count as continuity.
 
 The fail-closed negatives an account handoff must satisfy are pinned by
 `crates/agent-run-core/tests/session_continuity.rs`
-(`cargo test --locked -p agent-run-core --test session_continuity`), which
+(`cargo nextest run --locked -p agent-run-core -E 'test(/^session_continuity::/)'`), which
 drives the real `Service::resume` boundary with temporary homes and store
 fixtures only — no provider, credential store, or real account:
 
@@ -84,10 +84,10 @@ fixtures only — no provider, credential store, or real account:
 The remaining boundary conditions are already pinned by existing targets and
 are not duplicated:
 
-- `--test codex_resume`: account and model pinning at the config boundary,
+- `codex_resume` tests: account and model pinning at the config boundary,
   single-continuation lineage atomicity, runtime-home drift detection, and
   refusal of Python-created runs.
-- `--test resume_stream`: a result whose `session_id` is missing or foreign
+- `resume_stream` tests: a result whose `session_id` is missing or foreign
   cannot certify a resumed run.
 - `agent-run-adapters`' `codex_session.rs`: a replayed turn completion
   without a new turn ID is ignored, so tool results cannot be journaled

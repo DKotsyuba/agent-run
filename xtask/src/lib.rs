@@ -1,12 +1,14 @@
 //! Library surface for xtask's release/deploy logic.
 //!
 //! `main.rs` is a thin CLI shim over these modules; splitting them into a
-//! library target lets `xtask/tests/*.rs` integration tests exercise the
-//! same code the CLI calls (`cargo test -p xtask --test release` and
-//! `--test deploy_recovery`).
+//! library target lets the `xtask/tests/*.rs` integration modules (one `it`
+//! binary) exercise the same code the CLI calls, for example
+//! `cargo nextest run -p xtask -E 'test(/^(release|deploy_recovery)::/)'`.
 pub mod archive;
 pub mod deploy;
 pub mod family;
+/// Test steps of the repository gate (nextest, doctests, tmpfs scratch).
+pub mod gate;
 pub mod installer;
 pub mod release;
 

@@ -1,6 +1,6 @@
 //! Bounded block views and native tool-evidence contracts over real rows.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::AgentId,

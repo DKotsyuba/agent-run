@@ -1,7 +1,7 @@
 //! Journal batching of the supervisor's persistence facade against a real
 //! writer: batches are cut by exact encoded size, never lose a row and never
 //! exceed the operation's bound.
-mod common;
+use crate::common;
 use serde_json::json;
 
 /// A transcript whose chunks are all control characters encodes six times

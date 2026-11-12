@@ -1,6 +1,5 @@
 //! CLI-surface hook parser coverage using only temporary homes and fake payloads.
-#[path = "support/test_broker.rs"]
-mod test_broker;
+use crate::test_broker;
 
 use agent_run::{
     cli::{Bind, Cli, Command, Context, Hook, HookTransport},

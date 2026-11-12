@@ -3,7 +3,7 @@
 //! These tests drive the real stream runner against a file-backed fake engine
 //! so journal identity, dedup, and ordering are proven without a provider.
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{domain::Status, stream};

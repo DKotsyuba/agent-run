@@ -1005,7 +1005,11 @@ fn assert_fifo_install_refused(seal_file: &str) {
     .map(|path| path.to_string_lossy().into_owned())
     .join(":");
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "fifo_installer_child_entry", "--nocapture"])
+        .args([
+            "--exact",
+            exact_test("fifo_installer_child_entry").as_str(),
+            "--nocapture",
+        ])
         .env("AGENT_RUN_FIFO_INSTALL", paths)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1051,4 +1055,13 @@ fn fifo_complete_is_refused_by_the_installer_without_blocking() {
 #[test]
 fn fifo_manifest_is_refused_by_the_installer_without_blocking() {
     assert_fifo_install_refused("SHA256SUMS");
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

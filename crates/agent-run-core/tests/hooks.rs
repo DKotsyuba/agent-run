@@ -1,6 +1,6 @@
 //! Temp-home parity coverage for Python bind and context hook contracts.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{
     domain::{AgentId, OrchestratorRef, Outcome, Status, now},

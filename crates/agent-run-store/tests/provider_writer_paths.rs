@@ -3,7 +3,7 @@
 //! cleanup proof inside the terminal transaction (row 42) and nothing else
 //! does; runtime layouts (rows 88/89) are authorized against their owner
 //! execution, read inside the write transaction for a commit.
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::{AgentId, Outcome, Status},

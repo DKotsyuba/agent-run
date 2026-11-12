@@ -3,7 +3,7 @@
 //! process identities are parsed strictly and proven gone before offline
 //! authority is granted, and the online writer never follows a symlinked
 //! state database into another home.
-mod common;
+use crate::common;
 
 use agent_run_store::writer::{BrokerExclusion, StoreWriter, WriterLease};
 use fs2::FileExt;

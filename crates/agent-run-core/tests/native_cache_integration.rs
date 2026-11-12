@@ -8,7 +8,7 @@
 //! after sealing.
 #![cfg(feature = "test-fixtures")]
 
-mod common;
+use crate::common;
 
 use agent_run_core::{
     native_cache::{self},

@@ -1,6 +1,6 @@
 //! Mirrors Python `tests/test_run_stats.py` against the Rust durable store.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::domain::{AgentId, Outcome};
 use agent_run_platform::{fs, verify};

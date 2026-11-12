@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autotests = false
 
 [dependencies]
 agent-run-domain = { path = "../agent-run-domain" }
@@ -25,3 +26,8 @@ workspace = true
 name = "launch_fd6"
 path = "tests/launch_fd6.rs"
 harness = false
+
+# All other integration tests build into one binary; see tests/it/main.rs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

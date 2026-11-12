@@ -1,6 +1,6 @@
 //! Synthetic database identity, scope and backup invariants.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     Error, StoreId,

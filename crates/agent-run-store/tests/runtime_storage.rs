@@ -1,6 +1,6 @@
 //! Durable runtime storage-layout registry: contract, pins, recovery, removal.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{Error, domain::Outcome};
 use agent_run_store::{

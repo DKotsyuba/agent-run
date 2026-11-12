@@ -329,12 +329,12 @@ committed lockfile and the actual integrated source. Examples of existing target
 
 ```sh
 cargo test --locked -p agent-run-platform --all-features --lib shared_assets
-cargo test --locked -p agent-run-core --all-features --test native_publication
-cargo test --locked -p agent-run-adapters --all-features
-cargo test --locked -p agent-run-store --test process_ownership --test ownership
-cargo test --locked -p agent-run-store --test pool_chat --test pool_schema
-cargo test --locked -p agent-run --all-features --test provider_public_boundary --test worker_pool_wire
-cargo test --locked -p agent-run-store --test retention --test state_migrations --test diagnostics
+cargo nextest run --locked -p agent-run-core --all-features -E 'test(/^native_publication::/)'
+cargo nextest run --locked -p agent-run-adapters --all-features
+cargo nextest run --locked -p agent-run-store -E 'test(/^(process_ownership|ownership)::/)'
+cargo nextest run --locked -p agent-run-store -E 'test(/^(pool_chat|pool_schema)::/)'
+cargo nextest run --locked -p agent-run --all-features -E 'test(/^(provider_public_boundary|worker_pool_wire)::/)'
+cargo nextest run --locked -p agent-run-store -E 'test(/^(retention|state_migrations|diagnostics)::/)'
 ```
 
 After the full candidate is coherent, run the repository gate, offline dependency

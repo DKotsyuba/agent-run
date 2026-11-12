@@ -1344,17 +1344,23 @@ mod tests {
         assert!(!leader_may_be_signalled(&leader), "dead leader");
     }
 
-    /// A recorded leader that no longer leads its group (here: the test process,
-    /// which belongs to another group) is never a signalling target.
+    /// A recorded leader that no longer leads its group (here: a child that
+    /// inherits the test's group) is never a signalling target. A child is used
+    /// because a test runner such as nextest may make the test process itself
+    /// a group leader.
     #[test]
     fn a_non_leader_is_never_signalled() {
-        let me = process::inspect(std::process::id() as i32).unwrap();
-        assert_ne!(me.group, me.pid);
-        let mut claimed = me.clone();
-        claimed.group = me.pid;
-        assert!(
-            !leader_may_be_signalled(&claimed),
-            "claimed leadership is re-checked"
-        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let member = process::inspect(child.id() as i32).unwrap();
+        let mut claimed = member.clone();
+        claimed.group = member.pid;
+        let refused = !leader_may_be_signalled(&claimed);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_ne!(member.group, member.pid);
+        assert!(refused, "claimed leadership is re-checked");
     }
 }
