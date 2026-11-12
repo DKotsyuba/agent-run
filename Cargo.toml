@@ -61,6 +61,21 @@ opt-level = 3
 [profile.dev.package.cpufeatures]
 opt-level = 3
 
+# Backtraces keep file/line; dependencies carry no debug info. This keeps test
+# binaries small and links fast. Use `--profile debugging` for full debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

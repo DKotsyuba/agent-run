@@ -1,6 +1,6 @@
 //! Blocking wait behavior against durable state and observer deadlines.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{
     domain::{AgentId, Status},

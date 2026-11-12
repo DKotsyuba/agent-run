@@ -1,6 +1,6 @@
 //! Synthetic initial-task read tests; no provider process or live service is started.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     Error, ProviderStartRequest, Sha256Digest,

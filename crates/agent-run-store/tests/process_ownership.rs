@@ -1,6 +1,6 @@
 //! Durable ownership and conflict checks using inert identities rather than spawned processes.
 
-mod common;
+use crate::common;
 
 use agent_run_platform::process::{Identity, OwnedProcess, OwnershipSnapshot};
 use agent_run_store::Store;

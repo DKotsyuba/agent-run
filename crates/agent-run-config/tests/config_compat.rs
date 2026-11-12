@@ -14,7 +14,7 @@
 //! canonicalize the fixture path fields that production canonicalizes. This
 //! keeps every other value strict while tolerating host aliases such as
 //! Linux's `/bin/echo` -> `/usr/bin/echo`.
-mod common;
+use crate::common;
 
 use agent_run_config::{config::Config, profiles};
 use agent_run_domain::error::Error;
@@ -498,7 +498,7 @@ fn run_home_isolated_case(case: &Case) {
         std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "golden_config_cases_match_python",
+                exact_test("golden_config_cases_match_python").as_str(),
                 "--test-threads",
                 "1",
                 "--nocapture",
@@ -542,5 +542,14 @@ impl Drop for ConfigCaseChild {
     /// Kills/reaps this exact fixture child on every exit, including parent panic.
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
     }
 }

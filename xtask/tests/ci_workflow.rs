@@ -250,9 +250,14 @@ fn xtask_entrypoints_and_builds_use_locked_resolution() {
         source.contains("\"--\",\n            \"-D\",\n            \"warnings\","),
         "cargo xtask check must deny clippy warnings"
     );
+    let gate = repository_file("xtask/src/gate.rs");
     assert!(
-        source.contains("\"test\",\n            \"--offline\",\n            \"--locked\","),
-        "cargo xtask check must lock test resolution"
+        gate.contains("\"nextest\",\n            \"run\",\n            \"--offline\",\n            \"--locked\","),
+        "cargo xtask check must lock nextest resolution"
+    );
+    assert!(
+        gate.contains("\"test\",\n            \"--offline\",\n            \"--locked\","),
+        "cargo xtask check must lock doctest resolution"
     );
     assert!(
         source.contains(

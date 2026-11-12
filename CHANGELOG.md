@@ -4,6 +4,24 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `cargo xtask check` follows the Rust gate standard: tests run under
+  cargo-nextest (required; CI installs 0.9.149 from a checksum-verified
+  archive) with every failure reported, `RUST_TEST_THREADS` forwarded as
+  `--test-threads`; doctests and `launch_fd6` run under `cargo test`; test
+  temporaries use a private tmpfs directory when usable (`XTASK_TEST_TMPFS=0`
+  opts out). The redundant default-feature `cargo check` after Clippy is gone.
+  Every package builds its integration tests as one `it` binary, and the gate
+  rejects an unlisted `tests/*.rs` file or a `FOLLOW_TESTS` user missing from
+  its nextest group. The dev profile keeps line-table debug info only
+  (`--profile debugging` for full).
+
+### Fixed
+
+- `a_non_leader_is_never_signalled` checks a child process instead of the test
+  process, which a test runner may make a process-group leader.
+
 ## 0.31.1
 
 Released 2026-11-11.

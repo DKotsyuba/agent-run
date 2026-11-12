@@ -1,6 +1,6 @@
 //! Authenticated pool chat, proposals, votes, budgets and derived status.
 
-mod common;
+use crate::common;
 
 /// Snapshot of agent rows, the pool roster revision and current member rows.
 type ReplacementState = (

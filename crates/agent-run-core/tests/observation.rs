@@ -1,5 +1,5 @@
 //! Synthetic read-only observation regressions; no engines or external services.
-mod common;
+use crate::common;
 
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{Error, domain::AgentId, observation::AnswerChunkQuery};

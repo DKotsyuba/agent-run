@@ -3,7 +3,7 @@
 //! These tests use a file-backed fake engine and temporary homes only; none of
 //! them need a Unix socket or a real provider.
 
-mod common;
+use crate::common;
 
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{dispatch, domain::Status, service::Service, stream};

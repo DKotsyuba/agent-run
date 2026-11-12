@@ -1,5 +1,5 @@
 //! Historical quota requests can replay stored outcomes but cannot mutate the store.
-mod common;
+use crate::common;
 
 use agent_run_domain::storage::{
     MonoDeadline, OperationId, ProducerId, ProducerKind, RejectCode, RejectStage, StorageRejection,

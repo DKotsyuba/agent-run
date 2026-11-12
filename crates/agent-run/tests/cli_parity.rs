@@ -1,6 +1,5 @@
 //! Frozen parser and process-boundary checks mirroring Python CLI tests.
-#[path = "support/test_broker.rs"]
-mod test_broker;
+use crate::test_broker;
 
 use agent_run::{
     Error,

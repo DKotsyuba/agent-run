@@ -1,6 +1,6 @@
 //! History expiry tests use private databases and never spawn engine processes.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::Error;
 use agent_run_domain::domain::{AgentId, OrchestratorRef};

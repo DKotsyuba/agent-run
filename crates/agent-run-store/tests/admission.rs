@@ -1,6 +1,6 @@
 //! Admission transaction regressions ported from the Python state/service suite.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{Error, domain::Status};
 use serde_json::json;
@@ -191,7 +191,7 @@ fn process_death_mid_transaction_leaves_no_partial_admission() {
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "crash_worker_dies_between_admission_writes",
+            exact_test("crash_worker_dies_between_admission_writes").as_str(),
             "--nocapture",
         ])
         .env("AGENT_RUN_ADMISSION_CRASH_HOME", &home.path)
@@ -216,4 +216,13 @@ fn process_death_mid_transaction_leaves_no_partial_admission() {
             .unwrap(),
         0
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

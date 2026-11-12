@@ -93,8 +93,13 @@ async fn rpc_reports_leader_exit_instead_of_waiting_for_its_deadline() {
     assert!(error.to_string().contains("exit code 7"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(fixture.0.reap().await, Some(7));
-    assert_eq!(
-        process::observe(Some(child.pid), Some(&child.token), Some(child.birth)),
-        ProcessState::Dead
-    );
+    // The killed descendant may still be exiting right after the reap; observe
+    // until the leader identity reads as dead instead of sampling once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut state = process::observe(Some(child.pid), Some(&child.token), Some(child.birth));
+    while state != ProcessState::Dead && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        state = process::observe(Some(child.pid), Some(&child.token), Some(child.birth));
+    }
+    assert_eq!(state, ProcessState::Dead);
 }

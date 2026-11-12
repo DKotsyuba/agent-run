@@ -1,5 +1,5 @@
 //! Offline mixed-pool contract proofs; no engine/provider is launched.
-mod common;
+use crate::common;
 use agent_run_core::service::Service;
 use agent_run_domain::{
     catalog::{AccountRecord, AccountStatus},

@@ -1,6 +1,6 @@
 //! Ports `tests/test_role_plan.py` (canonical role resolution and its
 //! frozen, Python-compatible payload/hash).
-mod common;
+use crate::common;
 
 use agent_run_config::{
     config::Mcp,

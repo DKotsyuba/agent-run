@@ -1,6 +1,6 @@
 //! Store ports of Python terminal/outbox durability tests.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::domain::{OrchestratorRef, Outcome, Status};
 use agent_run_platform::{fs, verify};

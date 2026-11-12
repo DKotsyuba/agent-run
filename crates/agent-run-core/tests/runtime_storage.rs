@@ -962,7 +962,7 @@ fn run_bounded(command: &mut std::process::Command) -> std::process::Output {
 /// Ignored by default: it shells out to the real `codex` binary (`CODEX_BIN`
 /// or `PATH`) against owned fixture homes with no credentials and no model
 /// turn. Run it explicitly with
-/// `cargo test -p agent-run-core --features test-fixtures --test runtime_storage -- --ignored`.
+/// `cargo test -p agent-run-core --features test-fixtures --test it runtime_storage:: -- --ignored`.
 #[test]
 #[ignore = "runs the real codex binary; select it with CODEX_BIN"]
 fn native_codex_discovers_coordinator_parent_mount() {

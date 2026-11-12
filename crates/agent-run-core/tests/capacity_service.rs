@@ -1,5 +1,5 @@
 //! Capacity service parity tests for runtime filtering and JSON dispatch.
-mod common;
+use crate::common;
 
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::domain::now;

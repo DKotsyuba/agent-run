@@ -45,7 +45,11 @@ fn r2_socket_fake_peer_child() {
 async fn r2_fake_peer(executable: &Path, socket: &Path, frame: &str, output: &Path) -> String {
     let _ = std::fs::remove_file(output);
     let child = tokio::process::Command::new(executable)
-        .args(["--exact", "r2_socket_fake_peer_child", "--nocapture"])
+        .args([
+            "--exact",
+            exact_test("r2_socket_fake_peer_child").as_str(),
+            "--nocapture",
+        ])
         .env_clear()
         .env("RUN_R2_PEER_SOCKET", socket)
         .env("RUN_R2_PEER_FRAME", frame)
@@ -1052,4 +1056,14 @@ bridge_reader_credential_sha256="{token_hash}"
     assert_eq!(response["error"].as_object().unwrap().len(), 4);
     broker.abort();
     let _ = broker.await;
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+#[cfg(target_os = "linux")]
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

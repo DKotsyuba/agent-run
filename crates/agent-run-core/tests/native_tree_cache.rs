@@ -2,7 +2,7 @@
 //! Gated on the crate's deterministic test-seams feature.
 #![cfg(feature = "test-fixtures")]
 
-mod common;
+use crate::common;
 
 use agent_run_core::native_tree_cache::{self, FreezeOutcome, NativeCacheKind, NativeRefScan};
 use agent_run_platform::{

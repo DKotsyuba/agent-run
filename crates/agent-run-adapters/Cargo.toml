@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autotests = false
 
 [dependencies]
 agent-run-config = { path = "../agent-run-config" }
@@ -29,3 +30,8 @@ test-fixtures = []
 
 [lints]
 workspace = true
+
+# All other integration tests build into one binary; see tests/it/main.rs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

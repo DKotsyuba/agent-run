@@ -64,6 +64,18 @@ cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs
 ```
 
+`cargo xtask check` requires cargo-nextest: tests run one process per test
+with every failure reported, doctests and the custom-harness `launch_fd6`
+target run under `cargo test`, and test temporaries go to a private tmpfs
+directory (`XTASK_TEST_TMPFS=0` keeps them on disk). `RUST_TEST_THREADS` is
+passed to nextest as `--test-threads`. Each package builds its integration
+tests as one `tests/it/main.rs` binary: add every new `tests/*.rs` there as a
+module (the gate enforces it), declare shared helpers once there, and let a
+test that re-runs itself pass its module-qualified name (`exact_test`). Tests
+serialized by `FOLLOW_TESTS` must also be listed in `.config/nextest.toml`.
+While iterating, run targeted tests such as
+`cargo nextest run -p agent-run-core -E 'test(/^delivery::/)'`.
+
 If a transport changed, add a live API/MCP smoke. If an adapter or supervisor
 changed, identify the fixture or real-engine run proving it. `agent-run doctor`
 must remain clean. Release and deployment procedures are in

@@ -3,7 +3,7 @@
 //! reports the writer's operation, closed phase and SQLite codes with the real
 //! wait; the lane never reports a refusal as success and keeps its head.
 //! (The unknown-outcome totals are covered by the lane's scripted-peer tests.)
-mod common;
+use crate::common;
 use agent_run_core::{
     persist::{self, Persist},
     process::OwnedProcess,

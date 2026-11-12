@@ -1,5 +1,5 @@
 //! Global/profile selection, exact tool caps and frozen legacy compatibility.
-mod common;
+use crate::common;
 
 use agent_run_config::{
     config::Mcp,

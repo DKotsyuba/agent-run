@@ -5,7 +5,7 @@
 //! reads (never occupies) the original receipt, and delivery,
 //! reconciliation, service and history rows apply only their guarded
 //! transitions.
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::AgentId,

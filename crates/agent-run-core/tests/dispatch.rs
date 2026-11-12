@@ -1,5 +1,5 @@
 //! Dispatch parity tests for the transport-neutral public tool table.
-mod common;
+use crate::common;
 
 use agent_run_core::{dispatch, policy, profiles, service::LaunchIdentity, service::Service};
 use agent_run_domain::domain::Status;

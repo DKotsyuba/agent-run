@@ -1,6 +1,6 @@
 //! Service facade regressions that use durable state only and never launch an engine.
 
-mod common;
+use crate::common;
 
 use agent_run_core::service::{Query, Service};
 use agent_run_core::{policy, profiles};

@@ -447,7 +447,7 @@ fn rejected_parent_and_temp_creation_close_every_descriptor() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "rejected_parent_and_temp_creation_close_every_descriptor",
+                exact_test("rejected_parent_and_temp_creation_close_every_descriptor").as_str(),
                 "--nocapture",
             ])
             .env("AGENT_RUN_TEST_FD_ISOLATED", "1")
@@ -613,4 +613,13 @@ fn unsupported_directory_sync_does_not_reject_publication() {
         std::fs::read(root.path().join("answer.md")).unwrap(),
         b"replacement"
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

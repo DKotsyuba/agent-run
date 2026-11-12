@@ -1,5 +1,5 @@
 //! Incident retention/immutability tests use owned fixture databases and no model turns.
-mod common;
+use crate::common;
 use agent_run_domain::domain::{AgentId, Outcome};
 use agent_run_store::{Store, incidents};
 use rusqlite::params;

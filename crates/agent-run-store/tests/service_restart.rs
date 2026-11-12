@@ -1,5 +1,5 @@
 //! A restart captures existing work and atomically closes new admissions.
-mod common;
+use crate::common;
 
 use agent_run_domain::{Error, domain::OrchestratorRef};
 use serde_json::json;

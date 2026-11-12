@@ -1,5 +1,5 @@
 //! Real Codex runner, writer and process cleanup; no provider or model is invoked.
-mod common;
+use crate::common;
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::domain::Status;
 use agent_run_domain::worker::{FinishRequest, FinishStatus};

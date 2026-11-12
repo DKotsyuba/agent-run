@@ -154,8 +154,8 @@ thaw of both roots ≈2.4 s (≈1.5 s is the full content verification),
 store guard scan ≈0.14 s. The remainder is per-entry metadata syscalls
 (`linkat`, `openat`, `fchmodat`, `unlinkat` at ~0.1–0.5 ms each on APFS
 for 7732 entries), not flushes. Run the benchmark with
-`cargo test --release -p agent-run-core --features test-fixtures --test
-native_tree_cache measure_curated_increment -- --ignored --nocapture`.
+`cargo test --release -p agent-run-core --features test-fixtures --test it
+native_tree_cache::measure_curated_increment -- --ignored --nocapture`.
 
 Implementation note: a no-follow directory handle's `list` is single-shot
 per handle (its duplicate shares the enumeration offset), so every walk in

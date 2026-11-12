@@ -706,5 +706,4 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     );
 }
 
-#[path = "../../agent-run-core/tests/common/bridge.rs"]
-mod bridge_fixture;
+use crate::bridge_fixture;

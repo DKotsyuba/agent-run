@@ -653,13 +653,36 @@ esac
             fs::read_link(fixture.prefix.join("current")).unwrap(),
             current
         );
-        assert!(!fs::read_dir(fixture.temporary.path()).unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("agent-run-install.")
-        }));
+        let retained = retained_install_scratch(fixture.temporary.path());
+        assert!(
+            retained.is_empty(),
+            "installer scratch retained: {retained:?}"
+        );
     }
+}
+
+/// Lists `agent-run-install.*` scratch directories left in `dir` with their
+/// entry names, so a failure shows which run and stage kept its scratch (for
+/// example a `cleanup-unconfirmed` marker or partially downloaded assets).
+fn retained_install_scratch(dir: &Path) -> Vec<(String, Vec<String>)> {
+    let mut retained = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("agent-run-install.") {
+            let mut contents: Vec<String> = fs::read_dir(entry.path())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|item| item.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            contents.sort();
+            retained.push((name, contents));
+        }
+    }
+    retained
 }
 
 /// Both bundled commands use the configured home, honor overrides and reinstall safely.
@@ -1005,7 +1028,11 @@ fn assert_fifo_install_refused(seal_file: &str) {
     .map(|path| path.to_string_lossy().into_owned())
     .join(":");
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "fifo_installer_child_entry", "--nocapture"])
+        .args([
+            "--exact",
+            exact_test("fifo_installer_child_entry").as_str(),
+            "--nocapture",
+        ])
         .env("AGENT_RUN_FIFO_INSTALL", paths)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1051,4 +1078,13 @@ fn fifo_complete_is_refused_by_the_installer_without_blocking() {
 #[test]
 fn fifo_manifest_is_refused_by_the_installer_without_blocking() {
     assert_fifo_install_refused("SHA256SUMS");
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

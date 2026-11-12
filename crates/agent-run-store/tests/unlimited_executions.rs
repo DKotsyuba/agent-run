@@ -1,5 +1,5 @@
 //! Schema-28 migration preserves exact historical evidence while retiring active clocks.
-mod common;
+use crate::common;
 use agent_run_store::{VERSION, migrations};
 use rusqlite::{Connection, params};
 use serde_json::json;

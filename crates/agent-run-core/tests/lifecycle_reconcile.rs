@@ -3,7 +3,7 @@
 //! Each test name states the Python regression it mirrors.  The observer hook
 //! lets the tests cover unavailable PID evidence without fabricating OS state.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{
     domain::{Outcome, Status},

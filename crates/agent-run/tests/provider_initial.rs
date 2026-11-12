@@ -49,8 +49,7 @@ mod sqlite_busy;
 #[path = "provider_initial/quota_synthetic.rs"]
 mod quota_synthetic;
 
-#[path = "support/test_broker.rs"]
-mod test_broker;
+use crate::test_broker;
 
 /// Starts the ordinary agent-run supervisor executable under an in-process
 /// writer broker, authenticated with a launch capability, with one synthetic

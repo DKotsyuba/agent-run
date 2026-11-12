@@ -1,6 +1,6 @@
 //! Synthetic status wiring: one database snapshot, no provider process.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{

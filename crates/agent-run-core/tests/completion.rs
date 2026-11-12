@@ -1,7 +1,7 @@
 //! Ports the completion-decision-policy behavior of `tests/test_verify.py`
 //! (Python) to Rust's `verify::{inspect_answer, silence_seconds, verify_completion}`.
 //! Each test names the Python test it mirrors.
-mod common;
+use crate::common;
 use agent_run_domain::domain::{Outcome, Status};
 use agent_run_platform::verify::{
     self, ANSWER_INCOMPLETE, ANSWER_PRESENT, ENGINE_VANISHED, GROUP_SURVIVED, NO_ANSWER,

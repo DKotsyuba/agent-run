@@ -1,6 +1,6 @@
 //! Synthetic initial-task wiring through the shared dispatcher; no provider process.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{

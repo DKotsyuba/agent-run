@@ -14,7 +14,7 @@ For the local edit loop, check the affected package and run its relevant test:
 
 ```bash
 cargo check --frozen -p agent-run-core --all-targets
-cargo test --frozen -p agent-run-core --test delivery claude_uds
+cargo nextest run --frozen -p agent-run-core -E 'test(/^delivery::/)'
 ```
 
 Choose selectors for the actual changed package and behavior. This focused loop

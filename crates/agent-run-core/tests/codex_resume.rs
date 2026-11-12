@@ -1,6 +1,6 @@
 //! Python-parity tests for native Codex continuation identity and account homes.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{
     codex::runtime_home,

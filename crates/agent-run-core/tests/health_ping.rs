@@ -1,5 +1,5 @@
 //! Real writer, native stream and process cleanup; no provider or model is invoked.
-mod common;
+use crate::common;
 use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{domain::Status, service::Service, stream};
 use agent_run_domain::{health::PingPolicy, storage::WriteAuthority};

@@ -1,6 +1,6 @@
 //! Atomic success holds, permanent replay and authenticated release in disposable stores.
 
-mod common;
+use crate::common;
 
 #[path = "lineage_holds/writer.rs"]
 mod writer;

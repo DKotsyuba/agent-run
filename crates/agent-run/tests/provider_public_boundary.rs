@@ -28,7 +28,10 @@ fn fixture_temp_base_falls_back_to_tmpdir() {
     }
     let dir = tempfile::tempdir().unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "fixture_temp_base_falls_back_to_tmpdir"])
+        .args([
+            "--exact",
+            exact_test("fixture_temp_base_falls_back_to_tmpdir").as_str(),
+        ])
         .env_clear()
         .env("TMPDIR", dir.path())
         .env(CHILD, "1")
@@ -1690,4 +1693,13 @@ async fn delegation_guide_is_plain_text_on_every_public_transport() {
         strict_reply["result"].get("structuredContent").is_none(),
         "{strict_reply}"
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

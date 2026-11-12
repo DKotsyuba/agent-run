@@ -2,7 +2,7 @@
 //! the same home is refused by the lease, submissions reach the dedicated
 //! thread and come back typed, and a drained service refuses new work as
 //! not enqueued.
-mod common;
+use crate::common;
 use agent_run_core::writer::{WriterConfig, WriterService};
 use agent_run_domain::storage::{
     MonoDeadline, NotEnqueuedReason, OperationId, ProducerId, ProducerKind, RejectCode,

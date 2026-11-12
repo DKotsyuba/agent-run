@@ -1,6 +1,6 @@
 //! Logging setup parity checks for the process-wide Rust logger.
 
-mod common;
+use crate::common;
 
 use agent_run_core::logging::{self, Level};
 use agent_run_core::service::Service;
@@ -73,7 +73,7 @@ fn isolated_logging(test: &str, level: Option<&str>) -> bool {
     }
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", test, "--nocapture"])
+        .args(["--exact", exact_test(test).as_str(), "--nocapture"])
         .env("AGENT_RUN_TEST_LOGGING_CASE", test)
         .env_remove("AGENT_RUN_LOG_LEVEL");
     if let Some(level) = level {
@@ -238,4 +238,13 @@ fn config_reload_rejection_survives_warning_threshold() {
         fs::sha256(&original)
     )));
     assert!(!text.contains(invalid));
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

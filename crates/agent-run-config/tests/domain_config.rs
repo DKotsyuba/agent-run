@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 use agent_run_config::{
     config::{self, Adapter, Config},
     policy::{self, Constraint},

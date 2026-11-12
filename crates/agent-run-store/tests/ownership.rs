@@ -1,6 +1,6 @@
 //! Acceptance evidence for startup ownership claims and supervisor handoff.
 
-mod common;
+use crate::common;
 
 use agent_run_core::{domain::Status, lifecycle::reconcile::reconcile_with, process::ProcessState};
 use agent_run_domain::Error;

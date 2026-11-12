@@ -90,9 +90,9 @@ fixture credentials.
 ```sh
 cargo test --offline --locked -p agent-run-core --lib streaming_snapshot
 cargo test --offline --locked -p agent-run-core --lib busy_ownership_wait
-cargo test --offline --locked -p agent-run-store --test sqlite_busy
-cargo test --offline --locked -p agent-run --features test-fixtures \
-  --test provider_initial sqlite_busy
+cargo nextest run --offline --locked -p agent-run-store -E 'test(/^sqlite_busy::/)'
+cargo nextest run --offline --locked -p agent-run --features test-fixtures \
+  -E 'test(/^provider_initial::sqlite_busy::/)'
 cargo xtask check
 cargo xtask archive --verify
 cargo build --locked --release --package agent-run --bin agent-run

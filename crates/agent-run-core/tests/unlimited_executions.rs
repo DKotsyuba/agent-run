@@ -1,5 +1,5 @@
 //! Admission and hot reload retain concurrency controls without execution expiry.
-mod common;
+use crate::common;
 use agent_run_core::service::Service;
 use serde_json::json;
 

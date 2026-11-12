@@ -5,7 +5,7 @@
 //! operations on a missing execution leave no receipt, and supervisor scope is
 //! checked inside the transaction; a busy acquire carries closed diagnostics;
 //! recovery, reservations and maintenance keep their sole-writer bounds.
-mod common;
+use crate::common;
 
 use agent_run_domain::{
     domain::AgentId,

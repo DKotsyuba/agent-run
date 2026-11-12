@@ -2,7 +2,7 @@
 //! through the real service and dispatch: exact filters, privacy, revision
 //! consistency, read-only semantics, and live recommendation edits.
 
-mod common;
+use crate::common;
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{
     CapacityOrderQuery, ModelsQuery,

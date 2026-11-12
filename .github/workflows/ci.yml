@@ -71,6 +71,21 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo test --offline --locked -p agent-run-platform --all-features --lib shared_assets -- --nocapture
+      - name: Install cargo-nextest 0.9.149 from the checksum-verified release archive
+        shell: bash
+        run: |
+          if [ "$(uname -s)" = Darwin ]; then
+            archive=cargo-nextest-0.9.149-universal-apple-darwin.tar.gz
+            sum=47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507
+          else
+            archive=cargo-nextest-0.9.149-x86_64-unknown-linux-gnu.tar.gz
+            sum=32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770
+          fi
+          curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/$archive"
+          echo "$sum  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/nextest-bin"
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest-bin"
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
       - name: Run workspace gates
         run: cargo xtask check
       - name: Verify desktop transport and service probe fixtures

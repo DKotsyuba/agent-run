@@ -1,5 +1,5 @@
 //! Synthetic batch admission and interrupted-handoff replay, without engines.
-mod common;
+use crate::common;
 
 use agent_run_core::service::Service;
 use agent_run_domain::{

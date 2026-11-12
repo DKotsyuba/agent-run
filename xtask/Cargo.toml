@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autotests = false
 
 [lints]
 workspace = true
@@ -20,3 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+
+# All other integration tests build into one binary; see tests/it/main.rs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

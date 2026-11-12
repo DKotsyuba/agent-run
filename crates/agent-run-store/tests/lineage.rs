@@ -1,6 +1,6 @@
 //! Store ports of Python resume-lineage safety tests.
 
-mod common;
+use crate::common;
 
 use agent_run_domain::{Error, domain::Outcome};
 use serde_json::json;
