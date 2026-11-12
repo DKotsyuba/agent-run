@@ -68,7 +68,9 @@ jobs:
           fi
           curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/$archive"
           echo "$sum  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
-          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
+          mkdir -p "$RUNNER_TEMP/nextest-bin"
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest-bin"
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
       - name: Observe full source and dependency gates
         shell: bash
         run: |
@@ -193,7 +195,9 @@ jobs:
           fi
           curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/$archive"
           echo "$sum  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
-          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
+          mkdir -p "$RUNNER_TEMP/nextest-bin"
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest-bin"
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
       - name: Run Linux gates and build the exact payload
         shell: bash
         run: |

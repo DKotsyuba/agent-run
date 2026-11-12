@@ -653,13 +653,36 @@ esac
             fs::read_link(fixture.prefix.join("current")).unwrap(),
             current
         );
-        assert!(!fs::read_dir(fixture.temporary.path()).unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("agent-run-install.")
-        }));
+        let retained = retained_install_scratch(fixture.temporary.path());
+        assert!(
+            retained.is_empty(),
+            "installer scratch retained: {retained:?}"
+        );
     }
+}
+
+/// Lists `agent-run-install.*` scratch directories left in `dir` with their
+/// entry names, so a failure shows which run and stage kept its scratch (for
+/// example a `cleanup-unconfirmed` marker or partially downloaded assets).
+fn retained_install_scratch(dir: &Path) -> Vec<(String, Vec<String>)> {
+    let mut retained = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("agent-run-install.") {
+            let mut contents: Vec<String> = fs::read_dir(entry.path())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|item| item.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            contents.sort();
+            retained.push((name, contents));
+        }
+    }
+    retained
 }
 
 /// Both bundled commands use the configured home, honor overrides and reinstall safely.
