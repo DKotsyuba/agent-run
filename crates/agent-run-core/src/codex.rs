@@ -1001,6 +1001,11 @@ async fn run_inner(
     }
     let method = if let Some(s) = &record.resume_of_runtime_session_id {
         params["threadId"] = json!(s);
+        // Without this, Codex hydrates every earlier turn into the single
+        // resume reply; a long thread then exceeds the engine frame bound and
+        // the resume fails as a transport error before any work. Nothing here
+        // reads the returned turns: continuity is proven by the sealed rollout.
+        params["excludeTurns"] = json!(true);
         "thread/resume"
     } else {
         "thread/start"

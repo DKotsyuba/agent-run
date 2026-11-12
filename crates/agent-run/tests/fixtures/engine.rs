@@ -985,6 +985,13 @@ fn app_server() {
                 if let Some(reviewer) = params.get("approvalsReviewer") {
                     echo["approvalsReviewer"] = reviewer.clone();
                 }
+                // Like codex-cli 0.167, a resume hydrates all earlier turns
+                // unless `excludeTurns` is set; model a long thread whose
+                // hydrated reply exceeds the 8 MiB engine frame bound.
+                if method == "thread/resume" && params["excludeTurns"] != json!(true) {
+                    echo["thread"]["turns"] =
+                        json!([{"id":"turn-history","items":[{"text":"h".repeat(9 << 20)}]}]);
+                }
                 emit(json!({"id":id,"result":echo}));
             }
             "turn/start" => {

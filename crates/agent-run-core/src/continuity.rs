@@ -155,10 +155,34 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
     }
     let bytes = read(&seal.root, &seal.relative)?;
     if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
-        return Err(unavailable("native history changed since it was sealed"));
+        return Err(changed(seal, &bytes));
     }
     check(harness, &bytes, session)?;
     Ok(())
+}
+
+/// Builds the refusal for history whose bytes no longer match its seal.
+///
+/// The reason stays content-free but says whether the sealed bytes are still
+/// an intact prefix (something appended to the session after cleanup) or were
+/// rewritten (truncated, compacted or edited), with both byte lengths. Either
+/// way the continuation is refused; this only makes the cause diagnosable.
+fn changed(seal: &HistorySeal, bytes: &[u8]) -> Error {
+    let now = bytes.len();
+    let prefix = usize::try_from(seal.bytes)
+        .ok()
+        .and_then(|sealed| bytes.get(..sealed));
+    if now as u64 > seal.bytes && prefix.is_some_and(|prefix| fs::sha256(prefix) == seal.sha256) {
+        unavailable(format!(
+            "native history changed since it was sealed: grew from {} to {now} bytes after the intact sealed prefix",
+            seal.bytes
+        ))
+    } else {
+        unavailable(format!(
+            "native history changed since it was sealed: rewritten ({} sealed bytes, {now} now)",
+            seal.bytes
+        ))
+    }
 }
 
 /// Reads the private main database and optional WAL through anchored no-follow
@@ -350,7 +374,7 @@ pub fn admitted_turn_recorded(seal: &HistorySeal, turn: &str, input_sha256: &str
     }
     let bytes = read(&seal.root, &seal.relative)?;
     if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
-        return Err(unavailable("native history changed since it was sealed"));
+        return Err(changed(seal, &bytes));
     }
     let text =
         std::str::from_utf8(&bytes).map_err(|_| unavailable("native history is not UTF-8"))?;
@@ -567,8 +591,10 @@ fn claude(records: &[Value], session: &str) -> Result<()> {
 
 /// Checks repeated API-request tool records against earlier real conversation
 /// events; snapshots cannot introduce or settle a tool call of their own.
+/// Each real event is remembered with its record's `cwd`, which bounds the
+/// only accepted snapshot rewrite (see [`same_claude_snapshot_call`]).
 fn claude_request_snapshots(records: &[Value]) -> Result<()> {
-    let mut seen: BTreeMap<(&str, &str), &Value> = BTreeMap::new();
+    let mut seen: BTreeMap<(&str, &str), (&Value, Option<&str>)> = BTreeMap::new();
     let mut conversation = false;
     for record in records {
         let snapshot = record["type"] == "api-request-blob";
@@ -592,17 +618,18 @@ fn claude_request_snapshots(records: &[Value]) -> Result<()> {
             };
             if !snapshot {
                 if let Some(id) = id.filter(|id| !id.is_empty()) {
-                    seen.entry((kind, id)).or_insert(item);
+                    seen.entry((kind, id))
+                        .or_insert((item, record["cwd"].as_str()));
                 }
                 continue;
             }
-            let previous = id
+            let &(previous, cwd) = id
                 .filter(|id| !id.is_empty())
                 .and_then(|id| seen.get(&(kind, id)))
                 .ok_or_else(|| {
                     unavailable("Claude request snapshot references an unrecorded tool event")
                 })?;
-            if kind == "tool_use" && !same_claude_snapshot_call(previous, item) {
+            if kind == "tool_use" && !same_claude_snapshot_call(previous, cwd, item) {
                 return Err(unavailable("Claude request snapshot changes a tool call"));
             }
             if kind == "tool_result"
@@ -623,19 +650,80 @@ fn claude_request_snapshots(records: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// Compares a request-snapshot tool call while ignoring Claude's caller metadata.
-fn same_claude_snapshot_call(first: &Value, second: &Value) -> bool {
-    let (Some(first), Some(second)) = (first.as_object(), second.as_object()) else {
+/// Compares a request-snapshot tool call with the recorded call while ignoring
+/// Claude's caller metadata.
+///
+/// Claude Code (observed in 2.1.311 and 2.1.322) normalizes some recorded
+/// calls when it replays them in an API request snapshot. Exactly two
+/// semantics-preserving rewrites are accepted (see
+/// [`same_claude_snapshot_input`]); every other field, input key, tool and
+/// value must still match exactly, so a snapshot can neither introduce nor
+/// alter a tool call.
+fn same_claude_snapshot_call(recorded: &Value, cwd: Option<&str>, snapshot: &Value) -> bool {
+    let (Some(first), Some(second)) = (recorded.as_object(), snapshot.as_object()) else {
         return false;
     };
     first
-        .iter()
-        .filter(|(key, _)| key.as_str() != "caller")
-        .all(|(key, value)| second.get(key) == Some(value))
-        && second
-            .iter()
-            .filter(|(key, _)| key.as_str() != "caller")
-            .all(|(key, value)| first.get(key) == Some(value))
+        .keys()
+        .chain(second.keys())
+        .filter(|key| key.as_str() != "caller")
+        .all(|key| {
+            first.get(key) == second.get(key)
+                || (key == "input" && same_claude_snapshot_input(first, cwd, second))
+        })
+}
+
+/// Whether a snapshot's tool input differs from the recorded input only by one
+/// observed Claude Code normalization of the same call:
+///
+/// - `Bash`: `command` becomes exactly `cd <cwd> && <recorded command>`, where
+///   `<cwd>` is the absolute `cwd` of the transcript record holding the real
+///   call (the same command in the same directory). No other directory,
+///   quoting or separator is accepted, nor a call recorded without a `cwd`.
+/// - `Edit`: a recorded `replace_all: false`, the tool's default, is omitted.
+///
+/// Both calls must name the same tool and every other input key must be equal.
+fn same_claude_snapshot_input(
+    recorded: &serde_json::Map<String, Value>,
+    cwd: Option<&str>,
+    snapshot: &serde_json::Map<String, Value>,
+) -> bool {
+    let (Some(first), Some(second)) = (
+        recorded.get("input").and_then(Value::as_object),
+        snapshot.get("input").and_then(Value::as_object),
+    ) else {
+        return false;
+    };
+    let name = recorded.get("name").and_then(Value::as_str);
+    if name != snapshot.get("name").and_then(Value::as_str) {
+        return false;
+    }
+    // The single input key a normalization may change, and whether it holds.
+    let (key, normalized) = match name {
+        Some("Bash") => {
+            let replayed = second.get("command").and_then(Value::as_str);
+            let original = first.get("command").and_then(Value::as_str);
+            let prefixed = cwd.filter(|cwd| cwd.starts_with('/')).and_then(|cwd| {
+                replayed?
+                    .strip_prefix("cd ")?
+                    .strip_prefix(cwd)?
+                    .strip_prefix(" && ")
+            });
+            ("command", original.is_some() && prefixed == original)
+        }
+        Some("Edit") => (
+            "replace_all",
+            first.get("replace_all") == Some(&Value::Bool(false))
+                && !second.contains_key("replace_all"),
+        ),
+        _ => return false,
+    };
+    normalized
+        && first
+            .keys()
+            .chain(second.keys())
+            .filter(|other| other.as_str() != key)
+            .all(|other| first.get(other) == second.get(other))
 }
 
 /// Treats an absent tool-error flag as false; a malformed flag remains unknown.
@@ -846,6 +934,176 @@ mod tests {
         assert!(seal(HarnessId::ClaudeCode, temp.path(), "s1").is_ok());
     }
 
+    /// Regression for `history_unverifiable` on Claude resumes: Claude Code
+    /// replays a recorded `Bash` call in its request snapshot as
+    /// `cd <record cwd> && <command>` and drops an `Edit` call's default
+    /// `replace_all: false`. Those exact rewrites seal and verify (and
+    /// tampering after the seal is still refused); any other change to the
+    /// replayed call still refuses at the cleanup boundary.
+    #[test]
+    fn claude_request_blobs_may_apply_observed_harness_normalizations() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("projects/-work-repo");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        let cwd = "/work/repo";
+        let call = |name: &str, input: serde_json::Value| serde_json::json!({"type":"tool_use","id":"t1","name":name,"input":input});
+        let assistant = |item: serde_json::Value, cwd: Option<&str>| {
+            let mut record = serde_json::json!({"sessionId":"s1","type":"assistant",
+                "message":{"role":"assistant","content":[item]}});
+            if let Some(cwd) = cwd {
+                record["cwd"] = serde_json::json!(cwd);
+            }
+            record
+        };
+        let result = serde_json::json!({"sessionId":"s1","type":"user","cwd":cwd,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}});
+        let blob = |item: serde_json::Value| {
+            serde_json::json!({"sessionId":"s1","type":"api-request-blob","hash":"h",
+                "message":{"content":[item]}})
+        };
+        let write = |records: &[serde_json::Value]| {
+            let body: String = records
+                .iter()
+                .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+                .collect();
+            fs::write(&path, body).unwrap();
+        };
+        let bash = |command: &str| {
+            call(
+                "Bash",
+                serde_json::json!({"command":command,"description":"List files"}),
+            )
+        };
+        let history =
+            |recorded: serde_json::Value, cwd: Option<&str>, replay: serde_json::Value| {
+                vec![assistant(recorded, cwd), result.clone(), blob(replay)]
+            };
+
+        // The observed harness shape seals, verifies, and still detects later edits.
+        write(&history(
+            bash("git status"),
+            Some(cwd),
+            bash("cd /work/repo && git status"),
+        ));
+        let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
+        assert!(verify(&sealed, HarnessId::ClaudeCode, "s1").is_ok());
+        write(&history(
+            bash("git status"),
+            Some(cwd),
+            bash("cd /work/repo && git status --short"),
+        ));
+        assert!(verify(&sealed, HarnessId::ClaudeCode, "s1").is_err());
+        // A verbatim replay with caller metadata remains accepted.
+        let mut with_caller = bash("git status");
+        with_caller["caller"] = serde_json::json!({"type":"direct"});
+        write(&history(bash("git status"), Some(cwd), with_caller));
+        assert!(seal(HarnessId::ClaudeCode, temp.path(), "s1").is_ok());
+        // Edit: the default `replace_all: false` may be omitted on replay.
+        let edit = |input: serde_json::Value| call("Edit", input);
+        let edited = serde_json::json!({"file_path":"/work/repo/a","old_string":"x",
+            "new_string":"y","replace_all":false});
+        let mut replayed_edit = edited.clone();
+        replayed_edit.as_object_mut().unwrap().remove("replace_all");
+        write(&history(
+            edit(edited.clone()),
+            Some(cwd),
+            edit(replayed_edit.clone()),
+        ));
+        assert!(seal(HarnessId::ClaudeCode, temp.path(), "s1").is_ok());
+        let mut replace_every = edited.clone();
+        replace_every["replace_all"] = serde_json::json!(true);
+        let mut changed_edit = replayed_edit.clone();
+        changed_edit["new_string"] = serde_json::json!("z");
+        let mut replayed_true = replayed_edit.clone();
+        replayed_true["replace_all"] = serde_json::json!(true);
+
+        let mut extra_key = bash("cd /work/repo && git status");
+        extra_key["input"]["timeout"] = serde_json::json!(1);
+        let mut changed_description = bash("cd /work/repo && git status");
+        changed_description["input"]["description"] = serde_json::json!("Other");
+        let mut renamed = bash("cd /work/repo && git status");
+        renamed["name"] = serde_json::json!("Shell");
+        let refused = [
+            // Another directory, a changed command, or other separators.
+            history(
+                bash("git status"),
+                Some(cwd),
+                bash("cd /elsewhere && git status"),
+            ),
+            history(
+                bash("git status"),
+                Some(cwd),
+                bash("cd /work/repo && rm -rf ."),
+            ),
+            history(
+                bash("git status"),
+                Some(cwd),
+                bash("cd /work/repo; git status"),
+            ),
+            history(
+                bash("git status"),
+                Some(cwd),
+                bash("cd '/work/repo' && git status"),
+            ),
+            history(
+                bash("git status"),
+                Some(cwd),
+                bash("cd /work/repo && git status && rm x"),
+            ),
+            history(bash("git status"), Some(cwd), bash("rm x && git status")),
+            // No recorded or a relative directory proves nothing.
+            history(
+                bash("git status"),
+                None,
+                bash("cd /work/repo && git status"),
+            ),
+            history(
+                bash("git status"),
+                Some("work/repo"),
+                bash("cd work/repo && git status"),
+            ),
+            // Only `command` may differ, and only for Bash.
+            history(bash("git status"), Some(cwd), extra_key),
+            history(bash("git status"), Some(cwd), changed_description),
+            history(bash("git status"), Some(cwd), renamed),
+            history(
+                call("Read", serde_json::json!({"command":"git status"})),
+                Some(cwd),
+                call(
+                    "Read",
+                    serde_json::json!({"command":"cd /work/repo && git status"}),
+                ),
+            ),
+            // Edit may drop only a recorded `replace_all: false`, nothing else.
+            history(edit(replace_every), Some(cwd), edit(replayed_edit.clone())),
+            history(edit(edited.clone()), Some(cwd), edit(changed_edit)),
+            history(edit(edited.clone()), Some(cwd), edit(replayed_true)),
+            history(edit(replayed_edit.clone()), Some(cwd), edit(edited.clone())),
+            history(
+                call("Write", edited.clone()),
+                Some(cwd),
+                call("Write", replayed_edit.clone()),
+            ),
+            // The real record must not be the rewritten one.
+            history(
+                bash("cd /work/repo && git status"),
+                Some(cwd),
+                bash("git status"),
+            ),
+        ];
+        for records in refused {
+            write(&records);
+            let error = seal(HarnessId::ClaudeCode, temp.path(), "s1")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Claude request snapshot changes a tool call"),
+                "{error}"
+            );
+        }
+    }
+
     /// A result preceding its tool call cannot prove that later call finished.
     #[test]
     fn tool_results_must_follow_the_calls_they_acknowledge() {
@@ -941,17 +1199,22 @@ mod tests {
         let sealed = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
         assert!(super::verify(&sealed, HarnessId::Codex, "s1").is_ok());
         assert!(super::verify(&sealed, HarnessId::Codex, "s2").is_err());
-        for body in [
-            meta.to_owned(),
-            format!("{meta}{}", turn.replace("nonce-1", "nonce-2")),
-            format!("{meta}{turn}{turn}"),
+        for (body, cause) in [
+            (meta.to_owned(), "rewritten"),
+            (
+                format!("{meta}{}", turn.replace("nonce-1", "nonce-2")),
+                "rewritten",
+            ),
+            (format!("{turn}{meta}{turn}"), "rewritten"),
+            (format!("{meta}{turn}{turn}"), "grew from"),
         ] {
             fs::write(&path, &body).unwrap();
-            let error = super::verify(&sealed, HarnessId::Codex, "s1").unwrap_err();
-            assert!(
-                error.to_string().contains("changed since it was sealed"),
-                "{error}"
-            );
+            let error = super::verify(&sealed, HarnessId::Codex, "s1")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("changed since it was sealed"), "{error}");
+            // The diagnostic names the cause but never history content.
+            assert!(error.contains(cause) && !error.contains("nonce"), "{error}");
         }
     }
 

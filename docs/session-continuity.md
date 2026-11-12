@@ -122,6 +122,24 @@ the same test transcript. Ordered Claude handoff in Agent Run is separately
 covered by synthetic broker/supervisor tests. Other cross-account Claude paths
 remain refused. See `provider-contract.md` for triggers and proof requirements.
 
+## Harness history normalizations
+
+The Claude seal's structural check compares every `api-request-blob` tool
+call with the real transcript record it repeats. Claude Code 2.1.311 and
+2.1.322 replay some calls normalized, which previously prevented any seal
+(`native_history_unavailable`) and made the execution unresumable. Exactly
+two rewrites are accepted: a `Bash` `command` prefixed with
+`cd <cwd> && `, where `<cwd>` is the absolute `cwd` of the real record, and
+an `Edit` input without its recorded default `replace_all: false`. Any other
+directory, quoting, separator, key, value or tool still refuses.
+
+Codex `thread/resume` sets `excludeTurns`; otherwise codex-cli returns every
+earlier turn in one reply, which exceeds the engine frame on a long thread.
+
+A system resume preflight returns only its closed code. The account worker
+logs the content-free cause on stderr, including whether changed history grew
+after an intact sealed prefix or was rewritten.
+
 ## Stable public agent identity
 
 The public `agent_id` is the existing lineage root and remains the only agent
