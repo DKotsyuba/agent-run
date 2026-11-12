@@ -737,12 +737,27 @@ fn native_provider_keeps_login_and_model_alias() {
             (agent_run_domain::worker::MANAGED_ENV.into(), "1".into()),
             ("AGENT_RUN_WORKER_FUTURE".into(), "stale".into()),
             ("AGENT_RUN_LAUNCH_ID".into(), "foreign".into()),
+            (
+                "AGENT_RUN_SYSTEM_WRITER_SOCKET".into(),
+                "/run/agent-run/broker/writer.sock".into(),
+            ),
+            (
+                "AGENT_RUN_SYSTEM_OPERATOR_SOCKET".into(),
+                "/run/agent-run/broker/operator.sock".into(),
+            ),
         ]),
         &FakeReader,
         "task",
         None,
     )
     .unwrap();
+    // Supervisor-only system sockets never reach the harness.
+    assert!(
+        plan.launch
+            .environment
+            .keys()
+            .all(|name| !name.starts_with("AGENT_RUN_SYSTEM_"))
+    );
     assert_eq!(plan.native_model, "gpt-native");
     assert_eq!(plan.profile.body, role.prompt);
     assert!(
@@ -2268,6 +2283,118 @@ fn managed_codex_code_mode_requires_the_pinned_package_host() {
 
 /// Third-party MCPs cannot inherit private worker or system capability names,
 /// even when a programmatic configuration bypasses the normal parser.
+/// Codex's case-insensitive `shell_environment_policy` wildcard match
+/// (`*` spans any run of characters).
+fn codex_pattern_matches(pattern: &str, name: &str) -> bool {
+    fn glob(pattern: &[u8], name: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some((b'*', rest)) => (0..=name.len()).any(|skip| glob(rest, &name[skip..])),
+            Some((byte, rest)) => {
+                name.first()
+                    .is_some_and(|other| other.eq_ignore_ascii_case(byte))
+                    && glob(rest, &name[1..])
+            }
+        }
+    }
+    glob(pattern.as_bytes(), name.as_bytes())
+}
+
+/// A Codex tool shell sees none of Run's private launch variables, while the
+/// worker MCP keeps receiving its capability through declared `env_vars`.
+/// Set `AGENT_RUN_LIVE_CODEX` to a codex-cli binary to also run a real tool
+/// command through `codex sandbox` against the generated config.
+#[test]
+fn codex_tool_shells_exclude_private_launch_variables() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let config = config(root, &fake_engine(root));
+    let catalog = catalog(&config);
+    let role = role(root, false);
+    let provider: ProviderId = "codex-plus".parse().unwrap();
+    let account = "acct-native".parse().unwrap();
+    let run_home = root.join("shell-run");
+    materialize_selected(
+        &config, &catalog, &provider, "gpt", &account, &role, root, &run_home, root,
+    )
+    .unwrap();
+    let native: toml::Value =
+        toml::from_str(&fs::read_to_string(run_home.join("config.toml")).unwrap()).unwrap();
+    let policy = &native["shell_environment_policy"];
+    // A native login keeps Codex's default inheritance; only exclusions apply.
+    assert!(policy.get("inherit").is_none());
+    let patterns: Vec<&str> = policy["exclude"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pattern| pattern.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        patterns,
+        agent_run_adapters::worker_scope::CODEX_SHELL_EXCLUDE
+    );
+    let private = agent_run_domain::worker::ENV_NAMES.into_iter().chain([
+        agent_run_domain::worker::FINISH_ENV,
+        agent_run_domain::worker::RESEARCH_ENV,
+        agent_run_domain::worker::MANAGED_ENV,
+        "AGENT_RUN_SYSTEM_WRITER_SOCKET",
+        "AGENT_RUN_SYSTEM_OPERATOR_SOCKET",
+        "AGENT_RUN_LAUNCH_ID",
+        "AGENT_RUN_PROVIDER_TOKEN",
+    ]);
+    for name in private {
+        assert!(
+            patterns
+                .iter()
+                .any(|pattern| codex_pattern_matches(pattern, name)),
+            "{name} reaches Codex tool shells"
+        );
+    }
+    for kept in ["PATH", "HOME", "BRIDGE_NATIVE_OWNER_CHANNEL", "CARGO_HOME"] {
+        assert!(
+            !patterns
+                .iter()
+                .any(|pattern| codex_pattern_matches(pattern, kept))
+        );
+    }
+    // The worker MCP still receives every capability name it authenticates with.
+    let forwarded: Vec<&str> =
+        native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]["env_vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+    for name in agent_run_domain::worker::ENV_NAMES {
+        assert!(forwarded.contains(&name), "{name}");
+    }
+    let Some(codex) = std::env::var_os("AGENT_RUN_LIVE_CODEX") else {
+        return;
+    };
+    let output = std::process::Command::new(codex)
+        .args(["sandbox", "--", "/usr/bin/env"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root)
+        .env("CODEX_HOME", &run_home)
+        .env("AGENT_RUN_WORKER_TOKEN", "synthetic-capability")
+        .env("AGENT_RUN_WORKER_HOME", "/synthetic/home")
+        .env("AGENT_RUN_SYSTEM_WRITER_SOCKET", "/synthetic/writer.sock")
+        .env("AGENT_RUN_LAUNCH_ID", "synthetic-launch")
+        .env("ORDINARY_TOOL_SETTING", "kept")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let seen = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        seen.lines()
+            .any(|line| line == "ORDINARY_TOOL_SETTING=kept"),
+        "live codex sandbox did not run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!seen.contains("AGENT_RUN_"), "{seen}");
+}
+
 #[test]
 fn third_party_mcp_private_environment_is_refused() {
     let temp = tempfile::tempdir().unwrap();

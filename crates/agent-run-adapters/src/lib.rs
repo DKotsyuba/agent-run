@@ -20,6 +20,8 @@ pub mod opencode;
 pub mod plugins;
 pub mod provider;
 pub mod redact;
+/// Keeps private Agent Run launch variables out of agent tool processes.
+pub mod worker_scope;
 use agent_run_config::{
     config::{Adapter, Config, Runtime},
     profiles::Profile,
