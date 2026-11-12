@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.2
+
+Released 2026-11-12.
+
 ### Changed
 
 - Shared worker instructions ask delegated agents for brief working notes to themselves instead of complete silence between tool calls, and add common work rules: stay in scope, commit checkpoints only on the worker's own branch or worktree, ask the orchestrator instead of inventing business rules, verify proportionately, and clean up task-owned scratch. Applies to newly resolved roles; existing and resumed sessions keep their frozen prompt.
