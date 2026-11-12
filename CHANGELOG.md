@@ -6,6 +6,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ### Changed
 
+- Gate test scratch directories are named with the PID namespace and a random suffix, and stale cleanup only removes directories of exited processes from the same namespace.
+- The integration-test check ignores commented-out module lines and requires `autotests = false`.
 - `cargo xtask check` follows the Rust gate standard: tests run under
   cargo-nextest (required; CI installs 0.9.149 from a checksum-verified
   archive) with every failure reported, `RUST_TEST_THREADS` forwarded as
