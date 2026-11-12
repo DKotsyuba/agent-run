@@ -1060,6 +1060,7 @@ bridge_reader_credential_sha256="{token_hash}"
 
 /// Exact libtest name of a test defined in this module: integration tests run as
 /// modules of the crate's single `it` binary, so the name carries the module path.
+#[cfg(target_os = "linux")]
 fn exact_test(name: &str) -> String {
     match module_path!().split_once("::") {
         Some((_, module)) => format!("{module}::{name}"),
