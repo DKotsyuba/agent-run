@@ -8,11 +8,13 @@
 //! - Codex: the harness keeps the capability because its MCP children receive
 //!   only the explicitly forwarded `env_vars`; the generated
 //!   `shell_environment_policy.exclude` removes every `AGENT_RUN_*` name from
-//!   tool shells ([`CODEX_SHELL_EXCLUDE`]).
+//!   tool shells ([`CODEX_SHELL_EXCLUDE`](crate::worker_scope::CODEX_SHELL_EXCLUDE)).
 //! - Claude: Claude Code passes its whole environment to Bash and every other
-//!   child, so [`scope_claude_worker_mcp`] removes the capability from the
-//!   harness environment and writes it only into the worker MCP entry of a
-//!   private per-attempt copy of the sealed `--mcp-config`.
+//!   child, so
+//!   [`scope_claude_worker_mcp`](crate::worker_scope::scope_claude_worker_mcp)
+//!   removes the capability from the harness environment and writes it only
+//!   into the worker MCP entry of a private per-attempt copy of the sealed
+//!   `--mcp-config`.
 //!
 //! `AGENT_RUN_LAUNCH_ID` stays in every harness environment: it is a
 //! non-secret correlation marker that Bridge reads from the harness process
