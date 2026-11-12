@@ -2280,33 +2280,20 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         .map(|pair| std::path::Path::new(&pair[1]))
                         .collect();
                     // A scoped Claude worker launch points at its private
-                    // per-attempt copy of the sealed config; the digest below
-                    // keeps binding the sealed path.
+                    // per-attempt copy of the sealed config.
                     let launched_mcp = scoped_worker_mcp
                         .as_ref()
                         .map_or(expected_mcp.as_path(), |scoped| scoped.path());
                     if mcp_args != [launched_mcp] {
                         return Err(invalid("managed MCP configuration path did not verify"));
                     }
-                    let digest_args: Vec<String> = planned
-                        .launch
-                        .args
-                        .iter()
-                        .map(|arg| {
-                            if std::path::Path::new(arg) == launched_mcp {
-                                expected_mcp.to_string_lossy().into_owned()
-                            } else {
-                                arg.clone()
-                            }
-                        })
-                        .collect();
                     let settings = std::fs::read(runtime_home.join("settings.json"))?;
                     if settings.len() > 1024 * 1024 {
                         return Err(invalid("managed config unavailable"));
                     }
                     let catalog_sha256 = adapters::managed_role::claude_catalog_digest(catalogs)?;
                     let config_digest = agent_run_domain::canonical::sha256_hex(
-                        &json!({"settings_sha256":fs::sha256(&settings),"args":digest_args,"disallowed_tools":disallowed,"mcp_catalog_sha256":catalog_sha256}),
+                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args,"disallowed_tools":disallowed,"mcp_catalog_sha256":catalog_sha256}),
                         true,
                     );
                     crate::stream::run_managed(
