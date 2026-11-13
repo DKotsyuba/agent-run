@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.3
+
+Released 2026-11-13.
+
 ### Changed
 
 - Shared worker instructions tell delegated agents not to end a turn to wait for a background job, because Agent Run cannot see that wait: keep long commands in the foreground or poll their output in bounded loops until they finish. Applies to newly resolved roles; existing and resumed sessions keep their frozen prompt.
