@@ -69,7 +69,9 @@ pub struct FileSeal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteSeal {
-    /// `None` proves the WAL was absent; `Some` proves its exact bytes.
+    /// `None` proves the WAL held no frames (absent or empty); `Some` proves
+    /// its exact nonempty bytes. Older seals may record an empty WAL as
+    /// `Some` with zero bytes, which compares equal to `None`.
     pub wal: Option<FileSeal>,
     /// Hash of the settled native session and full projected message rows.
     /// Checked after native startup, whose checkpoint may change physical files.
@@ -224,6 +226,10 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
             ));
         }
         let mut current = seal_sqlite(&seal.root, session)?;
+        let mut seal = seal.clone();
+        if let Some(recorded) = seal.sqlite.as_mut() {
+            recorded.wal = frames(recorded.wal.take());
+        }
         // An unversioned seal proves the legacy version through its semantic
         // hash; compare it as recorded instead of failing on the new field.
         if let (Some(recorded), Some(now)) = (seal.sqlite.as_ref(), current.sqlite.as_mut())
@@ -232,7 +238,7 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
         {
             now.version = None;
         }
-        return if current == *seal {
+        return if current == seal {
             Ok(())
         } else {
             Err(unavailable("OpenCode history changed since cleanup"))
@@ -273,8 +279,19 @@ fn changed(seal: &HistorySeal, bytes: &[u8]) -> Error {
     }
 }
 
+/// Drops an empty WAL record: an absent and an empty WAL both mean "no frames".
+///
+/// OpenCode 2.3.0 checkpoints and deletes its WAL on a graceful exit, and the
+/// read-only proof connection then recreates an empty one (SQLite creates the
+/// WAL/SHM pair for readers when the directory is writable). Neither changes
+/// the database content, so both must yield the same evidence.
+fn frames(wal: Option<FileSeal>) -> Option<FileSeal> {
+    wal.filter(|wal| wal.bytes != 0)
+}
+
 /// Reads the private main database and optional WAL through anchored no-follow
 /// descriptors under a combined byte bound. No checkpoint or migration is run.
+/// An empty WAL is reported as absent; see [`frames`].
 fn sqlite_files(root: &Path) -> Result<(FileSeal, Option<FileSeal>)> {
     let directory =
         fs::Dir::open(root).map_err(|_| unavailable("OpenCode data root is unreadable"))?;
@@ -295,10 +312,10 @@ fn sqlite_files(root: &Path) -> Result<(FileSeal, Option<FileSeal>)> {
             bytes: main.len() as u64,
             sha256: fs::sha256(&main),
         },
-        wal.map(|bytes| FileSeal {
+        frames(wal.map(|bytes| FileSeal {
             bytes: bytes.len() as u64,
             sha256: fs::sha256(&bytes),
-        }),
+        })),
     ))
 }
 
@@ -1630,6 +1647,35 @@ mod tests {
             .execute_batch("CREATE TABLE session_pending(session_id TEXT); ALTER TABLE session_v2 ADD COLUMN time_suspended INTEGER; UPDATE session_v2 SET time_suspended=3")
             .unwrap();
         assert!(seal(HarnessId::OpenCode, root.path(), "ses_one").is_err());
+    }
+
+    /// 2.3.0 deletes its WAL on a graceful exit and the read-only proof
+    /// connection recreates it empty: sealing must not see that as a change,
+    /// and an older seal recording an empty WAL still verifies.
+    #[test]
+    fn opencode_seal_treats_absent_and_empty_wal_alike() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = native_sqlite_version(root.path(), "2.3.0");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        let wal = root.path().join("opencode.db-wal");
+        assert!(!wal.exists(), "closing the last connection removes the WAL");
+        let sealed = seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+        assert!(sealed.sqlite.as_ref().unwrap().wal.is_none());
+        verify(&sealed, HarnessId::OpenCode, "ses_one").unwrap();
+        fs::write(&wal, b"").unwrap();
+        verify(&sealed, HarnessId::OpenCode, "ses_one").unwrap();
+        let mut older = sealed.clone();
+        older.sqlite.as_mut().unwrap().wal = Some(super::FileSeal {
+            bytes: 0,
+            sha256: crate::fs::sha256(b""),
+        });
+        verify(&older, HarnessId::OpenCode, "ses_one").unwrap();
+        // Real frames are still bound exactly.
+        fs::write(&wal, b"not a frame").unwrap();
+        assert!(verify(&sealed, HarnessId::OpenCode, "ses_one").is_err());
     }
 
     /// A seal binds the OpenCode version: a resume under another qualified

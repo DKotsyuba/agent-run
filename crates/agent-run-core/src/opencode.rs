@@ -463,6 +463,29 @@ async fn idle_now(client: &Client, session: &str, deadline: tokio::time::Instant
         .unwrap_or(false)
 }
 
+/// Bound on awaiting native idle after an interrupt at finish or cancel.
+const SETTLE_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// Interrupts this session's native pass and returns whether fresh idle proof
+/// (awaitIdle plus an empty inbox) followed within [`SETTLE_ALLOWANCE`].
+/// Best effort: a session that does not settle is later refused as
+/// continuation evidence, never assumed settled.
+async fn settle(client: &Client, session: &str) -> bool {
+    let _ = client
+        .call(
+            Method::POST,
+            &format!("/api/session/{session}/interrupt"),
+            Some(json!({})),
+        )
+        .await;
+    idle_now(
+        client,
+        session,
+        tokio::time::Instant::now() + SETTLE_ALLOWANCE,
+    )
+    .await
+}
+
 /// Only this session's positive execution/status event can mark a native pass busy.
 /// Terminals and historical idle watermarks still require fresh native idle proof.
 /// 2.3.0 emits no `session.status`; `session.execution.started` plus the
@@ -873,6 +896,14 @@ async fn run_native(
                             &json!({"protocol":"opencode","reason":"closing_before_idle"}),
                         ))
                         .await?;
+                    // The finish is already durable. Settle the trailing native
+                    // pass so its session can later be sealed and resumed;
+                    // terminating serve mid-pass leaves it unsettled.
+                    process
+                        .observing(async {
+                            Ok::<bool, crate::Error>(settle(&client, &session).await)
+                        })
+                        .await?;
                 }
                 return Ok(result);
             }
@@ -952,13 +983,9 @@ async fn run_native(
                     ))
                     .await?;
 
-                let _ = process
-                    .observing(client.call(
-                        Method::POST,
-                        &format!("/api/session/{session}/interrupt"),
-                        Some(json!({})),
-                    ))
-                    .await;
+                process
+                    .observing(async { Ok::<bool, crate::Error>(settle(&client, &session).await) })
+                    .await?;
                 process
                     .observing(store.complete_command(&record.id, id, &json!({"accepted":true})))
                     .await?;
@@ -1288,6 +1315,36 @@ mod tests {
         .await;
         assert!(!idle_now(&client, "ses_one", deadline).await);
         assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// Finish/cancel settlement interrupts the native pass, then needs the same
+    /// fresh idle proof; a failed interrupt still waits and never fakes idle.
+    #[tokio::test]
+    async fn settle_interrupts_then_requires_fresh_idle_proof() {
+        let (client, server) = scripted_client(vec![
+            (
+                "/api/session/ses_one/interrupt",
+                200,
+                json!({"interrupted":true}),
+            ),
+            ("/api/experimental/session/ses_one/wait", 204, Value::Null),
+            ("/api/session/ses_one/inbox", 200, json!({"data":[]})),
+        ])
+        .await;
+        assert!(settle(&client, "ses_one").await);
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests[0].0,
+            "POST /api/session/ses_one/interrupt HTTP/1.1"
+        );
+        assert_eq!(requests[0].1, json!({}));
+        let (client, server) = scripted_client(vec![
+            ("/api/session/ses_one/interrupt", 500, json!({})),
+            ("/api/experimental/session/ses_one/wait", 500, json!({})),
+        ])
+        .await;
+        assert!(!settle(&client, "ses_one").await);
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 
     /// 2.3.0 ends pagination with one extra empty page whose `next` is null;
