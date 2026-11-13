@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.4
+
 ### Added
 
 - OpenCode 2.3.0 is qualified for the owned OpenCode v2 adapter. `/api/info`
