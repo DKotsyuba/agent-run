@@ -69,11 +69,93 @@ pub struct FileSeal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteSeal {
-    /// `None` proves the WAL was absent; `Some` proves its exact bytes.
+    /// `None` proves the WAL held no frames (absent or empty); `Some` proves
+    /// its exact nonempty bytes. Older seals may record an empty WAL as
+    /// `Some` with zero bytes, which compares equal to `None`.
     pub wal: Option<FileSeal>,
     /// Hash of the settled native session and full projected message rows.
     /// Checked after native startup, whose checkpoint may change physical files.
     pub semantic_sha256: String,
+    /// Qualified OpenCode version that wrote the sealed session. Absent only in
+    /// seals minted before versions were recorded, which could only seal
+    /// [`OPENCODE_LEGACY_VERSION`]; see [`SqliteSeal::opencode_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl SqliteSeal {
+    /// The OpenCode version a continuation must run under: the recorded one,
+    /// or the only version an unversioned (older) seal could have proven.
+    pub fn opencode_version(&self) -> &str {
+        self.version.as_deref().unwrap_or(OPENCODE_LEGACY_VERSION)
+    }
+}
+
+/// The single OpenCode version Run qualified before seals recorded a version.
+pub const OPENCODE_LEGACY_VERSION: &str = "2.0.28";
+
+/// Whether a native table or column is part of a qualified OpenCode schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    /// Must exist; absence is an incompatible schema, never an empty value.
+    Required,
+    /// This version is known to lack it. Absence is expected; if a later
+    /// migration added it anyway it is still checked.
+    KnownAbsent,
+}
+
+/// Native SQLite layout of one qualified OpenCode release, as far as the
+/// settled-session proof reads it.
+#[derive(Debug)]
+struct OpenCodeSchema {
+    /// Exact `session_v2.version` and `/api/info` version string.
+    version: &'static str,
+    /// Tables holding a session's not-yet-consumed input; each present one must
+    /// have no row for the session.
+    pending: &'static [(&'static str, Presence)],
+    /// `session_v2.time_suspended`, which must be null when present.
+    suspension: Presence,
+}
+
+/// OpenCode releases whose server protocol and native session schema are
+/// qualified. 2.0.28 stays: its schema and protocol were qualified against a
+/// source build, existing seals name it, and no other code path depends on an
+/// official binary. 2.3.0 drops `session_pending` (pending input lives only in
+/// `session_inbox`) and adds `session_v2.time_suspended`.
+const OPENCODE_SCHEMAS: &[OpenCodeSchema] = &[
+    OpenCodeSchema {
+        version: "2.0.28",
+        pending: &[
+            ("session_inbox", Presence::Required),
+            ("session_pending", Presence::Required),
+        ],
+        suspension: Presence::KnownAbsent,
+    },
+    OpenCodeSchema {
+        version: "2.3.0",
+        pending: &[
+            ("session_inbox", Presence::Required),
+            ("session_pending", Presence::KnownAbsent),
+        ],
+        suspension: Presence::Required,
+    },
+];
+
+/// Returns the qualified OpenCode version set, in ascending release order.
+pub fn opencode_qualified_versions() -> impl Iterator<Item = &'static str> {
+    OPENCODE_SCHEMAS.iter().map(|schema| schema.version)
+}
+
+/// Whether `version` is exactly one qualified OpenCode release.
+pub fn opencode_version_qualified(version: &str) -> bool {
+    opencode_schema(version).is_some()
+}
+
+/// Selects the exact schema of a qualified OpenCode version.
+fn opencode_schema(version: &str) -> Option<&'static OpenCodeSchema> {
+    OPENCODE_SCHEMAS
+        .iter()
+        .find(|schema| schema.version == version)
 }
 
 /// Builds the typed refusal for an unprovable continuation.
@@ -143,8 +225,20 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
                 "OpenCode database manifest is missing or foreign",
             ));
         }
-        let current = seal_sqlite(&seal.root, session)?;
-        return if current == *seal {
+        let mut current = seal_sqlite(&seal.root, session)?;
+        let mut seal = seal.clone();
+        if let Some(recorded) = seal.sqlite.as_mut() {
+            recorded.wal = frames(recorded.wal.take());
+        }
+        // An unversioned seal proves the legacy version through its semantic
+        // hash; compare it as recorded instead of failing on the new field.
+        if let (Some(recorded), Some(now)) = (seal.sqlite.as_ref(), current.sqlite.as_mut())
+            && recorded.version.is_none()
+            && now.version.as_deref() == Some(OPENCODE_LEGACY_VERSION)
+        {
+            now.version = None;
+        }
+        return if current == seal {
             Ok(())
         } else {
             Err(unavailable("OpenCode history changed since cleanup"))
@@ -185,8 +279,19 @@ fn changed(seal: &HistorySeal, bytes: &[u8]) -> Error {
     }
 }
 
+/// Drops an empty WAL record: an absent and an empty WAL both mean "no frames".
+///
+/// OpenCode 2.3.0 checkpoints and deletes its WAL on a graceful exit, and the
+/// read-only proof connection then recreates an empty one (SQLite creates the
+/// WAL/SHM pair for readers when the directory is writable). Neither changes
+/// the database content, so both must yield the same evidence.
+fn frames(wal: Option<FileSeal>) -> Option<FileSeal> {
+    wal.filter(|wal| wal.bytes != 0)
+}
+
 /// Reads the private main database and optional WAL through anchored no-follow
 /// descriptors under a combined byte bound. No checkpoint or migration is run.
+/// An empty WAL is reported as absent; see [`frames`].
 fn sqlite_files(root: &Path) -> Result<(FileSeal, Option<FileSeal>)> {
     let directory =
         fs::Dir::open(root).map_err(|_| unavailable("OpenCode data root is unreadable"))?;
@@ -207,18 +312,54 @@ fn sqlite_files(root: &Path) -> Result<(FileSeal, Option<FileSeal>)> {
             bytes: main.len() as u64,
             sha256: fs::sha256(&main),
         },
-        wal.map(|bytes| FileSeal {
+        frames(wal.map(|bytes| FileSeal {
             bytes: bytes.len() as u64,
             sha256: fs::sha256(&bytes),
-        }),
+        })),
     ))
 }
 
-/// Reads a WAL-aware query-only snapshot of one settled v2.0.28 native session.
-/// Pending input, compaction, revert, unfinished assistant/tool output, missing
-/// sessions or incompatible schemas refuse. Full native JSON stays in memory;
-/// only its hash/count leave this function. No provider credentials are queried.
-fn sqlite_state(root: &Path, session: &str) -> Result<(String, usize)> {
+/// Settled-session evidence of one native OpenCode session.
+#[derive(Debug, PartialEq, Eq)]
+struct SqliteState {
+    /// Hash over the selected session columns and full projected messages.
+    semantic_sha256: String,
+    /// Number of projected messages.
+    records: usize,
+    /// Qualified version that wrote the session.
+    version: String,
+}
+
+/// Whether the snapshot's schema has `table`, or `table.column` when given.
+fn sqlite_has(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: Option<&str>,
+) -> Result<bool> {
+    let count: i64 = match column {
+        None => transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        ),
+        Some(column) => transaction.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+            [table, column],
+            |row| row.get(0),
+        ),
+    }
+    .map_err(|_| unavailable("OpenCode schema cannot be inspected"))?;
+    Ok(count != 0)
+}
+
+/// Reads a WAL-aware query-only snapshot of one settled native session written
+/// by a qualified OpenCode version, using that version's schema. Pending input,
+/// suspension, compaction, revert, unfinished assistant/tool output, missing
+/// sessions, unqualified versions or incompatible schemas refuse. A table or
+/// column may be missing only where the session's version is known to lack it.
+/// Full native JSON stays in memory; only its hash/count/version leave this
+/// function. No provider credentials are queried.
+fn sqlite_state(root: &Path, session: &str) -> Result<SqliteState> {
     let connection = sqlite_access::reader_connection(
         &root.join("opencode.db"),
         std::time::Duration::from_millis(100),
@@ -230,8 +371,11 @@ fn sqlite_state(root: &Path, session: &str) -> Result<(String, usize)> {
     let state:String=transaction.query_row("SELECT json_object('id',id,'directory',directory,'agent',agent,'model',model,'permission',permission,'version',version,'idle',time_idle,'outcome',idle_outcome,'compacting',time_compacting,'revert',revert) FROM session_v2 WHERE id=?",[session],|row|row.get(0)).map_err(|_|unavailable("OpenCode session is missing or incompatible"))?;
     let state: Value =
         serde_json::from_str(&state).map_err(|_| unavailable("OpenCode session is malformed"))?;
+    let schema = state["version"]
+        .as_str()
+        .and_then(opencode_schema)
+        .ok_or_else(|| unavailable("OpenCode session version is not qualified"))?;
     if state["agent"] != "agent-run"
-        || state["version"] != "2.0.28"
         || state["idle"].is_null()
         || !state["compacting"].is_null()
         || !state["revert"].is_null()
@@ -242,9 +386,38 @@ fn sqlite_state(root: &Path, session: &str) -> Result<(String, usize)> {
     {
         return Err(unavailable("OpenCode session is not structurally settled"));
     }
-    let pending:i64=transaction.query_row("SELECT (SELECT COUNT(*) FROM session_inbox WHERE session_id=?1)+(SELECT COUNT(*) FROM session_pending WHERE session_id=?1)",[session],|row|row.get(0)).map_err(|_|unavailable("OpenCode pending-input state is incompatible"))?;
-    if pending != 0 {
-        return Err(unavailable("OpenCode session has pending input"));
+    if sqlite_has(&transaction, "session_v2", Some("time_suspended"))? {
+        let suspended: bool = transaction
+            .query_row(
+                "SELECT time_suspended IS NOT NULL FROM session_v2 WHERE id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .map_err(|_| unavailable("OpenCode suspension state is incompatible"))?;
+        if suspended {
+            return Err(unavailable("OpenCode session is suspended"));
+        }
+    } else if schema.suspension == Presence::Required {
+        return Err(unavailable("OpenCode suspension state is incompatible"));
+    }
+    for (table, presence) in schema.pending {
+        if !sqlite_has(&transaction, table, None)? {
+            if *presence == Presence::Required {
+                return Err(unavailable("OpenCode pending-input state is incompatible"));
+            }
+            continue;
+        }
+        // Table names come only from the static qualified schema table above.
+        let pending: i64 = transaction
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE session_id=?1"),
+                [session],
+                |row| row.get(0),
+            )
+            .map_err(|_| unavailable("OpenCode pending-input state is incompatible"))?;
+        if pending != 0 {
+            return Err(unavailable("OpenCode session has pending input"));
+        }
     }
     let mut statement=transaction.prepare("SELECT id,type,seq,data FROM session_message WHERE session_id=? ORDER BY seq,id LIMIT 4097").map_err(|_|unavailable("OpenCode message schema is incompatible"))?;
     let mut cursor = statement
@@ -302,20 +475,21 @@ fn sqlite_state(root: &Path, session: &str) -> Result<(String, usize)> {
     if messages.is_empty() {
         return Err(unavailable("OpenCode history has no projected input"));
     }
-    Ok((
-        fs::sha256(
+    Ok(SqliteState {
+        semantic_sha256: fs::sha256(
             &serde_json::to_vec(&(state, &messages))
                 .map_err(|_| unavailable("OpenCode history cannot be hashed"))?,
         ),
-        messages.len(),
-    ))
+        records: messages.len(),
+        version: schema.version.to_owned(),
+    })
 }
 
 /// Mints physical and semantic SQLite evidence only at verified process cleanup.
 /// A second no-follow manifest read rejects files changing during the SQL snapshot.
 fn seal_sqlite(root: &Path, session: &str) -> Result<HistorySeal> {
     let (main, wal) = sqlite_files(root)?;
-    let (semantic_sha256, records) = sqlite_state(root, session)?;
+    let state = sqlite_state(root, session)?;
     if sqlite_files(root)? != (main.clone(), wal.clone()) {
         return Err(unavailable("OpenCode database changed during sealing"));
     }
@@ -326,10 +500,11 @@ fn seal_sqlite(root: &Path, session: &str) -> Result<HistorySeal> {
         relative: "opencode.db".into(),
         bytes: main.bytes,
         sha256: main.sha256,
-        records,
+        records: state.records,
         sqlite: Some(SqliteSeal {
             wal,
-            semantic_sha256,
+            semantic_sha256: state.semantic_sha256,
+            version: Some(state.version),
         }),
     })
 }
@@ -337,7 +512,14 @@ fn seal_sqlite(root: &Path, session: &str) -> Result<HistorySeal> {
 /// Rechecks the same logical session after owned native startup, before input.
 /// Physical files may have checkpointed after the supervisor's pre-start verify;
 /// native session/message data, row count, root and identity must remain equal.
-pub fn verify_opencode_started(seal: &HistorySeal, root: &Path, session: &str) -> Result<()> {
+/// `running` is the verified `/api/info` version of the started server: a
+/// session sealed under one OpenCode version never resumes under another.
+pub fn verify_opencode_started(
+    seal: &HistorySeal,
+    root: &Path,
+    session: &str,
+    running: &str,
+) -> Result<()> {
     if seal.harness != HarnessId::OpenCode
         || seal.session != session
         || root.canonicalize().ok().as_deref() != Some(seal.root.as_path())
@@ -351,8 +533,17 @@ pub fn verify_opencode_started(seal: &HistorySeal, root: &Path, session: &str) -
         .sqlite
         .as_ref()
         .ok_or_else(|| unavailable("OpenCode semantic proof is missing"))?;
-    let (hash, records) = sqlite_state(root, session)?;
-    if hash != expected.semantic_sha256 || records != seal.records {
+    if running != expected.opencode_version() {
+        return Err(unavailable(format!(
+            "OpenCode version changed since the session was sealed ({} sealed, {running} running)",
+            expected.opencode_version()
+        )));
+    }
+    let state = sqlite_state(root, session)?;
+    if state.semantic_sha256 != expected.semantic_sha256
+        || state.records != seal.records
+        || state.version != expected.opencode_version()
+    {
         return Err(unavailable("OpenCode session changed during startup"));
     }
     Ok(())
@@ -742,7 +933,10 @@ fn prove(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySeal> 
 
 #[cfg(test)]
 mod tests {
-    use super::{HarnessId, HistorySeal, Path, prove, seal, verify, verify_opencode_started};
+    use super::{
+        HarnessId, HistorySeal, Path, opencode_qualified_versions, opencode_version_qualified,
+        prove, seal, verify, verify_opencode_started,
+    };
     use std::fs;
 
     /// Writes one Codex rollout for `session` with `body` records.
@@ -1312,15 +1506,210 @@ mod tests {
     /// Creates only the native tables the version-pinned read-only proof needs.
     /// The connection stays open so the test can exercise an authoritative WAL.
     fn native_sqlite(root: &Path) -> rusqlite::Connection {
+        native_sqlite_version(root, "2.0.28")
+    }
+
+    /// Creates the proof's tables in the shape `version` writes: 2.0.28 keeps
+    /// `session_pending`; 2.3.0 has only `session_inbox` (with its native
+    /// columns) and adds `time_suspended`/`resume_attempts` to `session_v2`.
+    fn native_sqlite_version(root: &Path, version: &str) -> rusqlite::Connection {
         let connection = rusqlite::Connection::open(root.join("opencode.db")).unwrap();
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
-            CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,agent TEXT,model TEXT,permission TEXT,version TEXT,time_idle INTEGER,idle_outcome TEXT,time_compacting INTEGER,revert TEXT);
+        let (extra_columns, extra_values, pending) = if version == "2.0.28" {
+            (
+                "",
+                "",
+                "CREATE TABLE session_inbox(session_id TEXT); CREATE TABLE session_pending(session_id TEXT);",
+            )
+        } else {
+            (
+                ",time_suspended INTEGER,resume_attempts INTEGER",
+                ",NULL,0",
+                "CREATE TABLE session_inbox(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,payload TEXT,delivery TEXT,enqueued_seq INTEGER,time_created INTEGER);",
+            )
+        };
+        connection.execute_batch(&format!("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,agent TEXT,model TEXT,permission TEXT,version TEXT,time_idle INTEGER,idle_outcome TEXT,time_compacting INTEGER,revert TEXT{extra_columns});
             CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,data TEXT);
-            CREATE TABLE session_inbox(session_id TEXT); CREATE TABLE session_pending(session_id TEXT);
-            INSERT INTO session_v2 VALUES('ses_one','/work','agent-run','{}','[]','2.0.28',5,'succeeded',NULL,NULL);
-            INSERT INTO session_message VALUES('msg_one','ses_one','user',1,'{\"text\":\"marker\"}');
-            INSERT INTO session_message VALUES('msg_two','ses_one','assistant',2,'{\"time\":{\"completed\":5},\"content\":[{\"type\":\"tool\",\"id\":\"finish\",\"state\":{\"status\":\"completed\"}}]}');").unwrap();
+            {pending}
+            INSERT INTO session_v2 VALUES('ses_one','/work','agent-run','{{}}','[]','{version}',5,'succeeded',NULL,NULL{extra_values});
+            INSERT INTO session_message VALUES('msg_one','ses_one','user',1,'{{\"text\":\"marker\"}}');
+            INSERT INTO session_message VALUES('msg_two','ses_one','assistant',2,'{{\"time\":{{\"completed\":5}},\"content\":[{{\"type\":\"tool\",\"id\":\"finish\",\"state\":{{\"status\":\"completed\"}}}}]}}');")).unwrap();
         connection
+    }
+
+    /// The qualified set is exact: both qualified releases, nothing nearby.
+    #[test]
+    fn opencode_qualified_versions_are_exact() {
+        assert_eq!(
+            opencode_qualified_versions().collect::<Vec<_>>(),
+            ["2.0.28", "2.3.0"]
+        );
+        for version in ["2.0.28", "2.3.0"] {
+            assert!(opencode_version_qualified(version), "{version}");
+        }
+        for version in ["", "2.3", "2.3.1", "2.2.0", "v2.3.0", "2.3.0 ", "2.0.27"] {
+            assert!(!opencode_version_qualified(version), "{version:?}");
+        }
+    }
+
+    /// 2.3.0 seals through `session_inbox` alone, records its version, and
+    /// refuses queued input, suspension and every schema gap it does not know.
+    #[test]
+    fn opencode_230_schema_uses_inbox_and_refuses_suspension() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = native_sqlite_version(root.path(), "2.3.0");
+        let sealed = seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+        assert_eq!(
+            sealed.sqlite.as_ref().unwrap().version.as_deref(),
+            Some("2.3.0")
+        );
+        verify(&sealed, HarnessId::OpenCode, "ses_one").unwrap();
+        verify_opencode_started(&sealed, root.path(), "ses_one", "2.3.0").unwrap();
+        // Columns outside the selected set (a fresh serve's bookkeeping) do not
+        // change the digest a resume compares after native startup.
+        connection
+            .execute("UPDATE session_v2 SET resume_attempts=0", [])
+            .unwrap();
+        verify_opencode_started(&sealed, root.path(), "ses_one", "2.3.0").unwrap();
+
+        let refused =
+            |connection: &rusqlite::Connection, change: &str, undo: &str, reason: &str| {
+                connection.execute_batch(change).unwrap();
+                let error = seal(HarnessId::OpenCode, root.path(), "ses_one")
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(reason), "{change}: {error}");
+                connection.execute_batch(undo).unwrap();
+            };
+        refused(
+            &connection,
+            "INSERT INTO session_inbox VALUES('msg_q','ses_one','prompt','{}','queue',1,1)",
+            "DELETE FROM session_inbox",
+            "pending input",
+        );
+        refused(
+            &connection,
+            "UPDATE session_v2 SET time_suspended=7",
+            "UPDATE session_v2 SET time_suspended=NULL",
+            "suspended",
+        );
+        // A table 2.3.0 is known to lack is still checked if it reappears.
+        refused(
+            &connection,
+            "CREATE TABLE session_pending(session_id TEXT); INSERT INTO session_pending VALUES('ses_one')",
+            "DROP TABLE session_pending",
+            "pending input",
+        );
+        refused(
+            &connection,
+            "ALTER TABLE session_inbox RENAME TO inbox_moved",
+            "ALTER TABLE inbox_moved RENAME TO session_inbox",
+            "pending-input state is incompatible",
+        );
+        refused(
+            &connection,
+            "ALTER TABLE session_v2 DROP COLUMN time_suspended",
+            "ALTER TABLE session_v2 ADD COLUMN time_suspended INTEGER",
+            "suspension state is incompatible",
+        );
+        refused(
+            &connection,
+            "UPDATE session_v2 SET version='2.4.0'",
+            "UPDATE session_v2 SET version='2.3.0'",
+            "version is not qualified",
+        );
+        seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+    }
+
+    /// 2.0.28 still requires both pending-input tables: a missing
+    /// `session_pending` is an incompatible schema, never an empty queue.
+    #[test]
+    fn opencode_2028_schema_never_treats_missing_pending_as_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = native_sqlite(root.path());
+        let sealed = seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+        assert_eq!(
+            sealed.sqlite.as_ref().unwrap().version.as_deref(),
+            Some("2.0.28")
+        );
+        connection
+            .execute_batch("DROP TABLE session_pending")
+            .unwrap();
+        let error = seal(HarnessId::OpenCode, root.path(), "ses_one")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("pending-input state is incompatible"),
+            "{error}"
+        );
+        // A later migration's suspension column is honoured when present.
+        connection
+            .execute_batch("CREATE TABLE session_pending(session_id TEXT); ALTER TABLE session_v2 ADD COLUMN time_suspended INTEGER; UPDATE session_v2 SET time_suspended=3")
+            .unwrap();
+        assert!(seal(HarnessId::OpenCode, root.path(), "ses_one").is_err());
+    }
+
+    /// 2.3.0 deletes its WAL on a graceful exit and the read-only proof
+    /// connection recreates it empty: sealing must not see that as a change,
+    /// and an older seal recording an empty WAL still verifies.
+    #[test]
+    fn opencode_seal_treats_absent_and_empty_wal_alike() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = native_sqlite_version(root.path(), "2.3.0");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        let wal = root.path().join("opencode.db-wal");
+        assert!(!wal.exists(), "closing the last connection removes the WAL");
+        let sealed = seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+        assert!(sealed.sqlite.as_ref().unwrap().wal.is_none());
+        verify(&sealed, HarnessId::OpenCode, "ses_one").unwrap();
+        fs::write(&wal, b"").unwrap();
+        verify(&sealed, HarnessId::OpenCode, "ses_one").unwrap();
+        let mut older = sealed.clone();
+        older.sqlite.as_mut().unwrap().wal = Some(super::FileSeal {
+            bytes: 0,
+            sha256: crate::fs::sha256(b""),
+        });
+        verify(&older, HarnessId::OpenCode, "ses_one").unwrap();
+        // Real frames are still bound exactly.
+        fs::write(&wal, b"not a frame").unwrap();
+        assert!(verify(&sealed, HarnessId::OpenCode, "ses_one").is_err());
+    }
+
+    /// A seal binds the OpenCode version: a resume under another qualified
+    /// version refuses before any input, and an unversioned seal from an older
+    /// Run means exactly the legacy version.
+    #[test]
+    fn opencode_seal_refuses_resume_under_another_version() {
+        let root = tempfile::tempdir().unwrap();
+        let _connection = native_sqlite_version(root.path(), "2.3.0");
+        let sealed = seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+        let error = verify_opencode_started(&sealed, root.path(), "ses_one", "2.0.28")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("continuation_unavailable") && error.contains("version changed"),
+            "{error}"
+        );
+        // A recorded version that disagrees with the native session refuses too.
+        let mut forged = sealed.clone();
+        forged.sqlite.as_mut().unwrap().version = Some("2.0.28".into());
+        assert!(verify(&forged, HarnessId::OpenCode, "ses_one").is_err());
+        assert!(verify_opencode_started(&forged, root.path(), "ses_one", "2.0.28").is_err());
+
+        let legacy_root = tempfile::tempdir().unwrap();
+        let _legacy = native_sqlite(legacy_root.path());
+        let mut legacy =
+            serde_json::to_value(seal(HarnessId::OpenCode, legacy_root.path(), "ses_one").unwrap())
+                .unwrap();
+        legacy["sqlite"].as_object_mut().unwrap().remove("version");
+        let legacy: HistorySeal = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.sqlite.as_ref().unwrap().opencode_version(), "2.0.28");
+        verify(&legacy, HarnessId::OpenCode, "ses_one").unwrap();
+        verify_opencode_started(&legacy, legacy_root.path(), "ses_one", "2.0.28").unwrap();
+        assert!(verify_opencode_started(&legacy, legacy_root.path(), "ses_one", "2.3.0").is_err());
     }
 
     /// WAL mutations, foreign sessions and symlink substitutions cannot resume;
@@ -1340,14 +1729,14 @@ mod tests {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
         assert!(verify(&seal, HarnessId::OpenCode, "ses_one").is_err());
-        verify_opencode_started(&seal, root.path(), "ses_one").unwrap();
+        verify_opencode_started(&seal, root.path(), "ses_one", "2.0.28").unwrap();
         connection
             .execute(
                 "UPDATE session_message SET data='{\"text\":\"changed\"}' WHERE id='msg_one'",
                 [],
             )
             .unwrap();
-        assert!(verify_opencode_started(&seal, root.path(), "ses_one").is_err());
+        assert!(verify_opencode_started(&seal, root.path(), "ses_one", "2.0.28").is_err());
         drop(connection);
         std::fs::write(root.path().join("foreign-wal"), b"unrelated").unwrap();
         std::os::unix::fs::symlink("foreign-wal", root.path().join("opencode.db-wal")).unwrap();

@@ -4,6 +4,40 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- OpenCode 2.3.0 is qualified for the owned OpenCode v2 adapter. `/api/info`
+  must report one of the explicit qualified versions, 2.3.0 or 2.0.28 (kept:
+  qualified from a source build and named by existing seals, but without an
+  official release binary). Continuity reads each version's own native schema:
+  2.3.0 keeps pending input only in `session_inbox` and a session with
+  `time_suspended` set cannot be sealed. Missing tables or columns are tolerated
+  only where that version is known to lack them. An opt-in live test
+  (`AGENT_RUN_LIVE_OPENCODE`) drives start, finish, explicit resume and cancel
+  against a real binary. See [provider configuration](docs/provider-config-v2.md#opencode-v2).
+
+### Fixed
+
+- OpenCode seals record the OpenCode version, and a resume under a different
+  running version refuses with `continuation_unavailable` before any input.
+  Older seals without a version mean 2.0.28.
+- An OpenCode session whose model kept working after a recorded finish was
+  stopped mid-pass and could not be sealed or resumed. Finish and cancel now
+  interrupt the native pass and await fresh idle proof (at most 5 seconds)
+  before stopping `serve`.
+- OpenCode sealing no longer refuses with "database changed during sealing" when
+  2.3.0 removed its WAL on exit and the proof reader recreated it empty; an
+  absent and an empty WAL are the same evidence.
+
+### Security
+
+- OpenCode tool processes no longer inherit the worker capability. Every
+  `AGENT_RUN_WORKER_*` and `AGENT_RUN_SYSTEM_*` name is removed from the `serve`
+  environment, so local MCP servers and the native shell tool never see it. The
+  worker MCP alone receives it through a private 0600 per-attempt context file
+  read by `_worker-mcp --context-file`; the rendered `opencode.json` names only
+  the path. See [provider materialization](docs/provider-materialization.md#private-launch-variables-and-tool-processes).
+
 ## 0.31.3
 
 Released 2026-11-13.

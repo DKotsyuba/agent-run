@@ -101,13 +101,13 @@ Agent Run's private launch variables must not reach a shell, test or child CLI
 that the agent starts, where a `cargo test` or a nested CLI could act on the live
 Run as the worker, or confuse Run and Bridge peer and ancestry tests.
 
-| Variable | Codex | Claude Code (and Claude-compatible providers) |
-| --- | --- | --- |
-| `AGENT_RUN_WORKER_*` (endpoint, run, attempt, token, catalog selectors) | Harness environment; worker MCP via `env_vars`; excluded from tool shells | Only the worker MCP entry's `env` in a private per-attempt `--mcp-config`; absent from the harness and its tools |
-| `AGENT_RUN_SYSTEM_*` (system writer and operator sockets) | Never forwarded | Never forwarded |
-| `AGENT_RUN_LAUNCH_ID` | Harness environment; excluded from tool shells | Harness environment; visible to tools |
-| `AGENT_RUN_PROVIDER_TOKEN` (custom gateway) | Harness environment; excluded from tool shells | Not used |
-| `BRIDGE_NATIVE_OWNER_*` | Unchanged | Unchanged |
+| Variable | Codex | Claude Code (and Claude-compatible providers) | OpenCode |
+| --- | --- | --- | --- |
+| `AGENT_RUN_WORKER_*` (endpoint, run, attempt, token, catalog selectors) | Harness environment; worker MCP via `env_vars`; excluded from tool shells | Only the worker MCP entry's `env` in a private per-attempt `--mcp-config`; absent from the harness and its tools | Only a private per-attempt context file read by `_worker-mcp --context-file`; absent from `serve`, every local MCP and the shell tool |
+| `AGENT_RUN_SYSTEM_*` (system writer and operator sockets) | Never forwarded | Never forwarded | Never forwarded |
+| `AGENT_RUN_LAUNCH_ID` | Harness environment; excluded from tool shells | Harness environment; visible to tools | Not set: OpenCode launches are not journaled; scoping never removes it |
+| `AGENT_RUN_PROVIDER_TOKEN` (custom gateway) | Harness environment; excluded from tool shells | Not used | Not used |
+| `BRIDGE_NATIVE_OWNER_*` | Unchanged | Unchanged | Unchanged |
 
 Before this change both harnesses inherited the worker capability in their own
 environment, and Claude Code passed it on to every Bash command. In system mode
@@ -148,9 +148,23 @@ grants no authority: Run and Bridge accept it only from a kernel-verified harnes
 incarnation. Codex tool shells do not inherit it; ancestry checks still find it
 on the harness itself.
 
-OpenCode is not changed beyond the `AGENT_RUN_SYSTEM_*` removal. Its stdio MCP
-servers inherit the harness environment, and moving the capability into a native
-per-server environment needs a qualified OpenCode configuration field first.
+OpenCode `serve` gives its whole environment to every local MCP server and to its
+native shell tool. Its per-server `environment` setting can override an inherited
+name but cannot remove it (an empty value stays present), and no setting scrubs
+the shell tool, so the capability cannot stay in `serve`. For each attempt the
+supervisor removes every `AGENT_RUN_WORKER_*` and `AGENT_RUN_SYSTEM_*` name from
+the `serve` launch and writes the worker values as one JSON object to
+`<runtime_home>/worker-mcp/opencode-context.json` (directory 0700, file 0600,
+outside the sealed index). The rendered `opencode.json` starts the worker MCP as
+`agent-run _worker-mcp --context-file <that path>`: the file names only the
+path, never a capability value. `_worker-mcp` given a context file reads only
+that file, opened without following links, and refuses unless it is a regular
+file owned by its effective user with no group/other permission bits, small,
+and holding nonempty `AGENT_RUN_WORKER_*` strings. The file is removed after the
+harness is reaped; an attempt without a worker capability removes any stale
+copy. The broker's finish guard still recognizes the scoped values. Checked
+against OpenCode 2.3.0: while a live session was idle, neither `serve` nor the
+worker MCP process carried a private name, and the worker MCP authenticated.
 
 This is protection against accidental inheritance. It is not a boundary against
 a same-UID agent that deliberately reads another process's `/proc/<pid>/environ`
@@ -184,7 +198,8 @@ remain unsupported. Research and IPC-isolated roles receive no projection.
 Provider materialization derives explicit-finish eligibility from the admitted
 worker-MCP role, preserving the same rule as the compatibility path.
 
-The pinned OpenCode 2.0.28 plugin reports lifecycle only. Incoming Bridge messages
+The OpenCode Bridge plugin (qualified with OpenCode 2.0.28; not yet qualified with
+2.3.0) reports lifecycle only. Incoming Bridge messages
 use the supervisor's existing owner route and native queue admission, with one
 original deadline and no second input scheduler. Context injection and standalone
 OpenCode root return delivery are not qualified by this managed-worker path.

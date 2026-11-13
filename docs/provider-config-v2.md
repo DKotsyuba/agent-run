@@ -292,10 +292,24 @@ The former `lua` and `codex_appserver` choices are retired.
 
 ## OpenCode v2
 
-OpenCode CLI 2.0.28 runs as an owned `serve --stdio --port 0` child. Stdin is
+OpenCode CLI runs as an owned `serve --stdio --port 0` child. Stdin is
 its lifetime lease; commands use authenticated loopback HTTP. Each lineage
 retains private config/data/cache/state roots and its own native database.
 The selected `native_model` must be an explicit `provider/model` reference.
+
+Qualified versions are exactly **2.3.0** and **2.0.28**. `/api/info` must report
+one of them and the owned child's PID, otherwise the launch refuses before any
+session or input. 2.3.0 is the official release to install (the release asset
+`opencode-linux-x64.tar.gz` for v2.3.0). 2.0.28 stays qualified because its
+protocol and schema were qualified from a source build and existing seals name
+it, but it has no official release binary. A session sealed under one version
+resumes only under that same version; see
+[session continuity](session-continuity.md#opencode-v2-continuation).
+
+The worker capability never enters the `serve` environment: OpenCode would pass
+it to every local MCP server and to its shell tool. It reaches only the worker
+MCP, through a private per-attempt context file; see
+[private launch variables](provider-materialization.md#private-launch-variables-and-tool-processes).
 
 ```toml
 [harnesses.opencode]
@@ -330,6 +344,14 @@ Start, cancel, idle steering and same-account explicit resume use the shared
 supervisor. Native shell background completion resumes the same parent through
 OpenCode's own notification mechanism; native inputs and synthetic notifications
 are journaled by stable native IDs. No second background scheduler is added.
+
+Busy detection uses `session.execution.started` plus fresh native idle proof
+(awaitIdle, then an empty inbox); 2.3.0 emits no `session.status` events and
+answers awaitIdle with 204 and no body. Message types and part types Run does not
+journal, such as 2.3.0 `idle` messages and `reasoning` parts, are skipped. After
+a recorded finish whose native pass is still running, and on cancel, Run
+interrupts the pass and awaits fresh idle proof for at most 5 seconds before
+stopping `serve`, so the session stays settled and can be sealed for resume.
 
 A configured launch-owned Bridge channel may admit a queued input only after
 fresh native idle and empty-inbox proof. The original absolute deadline, logical

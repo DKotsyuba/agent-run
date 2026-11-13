@@ -1879,13 +1879,21 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // Claude Code hands its whole environment to Bash and every other
         // child, so its worker capability lives only in the worker MCP entry of
         // a private per-attempt MCP config, never in the harness environment.
-        // Codex keeps it: its MCP children get only declared `env_vars`, and
-        // its generated shell policy excludes every `AGENT_RUN_*` name. The
-        // guard removes the file when this attempt's scope ends.
-        let scoped_worker_mcp = if identity.authority.harness == HarnessId::ClaudeCode {
-            adapters::worker_scope::scope_claude_worker_mcp(&mut planned.launch, &runtime_home)?
-        } else {
-            None
+        // OpenCode `serve` does the same for its local MCPs and shell tool, so
+        // its capability lives only in a private per-attempt context file the
+        // rendered worker MCP command reads. Codex keeps it: its MCP children
+        // get only declared `env_vars`, and its generated shell policy
+        // excludes every `AGENT_RUN_*` name. The guard removes the file when
+        // this attempt's scope ends.
+        let scoped_worker_mcp = match identity.authority.harness {
+            HarnessId::ClaudeCode => {
+                adapters::worker_scope::scope_claude_worker_mcp(&mut planned.launch, &runtime_home)?
+            }
+            HarnessId::OpenCode => adapters::worker_scope::scope_opencode_worker_mcp(
+                &mut planned.launch,
+                &runtime_home,
+            )?,
+            HarnessId::Codex => None,
         };
         // Any continuation re-verifies its recorded history seal at the
         // handoff itself, bound to the history root this exact launch plan

@@ -162,14 +162,37 @@ contract. The database schema is unchanged. See the embedded
 ## OpenCode v2 continuation
 
 A cleanup-bound `HistorySeal` additionally records the private SQLite main
-file, exact WAL presence/bytes and settled session/message semantics. SHM is
+file, exact WAL bytes and settled session/message semantics. An absent and an
+empty WAL are the same evidence (no frames): OpenCode 2.3.0 deletes its WAL on a
+graceful exit and the read-only proof connection recreates it empty. SHM is
 coordination data and is not history. Anchored no-follow reads, WAL-aware
 query-only SQL and byte/message bounds reject linked, changed, foreign or
-unfinished history. Pending input, compaction and revert cannot mint a seal.
-Historical Codex/Claude seals omit this optional field and retain their bytes.
+unfinished history. Pending input, suspension, compaction and revert cannot mint
+a seal. Historical Codex/Claude seals omit this optional field and retain their bytes.
+
+The seal records the OpenCode version that wrote the session
+(`sqlite.version`, from `session_v2.version`). Only qualified versions seal, and
+each uses its own schema table:
+
+| Version | Pending input (must be empty for the session) | `session_v2.time_suspended` |
+| --- | --- | --- |
+| 2.0.28 | `session_inbox` and `session_pending` (both required) | known absent; checked if present |
+| 2.3.0 | `session_inbox` (required); `session_pending` known absent, checked if present | required, must be null |
+
+A table or column may be missing only where the session's version is known to
+lack it; anywhere else its absence is an incompatible schema, never an empty
+queue. The semantic digest covers the same selected session columns and full
+projected messages for every version. Columns outside that selection, such as
+2.3.0's `resume_attempts`, do not enter it; a fresh 2.3.0 `serve` on the same
+database left the digest unchanged in live resume checks. A seal written before versions were recorded means 2.0.28, the only
+version that could seal then.
 
 Resume verifies the physical manifest before spawn. After native startup may
-checkpoint the database, the same session and full projected-message digest
-must still match before another input is admitted. No new baseline, summary
+checkpoint the database, the started server's `/api/info` version must equal the
+sealed version, and the same session and full projected-message digest must
+still match before another input is admitted. A session sealed under one
+OpenCode version therefore never resumes under another; the refusal is
+`continuation_unavailable`. Native startup may already have migrated the private
+database by then, which is why the version check happens before any input. No new baseline, summary
 substitution or latest-session lookup is allowed. OpenCode stays on the parent's
 account; cross-account automatic continuation is not enabled.

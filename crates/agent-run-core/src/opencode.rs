@@ -76,6 +76,20 @@ async fn messages(client: &Client, session: &str) -> Result<Vec<Value>> {
     }
 }
 
+/// Returns the owned server's version when `/api/info` names this exact child
+/// process and one qualified OpenCode release; anything else refuses.
+fn server_version(info: &Value, pid: i32) -> Result<&str> {
+    match info["version"].as_str() {
+        Some(version)
+            if info["pid"].as_i64() == Some(i64::from(pid))
+                && crate::continuity::opencode_version_qualified(version) =>
+        {
+            Ok(version)
+        }
+        _ => Err(invalid("OpenCode server identity/version did not verify")),
+    }
+}
+
 /// Text representations emitted by a completed native MCP/tool result.
 fn content_text(content: &Value) -> String {
     content
@@ -131,6 +145,147 @@ async fn item(
     Ok(())
 }
 
+/// One settled native observation of an admitted message, in source order.
+#[derive(Debug, PartialEq)]
+enum Projected {
+    /// A replayable journal item keyed by its native identity.
+    Item {
+        key: String,
+        role: &'static str,
+        text: String,
+        name: Option<String>,
+        native_ref: Option<String>,
+        error: Option<bool>,
+    },
+    /// A completed worker `finish` call whose result text is the receipt.
+    Finish(String),
+}
+
+/// Projects one native message into settled items without side effects.
+/// Input/notification messages and assistant text/tool parts are recognized;
+/// every other message type (for example 2.3.0 `idle`) and part type (for
+/// example `reasoning`) is skipped, so newer releases may add metadata without
+/// widening what Run journals. Partial text and streaming tools are not settled.
+/// Returns the steps and the native failure kind named by an assistant error.
+fn project(message: &Value, finish_name: &str) -> Result<(Vec<Projected>, Option<String>)> {
+    let id = identifier(&message["id"])?;
+    let mut steps = Vec::new();
+    if let Some(kind @ ("user" | "synthetic")) = message["type"].as_str() {
+        let Some(text) = message["text"].as_str() else {
+            if kind == "synthetic" {
+                return Err(invalid("OpenCode notification text is missing"));
+            }
+            return Ok((steps, None));
+        };
+        if !text.is_empty() {
+            steps.push(Projected::Item {
+                key: format!("{id}:input"),
+                role: "user",
+                text: text.to_owned(),
+                name: Some(
+                    if kind == "synthetic" {
+                        "opencode.notification"
+                    } else {
+                        "opencode.input"
+                    }
+                    .to_owned(),
+                ),
+                native_ref: None,
+                error: None,
+            });
+        }
+        return Ok((steps, None));
+    }
+    if message["type"] != "assistant" {
+        return Ok((steps, None));
+    }
+    let failure = message.get("error").filter(|v| !v.is_null()).map(|error| {
+        error["type"]
+            .as_str()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            })
+            .unwrap_or("opencode_native_failed")
+            .to_owned()
+    });
+    let Some(parts) = message["content"].as_array() else {
+        return Err(invalid("OpenCode assistant content is missing"));
+    };
+    for (ordinal, part) in parts.iter().enumerate() {
+        if part["type"] == "text"
+            && message
+                .pointer("/time/completed")
+                .is_some_and(|value| !value.is_null())
+        {
+            let text = part["text"]
+                .as_str()
+                .ok_or_else(|| invalid("OpenCode text is malformed"))?;
+            steps.push(Projected::Item {
+                key: format!("{id}:{ordinal}:text"),
+                role: "assistant",
+                text: text.to_owned(),
+                name: None,
+                native_ref: None,
+                error: None,
+            });
+        }
+        if part["type"] != "tool" {
+            continue;
+        }
+        let tool_id = part["id"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 1024)
+            .ok_or_else(|| invalid("OpenCode tool identity is missing"))?;
+        let name = part["name"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or_else(|| invalid("OpenCode tool name is missing"))?;
+        let state = &part["state"];
+        let status = state["status"]
+            .as_str()
+            .ok_or_else(|| invalid("OpenCode tool state is missing"))?;
+        if status == "streaming" {
+            continue;
+        }
+        if !["running", "completed", "error"].contains(&status) || !state["input"].is_object() {
+            return Err(invalid("OpenCode tool lifecycle is malformed"));
+        }
+        let key = crate::fs::sha256(format!("{id}\0{tool_id}").as_bytes());
+        let native_ref = format!("exec-opencode-{key}");
+        steps.push(Projected::Item {
+            key: format!("{key}:call"),
+            role: "tool_call",
+            text: serde_json::to_string(&state["input"])?,
+            name: Some(name.to_owned()),
+            native_ref: Some(native_ref.clone()),
+            error: None,
+        });
+        if status == "running" {
+            continue;
+        }
+        let mut text = content_text(&state["content"]);
+        if status == "error" && text.is_empty() {
+            text = serde_json::to_string(&state["error"])?;
+        }
+        let finished = name == finish_name && status == "completed";
+        steps.push(Projected::Item {
+            key: format!("{key}:result"),
+            role: "tool_result",
+            text: text.clone(),
+            name: Some(name.to_owned()),
+            native_ref: Some(native_ref),
+            error: Some(status == "error"),
+        });
+        if finished {
+            steps.push(Projected::Finish(text));
+        }
+    }
+    Ok((steps, failure))
+}
+
 /// Reconciles only newly admitted native messages; source tool identities own receipts.
 /// Native input/notification IDs are journaled once; the initial task echo is excluded.
 /// Partial reasoning/text is not mistaken for a settled replayable item.
@@ -148,137 +303,40 @@ async fn reconcile(
     );
     let mut failure = None;
     for message in rows {
-        let id = identifier(&message["id"])?;
-        if baseline.contains(id) {
+        if baseline.contains(identifier(&message["id"])?) {
             continue;
         }
-        if let Some(kind @ ("user" | "synthetic")) = message["type"].as_str() {
-            let Some(text) = message["text"].as_str() else {
-                if kind == "synthetic" {
-                    return Err(invalid("OpenCode notification text is missing"));
+        let (steps, failed) = project(message, &finish_name)?;
+        if failed.is_some() {
+            failure = failed;
+        }
+        for step in steps {
+            match step {
+                Projected::Item {
+                    key,
+                    role,
+                    text,
+                    name,
+                    native_ref,
+                    error,
+                } => {
+                    item(
+                        process,
+                        store,
+                        record,
+                        seen,
+                        key,
+                        role,
+                        &text,
+                        name.as_deref(),
+                        native_ref.as_deref(),
+                        error,
+                    )
+                    .await?;
                 }
-                continue;
-            };
-            if !text.is_empty() {
-                item(
-                    process,
-                    store,
-                    record,
-                    seen,
-                    format!("{id}:input"),
-                    "user",
-                    text,
-                    Some(if kind == "synthetic" {
-                        "opencode.notification"
-                    } else {
-                        "opencode.input"
-                    }),
-                    None,
-                    None,
-                )
-                .await?;
-            }
-            continue;
-        }
-        if message["type"] != "assistant" {
-            continue;
-        }
-        if let Some(error) = message.get("error").filter(|v| !v.is_null()) {
-            let kind = error["type"]
-                .as_str()
-                .filter(|s| {
-                    !s.is_empty()
-                        && s.len() <= 128
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-                })
-                .unwrap_or("opencode_native_failed");
-            failure = Some(kind.to_owned());
-        }
-        let Some(parts) = message["content"].as_array() else {
-            return Err(invalid("OpenCode assistant content is missing"));
-        };
-        for (ordinal, part) in parts.iter().enumerate() {
-            if part["type"] == "text"
-                && message
-                    .pointer("/time/completed")
-                    .is_some_and(|value| !value.is_null())
-            {
-                let text = part["text"]
-                    .as_str()
-                    .ok_or_else(|| invalid("OpenCode text is malformed"))?;
-                item(
-                    process,
-                    store,
-                    record,
-                    seen,
-                    format!("{id}:{ordinal}:text"),
-                    "assistant",
-                    text,
-                    None,
-                    None,
-                    None,
-                )
-                .await?;
-            }
-            if part["type"] != "tool" {
-                continue;
-            }
-            let tool_id = part["id"]
-                .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 1024)
-                .ok_or_else(|| invalid("OpenCode tool identity is missing"))?;
-            let name = part["name"]
-                .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 256)
-                .ok_or_else(|| invalid("OpenCode tool name is missing"))?;
-            let state = &part["state"];
-            let status = state["status"]
-                .as_str()
-                .ok_or_else(|| invalid("OpenCode tool state is missing"))?;
-            if status == "streaming" {
-                continue;
-            }
-            if !["running", "completed", "error"].contains(&status) || !state["input"].is_object() {
-                return Err(invalid("OpenCode tool lifecycle is malformed"));
-            }
-            let key = crate::fs::sha256(format!("{id}\0{tool_id}").as_bytes());
-            let native_ref = format!("exec-opencode-{key}");
-            item(
-                process,
-                store,
-                record,
-                seen,
-                format!("{key}:call"),
-                "tool_call",
-                &serde_json::to_string(&state["input"])?,
-                Some(name),
-                Some(&native_ref),
-                None,
-            )
-            .await?;
-            if status == "running" {
-                continue;
-            }
-            let mut text = content_text(&state["content"]);
-            if status == "error" && text.is_empty() {
-                text = serde_json::to_string(&state["error"])?;
-            }
-            item(
-                process,
-                store,
-                record,
-                seen,
-                format!("{key}:result"),
-                "tool_result",
-                &text,
-                Some(name),
-                Some(&native_ref),
-                Some(status == "error"),
-            )
-            .await?;
-            if name == finish_name && status == "completed" {
-                crate::worker_finish::receipt(process, store, record, &text).await?;
+                Projected::Finish(text) => {
+                    crate::worker_finish::receipt(process, store, record, &text).await?;
+                }
             }
         }
     }
@@ -405,8 +463,33 @@ async fn idle_now(client: &Client, session: &str, deadline: tokio::time::Instant
         .unwrap_or(false)
 }
 
+/// Bound on awaiting native idle after an interrupt at finish or cancel.
+const SETTLE_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// Interrupts this session's native pass and returns whether fresh idle proof
+/// (awaitIdle plus an empty inbox) followed within [`SETTLE_ALLOWANCE`].
+/// Best effort: a session that does not settle is later refused as
+/// continuation evidence, never assumed settled.
+async fn settle(client: &Client, session: &str) -> bool {
+    let _ = client
+        .call(
+            Method::POST,
+            &format!("/api/session/{session}/interrupt"),
+            Some(json!({})),
+        )
+        .await;
+    idle_now(
+        client,
+        session,
+        tokio::time::Instant::now() + SETTLE_ALLOWANCE,
+    )
+    .await
+}
+
 /// Only this session's positive execution/status event can mark a native pass busy.
 /// Terminals and historical idle watermarks still require fresh native idle proof.
+/// 2.3.0 emits no `session.status`; `session.execution.started` plus the
+/// wait/inbox proof in [`idle_now`] carry busy and idle detection there.
 fn busy_event(event: &Value, session: &str) -> bool {
     event.pointer("/data/sessionID").and_then(Value::as_str) == Some(session)
         && (event["type"] == "session.execution.started"
@@ -415,6 +498,21 @@ fn busy_event(event: &Value, session: &str) -> bool {
                     event.pointer("/data/status/type").and_then(Value::as_str),
                     Some("busy" | "retry")
                 )))
+}
+
+/// Whether a created or resumed native session carries the admitted role,
+/// model, grants and directory. Only the model's `id`/`providerID` are
+/// compared: 2.3.0 adds `variant:"default"` to the API model, which the stored
+/// session row does not carry, and Run admits no variants (effort refuses).
+fn session_authority(session: &Value, model: &Value, permissions: &Value, workdir: &Path) -> bool {
+    session["agent"] == opencode::AGENT
+        && session["model"].get("id") == model.get("id")
+        && session["model"].get("providerID") == model.get("providerID")
+        && session["permissions"] == *permissions
+        && session
+            .pointer("/location/directory")
+            .and_then(Value::as_str)
+            == workdir.to_str()
 }
 
 /// Refuses any change to the native session's frozen id, role, model or grants.
@@ -433,7 +531,8 @@ fn verify_session(current: &Value, initial: &Value) -> Result<()> {
 
 /// Allows the native default prefix shadowed by our initial wildcard denial,
 /// then the exact frozen rules, followed only by further native denials.
-/// v2.0.28 appends a browser denial after configured agent rules.
+/// 2.0.28 appends a browser denial after configured agent rules; 2.3.0 appends
+/// `browser *` and `skill browser` denials.
 fn grant_echo(grants: &[Value], frozen: &[Value]) -> bool {
     !frozen.is_empty()
         && frozen[0] == json!({"action":"*","resource":"*","effect":"deny"})
@@ -674,9 +773,7 @@ async fn run_native(
     let info = process
         .observing(client.call(Method::GET, "/api/info", None))
         .await?;
-    if info["pid"].as_i64() != Some(i64::from(process.owner.pid)) || info["version"] != "2.0.28" {
-        return Err(invalid("OpenCode server identity/version did not verify"));
-    }
+    let version = server_version(&info, process.owner.pid)?.to_owned();
     let model = opencode::model_ref(&plan.native_model)?;
     process
         .observing(verify_model(
@@ -707,15 +804,7 @@ async fn run_native(
     };
     let initial = data(&created).clone();
     let session = identifier(&initial["id"])?.to_owned();
-    if initial["agent"] != opencode::AGENT
-        || initial["model"].get("id") != model.get("id")
-        || initial["model"].get("providerID") != model.get("providerID")
-        || initial["permissions"] != permissions
-        || initial
-            .pointer("/location/directory")
-            .and_then(Value::as_str)
-            != record.request.workdir.to_str()
-    {
+    if !session_authority(&initial, &model, &permissions, &record.request.workdir) {
         return Err(invalid("OpenCode session grants/model did not verify"));
     }
     if record.resume_of_runtime_session_id.is_some() {
@@ -727,7 +816,12 @@ async fn run_native(
         let seal: crate::continuity::HistorySeal =
             serde_json::from_value(state["native_history"]["seal"].clone())
                 .map_err(|_| invalid("OpenCode parent history proof is missing"))?;
-        crate::continuity::verify_opencode_started(&seal, &_home.join("opencode-data"), &session)?;
+        crate::continuity::verify_opencode_started(
+            &seal,
+            &_home.join("opencode-data"),
+            &session,
+            &version,
+        )?;
     }
     process
         .observing(store.runtime_session(&record.id, &session))
@@ -802,6 +896,14 @@ async fn run_native(
                             "native_tool_coverage_gap_v1",
                             &json!({"protocol":"opencode","reason":"closing_before_idle"}),
                         ))
+                        .await?;
+                    // The finish is already durable. Settle the trailing native
+                    // pass so its session can later be sealed and resumed;
+                    // terminating serve mid-pass leaves it unsettled.
+                    process
+                        .observing(async {
+                            Ok::<bool, crate::Error>(settle(&client, &session).await)
+                        })
                         .await?;
                 }
                 return Ok(result);
@@ -882,13 +984,9 @@ async fn run_native(
                     ))
                     .await?;
 
-                let _ = process
-                    .observing(client.call(
-                        Method::POST,
-                        &format!("/api/session/{session}/interrupt"),
-                        Some(json!({})),
-                    ))
-                    .await;
+                process
+                    .observing(async { Ok::<bool, crate::Error>(settle(&client, &session).await) })
+                    .await?;
                 process
                     .observing(store.complete_command(&record.id, id, &json!({"accepted":true})))
                     .await?;
@@ -1192,6 +1290,200 @@ mod tests {
             );
             assert_eq!(server.await.unwrap().len(), 2);
         }
+    }
+
+    /// 2.3.0 answers awaitIdle with 204 and no body: that is success. A failed
+    /// wait never certifies idle, and the inbox is then not even consulted.
+    #[tokio::test]
+    async fn idle_wait_accepts_bodyless_204_and_refuses_failures() {
+        let (client, server) = scripted_client(vec![
+            ("/api/experimental/session/ses_one/wait", 204, Value::Null),
+            ("/api/session/ses_one/inbox", 200, json!({"data":[]})),
+        ])
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert!(idle_now(&client, "ses_one", deadline).await);
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests[0].0,
+            "POST /api/experimental/session/ses_one/wait HTTP/1.1"
+        );
+        let (client, server) = scripted_client(vec![(
+            "/api/experimental/session/ses_one/wait",
+            500,
+            json!({"error":"busy"}),
+        )])
+        .await;
+        assert!(!idle_now(&client, "ses_one", deadline).await);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// Finish/cancel settlement interrupts the native pass, then needs the same
+    /// fresh idle proof; a failed interrupt still waits and never fakes idle.
+    #[tokio::test]
+    async fn settle_interrupts_then_requires_fresh_idle_proof() {
+        let (client, server) = scripted_client(vec![
+            (
+                "/api/session/ses_one/interrupt",
+                200,
+                json!({"interrupted":true}),
+            ),
+            ("/api/experimental/session/ses_one/wait", 204, Value::Null),
+            ("/api/session/ses_one/inbox", 200, json!({"data":[]})),
+        ])
+        .await;
+        assert!(settle(&client, "ses_one").await);
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests[0].0,
+            "POST /api/session/ses_one/interrupt HTTP/1.1"
+        );
+        assert_eq!(requests[0].1, json!({}));
+        let (client, server) = scripted_client(vec![
+            ("/api/session/ses_one/interrupt", 500, json!({})),
+            ("/api/experimental/session/ses_one/wait", 500, json!({})),
+        ])
+        .await;
+        assert!(!settle(&client, "ses_one").await);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// 2.3.0 ends pagination with one extra empty page whose `next` is null;
+    /// the timeline is complete in source order after exactly that request.
+    #[tokio::test]
+    async fn message_pagination_ends_on_one_empty_page() {
+        let (client, server) = scripted_client(vec![
+            (
+                "/api/session/ses_one/message?limit=100&order=asc",
+                200,
+                json!({"data":[{"id":"msg_a","type":"user"}],"cursor":{"previous":null,"next":"c1"}}),
+            ),
+            (
+                "/api/session/ses_one/message?limit=100&cursor=c1",
+                200,
+                json!({"data":[{"id":"msg_b","type":"idle"}],"cursor":{"previous":"c0","next":"c2"}}),
+            ),
+            (
+                "/api/session/ses_one/message?limit=100&cursor=c2",
+                200,
+                json!({"data":[],"cursor":{"previous":"c1","next":null}}),
+            ),
+        ])
+        .await;
+        let rows = messages(&client, "ses_one").await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row["id"].clone()).collect::<Vec<_>>(),
+            [json!("msg_a"), json!("msg_b")]
+        );
+        assert_eq!(server.await.unwrap().len(), 3);
+        // A repeated cursor is a protocol refusal, never an endless loop.
+        let page = json!({"data":[],"cursor":{"next":"c1"}});
+        let (client, server) = scripted_client(vec![
+            (
+                "/api/session/ses_one/message?limit=100&order=asc",
+                200,
+                page.clone(),
+            ),
+            (
+                "/api/session/ses_one/message?limit=100&cursor=c1",
+                200,
+                page,
+            ),
+        ])
+        .await;
+        assert!(messages(&client, "ses_one").await.is_err());
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// Unknown message types (2.3.0 `idle`) and part types (`reasoning`) are
+    /// skipped; settled text, tools and the worker finish receipt still project.
+    #[test]
+    fn projection_skips_unknown_message_and_part_types() {
+        let finish = "agent_run_worker_finish";
+        for unknown in [
+            json!({"id":"msg_idle","type":"idle","time":{"created":1}}),
+            json!({"id":"msg_new","type":"future-kind","content":"opaque"}),
+        ] {
+            assert_eq!(project(&unknown, finish).unwrap(), (Vec::new(), None));
+        }
+        let assistant = json!({"id":"msg_one","type":"assistant","time":{"completed":5},"content":[
+            {"type":"reasoning","text":"private chain"},
+            {"type":"text","text":"done"},
+            {"type":"future-part","payload":{}},
+            {"type":"tool","id":"call_1","name":finish,"state":{"status":"completed","input":{"result":"OK"},"content":[{"type":"text","text":"accepted"}]}}
+        ]});
+        let (steps, failure) = project(&assistant, finish).unwrap();
+        assert!(failure.is_none());
+        let roles: Vec<_> = steps
+            .iter()
+            .map(|step| match step {
+                Projected::Item { role, .. } => *role,
+                Projected::Finish(_) => "finish",
+            })
+            .collect();
+        assert_eq!(roles, ["assistant", "tool_call", "tool_result", "finish"]);
+        assert!(!format!("{steps:?}").contains("private chain"));
+        assert_eq!(steps[3], Projected::Finish("accepted".into()));
+        // An unfinished assistant message projects no partial text.
+        let mut partial = assistant.clone();
+        partial["time"]["completed"] = Value::Null;
+        let (steps, _) = project(&partial, finish).unwrap();
+        assert!(steps.iter().all(|step| !matches!(
+            step,
+            Projected::Item {
+                role: "assistant",
+                ..
+            }
+        )));
+        // Known shapes stay strict: a malformed tool lifecycle still refuses.
+        let mut malformed = assistant;
+        malformed["content"][3]["state"]["status"] = json!("paused");
+        assert!(project(&malformed, finish).is_err());
+    }
+
+    /// `/api/info` must name this exact child and one qualified release.
+    #[test]
+    fn server_version_requires_owned_pid_and_qualified_release() {
+        for version in ["2.0.28", "2.3.0"] {
+            assert_eq!(
+                server_version(&json!({"version":version,"pid":42}), 42).unwrap(),
+                version
+            );
+        }
+        for info in [
+            json!({"version":"2.3.0","pid":43}),
+            json!({"version":"2.3.1","pid":42}),
+            json!({"version":"2.2.0","pid":42}),
+            json!({"pid":42}),
+            json!({"version":230,"pid":42}),
+        ] {
+            assert!(server_version(&info, 42).is_err(), "{info}");
+        }
+    }
+
+    /// 2.3.0's session model carries `variant:"default"`; only id/providerID
+    /// bind the admitted model, while a different model or grant still refuses.
+    #[test]
+    fn session_authority_ignores_model_variant_only() {
+        let model = json!({"id":"deepseek-v4.1-flash-free","providerID":"opencode"});
+        let permissions = json!([{"action":"*","resource":"*","effect":"deny"}]);
+        let workdir = Path::new("/work");
+        let session = json!({"id":"ses_one","agent":opencode::AGENT,
+            "model":{"id":"deepseek-v4.1-flash-free","providerID":"opencode","variant":"default"},
+            "permissions":permissions,"location":{"directory":"/work"}});
+        assert!(session_authority(&session, &model, &permissions, workdir));
+        let mut other = session.clone();
+        other["model"]["providerID"] = json!("foreign");
+        assert!(!session_authority(&other, &model, &permissions, workdir));
+        let mut other = session.clone();
+        other["permissions"] = json!([]);
+        assert!(!session_authority(&other, &model, &permissions, workdir));
+        assert!(!session_authority(
+            &session,
+            &model,
+            &permissions,
+            Path::new("/elsewhere")
+        ));
     }
 
     /// A Bridge wake stays queued with the exact immutable payload, never requesting active-pass steering.

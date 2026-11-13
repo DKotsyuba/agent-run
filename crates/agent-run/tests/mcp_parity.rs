@@ -791,6 +791,174 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
     mcp.finish();
 }
 
+/// OpenCode `serve` hands its environment to every local MCP server and its
+/// shell tool. After scoping, a tool child launched with that environment sees
+/// no `AGENT_RUN_WORKER_*`/`AGENT_RUN_SYSTEM_*` name (the launch marker stays),
+/// while the real `_worker-mcp`, given only the private per-attempt context
+/// file, still authenticates to the broker with the attempt's exact capability.
+/// An unsafe or missing context file refuses instead of falling back.
+#[test]
+fn opencode_worker_capability_reaches_only_the_worker_mcp() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let harness = Harness::new();
+    let runtime = harness.home.join("opencode-run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let token = "b".repeat(64);
+    let mut launch = agent_run_adapters::LaunchPlan {
+        binary: "/usr/bin/opencode".into(),
+        args: vec!["serve".into()],
+        cwd: runtime.clone(),
+        environment: std::collections::BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                "AGENT_RUN_WORKER_HOME".into(),
+                harness.home.to_string_lossy().into_owned(),
+            ),
+            (
+                "AGENT_RUN_WORKER_RUN_ID".into(),
+                "ag-20260928-000000-0000000002".into(),
+            ),
+            (
+                "AGENT_RUN_WORKER_ATTEMPT_ID".into(),
+                "opencode-attempt".into(),
+            ),
+            ("AGENT_RUN_WORKER_TOKEN".into(), token.clone()),
+            (agent_run_domain::worker::FINISH_ENV.into(), "1".into()),
+            (agent_run_domain::worker::RESEARCH_ENV.into(), "0".into()),
+            (agent_run_domain::worker::MANAGED_ENV.into(), "0".into()),
+            (
+                "AGENT_RUN_SYSTEM_WRITER_SOCKET".into(),
+                "/synthetic/writer.sock".into(),
+            ),
+            ("AGENT_RUN_LAUNCH_ID".into(), "synthetic-launch".into()),
+            ("ORDINARY_TOOL_SETTING".into(), "kept".into()),
+        ]),
+        initial_input: None,
+    };
+    let scoped = agent_run_adapters::worker_scope::scope_opencode_worker_mcp(&mut launch, &runtime)
+        .unwrap()
+        .unwrap();
+    let context = scoped.path().to_owned();
+    assert_eq!(
+        context,
+        agent_run_adapters::worker_scope::opencode_context_path(&runtime)
+    );
+    // A native tool child inherits exactly the scoped serve environment.
+    let tool = Command::new("/usr/bin/env")
+        .env_clear()
+        .envs(&launch.environment)
+        .output()
+        .unwrap();
+    let seen = String::from_utf8_lossy(&tool.stdout);
+    assert!(
+        seen.lines()
+            .any(|line| line == "ORDINARY_TOOL_SETTING=kept"),
+        "{seen}"
+    );
+    assert!(
+        seen.lines()
+            .any(|line| line == "AGENT_RUN_LAUNCH_ID=synthetic-launch"),
+        "{seen}"
+    );
+    assert!(!seen.contains("AGENT_RUN_WORKER_"), "{seen}");
+    assert!(!seen.contains("AGENT_RUN_SYSTEM_"), "{seen}");
+    assert!(!seen.contains(&token), "{seen}");
+
+    let worker = |path: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("_worker-mcp")
+            .arg("--context-file")
+            .arg(path)
+            .env_clear()
+            .envs(&launch.environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // Group/other-readable or linked context files refuse before serving.
+    let loose = runtime.join("loose.json");
+    std::fs::copy(&context, &loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let linked = runtime.join("linked.json");
+    std::os::unix::fs::symlink(&context, &linked).unwrap();
+    for refused in [
+        loose.as_path(),
+        linked.as_path(),
+        &runtime.join("missing.json"),
+    ] {
+        let output = worker(refused).wait_with_output().unwrap();
+        assert!(!output.status.success(), "{}", refused.display());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
+    }
+
+    let listener = std::os::unix::net::UnixListener::bind(harness.home.join("api.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let expected_token = token.clone();
+    let broker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for expected in [
+            agent_run_domain::worker::CATALOG_METHOD,
+            agent_run_domain::worker::TOOL_METHOD,
+        ] {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "fixture broker accept deadline");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("fixture broker accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let call: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(call["method"], expected);
+            assert_eq!(call["params"]["run_id"], "ag-20260928-000000-0000000002");
+            assert_eq!(call["params"]["attempt_id"], "opencode-attempt");
+            assert_eq!(call["params"]["token"], expected_token);
+            let result = if expected == agent_run_domain::worker::CATALOG_METHOD {
+                json!({"registered":true})
+            } else {
+                assert_eq!(call["params"]["tool"], "notify_orchestrator");
+                json!({"notification_id":"ntf_opencode","state":"pending","duplicate":false})
+            };
+            writeln!(
+                stream,
+                "{}",
+                json!({"jsonrpc":"2.0","id":call["id"],"result":result})
+            )
+            .unwrap();
+        }
+    });
+    let mut mcp = Mcp::from_child(worker(&context));
+    let info = mcp.send(initialize("2025-11-25")).unwrap();
+    assert_eq!(info["result"]["serverInfo"]["name"], "agent-run-worker");
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let receipt = mcp
+        .send(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"notify_orchestrator","arguments":{"request_id":"oc-1","message":"scoped"}}}),
+        )
+        .unwrap();
+    assert_eq!(receipt["result"]["isError"], false, "{receipt}");
+    assert!(receipt.to_string().contains("ntf_opencode"));
+    assert!(!receipt.to_string().contains(&token));
+    broker.join().unwrap();
+    mcp.finish();
+    // The attempt guard retires the capability file.
+    drop(scoped);
+    assert!(!context.exists());
+}
+
 /// Valid calls use the exact compiled operator server; current discovery equals
 /// the reviewed snapshot, malformed calls use protocol errors, and cancellation
 /// notifications leave the session usable without inventing an agent mutation.

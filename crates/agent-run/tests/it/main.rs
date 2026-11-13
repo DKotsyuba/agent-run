@@ -41,6 +41,8 @@ mod launch;
 mod launchd;
 #[path = "../mcp_parity.rs"]
 mod mcp_parity;
+#[path = "../opencode_live.rs"]
+mod opencode_live;
 #[path = "../operator_answer.rs"]
 mod operator_answer;
 #[path = "../operator_cli_mode.rs"]

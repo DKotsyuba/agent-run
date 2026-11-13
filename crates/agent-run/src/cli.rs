@@ -540,7 +540,12 @@ pub enum Command {
     Mcp,
     /// Internal run-bound worker channel; context is inherited from the supervisor.
     #[command(name = "_worker-mcp", hide = true)]
-    WorkerMcp,
+    WorkerMcp {
+        /// Private per-attempt context file written by the supervisor; when
+        /// given, the environment is not consulted.
+        #[arg(long = "context-file")]
+        context_file: Option<PathBuf>,
+    },
     /// Account-owned launcher used by a shared broker.
     #[command(name = "_launch-worker", hide = true)]
     LaunchWorker {
@@ -1757,8 +1762,8 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     // A worker frontend is a thin socket client. It must never migrate/open
     // the store or inherit Desktop host capabilities through the normal MCP.
-    if matches!(cli.command, Command::WorkerMcp) {
-        transport::worker_mcp::serve_from_env().await?;
+    if let Command::WorkerMcp { context_file } = &cli.command {
+        transport::worker_mcp::serve_from_env(context_file.as_deref()).await?;
         return Ok(0);
     }
     let home = fs::home(cli.home.clone())?;
@@ -3128,7 +3133,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 .ok_or_else(|| invalid("delegation guide must be text"))?;
             (dependencies.text_output)(&format!("{text}\n"))?;
         }
-        Command::WorkerMcp => transport::worker_mcp::serve_from_env().await?,
+        Command::WorkerMcp { context_file } => {
+            transport::worker_mcp::serve_from_env(context_file.as_deref()).await?
+        }
         Command::LaunchWorker { socket } => crate::system::serve_worker(&home, &socket).await?,
         Command::Api { command } => match command {
             Api::Serve {
