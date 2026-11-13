@@ -406,13 +406,84 @@ impl ServerHandler for WorkerProxy {
     }
 }
 
-/// Read a supervisor-provided nonempty UTF-8 context variable. Errors deliberately
-/// omit its value so missing or corrupt capability material cannot reach stderr.
-fn inherited(name: &str) -> Result<String> {
-    std::env::var(name)
-        .ok()
+/// Largest private worker context file accepted (a handful of short names).
+const MAX_CONTEXT_FILE: u64 = 64 * 1024;
+
+/// Where this worker MCP's supervisor-provided attempt context comes from.
+/// Never Debug: the file variant holds the capability.
+enum WorkerContext {
+    /// Inherited process environment (Codex `env_vars`, Claude MCP `env`).
+    Environment,
+    /// Private per-attempt context file (OpenCode); the environment is ignored.
+    File(std::collections::BTreeMap<String, String>),
+}
+
+impl WorkerContext {
+    /// Loads the context file the supervisor wrote for an OpenCode attempt.
+    ///
+    /// The path is opened without following a final link and must be a regular
+    /// file owned by this effective user, with no group/other permissions,
+    /// within a small size bound, holding one JSON object of nonempty
+    /// `AGENT_RUN_WORKER_*` strings. Errors never echo its contents.
+    fn from_file(path: &std::path::Path) -> Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let refused = || invalid("worker MCP context file is unavailable or unsafe");
+        if !path.is_absolute() {
+            return Err(refused());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| refused())?;
+        let metadata = file.metadata().map_err(|_| refused())?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_file()
+            || metadata.uid() != euid
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > MAX_CONTEXT_FILE
+        {
+            return Err(refused());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CONTEXT_FILE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| refused())?;
+        if bytes.len() as u64 > MAX_CONTEXT_FILE {
+            return Err(refused());
+        }
+        let values: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&bytes).map_err(|_| refused())?;
+        if values.iter().any(|(name, value)| {
+            !name.starts_with(agent_run_adapters::worker_scope::WORKER_PREFIX) || value.is_empty()
+        }) {
+            return Err(refused());
+        }
+        Ok(Self::File(values))
+    }
+
+    /// Read a supervisor-provided nonempty UTF-8 context value. Errors deliberately
+    /// omit its value so missing or corrupt capability material cannot reach stderr.
+    fn required(&self, name: &str) -> Result<String> {
+        self.optional(name)
+            .ok_or_else(|| invalid("worker MCP requires supervisor-provided context"))
+    }
+
+    /// Reads one optional nonempty context value from this context's source only.
+    fn optional(&self, name: &str) -> Option<String> {
+        match self {
+            Self::Environment => std::env::var(name).ok(),
+            Self::File(values) => values.get(name).cloned(),
+        }
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid("worker MCP requires supervisor-provided context"))
+    }
+
+    /// Whether a boolean context flag is exactly `1`.
+    fn flag(&self, name: &str) -> bool {
+        self.optional(name).is_some_and(|value| value == "1")
+    }
 }
 
 /// A worker's inherited local endpoint, parsed before any capability is sent.
@@ -469,21 +540,29 @@ impl CliBroker for SystemWorkerBroker {
     }
 }
 
-/// Serve until stdin EOF using only inherited attempt context and bounded frames.
-/// Never opens SQLite, loads config, starts a broker or invokes the Desktop host.
-pub async fn serve_from_env() -> Result<()> {
-    let endpoint = WorkerEndpoint::parse(&inherited(ENV_NAMES[0])?)?;
+/// Serve until stdin EOF using only supervisor-provided attempt context and
+/// bounded frames: the inherited environment, or exclusively the private
+/// per-attempt `context_file` when one is named (OpenCode, whose tools must not
+/// inherit the capability). Never opens SQLite, loads config, starts a broker
+/// or invokes the Desktop host.
+pub async fn serve_from_env(context_file: Option<&std::path::Path>) -> Result<()> {
+    let context = match context_file {
+        Some(path) => WorkerContext::from_file(path)?,
+        None => WorkerContext::Environment,
+    };
+    let endpoint = WorkerEndpoint::parse(&context.required(ENV_NAMES[0])?)?;
     let broker: Arc<dyn CliBroker> = match endpoint {
         WorkerEndpoint::Private(home) => Arc::new(SocketBroker { home }),
         WorkerEndpoint::System { socket, broker_uid } => {
             Arc::new(SystemWorkerBroker { socket, broker_uid })
         }
     };
-    let run_id = inherited(ENV_NAMES[1])?
+    let run_id = context
+        .required(ENV_NAMES[1])?
         .parse()
         .map_err(|_| invalid("invalid worker run identity"))?;
-    let attempt_id = inherited(ENV_NAMES[2])?;
-    let token = inherited(ENV_NAMES[3])?;
+    let attempt_id = context.required(ENV_NAMES[2])?;
+    let token = context.required(ENV_NAMES[3])?;
     if attempt_id.len() > 128 || token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err(invalid("invalid worker capability"));
@@ -496,12 +575,9 @@ pub async fn serve_from_env() -> Result<()> {
         attempt_id,
         token,
         catalog_registered: Arc::new(AtomicBool::new(false)),
-        research: std::env::var(agent_run_domain::worker::RESEARCH_ENV)
-            .is_ok_and(|value| value == "1"),
-        explicit_finish: std::env::var(agent_run_domain::worker::FINISH_ENV)
-            .is_ok_and(|value| value == "1"),
-        managed: std::env::var(agent_run_domain::worker::MANAGED_ENV)
-            .is_ok_and(|value| value == "1"),
+        research: context.flag(agent_run_domain::worker::RESEARCH_ENV),
+        explicit_finish: context.flag(agent_run_domain::worker::FINISH_ENV),
+        managed: context.flag(agent_run_domain::worker::MANAGED_ENV),
     };
     // The managed surface exists only in explicit, non-research mode; any
     // other combination is a supervisor contract error, never a wider catalog.

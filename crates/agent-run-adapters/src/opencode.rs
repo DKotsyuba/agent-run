@@ -203,7 +203,10 @@ pub fn permissions(profile: &Profile, home: &Path, workdir: &Path) -> Result<Val
 /// `explicit_finish` permits only the configured first-party lifecycle projection;
 /// one-shot and IPC-isolated roles retain an empty plugin list. Eligible local
 /// MCPs retain their backend behind the first-party per-call metadata transport;
-/// the private worker MCP remains on its original capability-bearing route.
+/// the private worker MCP keeps its direct route and reads its capability from
+/// the per-attempt context file named by
+/// [`opencode_context_path`](crate::worker_scope::opencode_context_path), which the
+/// supervisor writes after removing every private name from `serve`'s environment.
 pub fn render(
     config: &Config,
     runtime: &Runtime,
@@ -224,6 +227,14 @@ pub fn render(
             .ok_or_else(|| invalid("OpenCode selected MCP is unavailable"))?;
         let mut command = vec![server.command.to_string_lossy().into_owned()];
         command.extend(server.args.clone());
+        if name == agent_run_domain::worker::SERVER_NAME {
+            command.extend([
+                crate::worker_scope::CONTEXT_FILE_FLAG.to_owned(),
+                crate::worker_scope::opencode_context_path(home)
+                    .to_string_lossy()
+                    .into_owned(),
+            ]);
+        }
         if let Some((_, _, directory)) = projection
             && name != agent_run_domain::worker::SERVER_NAME
         {
@@ -239,7 +250,8 @@ pub fn render(
             command = proxy;
             native_servers.push(name.clone());
         }
-        // Inherit the already filtered child's environment; capability values never enter this file.
+        // Inherit the already filtered child's environment, which carries no
+        // private Agent Run name; capability values never enter this file.
         servers.insert(
             name.clone(),
             json!({"type":"local","command":command,"codemode":false}),
@@ -810,7 +822,11 @@ mod tests {
         );
         assert_eq!(
             projected["mcp"]["servers"][agent_run_domain::worker::SERVER_NAME]["command"],
-            json!(["/backend/worker"])
+            json!([
+                "/backend/worker",
+                "--context-file",
+                "/native/worker-mcp/opencode-context.json"
+            ])
         );
         assert_eq!(
             projected["plugins"][0]["options"]["mcpServers"],

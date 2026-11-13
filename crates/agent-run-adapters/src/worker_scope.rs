@@ -15,6 +15,14 @@
 //!   removes the capability from the harness environment and writes it only
 //!   into the worker MCP entry of a private per-attempt copy of the sealed
 //!   `--mcp-config`.
+//! - OpenCode: `serve` passes its whole environment to every local MCP server
+//!   and to its native shell tool, and its per-server `environment` setting
+//!   can override but never remove an inherited name. So
+//!   [`scope_opencode_worker_mcp`](crate::worker_scope::scope_opencode_worker_mcp)
+//!   removes every private name from the `serve` environment and writes the
+//!   worker variables only into a private per-attempt context file that the
+//!   rendered worker MCP command (`_worker-mcp --context-file <path>`) reads.
+//!   The rendered `opencode.json` carries that path, never a capability value.
 //!
 //! `AGENT_RUN_LAUNCH_ID` stays in every harness environment: it is a
 //! non-secret correlation marker that Bridge reads from the harness process
@@ -44,6 +52,11 @@ pub const CODEX_SHELL_EXCLUDE: &[&str] = &["AGENT_RUN_*"];
 /// Directory, relative to the runtime home and outside the sealed index, that
 /// holds the per-attempt Claude MCP configuration.
 pub const CLAUDE_ATTEMPT_DIR: &str = "worker-mcp";
+/// File name, inside [`CLAUDE_ATTEMPT_DIR`], of the per-attempt OpenCode
+/// worker context read by `_worker-mcp --context-file`.
+pub const OPENCODE_CONTEXT_FILE: &str = "opencode-context.json";
+/// Flag naming the private worker context file of an OpenCode worker MCP.
+pub const CONTEXT_FILE_FLAG: &str = "--context-file";
 /// Upper bound on the sealed Claude MCP configuration read per attempt.
 const MCP_CONFIG_LIMIT: u64 = 1024 * 1024;
 
@@ -53,8 +66,16 @@ pub fn is_private_launch_name(name: &str) -> bool {
     name.starts_with(WORKER_PREFIX) || name.starts_with(SYSTEM_PREFIX)
 }
 
-/// The per-attempt Claude MCP configuration that alone carries the worker
-/// capability. Dropping it removes the file; the capability values are also
+/// Path of the per-attempt OpenCode worker context under `runtime_home`. The
+/// rendered worker MCP command names it; only the supervisor writes it.
+pub fn opencode_context_path(runtime_home: &Path) -> PathBuf {
+    runtime_home
+        .join(CLAUDE_ATTEMPT_DIR)
+        .join(OPENCODE_CONTEXT_FILE)
+}
+
+/// The per-attempt Claude MCP configuration (or OpenCode worker context) that
+/// alone carries the worker capability. Dropping it removes the file; the capability values are also
 /// kept in memory for the broker's finish guard. No `Debug` is provided.
 pub struct ScopedWorkerMcp {
     path: PathBuf,
@@ -62,7 +83,7 @@ pub struct ScopedWorkerMcp {
 }
 
 impl ScopedWorkerMcp {
-    /// Path of the private per-attempt `--mcp-config` file.
+    /// Path of the private per-attempt `--mcp-config` or context file.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -164,6 +185,54 @@ pub fn scope_claude_worker_mcp(
         0o600,
     )?;
     launch.args[position] = path.to_string_lossy().into_owned();
+    Ok(Some(scoped))
+}
+
+/// Removes every private Agent Run name (`AGENT_RUN_WORKER_*` and
+/// `AGENT_RUN_SYSTEM_*`) from an OpenCode `serve` launch and writes the worker
+/// variables, as one JSON object, into the private per-attempt context file
+/// [`opencode_context_path`] (directory 0700, file 0600). `AGENT_RUN_LAUNCH_ID`
+/// and every non-private name stay.
+///
+/// Returns `None`, after still removing any system names, when the launch
+/// carries no worker variables; any stale context from an earlier attempt is
+/// then removed so a worker MCP can never authenticate with it. The rendered
+/// `opencode.json` is not touched: capability values never enter that file.
+pub fn scope_opencode_worker_mcp(
+    launch: &mut LaunchPlan,
+    runtime_home: &Path,
+) -> Result<Option<ScopedWorkerMcp>> {
+    let path = opencode_context_path(runtime_home);
+    let mut environment = BTreeMap::new();
+    let private: Vec<String> = launch
+        .environment
+        .keys()
+        .filter(|name| is_private_launch_name(name))
+        .cloned()
+        .collect();
+    for name in private {
+        if let Some(value) = launch.environment.remove(&name)
+            && name.starts_with(WORKER_PREFIX)
+        {
+            environment.insert(name, value);
+        }
+    }
+    if environment.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(None);
+    }
+    let directory = runtime_home.join(CLAUDE_ATTEMPT_DIR);
+    agent_run_platform::fs::private_dir(&directory)?;
+    let scoped = ScopedWorkerMcp { path, environment };
+    agent_run_platform::fs::Dir::open(&directory)?.write(
+        Path::new(OPENCODE_CONTEXT_FILE),
+        &serde_json::to_vec(&scoped.environment)?,
+        0o600,
+    )?;
     Ok(Some(scoped))
 }
 
@@ -275,6 +344,75 @@ mod tests {
         .unwrap();
         assert!(scope_claude_worker_mcp(&mut plan, root.path()).is_err());
         assert!(plan.environment.contains_key("AGENT_RUN_WORKER_TOKEN"));
+    }
+
+    /// OpenCode: every private name leaves `serve`'s environment, only the
+    /// worker values enter the 0600 context file, the launch marker and other
+    /// names stay, a launch without a capability retires any stale context,
+    /// and the guard removes the file.
+    #[test]
+    fn opencode_worker_capability_moves_into_the_attempt_context_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut plan = launch(root.path());
+        plan.environment.insert(
+            "AGENT_RUN_SYSTEM_WRITER_SOCKET".into(),
+            "/run/writer.sock".into(),
+        );
+        let scoped = scope_opencode_worker_mcp(&mut plan, root.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            plan.environment
+                .keys()
+                .all(|name| !is_private_launch_name(name))
+        );
+        for kept in ["AGENT_RUN_LAUNCH_ID", "BRIDGE_NATIVE_OWNER_CHANNEL", "POOL"] {
+            assert!(plan.environment.contains_key(kept), "{kept}");
+        }
+        assert_eq!(scoped.path(), opencode_context_path(root.path()));
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(scoped.path()), 0o600);
+        assert_eq!(mode(&root.path().join(CLAUDE_ATTEMPT_DIR)), 0o700);
+        let context: Value =
+            serde_json::from_slice(&std::fs::read(scoped.path()).unwrap()).unwrap();
+        assert_eq!(
+            context,
+            json!({"AGENT_RUN_WORKER_FINISH":"1","AGENT_RUN_WORKER_TOKEN":"a".repeat(64)})
+        );
+        assert_eq!(
+            scoped.with_launch(&plan.environment)["AGENT_RUN_WORKER_TOKEN"],
+            "a".repeat(64)
+        );
+        // The launch's argv is untouched: the rendered config names the file.
+        assert_eq!(plan.args, launch(root.path()).args);
+        let path = scoped.path().to_owned();
+        std::mem::forget(scoped);
+        // A later attempt without a capability never inherits the stale file.
+        let mut plain = launch(root.path());
+        plain
+            .environment
+            .retain(|name, _| !name.starts_with(WORKER_PREFIX));
+        plain.environment.insert(
+            "AGENT_RUN_SYSTEM_OPERATOR_SOCKET".into(),
+            "/run/op.sock".into(),
+        );
+        assert!(
+            scope_opencode_worker_mcp(&mut plain, root.path())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.exists());
+        assert!(
+            !plain
+                .environment
+                .contains_key("AGENT_RUN_SYSTEM_OPERATOR_SOCKET")
+        );
+        let scoped = scope_opencode_worker_mcp(&mut launch(root.path()), root.path())
+            .unwrap()
+            .unwrap();
+        drop(scoped);
+        assert!(!path.exists());
     }
 
     /// Only worker and system names are private; the launch marker, Bridge
