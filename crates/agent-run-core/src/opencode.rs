@@ -531,7 +531,8 @@ fn verify_session(current: &Value, initial: &Value) -> Result<()> {
 
 /// Allows the native default prefix shadowed by our initial wildcard denial,
 /// then the exact frozen rules, followed only by further native denials.
-/// v2.0.28 appends a browser denial after configured agent rules.
+/// 2.0.28 appends a browser denial after configured agent rules; 2.3.0 appends
+/// `browser *` and `skill browser` denials.
 fn grant_echo(grants: &[Value], frozen: &[Value]) -> bool {
     !frozen.is_empty()
         && frozen[0] == json!({"action":"*","resource":"*","effect":"deny"})

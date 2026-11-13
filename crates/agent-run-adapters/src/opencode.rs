@@ -405,7 +405,8 @@ impl Client {
         Ok(serde_json::from_slice(&bytes)?)
     }
     /// Opens the volatile native event stream; its body has no lifetime deadline.
-    /// Standard v2.0.28 serve does not persist event payloads, so recovery uses messages.
+    /// Standard v2 serve (2.0.28, 2.3.0) does not persist event payloads, so
+    /// recovery uses messages.
     pub async fn subscribe(&self) -> Result<Log> {
         let route = "/api/event";
         let response = tokio::time::timeout(
