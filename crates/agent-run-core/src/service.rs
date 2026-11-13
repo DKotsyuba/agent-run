@@ -3702,6 +3702,13 @@ pub fn system_resume_preflight(
     route_fingerprint: &str,
 ) -> std::result::Result<String, crate::system_launch::ResumePreflightFailure> {
     use crate::system_launch::ResumePreflightFailure as Failure;
+    // Only the closed code crosses the socket; the worker's own log keeps the
+    // content-free cause (for example whether history grew or was rewritten
+    // after its seal) so a refusal can be diagnosed without native access.
+    let history = |cause: &dyn std::fmt::Display| {
+        eprintln!("resume preflight for {parent}: history_unverifiable: {cause}");
+        Failure::HistoryUnverifiable
+    };
     let store = Store::open(home).map_err(|_| Failure::ParentUnverifiable)?;
     let before = agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
         .map_err(|_| Failure::ParentUnverifiable)?;
@@ -3724,7 +3731,7 @@ pub fn system_resume_preflight(
     let session = row
         .runtime_session_id
         .as_deref()
-        .ok_or(Failure::HistoryUnverifiable)?;
+        .ok_or_else(|| history(&"the parent recorded no native session"))?;
     crate::runtime_storage::verify(
         &store,
         &route.private_home,
@@ -3734,11 +3741,11 @@ pub fn system_resume_preflight(
     .map_err(|_| Failure::AssetsUnverifiable)?;
     let state = store
         .latest_attempt_state(parent)
-        .map_err(|_| Failure::HistoryUnverifiable)?;
+        .map_err(|_| history(&"the parent attempt state is unreadable"))?;
     let expected_root = (frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex)
         .then_some(runtime_home);
     verify_recorded_history(&state, &frozen, expected_root, session)
-        .map_err(|_| Failure::HistoryUnverifiable)?;
+        .map_err(|error| history(&error))?;
     if agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
         .map_err(|_| Failure::ParentUnverifiable)?
         != before

@@ -1876,6 +1876,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 planned.launch.environment.insert(name.into(), value);
             }
         }
+        // Claude Code hands its whole environment to Bash and every other
+        // child, so its worker capability lives only in the worker MCP entry of
+        // a private per-attempt MCP config, never in the harness environment.
+        // Codex keeps it: its MCP children get only declared `env_vars`, and
+        // its generated shell policy excludes every `AGENT_RUN_*` name. The
+        // guard removes the file when this attempt's scope ends.
+        let scoped_worker_mcp = if identity.authority.harness == HarnessId::ClaudeCode {
+            adapters::worker_scope::scope_claude_worker_mcp(&mut planned.launch, &runtime_home)?
+        } else {
+            None
+        };
         // Any continuation re-verifies its recorded history seal at the
         // handoff itself, bound to the history root this exact launch plan
         // selects: a seal for one directory never authorizes a launch whose
@@ -2039,9 +2050,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             // carries one, or that arrives while the context is unavailable.
             // A refusal here (an oversized context or a writer error) still
             // leaves a never-spawned attempt that failure handling closes.
-            store
-                .install_finish_guard(&planned.launch.environment)
-                .await?;
+            let launch_secrets = match &scoped_worker_mcp {
+                Some(scoped) => scoped.with_launch(&planned.launch.environment),
+                None => planned.launch.environment.clone(),
+            };
+            store.install_finish_guard(&launch_secrets).await?;
         }
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
@@ -2266,7 +2279,12 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         .filter(|pair| pair[0] == "--mcp-config")
                         .map(|pair| std::path::Path::new(&pair[1]))
                         .collect();
-                    if mcp_args != [expected_mcp.as_path()] {
+                    // A scoped Claude worker launch points at its private
+                    // per-attempt copy of the sealed config.
+                    let launched_mcp = scoped_worker_mcp
+                        .as_ref()
+                        .map_or(expected_mcp.as_path(), |scoped| scoped.path());
+                    if mcp_args != [launched_mcp] {
                         return Err(invalid("managed MCP configuration path did not verify"));
                     }
                     let settings = std::fs::read(runtime_home.join("settings.json"))?;
@@ -2307,6 +2325,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
         let cleanup_ended = std::time::Instant::now();
         let exit = process.reap().await;
+        // The harness and its MCP children are gone: retire the capability file.
+        drop(scoped_worker_mcp);
         retain_cleanup_evidence(
             &agent_dir,
             &attempt_id,

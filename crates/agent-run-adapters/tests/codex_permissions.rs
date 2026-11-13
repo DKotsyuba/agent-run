@@ -176,8 +176,9 @@ fn python_golden_codex_home_config_matches_read_only_and_write_captures() {
         )
         .expect("golden JSON");
         // Old snapshots retain their original bytes; only newly generated
-        // homes add the runtime-owned remote catalog switch.
-        let expected_config = expected["config.toml"]["content"]
+        // homes add the runtime-owned remote catalog switch and the tool
+        // shell exclusion of Agent Run's private launch variables.
+        let mut expected_config = expected["config.toml"]["content"]
             .as_str()
             .expect("golden config")
             .replace(
@@ -188,6 +189,7 @@ fn python_golden_codex_home_config_matches_read_only_and_write_captures() {
                 "\n[projects.",
                 "\n[features]\nremote_plugin = false\n\n[projects.",
             );
+        expected_config.push_str("\n[shell_environment_policy]\nexclude = [\"AGENT_RUN_*\"]\n");
         assert_eq!(
             std::fs::read_to_string(home.join("config.toml")).expect("generated config"),
             expected_config,

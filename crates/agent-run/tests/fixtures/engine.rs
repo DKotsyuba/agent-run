@@ -56,6 +56,46 @@ fn pool_resident_request(args: &[String]) {
     std::fs::write(output, reply).expect("fixture response file");
 }
 
+/// Claude Code's stdio MCP environment: the harness environment plus the
+/// entry's `env`, where a whole `${NAME}` value expands from the harness.
+/// Agent Run writes the worker capability there as literal values.
+fn server_env(server: &Value) -> Vec<(String, String)> {
+    server["env"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| {
+            let value = value.as_str().unwrap();
+            let value = match value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+                Some(inherited) => std::env::var(inherited).unwrap_or_default(),
+                None => value.to_owned(),
+            };
+            (name.clone(), value)
+        })
+        .collect()
+}
+
+/// One worker setting as the worker MCP child would receive it.
+fn worker_setting(args: &[String], name: &str) -> Option<String> {
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(argument(args, "--mcp-config")?).ok()?).ok()?;
+    server_env(&config["mcpServers"]["agent_run_worker"])
+        .into_iter()
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+/// Runs one ordinary tool command the way Claude's Bash tool does (inheriting
+/// the harness environment) and records only the variable names it sees.
+fn record_tool_environment() {
+    let output = std::process::Command::new("/usr/bin/env").output().unwrap();
+    assert!(output.status.success());
+    let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+        .collect();
+    std::fs::write("tool-environment.txt", names.join("\n")).unwrap();
+}
+
 /// Completes a synthetic attempt through the real worker MCP and emits the
 /// matching native tool-use and receipt frames for supervisor observation.
 fn worker_finish(args: &[String], session: &str, summary: &str) {
@@ -78,7 +118,7 @@ fn worker_finish(args: &[String], session: &str, summary: &str) {
         use agent_run::transport::{frame, socket};
         use tokio::io::BufReader;
         use std::process::Stdio;
-        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap()).envs(server_env(server))
             .args(server["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
             .kill_on_drop(true).spawn().unwrap();
@@ -123,7 +163,7 @@ fn worker_report(args: &[String]) {
         use agent_run::transport::{frame, socket};
         use tokio::io::BufReader;
         use std::process::Stdio;
-        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap()).envs(server_env(server))
             .args(server["args"].as_array().unwrap().iter().map(|arg|arg.as_str().unwrap()))
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
         let mut input = child.stdin.take().unwrap();
@@ -166,7 +206,7 @@ fn pool_script(args: &[String], lead: bool) {
         use agent_run::transport::{frame, socket};
         use std::process::Stdio;
         use tokio::io::BufReader;
-        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap()).envs(server_env(server))
             .args(server["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -242,7 +282,7 @@ fn pool_enroll(args: &[String]) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         use agent_run::transport::{frame,socket};
         use std::process::Stdio;
-        let mut child=tokio::process::Command::new(server["command"].as_str().unwrap())
+        let mut child=tokio::process::Command::new(server["command"].as_str().unwrap()).envs(server_env(server))
             .args(server["args"].as_array().unwrap().iter().map(|a|a.as_str().unwrap()))
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
         let mut input=child.stdin.take().unwrap();
@@ -710,6 +750,7 @@ fn main() {
         );
     }
     if task == "fixture:worker-notify" {
+        record_tool_environment();
         worker_report(&args);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !std::path::Path::new("worker-continue").exists()
@@ -724,7 +765,7 @@ fn main() {
         || (is_resumed && task.ends_with("\n\nfixture:worker-finish"))
         || ((resume_path.is_some()
             || (is_resumed && task.contains("Agent Run has finished its restart procedure.")))
-            && std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref() == Ok("1"))
+            && worker_setting(&args, agent_run_domain::worker::FINISH_ENV).as_deref() == Some("1"))
     {
         worker_finish(&args, &session, "fixture callback answer");
     }
@@ -984,6 +1025,13 @@ fn app_server() {
                 }
                 if let Some(reviewer) = params.get("approvalsReviewer") {
                     echo["approvalsReviewer"] = reviewer.clone();
+                }
+                // Like codex-cli 0.167, a resume hydrates all earlier turns
+                // unless `excludeTurns` is set; model a long thread whose
+                // hydrated reply exceeds the 8 MiB engine frame bound.
+                if method == "thread/resume" && params["excludeTurns"] != json!(true) {
+                    echo["thread"]["turns"] =
+                        json!([{"id":"turn-history","items":[{"text":"h".repeat(9 << 20)}]}]);
                 }
                 emit(json!({"id":id,"result":echo}));
             }

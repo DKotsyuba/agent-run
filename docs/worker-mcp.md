@@ -40,8 +40,14 @@ approval. The orchestrator can send a response through existing `steer`.
 ## Identity and delivery
 
 The supervisor binds a fresh capability to each exact run and attempt. Only its
-SHA-256 digest is stored. The plaintext is inherited through environment variables,
-never written into generated config, role snapshots or argv. The worker MCP
+SHA-256 digest is stored. The plaintext reaches only the worker MCP child, never
+the sealed runtime home, role snapshots or argv. Codex keeps it in the harness
+environment and forwards it only through the worker server's `env_vars`; tool
+shells exclude every `AGENT_RUN_*` name. Claude Code receives it only in the
+worker entry's `env` of a private per-attempt `--mcp-config` (mode 0600, removed
+after the attempt), not in its own environment. See
+[provider materialization](provider-materialization.md#private-launch-variables-and-tool-processes).
+The worker MCP
 adds this context itself; tool arguments cannot choose an agent, run or recipient.
 The broker rejects calls from a non-running, expired, cancelled or replaced
 attempt, and requires a supported orchestrator binding (`codex_queue` or

@@ -989,16 +989,26 @@ fn materialize_with_provider(
                 let mut providers = toml::Table::new();
                 providers.insert("agent_run_gateway".into(), toml::Value::Table(gateway));
                 doc.insert("model_providers".into(), toml::Value::Table(providers));
-                let mut shell = toml::Table::new();
-                shell.insert("inherit".into(), toml::Value::String("core".into()));
-                shell.insert(
-                    "exclude".into(),
-                    toml::Value::Array(vec![toml::Value::String(
-                        "AGENT_RUN_PROVIDER_TOKEN".into(),
-                    )]),
-                );
-                doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
             }
+            // Tool shells never inherit Agent Run's private launch variables:
+            // the worker capability, system sockets, launch marker and custom
+            // gateway token. MCP children are unaffected; Codex gives them only
+            // their declared `env_vars`, so the worker MCP still authenticates.
+            // A custom gateway also narrows inheritance to Codex's core set.
+            let mut shell = toml::Table::new();
+            if custom {
+                shell.insert("inherit".into(), toml::Value::String("core".into()));
+            }
+            shell.insert(
+                "exclude".into(),
+                toml::Value::Array(
+                    super::worker_scope::CODEX_SHELL_EXCLUDE
+                        .iter()
+                        .map(|pattern| toml::Value::String((*pattern).into()))
+                        .collect(),
+                ),
+            );
+            doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
             if research {
                 // Native controls override only this frozen research snapshot.
                 let controls: toml::Table =

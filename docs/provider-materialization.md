@@ -95,6 +95,67 @@ alias. Its compatibility-only removal points are
 `adapters::auth`, and the matching `core::supervisor` dispatch. No
 public permanent GLM launch alias is promised by the v2 path.
 
+## Private launch variables and tool processes
+
+Agent Run's private launch variables must not reach a shell, test or child CLI
+that the agent starts, where a `cargo test` or a nested CLI could act on the live
+Run as the worker, or confuse Run and Bridge peer and ancestry tests.
+
+| Variable | Codex | Claude Code (and Claude-compatible providers) |
+| --- | --- | --- |
+| `AGENT_RUN_WORKER_*` (endpoint, run, attempt, token, catalog selectors) | Harness environment; worker MCP via `env_vars`; excluded from tool shells | Only the worker MCP entry's `env` in a private per-attempt `--mcp-config`; absent from the harness and its tools |
+| `AGENT_RUN_SYSTEM_*` (system writer and operator sockets) | Never forwarded | Never forwarded |
+| `AGENT_RUN_LAUNCH_ID` | Harness environment; excluded from tool shells | Harness environment; visible to tools |
+| `AGENT_RUN_PROVIDER_TOKEN` (custom gateway) | Harness environment; excluded from tool shells | Not used |
+| `BRIDGE_NATIVE_OWNER_*` | Unchanged | Unchanged |
+
+Before this change both harnesses inherited the worker capability in their own
+environment, and Claude Code passed it on to every Bash command. In system mode
+the supervisor's `AGENT_RUN_SYSTEM_WRITER_SOCKET` and
+`AGENT_RUN_SYSTEM_OPERATOR_SOCKET` also reached every harness. Codex excluded only
+the custom gateway token from tool shells.
+
+Every generated Codex `config.toml` now writes
+`shell_environment_policy.exclude = ["AGENT_RUN_*"]`; a custom gateway also keeps
+`inherit = "core"`. Codex starts stdio MCP children with a separately filtered
+environment plus the declared `env_vars`, so the worker MCP still authenticates.
+This was checked against codex-cli 0.167.1: a `codex sandbox` command saw none of
+the excluded names, and an MCP child still received its `env_vars`. The managed
+Code Mode host is not a shell. Model code there can call only the enabled MCP
+tools and has no process environment API. The policy applies to newly
+materialized runtime homes; a lineage resumed from an earlier frozen home keeps
+its sealed config.
+
+Claude Code gives its whole environment to Bash and every other child process.
+For each attempt the supervisor therefore removes `AGENT_RUN_WORKER_*` from the
+launch environment. It copies the sealed `mcp/mcp-config.json` to
+`<runtime_home>/worker-mcp/mcp-config.json` (directory 0700, file 0600, outside
+the sealed index), writes the values into the worker entry's `env`, and points
+`--mcp-config` at the copy. The sealed file and its digest are unchanged. The copy
+is removed after the harness is reaped. If a supervisor dies, the next attempt
+replaces the stale copy, and the broker refuses the old capability once its
+attempt ends. User MCP catalog discovery for Claude starts after this split, so
+discovery children also no longer receive the capability. The broker's finish
+guard still recognizes the scoped values.
+
+`AGENT_RUN_LAUNCH_ID` is deliberately kept in both harness environments. It is a
+non-secret correlation marker, not a credential. Bridge reads it directly from
+the matched harness process's `/proc/<pid>/environ` to bind a hook to its
+journaled launch (`os::attempt::capture_launch`). Bridge's `detached_consumer`
+and Run's Pool-resident peer check treat it in any same-UID ancestor as "inside
+a managed launch". Removing it from the harness would break that detection. It
+grants no authority: Run and Bridge accept it only from a kernel-verified harness
+incarnation. Codex tool shells do not inherit it; ancestry checks still find it
+on the harness itself.
+
+OpenCode is not changed beyond the `AGENT_RUN_SYSTEM_*` removal. Its stdio MCP
+servers inherit the harness environment, and moving the capability into a native
+per-server environment needs a qualified OpenCode configuration field first.
+
+This is protection against accidental inheritance. It is not a boundary against
+a same-UID agent that deliberately reads another process's `/proc/<pid>/environ`
+or the private per-attempt file.
+
 ## Native process ownership for Bridge
 
 Managed native wake requires Agent Run to own the actual harness process as its
