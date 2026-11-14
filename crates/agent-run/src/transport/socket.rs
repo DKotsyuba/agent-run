@@ -2167,6 +2167,9 @@ async fn serve_endpoints(
     let reconciler = service.clone();
     workers.spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        // A pass longer than the period must not be followed by catch-up
+        // passes back to back; the next pass starts one period after it ends.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             if let Err(error) = reconciler.reconcile().await {

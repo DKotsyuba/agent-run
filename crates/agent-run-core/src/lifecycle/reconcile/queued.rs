@@ -266,7 +266,7 @@ struct OrphanPreparation {
 /// Prepare orphan cleanup using only recorded immutable identity and native absence proof.
 fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
     let store = Store::open(home)?;
-    let select = "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id,t.created_at FROM attempts t JOIN agents a ON a.id=t.agent_id WHERE a.status IN ('succeeded','failed','cancelled','lost','timed_out') AND (t.ownership_active=1 OR (t.phase='cleanup_complete' AND json_extract(t.cleanup_proof_json,'$.confirmed')=1 AND EXISTS(SELECT 1 FROM process_ownership p WHERE p.owner_kind='attempt' AND p.owner_id=t.id)))";
+    let select = orphan_select();
     let cursor: Option<(f64, String)> = store
         .conn
         .query_row(
@@ -452,6 +452,20 @@ fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
     Ok(prepared)
 }
 
+/// Candidate attempts of terminal executions: still owned, or released with
+/// confirmed cleanup but retaining process evidence that compaction may now
+/// remove. Evidence that compaction must keep (an actively pinned lineage or a
+/// sibling attempt without confirmed cleanup) is not selected: re-examining it
+/// could only repeat the full process-table cleanup scan and commit another
+/// no-op release receipt on every one-second pass. It becomes a candidate
+/// again as soon as the blocking pin or sibling attempt settles.
+fn orphan_select() -> String {
+    format!(
+        "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id,t.created_at FROM attempts t JOIN agents a ON a.id=t.agent_id WHERE a.status IN ('succeeded','failed','cancelled','lost','timed_out') AND (t.ownership_active=1 OR (t.phase='cleanup_complete' AND json_extract(t.cleanup_proof_json,'$.confirmed')=1 AND EXISTS(SELECT 1 FROM process_ownership p WHERE p.owner_kind='attempt' AND p.owner_id=t.id) AND {}))",
+        agent_run_store::process_ownership::COMPACTION_ELIGIBLE_AGENT
+    )
+}
+
 /// Return a cursor update only when its exact last-read key changes. This
 /// read-side optimization avoids a new durable receipt on every idle sweep;
 /// cursor wrap/fairness and all writer-side ownership checks remain unchanged.
@@ -489,4 +503,103 @@ async fn persist_process_batches(
         offset = end;
     }
     Ok(())
+}
+
+/// Orphan-sweep selection against retained, actively pinned process evidence.
+#[cfg(test)]
+mod tests {
+    use super::prepare_orphans;
+    use agent_run_platform::process::{Identity, OwnershipSnapshot};
+    use agent_run_store::ops;
+    use rusqlite::params;
+    use serde_json::json;
+
+    /// Released, cleanup-confirmed evidence of a pinned lineage is retained
+    /// without being re-swept on every pass; releasing the pin makes it one
+    /// compaction candidate again. Identities are inert and never signalled.
+    #[test]
+    fn pinned_released_evidence_is_not_reswept_until_unpinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        agent_run_platform::fs::private_dir(&home).unwrap();
+        let config = format!(
+            "schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary='/bin/true'\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",
+            toml::Value::String(home.join("runtimes/mock").to_string_lossy().into_owned())
+        );
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        let config = agent_run_config::config::Config::load(&home).unwrap();
+        agent_run_store::fixture::initialize(&home).unwrap();
+        let mut store = agent_run_store::fixture::open(&home).unwrap();
+        let mut request: agent_run_domain::domain::StartRequest = serde_json::from_value(json!({
+            "runtime":"mock","model":"fixture","profile":"review","task":"fixture task","workdir":home
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+        let pin = agent_run_domain::batch::PinId::new();
+        store
+            .conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                params![pin.as_str(), id.as_str()],
+            )
+            .unwrap();
+        store.running(&id, 10).unwrap();
+        let attempt = format!("{id}:1");
+        let leader = Identity {
+            pid: 10,
+            ppid: 2,
+            group: 10,
+            birth: 123.0,
+            token: "inert-root".into(),
+            program: None,
+            zombie: false,
+        };
+        let snapshot = OwnershipSnapshot {
+            leader: leader.clone(),
+            members: vec![leader],
+            descendants_observed: true,
+        };
+        store
+            .remember_processes("attempt", &attempt, &snapshot)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET ownership_active=0,phase='cleanup_complete',cleanup_proof_json=? WHERE id=?",
+                params![
+                    json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),
+                    attempt
+                ],
+            )
+            .unwrap();
+        store
+            .finish(
+                &id,
+                &agent_run_domain::domain::Outcome::failure("fixture"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .remembered_processes("attempt", &attempt)
+                .unwrap()
+                .is_some(),
+            "an active pin retains process evidence"
+        );
+        for _ in 0..3 {
+            let prepared = prepare_orphans(&home, 100).unwrap();
+            assert!(prepared.releases.is_empty(), "pinned evidence is re-swept");
+            assert!(prepared.captured.is_empty());
+        }
+        store.release_history_pin(&pin).unwrap().unwrap();
+        let prepared = prepare_orphans(&home, 100).unwrap();
+        assert_eq!(prepared.releases.len(), 1);
+        assert_eq!(prepared.releases[0].attempt, attempt);
+        assert!(matches!(
+            prepared.releases[0].outcome,
+            ops::OrphanOutcome::Release { proof: None }
+        ));
+    }
 }
