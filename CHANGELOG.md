@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- The broker's one-second orphaned-attempt sweep no longer re-selects released
+  attempts whose process evidence must be retained (an actively pinned lineage,
+  or a sibling attempt without confirmed cleanup). Each such attempt previously
+  repeated a full process-table cleanup scan and committed a no-op
+  `release_orphaned_attempt` receipt on every pass, which kept an idle broker
+  near one CPU core and grew `state.db` without bound. The evidence becomes a
+  compaction candidate again once the pin or sibling settles. A reconcile pass
+  that overruns its period no longer triggers immediate catch-up passes.
+
 ## 0.31.4
 
 ### Added
