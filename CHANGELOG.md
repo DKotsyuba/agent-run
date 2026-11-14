@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.5
+
 ### Fixed
 
 - The broker's one-second orphaned-attempt sweep no longer re-selects released
