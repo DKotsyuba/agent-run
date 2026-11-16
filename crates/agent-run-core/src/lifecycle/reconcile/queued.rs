@@ -24,7 +24,7 @@ pub async fn reconcile(home: &Path, lane: &BrokerLane, limit: usize) -> Result<V
         let (rows, cursor) = tokio::task::spawn_blocking(move || {
             agent_run_store::writer::StoreReader::cached(
                 &root,
-                std::time::Duration::from_millis(250),
+                std::time::Duration::from_secs(5),
                 |store| {
                     let rows = fair_read(store, name, select, remaining)?;
                     let cursor = rows
@@ -270,11 +270,9 @@ struct OrphanPreparation {
 
 /// Prepare orphan cleanup using only recorded immutable identity and native absence proof.
 fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
-    agent_run_store::writer::StoreReader::cached(
-        home,
-        std::time::Duration::from_millis(250),
-        |store| prepare_orphans_on(store, limit),
-    )
+    agent_run_store::writer::StoreReader::cached(home, std::time::Duration::from_secs(5), |store| {
+        prepare_orphans_on(store, limit)
+    })
 }
 
 /// Prepares one orphan page on the caller's read connection, without retaining a snapshot.

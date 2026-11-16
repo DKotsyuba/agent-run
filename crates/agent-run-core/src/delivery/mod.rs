@@ -500,7 +500,7 @@ async fn pending(home: &Path, at: f64) -> Result<bool> {
     tokio::task::spawn_blocking(move || {
         agent_run_store::writer::StoreReader::cached(
             &reader_home,
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(5),
             |reader| reader.delivery_pending(at),
         )
     })

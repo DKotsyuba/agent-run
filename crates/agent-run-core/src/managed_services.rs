@@ -70,28 +70,24 @@ const GENERATIONS: &str = "SELECT json_object('id',id,'service_id',service_id,'r
 
 /// Reads frozen generations without holding a database connection across process or probe waits.
 fn generations(home: &Path) -> Result<Vec<Generation>> {
-    agent_run_store::writer::StoreReader::cached(
-        home,
-        std::time::Duration::from_millis(250),
-        |store| {
-            let mut query = store.conn.prepare(&format!(
-                "{GENERATIONS} WHERE state != 'stopped' ORDER BY created_at,id"
-            ))?;
+    agent_run_store::writer::StoreReader::cached(home, std::time::Duration::from_secs(5), |store| {
+        let mut query = store.conn.prepare(&format!(
+            "{GENERATIONS} WHERE state != 'stopped' ORDER BY created_at,id"
+        ))?;
 
-            query
-                .query_map([], |row| row.get::<_, String>(0))?
-                .map(|row| -> Result<Generation> {
-                    let generation: Generation = serde_json::from_str(&row?)?;
-                    if generation.definition.revision()? != generation.revision {
-                        return Err(Error::Integrity(
-                            "managed service definition changed".into(),
-                        ));
-                    }
-                    Ok(generation)
-                })
-                .collect()
-        },
-    )
+        query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| -> Result<Generation> {
+                let generation: Generation = serde_json::from_str(&row?)?;
+                if generation.definition.revision()? != generation.revision {
+                    return Err(Error::Integrity(
+                        "managed service definition changed".into(),
+                    ));
+                }
+                Ok(generation)
+            })
+            .collect()
+    })
 }
 
 /// Observes an exact recorded identity; missing permissions never mean a stopped service.
@@ -246,7 +242,7 @@ impl Manager {
     async fn recover_probes(&self) -> Result<()> {
         let ids: Vec<String> = agent_run_store::writer::StoreReader::cached(
             &self.home,
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(5),
             |store| {
                 let mut query = store
                     .conn
@@ -306,7 +302,7 @@ impl Manager {
     async fn prepare_pending(&mut self) -> Result<()> {
         let ids: Vec<String> = agent_run_store::writer::StoreReader::cached(
             &self.home,
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(5),
             |store| {
                 let mut query = store.conn.prepare("SELECT g.agent_id FROM agent_service_gates g JOIN agents a ON a.id=g.agent_id WHERE g.state='pending' AND a.status IN ('created','starting','running','cancelling') ORDER BY a.created_at,a.id")?;
 

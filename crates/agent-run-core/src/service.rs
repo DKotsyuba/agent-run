@@ -3111,7 +3111,7 @@ impl Service {
         let started = tokio::time::Instant::now();
         let until = started + Duration::from_secs_f64(query.wait_seconds);
         loop {
-            let value = StoreReader::cached(&self.home, READ_ALLOWANCE, |store| {
+            let value = StoreReader::cached(&self.home, Duration::from_secs(5), |store| {
                 let revision = store.revision()?;
                 let message_revision = store.message_revision()?;
                 // Journal rows never advance the event revision, so a
