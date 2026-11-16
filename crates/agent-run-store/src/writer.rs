@@ -1212,7 +1212,60 @@ pub struct StoreReader {
     history_pause: std::cell::RefCell<Option<Box<dyn Fn() + Send>>>,
 }
 
+thread_local! {
+    /// One idle read connection per worker thread; never a retained transaction.
+    static IDLE_READER: std::cell::RefCell<Option<(std::fs::Metadata, StoreReader)>> = const { std::cell::RefCell::new(None) };
+}
+
 impl StoreReader {
+    /// Runs a synchronous read using at most one cached connection on this thread.
+    /// Reopens after path replacement or home changes. Every call checks schema
+    /// version and busy allowance; only autocommit, query-only connections return
+    /// to the cache. Results and transactions are never cached. A panic drops the
+    /// checked-out connection, and nested reads use their own connection.
+    pub fn cached<T>(
+        home: &Path,
+        busy: Duration,
+        read: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        use std::os::unix::fs::MetadataExt;
+        let home = canonical_home(home)?;
+        let path = state_path(&home)?
+            .ok_or_else(|| Error::Unsupported("state database is missing".into()))?;
+        let metadata = std::fs::metadata(path)?;
+        let cached = IDLE_READER.with(|slot| slot.borrow_mut().take());
+        let reader = match cached {
+            Some((previous, reader))
+                if reader.store.home == home
+                    && previous.dev() == metadata.dev()
+                    && previous.ino() == metadata.ino()
+                    && previous.uid() == metadata.uid()
+                    && previous.mode() == metadata.mode() =>
+            {
+                reader
+            }
+            _ => Self::open_with(&home, busy)?,
+        };
+        reader.conn().busy_timeout(busy)?;
+        let version: i64 = reader
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != VERSION {
+            return Err(Error::Unsupported(format!(
+                "state schema v{version} is not v{VERSION}; offline migration required"
+            )));
+        }
+        let result = read(&reader);
+        if reader.conn().is_autocommit()
+            && reader
+                .conn()
+                .pragma_query_value(None, "query_only", |r| r.get::<_, bool>(0))?
+        {
+            IDLE_READER.with(|slot| *slot.borrow_mut() = Some((metadata, reader)));
+        }
+        result
+    }
+
     /// Read-only superset preflight for expired history and auxiliary tables.
     /// Finite Unix seconds at least the history window are required. False lets
     /// maintenance skip SQL writes; the writer still rechecks every protected row.
@@ -1605,6 +1658,98 @@ impl StoreReader {
 mod tests {
     //! Maintenance wait bounding and connection settlement of the writer.
     use super::*;
+
+    /// Cached readers see commits between uses and never retain a read transaction.
+    #[test]
+    fn cached_reader_reuses_connection_but_refreshes_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::fixture::initialize(home.path()).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE cache_probe(value INTEGER); INSERT INTO cache_probe VALUES(1)",
+            )
+            .unwrap();
+        StoreReader::cached(home.path(), WRITER_BUSY, |reader| {
+            reader.conn().pragma_update(None, "cache_size", 123)?;
+            assert_eq!(
+                reader
+                    .conn()
+                    .query_row("SELECT value FROM cache_probe", [], |r| r.get::<_, i64>(0))?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        store
+            .conn
+            .execute("UPDATE cache_probe SET value=2", [])
+            .unwrap();
+        StoreReader::cached(home.path(), WRITER_BUSY, |reader| {
+            assert!(reader.conn().is_autocommit());
+            assert_eq!(
+                reader
+                    .conn()
+                    .pragma_query_value(None, "cache_size", |r| r.get::<_, i64>(0))?,
+                123
+            );
+            assert_eq!(
+                reader
+                    .conn()
+                    .query_row("SELECT value FROM cache_probe", [], |r| r.get::<_, i64>(0))?,
+                2
+            );
+            assert!(
+                reader
+                    .conn()
+                    .execute("UPDATE cache_probe SET value=3", [])
+                    .is_err()
+            );
+            Ok(())
+        })
+        .unwrap();
+        IDLE_READER.with(|slot| slot.borrow_mut().take());
+    }
+
+    /// A renamed replacement or symlink must never reuse the prior open inode.
+    #[test]
+    fn cached_reader_detects_replaced_database_and_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        drop(crate::fixture::initialize(home.path()).unwrap());
+        StoreReader::cached(home.path(), WRITER_BUSY, |_| Ok(())).unwrap();
+        let replacement = home.path().join("replacement.db");
+        let connection = rusqlite::Connection::open(&replacement).unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
+        drop(connection);
+        std::fs::rename(&replacement, home.path().join("state.db")).unwrap();
+        assert!(matches!(
+            StoreReader::cached(home.path(), WRITER_BUSY, |_| Ok(())),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::remove_file(home.path().join("state.db")).unwrap();
+        std::os::unix::fs::symlink("replacement.db", home.path().join("state.db")).unwrap();
+        assert!(StoreReader::cached(home.path(), WRITER_BUSY, |_| Ok(())).is_err());
+        IDLE_READER.with(|slot| slot.borrow_mut().take());
+    }
+
+    /// Unfinished transactions are closed instead of contaminating the next job.
+    #[test]
+    fn cached_reader_discards_unfinished_transactions() {
+        let home = tempfile::tempdir().unwrap();
+        drop(crate::fixture::initialize(home.path()).unwrap());
+        StoreReader::cached(home.path(), WRITER_BUSY, |reader| {
+            reader.conn().execute_batch("BEGIN")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(IDLE_READER.with(|slot| slot.borrow().is_none()));
+        StoreReader::cached(home.path(), WRITER_BUSY, |reader| {
+            assert!(reader.conn().is_autocommit());
+            Ok(())
+        })
+        .unwrap();
+        IDLE_READER.with(|slot| slot.borrow_mut().take());
+    }
 
     /// Neither receipt lookup API can assert durability through an open transaction; rollback restores truthful lookup.
     #[test]

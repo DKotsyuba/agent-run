@@ -70,23 +70,28 @@ const GENERATIONS: &str = "SELECT json_object('id',id,'service_id',service_id,'r
 
 /// Reads frozen generations without holding a database connection across process or probe waits.
 fn generations(home: &Path) -> Result<Vec<Generation>> {
-    let store = Store::open(home)?;
-    let mut query = store.conn.prepare(&format!(
-        "{GENERATIONS} WHERE state != 'stopped' ORDER BY created_at,id"
-    ))?;
+    agent_run_store::writer::StoreReader::cached(
+        home,
+        std::time::Duration::from_millis(250),
+        |store| {
+            let mut query = store.conn.prepare(&format!(
+                "{GENERATIONS} WHERE state != 'stopped' ORDER BY created_at,id"
+            ))?;
 
-    query
-        .query_map([], |row| row.get::<_, String>(0))?
-        .map(|row| -> Result<Generation> {
-            let generation: Generation = serde_json::from_str(&row?)?;
-            if generation.definition.revision()? != generation.revision {
-                return Err(Error::Integrity(
-                    "managed service definition changed".into(),
-                ));
-            }
-            Ok(generation)
-        })
-        .collect()
+            query
+                .query_map([], |row| row.get::<_, String>(0))?
+                .map(|row| -> Result<Generation> {
+                    let generation: Generation = serde_json::from_str(&row?)?;
+                    if generation.definition.revision()? != generation.revision {
+                        return Err(Error::Integrity(
+                            "managed service definition changed".into(),
+                        ));
+                    }
+                    Ok(generation)
+                })
+                .collect()
+        },
+    )
 }
 
 /// Observes an exact recorded identity; missing permissions never mean a stopped service.
@@ -239,16 +244,20 @@ impl Manager {
 
     /// Cleans probes interrupted by broker death before any new probe or service admission can run.
     async fn recover_probes(&self) -> Result<()> {
-        let ids: Vec<String> = {
-            let store = Store::open(&self.home)?;
-            let mut query = store
-                .conn
-                .prepare("SELECT id FROM managed_service_probes")?;
+        let ids: Vec<String> = agent_run_store::writer::StoreReader::cached(
+            &self.home,
+            std::time::Duration::from_millis(250),
+            |store| {
+                let mut query = store
+                    .conn
+                    .prepare("SELECT id FROM managed_service_probes")?;
 
-            query
-                .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
+                query
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(Error::from)
+            },
+        )?;
         for id in ids {
             let captured = Store::open(&self.home)?.remembered_processes("probe", &id)?;
             let confirmed = match captured {
@@ -273,8 +282,11 @@ impl Manager {
     async fn release_finished(&self) -> Result<()> {
         let home = self.home.clone();
         let pending = tokio::task::spawn_blocking(move || {
-            agent_run_store::writer::StoreReader::open_with(&home, Duration::from_millis(250))?
-                .service_lease_release_pending()
+            agent_run_store::writer::StoreReader::cached(
+                &home,
+                Duration::from_millis(250),
+                |reader| reader.service_lease_release_pending(),
+            )
         })
         .await
         .map_err(|_| Error::Runtime("service lease preflight task failed".into()))??;
@@ -292,14 +304,18 @@ impl Manager {
 
     /// Resolves each pending agent's frozen definitions and acquires leases before publishing its ready gate.
     async fn prepare_pending(&mut self) -> Result<()> {
-        let ids: Vec<String> = {
-            let store = Store::open(&self.home)?;
-            let mut query = store.conn.prepare("SELECT g.agent_id FROM agent_service_gates g JOIN agents a ON a.id=g.agent_id WHERE g.state='pending' AND a.status IN ('created','starting','running','cancelling') ORDER BY a.created_at,a.id")?;
+        let ids: Vec<String> = agent_run_store::writer::StoreReader::cached(
+            &self.home,
+            std::time::Duration::from_millis(250),
+            |store| {
+                let mut query = store.conn.prepare("SELECT g.agent_id FROM agent_service_gates g JOIN agents a ON a.id=g.agent_id WHERE g.state='pending' AND a.status IN ('created','starting','running','cancelling') ORDER BY a.created_at,a.id")?;
 
-            query
-                .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
+                query
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(Error::from)
+            },
+        )?;
         for id in ids {
             let agent: AgentId = id.parse()?;
             let row = Store::open(&self.home)?.get(&agent)?;

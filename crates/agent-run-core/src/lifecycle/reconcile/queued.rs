@@ -22,20 +22,25 @@ pub async fn reconcile(home: &Path, lane: &BrokerLane, limit: usize) -> Result<V
         }
         let root = home.to_owned();
         let (rows, cursor) = tokio::task::spawn_blocking(move || {
-            let store = Store::open(&root)?;
-            let rows = fair_read(&store, name, select, remaining)?;
-            let cursor = rows
-                .last()
-                .map(|last| ops::ReconcileReapedAgent {
-                    cursor: name.into(),
-                    created_at: last.created_at,
-                    execution: last.id.clone(),
-                    attempt: None,
-                })
-                .map(|op| changed_cursor(&store, op))
-                .transpose()?
-                .flatten();
-            Ok::<_, Error>((rows, cursor))
+            agent_run_store::writer::StoreReader::cached(
+                &root,
+                std::time::Duration::from_millis(250),
+                |store| {
+                    let rows = fair_read(store, name, select, remaining)?;
+                    let cursor = rows
+                        .last()
+                        .map(|last| ops::ReconcileReapedAgent {
+                            cursor: name.into(),
+                            created_at: last.created_at,
+                            execution: last.id.clone(),
+                            attempt: None,
+                        })
+                        .map(|op| changed_cursor(store, op))
+                        .transpose()?
+                        .flatten();
+                    Ok::<_, Error>((rows, cursor))
+                },
+            )
         })
         .await
         .map_err(|_| Error::Runtime("reconciliation reader stopped".into()))??;
@@ -265,7 +270,15 @@ struct OrphanPreparation {
 
 /// Prepare orphan cleanup using only recorded immutable identity and native absence proof.
 fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
-    let store = Store::open(home)?;
+    agent_run_store::writer::StoreReader::cached(
+        home,
+        std::time::Duration::from_millis(250),
+        |store| prepare_orphans_on(store, limit),
+    )
+}
+
+/// Prepares one orphan page on the caller's read connection, without retaining a snapshot.
+fn prepare_orphans_on(store: &Store, limit: usize) -> Result<OrphanPreparation> {
     let select = orphan_select();
     let cursor: Option<(f64, String)> = store
         .conn
@@ -325,10 +338,10 @@ fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
         releases: Vec::new(),
     };
     if let Some(op) = prepared.cursor.take() {
-        prepared.cursor = changed_cursor(&store, op)?;
+        prepared.cursor = changed_cursor(store, op)?;
     }
     for (attempt, _) in rows {
-        if !cleanup_mcp_discovery(&store, &attempt.id)? {
+        if !cleanup_mcp_discovery(store, &attempt.id)? {
             continue;
         }
         let saved = store.remembered_processes("attempt", &attempt.id)?;
