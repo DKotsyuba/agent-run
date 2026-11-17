@@ -235,34 +235,32 @@ impl Store<'_> {
     /// `executions` counts retained rows; an absent lineage has zero rows and
     /// null totals. SQLite errors, including integer overflow, propagate.
     pub fn usage_cumulative(&self, root: &AgentId) -> Result<UsageCumulativeView> {
-        let columns = [
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_write_tokens",
-            "reasoning_tokens",
-            "total_tokens",
-            "num_turns",
-            "cost_usd",
-        ];
-        let selects = columns.iter().map(|column| format!(
-            "CASE WHEN MIN(l.sequence)=1 AND MAX(l.sequence)=COUNT(*) AND COUNT(s.{column})=COUNT(*) THEN SUM(s.{column}) END"
-        )).collect::<Vec<_>>().join(",");
+        let selects = cumulative_selects();
         Ok(self.conn.query_row(
             &format!("SELECT COUNT(*),{selects} FROM agents l LEFT JOIN run_stats s ON s.agent_id=l.id WHERE l.id=?1 OR l.root_agent_id=?1"),
             [root.as_str()],
-            |row| Ok(UsageCumulativeView {
-                executions: row.get(0)?,
-                input_tokens: row.get(1)?,
-                output_tokens: row.get(2)?,
-                cache_read_tokens: row.get(3)?,
-                cache_write_tokens: row.get(4)?,
-                reasoning_tokens: row.get(5)?,
-                total_tokens: row.get(6)?,
-                num_turns: row.get(7)?,
-                cost_usd: row.get(8)?,
-            }),
+            read_cumulative,
         )?)
+    }
+
+    /// Reads cumulative usage for the page's distinct roots in one statement.
+    /// Aggregates retain the exact per-root missing-history and NULL semantics.
+    pub fn usage_cumulative_page(
+        &self,
+        records: &[Record],
+    ) -> Result<std::collections::BTreeMap<String, UsageCumulativeView>> {
+        let roots: std::collections::BTreeSet<_> =
+            records.iter().map(|r| r.root_agent_id.as_str()).collect();
+        let roots = serde_json::to_string(&roots)?;
+        let selects = cumulative_selects();
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT COUNT(*),{selects},roots.value FROM json_each(?1) roots JOIN agents l ON l.id=roots.value OR l.root_agent_id=roots.value LEFT JOIN run_stats s ON s.agent_id=l.id GROUP BY roots.value"
+        ))?;
+        Ok(statement
+            .query_map([roots], |row| {
+                Ok((row.get::<_, String>(9)?, read_cumulative(row)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Returns a stable offset page and the global event revision from one SQLite read transaction.
@@ -462,4 +460,36 @@ impl Store<'_> {
             last_attempt: json(evidence)?,
         })
     }
+}
+
+/// Shares exact integer aggregates and completeness checks between single and page reads.
+fn cumulative_selects() -> String {
+    let columns = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "num_turns",
+        "cost_usd",
+    ];
+    columns.iter().map(|column| format!(
+        "CASE WHEN MIN(l.sequence)=1 AND MAX(l.sequence)=COUNT(*) AND COUNT(s.{column})=COUNT(*) THEN SUM(s.{column}) END"
+    )).collect::<Vec<_>>().join(",")
+}
+
+/// Decodes the stable aggregate column order shared by both queries.
+fn read_cumulative(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageCumulativeView> {
+    Ok(UsageCumulativeView {
+        executions: row.get(0)?,
+        input_tokens: row.get(1)?,
+        output_tokens: row.get(2)?,
+        cache_read_tokens: row.get(3)?,
+        cache_write_tokens: row.get(4)?,
+        reasoning_tokens: row.get(5)?,
+        total_tokens: row.get(6)?,
+        num_turns: row.get(7)?,
+        cost_usd: row.get(8)?,
+    })
 }

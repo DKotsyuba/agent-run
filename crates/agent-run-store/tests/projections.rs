@@ -120,12 +120,14 @@ fn usage_cumulative_is_null_until_lineage_evidence_is_complete() {
         )
         .unwrap();
 
+    assert_page_usage_matches_exact(&store);
     let incomplete = store.usage_cumulative(&root).unwrap();
     assert_eq!(incomplete.executions, 2);
     assert_eq!(incomplete.input_tokens, None, "a missing row is not zero");
     assert_eq!(incomplete.output_tokens, None);
 
     stats_row(&store, &child, Some(5), None);
+    assert_page_usage_matches_exact(&store);
     let partial = store.usage_cumulative(&root).unwrap();
     assert_eq!(partial.input_tokens, Some(15));
     assert_eq!(
@@ -147,6 +149,7 @@ fn usage_cumulative_requires_history_and_preserves_integer_precision() {
     let mut store = home.store();
     let root = agent(&mut store, &home);
     stats_row(&store, &root, Some(9_007_199_254_740_993), Some(0));
+    assert_page_usage_matches_exact(&store);
     assert_eq!(
         store.usage_cumulative(&root).unwrap().input_tokens,
         Some(9_007_199_254_740_993)
@@ -155,6 +158,7 @@ fn usage_cumulative_requires_history_and_preserves_integer_precision() {
         .conn
         .execute("UPDATE agents SET sequence=2 WHERE id=?", [root.as_str()])
         .unwrap();
+    assert_page_usage_matches_exact(&store);
     let incomplete = store.usage_cumulative(&root).unwrap();
     assert_eq!(incomplete.executions, 1);
     assert_eq!(incomplete.input_tokens, None);
@@ -181,4 +185,17 @@ fn agent_view_carries_display_name_and_usage() {
     assert_eq!(view.name.as_deref(), Some("Fixture Lead"));
     assert!(view.usage.is_none());
     assert_eq!(view.usage_cumulative.as_ref().unwrap().executions, 1);
+}
+
+/// Page aggregation matches exact reads for repeated roots and absent measurements.
+fn assert_page_usage_matches_exact(store: &agent_run_store::Store<'_>) {
+    let (rows, _) = store.list(false, 0, 100, None).unwrap();
+    let page = store.usage_cumulative_page(&rows).unwrap();
+    for row in rows {
+        assert_eq!(
+            serde_json::to_value(&page[row.root_agent_id.as_str()]).unwrap(),
+            serde_json::to_value(store.usage_cumulative(&row.root_agent_id).unwrap()).unwrap()
+        );
+    }
+    assert!(store.usage_cumulative_page(&[]).unwrap().is_empty());
 }

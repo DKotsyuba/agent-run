@@ -1128,3 +1128,99 @@ async fn blocked_start_remembers_known_caller() {
         0
     );
 }
+
+/// A full page preserves exact single-record views and cumulative NULL semantics.
+#[tokio::test]
+async fn list_page_matches_exact_views_for_one_hundred_executions() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    for n in 0..100 {
+        let request = agent_run_domain::domain::StartRequest {
+            request_id: Some(format!("page-{n}")),
+            ..home.request()
+        };
+        let (id, _) = store
+            .admit(&request, &home.config, &json!({}), None)
+            .unwrap();
+        store
+            .finish(&id, &Outcome::failure("fixture"), None, None)
+            .unwrap();
+    }
+    let service = Service::new(home.path.clone());
+    let page = service
+        .list(Query {
+            limit: 100,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let (rows, _) = store.list(false, 0, 100, None).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 100);
+    for (row, item) in rows.iter().zip(page["items"].as_array().unwrap()) {
+        let mut expected = service.view(&store, row).unwrap();
+        let mut actual = item.clone();
+        expected.as_object_mut().unwrap().remove("observed_at");
+        actual.as_object_mut().unwrap().remove("observed_at");
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            store.delivery_status(&row.id).unwrap(),
+            store.delivery_status_for_record(row).unwrap()
+        );
+        assert_eq!(
+            store.tool_counts(&row.id).unwrap(),
+            store.tool_counts_for_record(row).unwrap()
+        );
+        assert_eq!(
+            store.health_view(&row.id).unwrap(),
+            store.health_view_for_record(row).unwrap()
+        );
+    }
+}
+
+/// Delivery work must not grow with unrelated event history (SQLite VM budget).
+#[test]
+fn delivery_projection_has_bounded_unrelated_event_work() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let home = common::Home::new();
+    let id = admit(&home, home.request(), json!({}));
+    let mut store = home.store();
+    store
+        .finish(&id, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+    let row = store.get(&id).unwrap();
+    let steps = Arc::new(AtomicUsize::new(0));
+    let counter = steps.clone();
+    store
+        .conn
+        .progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+    let expected = store.delivery_status_for_record(&row).unwrap();
+    let baseline = steps.swap(0, Ordering::Relaxed);
+    store.conn.execute(
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<2000) INSERT INTO events(agent_id,at,kind,data_json) SELECT ?1,1.0,'irrelevant','{}' FROM n",
+        [id.as_str()],
+    ).unwrap();
+    steps.store(0, Ordering::Relaxed);
+    assert_eq!(expected, store.delivery_status_for_record(&row).unwrap());
+    let actual = steps.load(Ordering::Relaxed);
+    assert!(
+        actual <= baseline + 100,
+        "delivery VM steps grew: {baseline} -> {actual}"
+    );
+    store
+        .conn
+        .progress_handler(0, None::<fn() -> bool>)
+        .unwrap();
+}

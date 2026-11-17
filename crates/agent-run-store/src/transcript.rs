@@ -119,43 +119,83 @@ impl Store<'_> {
     /// not add calls. Missing or conflicting result flags make failed null.
     /// Empty measured history is a known zero. This reads no tool arguments.
     pub fn tool_counts(&self, id: &AgentId) -> Result<agent_run_domain::views::ToolCountsView> {
+        self.tool_counts_for_record(&self.get(id)?)
+    }
+
+    /// Counts this selected execution's tools without reading its record again.
+    pub fn tool_counts_for_record(
+        &self,
+        record: &crate::Record,
+    ) -> Result<agent_run_domain::views::ToolCountsView> {
+        Ok(self
+            .tool_counts_page(std::slice::from_ref(record))?
+            .remove(record.id.as_str())
+            .unwrap_or_default())
+    }
+
+    /// Counts a page's tools with one grouped message read and reused coverage checks.
+    /// Only covered executions are scanned; NULL IDs and conflicting results retain
+    /// the exact single-execution unknown semantics. No content or arguments are read.
+    pub fn tool_counts_page(
+        &self,
+        records: &[crate::Record],
+    ) -> Result<std::collections::BTreeMap<String, agent_run_domain::views::ToolCountsView>> {
         use agent_run_domain::views::ToolCountsView;
-        self.get(id)?;
-        let covered: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=?1 AND kind='native_tool_observer_v1') AND NOT EXISTS(SELECT 1 FROM events WHERE agent_id=?1 AND kind='native_tool_coverage_gap_v1')              AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.agent_id=?1 AND a.process_identity IS NOT NULL              AND NOT EXISTS(SELECT 1 FROM events e WHERE e.agent_id=?1 AND e.attempt_id=a.id AND e.kind='native_tool_observer_v1'))",
-            [id.as_str()], |row| row.get(0),
-        )?;
-        if !covered {
-            return Ok(ToolCountsView::default());
+        let mut coverage = self.conn.prepare("SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=?1 AND kind='native_tool_observer_v1') AND NOT EXISTS(SELECT 1 FROM events WHERE agent_id=?1 AND kind='native_tool_coverage_gap_v1')              AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.agent_id=?1 AND a.process_identity IS NOT NULL              AND NOT EXISTS(SELECT 1 FROM events e WHERE e.agent_id=?1 AND e.attempt_id=a.id AND e.kind='native_tool_observer_v1'))")?;
+        let mut counts = std::collections::BTreeMap::new();
+        let mut covered_ids = Vec::new();
+        for record in records {
+            let id = record.id.as_str();
+            let covered: bool = coverage.query_row([id], |row| row.get(0))?;
+            counts.insert(
+                id.to_owned(),
+                if covered {
+                    covered_ids.push(id);
+                    ToolCountsView {
+                        calls: Some(0),
+                        failed: Some(0),
+                        unknown_results: Some(0),
+                    }
+                } else {
+                    ToolCountsView::default()
+                },
+            );
         }
-        // ponytail: per-execution scan; persist summaries only if measured list latency requires it.
+        if covered_ids.is_empty() {
+            return Ok(counts);
+        }
         let mut statement = self.conn.prepare(
-            "SELECT raw_ref,MIN(CASE WHEN role='tool_result' THEN error END),             MAX(CASE WHEN role='tool_result' THEN error END),             SUM(CASE WHEN role='tool_result' THEN 1 ELSE 0 END),COUNT(error)              FROM messages WHERE agent_id=?1 AND role IN ('tool_call','tool_result')              GROUP BY attempt_id,raw_ref"
+            "SELECT agent_id,raw_ref,MIN(CASE WHEN role='tool_result' THEN error END),MAX(CASE WHEN role='tool_result' THEN error END),SUM(CASE WHEN role='tool_result' THEN 1 ELSE 0 END),COUNT(error) FROM messages WHERE agent_id IN (SELECT value FROM json_each(?1)) AND role IN ('tool_call','tool_result') GROUP BY agent_id,attempt_id,raw_ref"
         )?;
-        let mut rows = statement.query([id.as_str()])?;
-        let mut calls = 0;
-        let mut failed = 0;
-        let mut unknown = 0;
+        let ids = serde_json::to_string(&covered_ids)?;
+        let mut rows = statement.query([ids])?;
         while let Some(row) = rows.next()? {
-            if row.get::<_, Option<String>>(0)?.is_none() {
-                return Ok(ToolCountsView::default());
+            let id: String = row.get(0)?;
+            let count = counts
+                .get_mut(&id)
+                .expect("query only selects covered page IDs");
+            if count.calls.is_none() {
+                continue;
             }
-            calls += 1;
-            let min: Option<bool> = row.get(1)?;
-            let max: Option<bool> = row.get(2)?;
-            let results: u64 = row.get(3)?;
-            let reported: u64 = row.get(4)?;
+            if row.get::<_, Option<String>>(1)?.is_none() {
+                *count = ToolCountsView::default();
+                continue;
+            }
+            *count.calls.as_mut().expect("covered count") += 1;
+            let min: Option<bool> = row.get(2)?;
+            let max: Option<bool> = row.get(3)?;
+            let results: u64 = row.get(4)?;
+            let reported: u64 = row.get(5)?;
             if min.is_none() || min != max || results != reported {
-                unknown += 1;
-            } else if min == Some(true) {
-                failed += 1;
+                *count.unknown_results.as_mut().expect("covered count") += 1;
+                count.failed = None;
+            } else if min == Some(true)
+                && let Some(failed) = &mut count.failed
+            {
+                *failed += 1;
             }
         }
-        Ok(ToolCountsView {
-            calls: Some(calls),
-            failed: (unknown == 0).then_some(failed),
-            unknown_results: Some(unknown),
-        })
+        Ok(counts)
     }
 
     /// Reads raw compatible history or bounded blocks according to shared
