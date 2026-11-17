@@ -498,7 +498,11 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 async fn pending(home: &Path, at: f64) -> Result<bool> {
     let reader_home = home.to_owned();
     tokio::task::spawn_blocking(move || {
-        agent_run_store::writer::StoreReader::open(&reader_home)?.delivery_pending(at)
+        agent_run_store::writer::StoreReader::cached(
+            &reader_home,
+            std::time::Duration::from_secs(5),
+            |reader| reader.delivery_pending(at),
+        )
     })
     .await
     .map_err(|_| invalid("delivery preflight task failed"))?

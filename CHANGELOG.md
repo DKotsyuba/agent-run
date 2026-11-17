@@ -4,6 +4,21 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- An idle broker no longer burns CPU opening read connections. The one-second
+  service, reconciliation, health, restart and delivery sweeps each opened a
+  fresh read-only SQLite connection, so cold schema and page-cache
+  initialization and allocator contention dominated even with no clients. Each
+  worker thread now reuses at most one idle read-only connection, validated
+  against the store identity (home, device, inode, owner, mode) and the schema
+  on every use, with the caller's busy allowance restored per use. Only
+  autocommit query-only handles return to the cache; no result or read
+  transaction survives between calls, and explicit compound read snapshots are
+  unchanged. On a copy of a production store, idle CPU fell from 4.97-12.56% to
+  0.37% and idle read throughput from 2.5 MB/s to 29 KB/s; an exact `status`
+  call fell from 5.3 ms to 2.5 ms. There is no migration or transport change.
+
 ## 0.31.5
 
 ### Fixed

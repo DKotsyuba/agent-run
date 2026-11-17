@@ -2303,7 +2303,7 @@ impl Service {
         job: impl FnOnce(&StoreReader) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let home = self.home.clone();
-        tokio::task::spawn_blocking(move || job(&StoreReader::open_with(&home, READ_ALLOWANCE)?))
+        tokio::task::spawn_blocking(move || StoreReader::cached(&home, READ_ALLOWANCE, job))
             .await
             .map_err(|_| Error::Runtime("store read task failed".into()))?
     }
@@ -3111,8 +3111,7 @@ impl Service {
         let started = tokio::time::Instant::now();
         let until = started + Duration::from_secs_f64(query.wait_seconds);
         loop {
-            let value = {
-                let store = Store::open(&self.home)?;
+            let value = StoreReader::cached(&self.home, Duration::from_secs(5), |store| {
                 let revision = store.revision()?;
                 let message_revision = store.message_revision()?;
                 // Journal rows never advance the event revision, so a
@@ -3128,7 +3127,7 @@ impl Service {
                     .is_some_and(|m| message_revision > m)
                     && started.elapsed() >= Duration::from_secs(1);
                 if tokio::time::Instant::now() < until && !events_advanced && !journal_advanced {
-                    None
+                    Ok(None)
                 } else {
                     let list = if latest {
                         Store::list_latest
@@ -3136,7 +3135,7 @@ impl Service {
                         Store::list
                     };
                     let (rows, total) = list(
-                        &store,
+                        store,
                         query.active,
                         query.offset,
                         query.limit,
@@ -3144,14 +3143,14 @@ impl Service {
                     )?;
                     let items = rows
                         .iter()
-                        .map(|r| self.view(&store, r))
+                        .map(|r| self.view(store, r))
                         .collect::<Result<Vec<_>>>()?;
                     let next = query.offset.saturating_add(items.len());
-                    Some(
+                    Ok(Some(
                         json!({"items":items,"total":total,"offset":query.offset,"limit":query.limit,"next_offset":if next<total as usize{Some(next)}else{None},"complete":next>=total as usize,"revision":revision,"message_revision":message_revision,"observed_at":now()}),
-                    )
+                    ))
                 }
-            };
+            })?;
             if let Some(value) = value {
                 return Ok(value);
             }
