@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.7
+
 ### Fixed
 
 - `list_agents` no longer re-reads and re-decodes the same frozen execution
