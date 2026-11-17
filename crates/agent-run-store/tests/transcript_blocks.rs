@@ -534,3 +534,50 @@ fn recovery_scope_is_explicit_and_independent_of_unknown_message_identity() {
     assert!(raw["messages"][0].get("scope_start").is_none());
     assert_eq!(raw["messages"][0]["raw_ref"], serde_json::Value::Null);
 }
+
+/// Identical native call IDs in different page executions never merge; unknown
+/// coverage and missing native IDs remain unknown for only their own execution.
+#[test]
+fn tool_counts_page_keeps_execution_and_coverage_boundaries() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        let id = agent(&mut store, &home);
+        if n != 3 {
+            store
+                .event(&id, "native_tool_observer_v1", &json!({}))
+                .unwrap();
+        }
+        store
+            .message_with_error(
+                &id,
+                "tool_call",
+                "",
+                Some("Bash"),
+                if n == 2 { None } else { Some("same") },
+                None,
+            )
+            .unwrap();
+        store
+            .message_with_error(
+                &id,
+                "tool_result",
+                "",
+                Some("Bash"),
+                if n == 2 { None } else { Some("same") },
+                Some((n == 1, "claude.is_error")),
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    let records: Vec<_> = ids.iter().map(|id| store.get(id).unwrap()).collect();
+    let counts = store.tool_counts_page(&records).unwrap();
+    assert_eq!(counts[ids[0].as_str()].calls, Some(1));
+    assert_eq!(counts[ids[0].as_str()].failed, Some(0));
+    assert_eq!(counts[ids[1].as_str()].calls, Some(1));
+    assert_eq!(counts[ids[1].as_str()].failed, Some(1));
+    assert_eq!(counts[ids[2].as_str()], Default::default());
+    assert_eq!(counts[ids[3].as_str()], Default::default());
+    assert!(store.tool_counts_page(&[]).unwrap().is_empty());
+}

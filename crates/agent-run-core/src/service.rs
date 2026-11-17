@@ -3141,9 +3141,18 @@ impl Service {
                         query.limit,
                         query.orchestrator.as_ref(),
                     )?;
+                    let usage = store.usage_cumulative_page(&rows)?;
+                    let tools = store.tool_counts_page(&rows)?;
                     let items = rows
                         .iter()
-                        .map(|r| self.view(store, r))
+                        .map(|r| {
+                            self.view_with_projections(
+                                store,
+                                r,
+                                usage.get(r.root_agent_id.as_str()),
+                                tools.get(r.id.as_str()),
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()?;
                     let next = query.offset.saturating_add(items.len());
                     Ok(Some(
@@ -3227,6 +3236,33 @@ impl Service {
     /// written and no process is launched; store/serialization errors propagate.
     /// Public transports subsequently normalize execution identity to the root.
     pub fn view(&self, store: &Store, row: &Record) -> Result<Value> {
+        self.view_with_projections(store, row, None, None)
+    }
+
+    /// Reuses call-local usage and tool projections for pages; exact reads fall back.
+    fn view_with_projections(
+        &self,
+        store: &Store,
+        row: &Record,
+        usage: Option<&agent_run_domain::views::UsageCumulativeView>,
+        tools: Option<&agent_run_domain::views::ToolCountsView>,
+    ) -> Result<Value> {
+        let cumulative;
+        let usage = match usage {
+            Some(usage) => usage,
+            None => {
+                cumulative = store.usage_cumulative(&row.root_agent_id)?;
+                &cumulative
+            }
+        };
+        let tool_counts;
+        let tools = match tools {
+            Some(tools) => tools,
+            None => {
+                tool_counts = store.tool_counts_for_record(row)?;
+                &tool_counts
+            }
+        };
         let observed = now();
         let progress = store.last_progress(&row.id)?;
         let phase = if row.status.terminal() {
@@ -3255,8 +3291,8 @@ impl Service {
             .and_then(|i| i.get("effective_policy"));
         let mut view = json!({"agent_id":row.id,"name":row.display_name,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
-            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
-            "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?,"tool_counts":store.tool_counts(&row.id)?});
+            "delivery":store.delivery_status_for_record(row)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
+            "usage":store.usage_view(&row.id)?,"usage_cumulative":usage,"tool_counts":tools});
         if let Some((status, reason)) =
             agent_run_store::service_restart::restart_view(&store.conn, &row.id)?
         {
@@ -3307,7 +3343,7 @@ impl Service {
             view["turn_count"] = lifecycle["turn_count"].clone();
             view["idle_seconds"] = lifecycle["idle_seconds"].clone();
         }
-        if let Some(health) = store.health_view(&row.id)? {
+        if let Some(health) = store.health_view_for_record(row)? {
             view["health"] = health;
         }
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());

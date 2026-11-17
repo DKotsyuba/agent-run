@@ -4,6 +4,22 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `list_agents` no longer re-reads and re-decodes the same frozen execution
+  record for every projection. Delivery, health and tool-count projections
+  reuse the selected record, cumulative usage and tool counts are computed with
+  one grouped statement per page, and the delivery exclusion uses indexed
+  correlated `NOT EXISTS` lookups instead of a global events scan for each
+  selected execution. Health still validates the frozen policy, and no
+  projection or result survives between calls. On a production-sized copy
+  (113 executions, 13,445 messages, 4,255 events) a 100-item list fell from a
+  134.8 ms to a 60.3 ms median, CPU per call from 136 ms to 61 ms and bytes
+  read from 40 MB to 23 MB. Ten clients polling every 500 ms dropped from 206%
+  to 106% of one core. There is no schema, migration or transport change.
+- The delivery exclusion with `NOT EXISTS` no longer hides a delivery row whose
+  `terminal_event_seq` is NULL depending on unrelated events.
+
 ## 0.31.6
 
 ### Fixed

@@ -517,7 +517,12 @@ impl Store<'_> {
     /// Return public content-free diagnostics of the latest attempt. This does
     /// not mutate state, certify a model's claim or extend a probe's deadline.
     pub fn health_view(&self, run: &AgentId) -> Result<Option<Value>> {
-        let row = self.get(run)?;
+        self.health_view_for_record(&self.get(run)?)
+    }
+
+    /// Projects health using the selected execution and its frozen policy.
+    pub fn health_view_for_record(&self, row: &crate::Record) -> Result<Option<Value>> {
+        let run = &row.id;
         let attempt: Option<String> = self
             .conn
             .query_row(
@@ -529,7 +534,8 @@ impl Store<'_> {
         let Some(attempt) = attempt else {
             return Ok(None);
         };
-        let Some(state) = self.health_snapshot(run, &attempt)? else {
+        let Some(state) = self.health_snapshot_with_policy(run, &attempt, row.request.idle_ping)?
+        else {
             return Ok(None);
         };
         let idle = self
@@ -667,11 +673,20 @@ impl Store<'_> {
 
     /// Decode the current typed snapshot without silently replacing corrupt state.
     fn health_snapshot(&self, run: &AgentId, attempt: &str) -> Result<Option<Snapshot>> {
+        self.health_snapshot_with_policy(run, attempt, self.get(run)?.request.idle_ping)
+    }
+
+    /// Reads the latest health fact and checks its frozen admission policy.
+    fn health_snapshot_with_policy(
+        &self,
+        run: &AgentId,
+        attempt: &str,
+        policy: PingPolicy,
+    ) -> Result<Option<Snapshot>> {
         let raw:Option<String>=self.conn.query_row("SELECT data_json FROM events WHERE agent_id=? AND attempt_id=? AND kind=? ORDER BY seq DESC LIMIT 1",params![run.as_str(),attempt,STATE],|r|r.get(0)).optional()?;
         let state: Option<Snapshot> = raw
             .map(|s| serde_json::from_str(&s).map_err(Error::from))
             .transpose()?;
-        let policy = self.get(run)?.request.idle_ping;
         if state.as_ref().is_some_and(|state| state.policy != policy) {
             return Err(Error::Integrity(
                 "health policy differs from frozen admission".into(),
