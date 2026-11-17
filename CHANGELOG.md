@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.6
+
 ### Fixed
 
 - An idle broker no longer burns CPU opening read connections. The one-second
