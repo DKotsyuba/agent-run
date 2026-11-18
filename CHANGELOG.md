@@ -14,9 +14,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   double-forked or `setsid` descendants reparent to it, are captured at every
   termination point and killed by cleanup, and captured orphan zombies are
   reaped by exact PID. Every child is registered by exact PID and start token
-  before its program runs (a child that cannot be registered never execs) and
-  stays registered until its spawner collected the status, so the supervisor's
-  own children are never adopted or reaped. When the engine was spawned while
+  before its program runs (a child that cannot be registered never execs, and
+  one whose launch fails after it started is killed and reaped before the
+  failure is reported) and stays registered until its spawner collected the
+  status, so the supervisor's own children are never adopted or reaped. When the engine was spawned while
   the supervisor had no other child, the mid-run refresh slows to 2 s
   (`AGENT_RUN_DESCENDANT_REFRESH_MS`, 200 to 600000) for durable crash-recovery
   evidence; otherwise, and on macOS, the 200 ms polling remains. On a

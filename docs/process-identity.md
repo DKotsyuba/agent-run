@@ -69,17 +69,23 @@ The supervisor tells its own spawns from adopted orphans only by an explicit
 registry. Every child is forked through a spawn gate: before `exec` the child
 reports its PID and waits until the supervisor has registered its exact PID and
 start token under an admission lock. A child that cannot be registered never
-runs its program; the spawn fails and is reaped. A registration stays until the
-spawner collected the exit status. Process groups and PID listings never decide
+runs its program; the spawn fails and is reaped. If the launch fails after the
+program started (tokio can fail while wrapping a live child and drops it
+unwaited), the registered child is pinned by pidfd, killed and reaped before
+the failure is reported. A registration stays until the spawner collected the
+exit status. Process groups and PID listings never decide
 ownership. An orphan cannot name its tree, so it is attributed to an engine only
 when that engine was spawned at a clean boundary: under the same lock and
-before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT)` reported that the supervisor
-had no child at all, so every later orphan descends from that engine until
+before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT | __WALL)` reported that the
+supervisor had no child at all (of any exit signal, live or zombie), so every later orphan descends from that engine until
 another spawn is admitted. Any other engine attributes nothing and keeps the
 200 ms polling refresh. Only captured orphans are reaped, with
 `waitpid(pid, WNOHANG)` after a fresh check that the exact PID and token are an
-unregistered zombie child; `waitpid(-1)` is never used. Orphans that were never
-captured are not reaped and remain zombies of the supervisor until it exits.
+unregistered zombie child; `waitpid(-1)` is never used. Every owner does one
+last such reap when it is released (end of cleanup, engine transport drop), so
+a member that exited after the last observation cannot linger and deny the
+next spawn its clean boundary. Orphans that were never captured are not reaped
+and remain zombies of the supervisor until it exits.
 
 The engine itself is not made a subreaper: Bun-based (Claude, OpenCode) and
 tokio-based (Codex) engines reap only children they spawned, so adopted
