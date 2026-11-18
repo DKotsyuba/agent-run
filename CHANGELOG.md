@@ -20,7 +20,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   after the engine started is no longer reported as never spawned: its root is
   recorded, its whole tree is cleaned through the ordinary ownership cleanup,
   and ownership is kept with a `cleanup unconfirmed` outcome unless the tree
-  is proven gone. When the engine was spawned while
+  is proven gone and its recovery evidence was written. Children whose owner
+  went away before their exit status was collected are reaped by one
+  process-wide reaper thread instead of a thread per child. When the engine was spawned while
   the supervisor had no other child, the mid-run refresh slows to 2 s
   (`AGENT_RUN_DESCENDANT_REFRESH_MS`, 200 to 600000) for durable crash-recovery
   evidence; otherwise, and on macOS, the 200 ms polling remains. On a

@@ -77,8 +77,21 @@ the exact root as the attempt's process (so the attempt is never certified as
 never spawned), runs the ordinary bounded cleanup and records a confirmed
 cleanup proof only when the tree is proven gone and the engine's status was
 collected. Otherwise ownership is retained and the run reports
-`cleanup unconfirmed` for recovery. A registration stays until the spawner
-collected the exit status. Process groups and PID listings never decide
+`cleanup unconfirmed` for recovery. Before and after that cleanup the
+captured identities are sealed into the same private per-attempt recovery
+receipt ordinary cleanup writes, so the evidence survives an unavailable
+writer. A registration stays until the spawner collected the exit status; a
+child whose owner went away first (a dropped engine transport, an unconfirmed
+started launch) is handed to one process-wide reaper thread, which never kills
+it and releases the registration only after collecting its status.
+
+The admission lock is never held across the spawn itself: an admission mark
+taken under the lock (with the clean-boundary check) keeps other spawns and
+adoption waiting until the registrar registers the child, and the registrar's
+wait for the child's PID report is bounded. A child stopped before it reports
+can still hold its own launching thread inside `Command::spawn` (the standard
+library offers no bound there), but no longer the lock, other spawns or
+adoption. Process groups and PID listings never decide
 ownership. An orphan cannot name its tree, so it is attributed to an engine only
 when that engine was spawned at a clean boundary: under the same lock and
 before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT | __WALL)` reported that the
