@@ -197,9 +197,10 @@ async fn historical_native_attempts_are_retained_without_publication() {
     }
 }
 
-/// All four notice forms publish through the same SDK route; none creates native acceptance evidence.
+/// Both notice forms publish through the same SDK route; none creates native
+/// acceptance evidence. Historical legacy pool notices are retired, never published.
 #[tokio::test]
-async fn all_four_notice_forms_use_only_bridge() {
+async fn notice_forms_use_only_bridge_and_retire_legacy_pool_notices() {
     let home = common::Home::new();
     let bridge = bridge_fixture::start(&home.path, false);
     delivery(&home.path, "ntf_completion", "codex_queue", "pending");
@@ -229,11 +230,15 @@ async fn all_four_notice_forms_use_only_bridge() {
             db.execute("INSERT INTO pools(id,request_namespace,request_id,request_sha256,orchestrator_session_id,goal,acceptance_json,state,roster_revision,completed_at,completion_delivery_id,created_at) VALUES(?,'fixture','four',?,'sess','fixture','[]','completed',1,?,'ntf_pool',?)", params![pool,"a".repeat(64),now(),now()]).unwrap();
         }
     }
-    let result = dispatch_with_batch(&home.path, 4).await.unwrap();
-    assert_eq!(
-        (result.claimed, result.transferred, result.delivered),
-        (4, 4, 0)
-    );
+    // A retired row ends the current batch like any held row; later ticks drain the rest.
+    let (mut claimed, mut transferred) = (0, 0);
+    for _ in 0..6 {
+        let result = dispatch_with_batch(&home.path, 4).await.unwrap();
+        assert_eq!(result.delivered, 0);
+        claimed += result.claimed;
+        transferred += result.transferred;
+    }
+    assert_eq!((claimed, transferred), (2, 2));
     let mut kinds: Vec<_> = bridge
         .published
         .lock()
@@ -242,15 +247,7 @@ async fn all_four_notice_forms_use_only_bridge() {
         .map(|p| p.kind.clone())
         .collect();
     kinds.sort();
-    assert_eq!(
-        kinds,
-        [
-            "agent-run.completion",
-            "agent-run.pool-attention",
-            "agent-run.pool-completion",
-            "agent-run.worker-report"
-        ]
-    );
+    assert_eq!(kinds, ["agent-run.completion", "agent-run.worker-report"]);
     assert_eq!(
         db.query_row(
             "SELECT COUNT(*) FROM bridge_delivery_intents WHERE custody_state='custody_accepted'",
@@ -258,7 +255,16 @@ async fn all_four_notice_forms_use_only_bridge() {
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        4
+        2
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE id IN ('ntf_pool','ntf_attention') AND state='failed' AND last_error='legacy_pool_retired'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
     );
     assert_eq!(dispatch(&home.path).await.unwrap().claimed, 0);
 }

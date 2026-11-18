@@ -48,17 +48,19 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has 126 active rows with stable, unique wire ids and
-/// unique snake-case names, and rows 6, 49 and 79 are internal-only.
+/// The inventory has 116 active rows with stable, unique wire ids and
+/// unique snake-case names, and row 79 is internal-only. Removed rows keep
+/// their ids reserved: none decodes and none is reused.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 126);
+    assert_eq!(all.len(), 116);
+    let reserved = agent_run_store::ops::RESERVED_WIRE_IDS;
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(
             kind.wire_id() as usize,
             (1..=131)
-                .filter(|id| ![54, 55, 58, 103, 104].contains(id))
+                .filter(|id| !reserved.contains(&(*id as u16)))
                 .nth(index)
                 .unwrap()
         );
@@ -78,11 +80,30 @@ fn inventory_is_closed_with_stable_unique_ids() {
         Some(OpKindRef::AdmitManagedEnrollment)
     );
     assert_eq!(OpKindRef::from_wire_id(132), None);
-    for retired in [54, 55, 58, 103, 104] {
+    for retired in [4, 5, 6, 7, 47, 48, 49, 50, 51, 54, 55, 58, 95, 103, 104] {
+        assert!(reserved.contains(&retired));
         assert_eq!(OpKindRef::from_wire_id(retired), None);
+        assert_eq!(
+            WriteEnvelope::from_wire(retired, b"{}").unwrap_err().code,
+            RejectCode::ProtocolUnsupported
+        );
     }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 126);
+    assert_eq!(names.len(), 116);
+    for removed in [
+        "admit_pool",
+        "replace_pool_member",
+        "acknowledge_enrollment",
+        "reconcile_pool_enrollments",
+        "pool_write",
+        "pool_operator_post",
+        "fanout_entry",
+        "settle_pool",
+        "bind_pool",
+        "report_pool_read_loop",
+    ] {
+        assert!(!names.contains(removed));
+    }
     assert!(
         names
             .iter()
@@ -93,8 +114,8 @@ fn inventory_is_closed_with_stable_unique_ids() {
         .filter(|kind| kind.internal_only())
         .map(|kind| kind.wire_id())
         .collect();
-    assert_eq!(internal, vec![6, 49, 79]);
-    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 54);
+    assert_eq!(internal, vec![79]);
+    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 53);
 }
 
 /// The static matrix confines worker rows to Worker, broker rows to Broker
@@ -227,16 +248,7 @@ fn authority_matrix_confines_roles() {
     for role in [&cli, &collector, &supervisor] {
         assert!(!OpKindRef::AcceptHealthReply.permits(role));
     }
-    assert_eq!(OpKindRef::ReportPoolReadLoop.wire_id(), 95);
-    assert!(OpKindRef::ReportPoolReadLoop.permits(&worker));
-    for role in [&cli, &collector, &supervisor, &WriteAuthority::Broker] {
-        assert!(!OpKindRef::ReportPoolReadLoop.permits(role));
-    }
-    for kind in [
-        OpKindRef::HealthTick,
-        OpKindRef::AcceptHealthReply,
-        OpKindRef::ReportPoolReadLoop,
-    ] {
+    for kind in [OpKindRef::HealthTick, OpKindRef::AcceptHealthReply] {
         assert!(!kind.is_remote());
         assert_eq!(
             WriteEnvelope::from_wire(kind.wire_id(), b"{}")
@@ -442,9 +454,8 @@ fn lease_is_exclusive_and_writer_refuses_unimplemented_paths() {
         producer(),
         1,
         deadline(),
-        agent_run_store::ops::LocalOp::from(agent_run_store::ops::AcknowledgeEnrollment {
-            root: "ag-20261011-000000-0000000001".parse().unwrap(),
-            seq: 1,
+        agent_run_store::ops::LocalOp::from(agent_run_store::ops::RetainExhausted {
+            account: "acct".parse().unwrap(),
         }),
     )
     .unwrap();

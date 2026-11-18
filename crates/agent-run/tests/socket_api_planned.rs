@@ -620,28 +620,28 @@ async fn python_capacity_order_and_durable_cancel_use_independent_paths() {
     drop(home);
 }
 
-/// The live Unix socket discovers and dispatches list_pools with typed validation.
+/// The live Unix socket refuses every removed legacy pool method as unknown.
 #[tokio::test]
-async fn list_pools_live_socket_round_trip() {
+async fn removed_pool_methods_are_unknown_on_the_live_socket() {
     let (_temp, path, task) = broker().await;
-    let response = request(
-        &path,
-        json!({"jsonrpc":"2.0","id":1,
-        "method":"list_pools","params":{"state":"open","limit":1,"offset":0}}),
-    )
-    .await;
-    assert_eq!(response["result"]["items"], json!([]));
-    assert_eq!(response["result"]["total"], 0);
-    assert_eq!(response["result"]["complete"], true);
-    assert_eq!(response["result"]["limit"], 1);
-    let bad = request(
-        &path,
-        json!({"jsonrpc":"2.0","id":2,
-        "method":"list_pools","params":{"limit":201}}),
-    )
-    .await;
-    assert_eq!(bad["error"]["code"], -32602);
-    assert_eq!(bad["error"]["message"], "invalid pool list page arguments");
+    for (id, method) in [
+        "start_pool",
+        "pool_post",
+        "pool_replace",
+        "pool",
+        "list_pools",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = request(
+            &path,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32601, "{method}");
+        assert!(response.get("result").is_none(), "{method}");
+    }
     stop(task).await;
 }
 
@@ -680,7 +680,8 @@ async fn python_successful_tool_round_trip() {
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_surface_is_dispatch_tools_plus_control_methods`.
 /// The current shared surface additionally exposes the compact delegation guide
-/// and the five cooperative-pool operator tools plus the native integration read.
+/// plus the native integration and observation reads; the removed legacy pool
+/// tools are absent.
 #[test]
 fn python_socket_surface_is_shared_tools_plus_controls() {
     let names = agent_run::dispatch::tools()
@@ -697,7 +698,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         "pool",
         "list_pools",
     ] {
-        assert!(names.contains(pool), "{pool}");
+        assert!(!names.contains(pool), "{pool}");
     }
     let registry: std::collections::BTreeSet<_> = agent_run_domain::registry()
         .iter()
@@ -705,7 +706,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 24);
+    assert_eq!(names.len(), 19);
     assert!(!names.contains("models"));
     assert!(!names.contains("capacity_order"));
 }

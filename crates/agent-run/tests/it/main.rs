@@ -79,8 +79,6 @@ mod socket_protocol;
 mod storage_admin;
 #[path = "../support/test_broker.rs"]
 mod test_broker;
-#[path = "../worker_pool_wire.rs"]
-mod worker_pool_wire;
 #[path = "../writer_load.rs"]
 mod writer_load;
 #[path = "../writer_socket.rs"]

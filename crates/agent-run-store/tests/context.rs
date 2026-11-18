@@ -4,10 +4,7 @@
 
 use crate::common;
 
-use agent_run_domain::{
-    domain::{OrchestratorRef, Outcome},
-    pool::PoolId,
-};
+use agent_run_domain::domain::{OrchestratorRef, Outcome};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -190,7 +187,7 @@ fn session_list_filter_includes_split_canonical_and_alias_rows() {
 
 /// Binding accepts duplicate known rows for one chat without rewriting their pointers.
 #[test]
-fn alias_rebind_preserves_split_agent_and_pool_session_rows() {
+fn alias_rebind_preserves_split_agent_session_rows() {
     let home = common::Home::new();
     let mut store = home.store();
     let (legacy_agent, _) = store
@@ -221,36 +218,12 @@ fn alias_rebind_preserves_split_agent_and_pool_session_rows() {
             [legacy_agent.as_str()],
         )
         .unwrap();
-    let pool_id: PoolId = "pool-20261004-120000-0123456789".parse().unwrap();
-    store
-        .conn
-        .execute(
-            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at,orchestrator_session_id) VALUES(?,'ns','req',lower(hex(zeroblob(32))),'goal','[]','open',1,1,'os-legacy')",
-            [pool_id.as_str()],
-        )
-        .unwrap();
-    for (slot, agent) in [(1, &legacy_agent), (2, &canonical_agent)] {
-        store
-            .conn
-            .execute(
-                "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,?,?,'role','task',1)",
-                rusqlite::params![agent.as_str(), pool_id.as_str(), slot, format!("m{slot}")],
-            )
-            .unwrap();
-    }
-
     assert_eq!(
         store
             .bind_orchestrator(&legacy_agent, &canonical, 2.0)
             .unwrap(),
         "os-legacy"
     );
-    let alias = OrchestratorRef {
-        transport: "codex".into(),
-        external_turn_id: Some("turn-retry".into()),
-        ..canonical.clone()
-    };
-    assert_eq!(store.bind_pool(&pool_id, &alias, 3.0).unwrap(), "os-legacy");
     for (agent, expected) in [
         (&legacy_agent, "os-legacy"),
         (&canonical_agent, canonical_session.as_str()),
@@ -265,121 +238,6 @@ fn alias_rebind_preserves_split_agent_and_pool_session_rows() {
             .unwrap();
         assert_eq!(actual, expected);
     }
-    let pool_session: String = store
-        .conn
-        .query_row(
-            "SELECT orchestrator_session_id FROM pools WHERE id=?",
-            [pool_id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(pool_session, "os-legacy");
-    let refreshed: i64 = store.conn.query_row(
-        "SELECT COUNT(*) FROM orchestrator_sessions WHERE external_session_id='same-chat' AND external_turn_id='turn-retry' AND last_seen_at=3",
-        [],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(refreshed, 2);
-
-    for rejected in [
-        OrchestratorRef {
-            external_session_id: "different-chat".into(),
-            ..alias.clone()
-        },
-        OrchestratorRef {
-            transport: "claude_uds".into(),
-            ..alias.clone()
-        },
-        OrchestratorRef {
-            transport: "unknown".into(),
-            ..alias.clone()
-        },
-    ] {
-        assert!(store.bind_pool(&pool_id, &rejected, 4.0).is_err());
-    }
-    let unchanged: i64 = store.conn.query_row(
-        "SELECT COUNT(*) FROM orchestrator_sessions WHERE external_session_id='same-chat' AND external_turn_id='turn-retry' AND last_seen_at=3",
-        [],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(unchanged, 2);
-}
-
-/// A pool bind validates every seat tip before touching any session or pointer.
-#[test]
-fn mixed_tip_binding_rejects_pool_bind_without_any_change() {
-    let home = common::Home::new();
-    let mut store = home.store();
-    let (first, _) = store
-        .admit(&home.request(), &home.config, &json!({}), None)
-        .unwrap();
-    let (second, _) = store
-        .admit(&home.request(), &home.config, &json!({}), None)
-        .unwrap();
-    store
-        .conn
-        .execute(
-            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES('os-same','codex','same-chat','t0',1,1),('os-other','codex','other-chat','t0',1,1)",
-            [],
-        )
-        .unwrap();
-    for (agent, session) in [(&first, "os-same"), (&second, "os-other")] {
-        store
-            .conn
-            .execute(
-                "UPDATE agents SET orchestrator_session_id=? WHERE id=?",
-                [session, agent.as_str()],
-            )
-            .unwrap();
-    }
-    let pool_id: PoolId = "pool-20261004-120000-0123456790".parse().unwrap();
-    store
-        .conn
-        .execute(
-            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES(?,'ns','req2',lower(hex(zeroblob(32))),'goal','[]','open',1,1)",
-            [pool_id.as_str()],
-        )
-        .unwrap();
-    for (slot, agent) in [(1, &first), (2, &second)] {
-        store
-            .conn
-            .execute(
-                "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,?,?,'role','task',1)",
-                rusqlite::params![agent.as_str(), pool_id.as_str(), slot, format!("m{slot}")],
-            )
-            .unwrap();
-    }
-    let reference = OrchestratorRef {
-        transport: "codex_queue".into(),
-        external_session_id: "same-chat".into(),
-        external_turn_id: Some("t1".into()),
-    };
-    assert!(store.bind_pool(&pool_id, &reference, 5.0).is_err());
-    let pool: Option<String> = store
-        .conn
-        .query_row(
-            "SELECT orchestrator_session_id FROM pools WHERE id=?",
-            [pool_id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(pool, None);
-    let touched: i64 = store
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM orchestrator_sessions WHERE last_seen_at<>1 OR external_turn_id<>'t0'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(touched, 0, "a refused bind must not touch any session row");
-    let total: i64 = store
-        .conn
-        .query_row("SELECT COUNT(*) FROM orchestrator_sessions", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(total, 2);
 }
 
 /// A fresh admission reuses an exact historical alias row instead of adding a canonical twin.
