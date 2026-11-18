@@ -9,7 +9,7 @@
 //! process tree goes through the ordinary [`OwnedProcess`] cleanup.
 
 use agent_run_domain::{Error, Result};
-use agent_run_platform::process::{Cleanup, OwnedProcess, OwnershipSnapshot, SpawnedChild};
+use agent_run_platform::process::{self, Cleanup, OwnedProcess, OwnershipSnapshot, SpawnedChild};
 use std::{process::ExitStatus, time::Duration};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
@@ -65,7 +65,12 @@ impl EngineChild {
         }
     }
 
-    /// Hand off the unreaped child (for example to a waiter thread on drop).
+    /// Whether the exit status was already collected.
+    pub(crate) fn exited(&self) -> bool {
+        self.status.is_some()
+    }
+
+    /// Hand off the unreaped child (for example to the reaper on drop).
     pub(crate) fn detach(&mut self) -> Option<std::process::Child> {
         if self.status.is_some() {
             return None;
@@ -189,8 +194,10 @@ pub struct LaunchCleanup {
     pub confirmed: bool,
     /// Final captured identities, for durable recovery evidence.
     pub snapshot: Option<OwnershipSnapshot>,
-    /// The engine child when its status could not be collected.
-    pub retained: Option<std::process::Child>,
+    /// PID of an engine whose status could not be collected. It stays
+    /// registered and is handed to the process-wide reaper, which collects
+    /// its status (never kills it) whenever it exits.
+    pub unreaped: Option<u32>,
 }
 
 impl StartedLaunch {
@@ -249,20 +256,22 @@ impl StartedLaunch {
     fn finish(self, proof: Result<Cleanup>, reaped: bool) -> LaunchCleanup {
         let confirmed = reaped && proof.as_ref().is_ok_and(|proof| proof.confirmed);
         let snapshot = self.owner.snapshot();
-        let retained = if reaped {
+        let unreaped = if reaped {
             self.claim.reaped();
             None
         } else {
-            // The claim is dropped unreleased, which keeps the registration:
-            // nothing else may adopt or reap this engine while it may run.
-            Some(self.child)
+            // Ownership is retained: the registration stays until the reaper
+            // collects the engine's status, so nothing adopts or reaps it.
+            let pid = self.child.id();
+            process::reap_later(self.child, Some(self.claim));
+            Some(pid)
         };
         LaunchCleanup {
             error: self.error,
             proof,
             confirmed,
             snapshot,
-            retained,
+            unreaped,
         }
     }
 }
@@ -323,6 +332,69 @@ pub mod fixture {
 
 #[cfg(test)]
 mod tests {
+    //! Portable checks (macOS runs them too): the polling exit wait and the
+    //! process-wide reaper, without a subreaper.
+    use super::EngineChild;
+    use agent_run_platform::process;
+    use std::time::{Duration, Instant};
+
+    /// An exited engine child, polled without a pidfd.
+    fn polling(child: std::process::Child) -> EngineChild {
+        EngineChild {
+            inner: Some(child),
+            status: None,
+            #[cfg(target_os = "linux")]
+            exit: None,
+        }
+    }
+
+    /// The fallback wait (no pidfd) reports a running child as running and
+    /// then collects its exact exit status.
+    #[tokio::test]
+    async fn the_polling_exit_wait_collects_the_status() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.3; exit 3"])
+            .spawn()
+            .unwrap();
+        let mut engine = polling(child);
+        assert!(engine.try_wait().unwrap().is_none(), "still running");
+        let status = tokio::time::timeout(Duration::from_secs(10), engine.wait())
+            .await
+            .expect("bounded wait")
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(engine.exited());
+        assert!(
+            engine.detach().is_none(),
+            "a reaped child is not handed off"
+        );
+        assert_eq!(engine.wait().await.unwrap().code(), Some(3), "cached");
+    }
+
+    /// A child handed to the reaper is collected after it exits, never killed.
+    #[test]
+    fn the_reaper_collects_a_handed_off_child() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.3"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        process::reap_later(child, None);
+        assert!(process::inspect(pid).is_ok_and(|p| !p.zombie), "not killed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process::inspect(pid).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the handed-off child was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    //! Started-launch cleanup with a subreaper and `setsid` fixtures (Linux).
     use super::fixture::{fail_next_wrap, hide_next_owner};
     use agent_run_domain::Error;
     use std::{
@@ -348,7 +420,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                &format!("engine_launch::tests::{name}"),
+                &format!("engine_launch::linux_tests::{name}"),
                 "--nocapture",
             ])
             .env(CASE, name)
@@ -433,7 +505,7 @@ mod tests {
                 let tree = tree(&started);
                 let outcome = started.cleanup(Duration::from_millis(500)).await;
                 assert!(outcome.confirmed, "{:?}", outcome.proof.as_ref().err());
-                assert!(outcome.retained.is_none());
+                assert!(outcome.unreaped.is_none());
                 for member in &tree {
                     assert!(gone(member), "engine tree member {} survived", member.pid);
                 }
@@ -474,8 +546,8 @@ mod tests {
                 assert!(started.owner.leader.is_none());
                 let outcome = started.cleanup(Duration::from_millis(200)).await;
                 assert!(!outcome.confirmed);
-                let mut retained = outcome.retained.expect("engine handle retained");
-                let leader = process::inspect(retained.id() as i32).unwrap();
+                let unreaped = outcome.unreaped.expect("engine left to the reaper") as i32;
+                let leader = process::inspect(unreaped).unwrap();
                 assert!(!leader.zombie, "the unverified engine was not signalled");
                 // Still registered: a new spawn is not exclusive.
                 let mut next = std::process::Command::new("/bin/sleep");
@@ -486,7 +558,8 @@ mod tests {
                 child.kill().unwrap();
                 child.wait().unwrap();
                 claim.reaped();
-                // Test teardown of the retained engine tree.
+                // Test teardown of the retained engine tree; the reaper then
+                // collects the engine and releases its registration.
                 let me = std::process::id() as i32;
                 for p in process::processes().unwrap() {
                     if p.ppid == me || p.group == leader.pid {
@@ -494,7 +567,14 @@ mod tests {
                         unsafe { libc::kill(p.pid, libc::SIGKILL) };
                     }
                 }
-                retained.wait().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while process::inspect(unreaped).is_ok_and(|p| p.token == leader.token) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the reaper never collected the engine"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             });
         });
     }

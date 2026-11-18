@@ -1893,6 +1893,7 @@ async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
 }
 
 /// PIDs the fork-before-wrap fixture engine recorded in `home`.
+#[cfg(target_os = "linux")]
 fn fork_before_wrap_pids(home: &Path) -> Vec<i32> {
     ["fork-leader.pid", "fork-child.pid", "fork-daemon.pid"]
         .iter()
@@ -1907,12 +1908,14 @@ fn fork_before_wrap_pids(home: &Path) -> Vec<i32> {
 }
 
 /// Whether `pid` is gone or only an unreaped zombie.
+#[cfg(target_os = "linux")]
 fn ended(pid: i32) -> bool {
     agent_run_platform::process::inspect(pid).map_or(true, |now| now.zombie)
 }
 
 /// Run one provider attempt whose engine forks a child and a daemon and then
 /// has its launch wrapping fail; returns the execution and its attempt row.
+#[cfg(target_os = "linux")]
 async fn wrap_failure_run(home: &Path) -> (AgentId, i64, Option<String>, Option<String>) {
     fs::write(home.join("fixture-wrap-failure"), "").unwrap();
     fs::write(home.join("fixture-fork-before-wrap"), "").unwrap();
@@ -1939,7 +1942,35 @@ async fn wrap_failure_run(home: &Path) -> (AgentId, i64, Option<String>, Option<
     (id, active, proof, process)
 }
 
+/// The private recovery receipt sealed for the execution's only attempt.
+#[cfg(target_os = "linux")]
+fn recovery_receipt(home: &Path, id: &AgentId) -> serde_json::Value {
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let attempt: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let path = home
+        .join("agents")
+        .join(id.as_str())
+        .join(format!("recovery.{attempt}.json"));
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// Whether `receipt` captured each of `pids`.
+#[cfg(target_os = "linux")]
+fn receipt_holds(receipt: &serde_json::Value, pids: &[i32]) -> bool {
+    let members = receipt["ownership"]["members"].as_array().unwrap();
+    pids.iter()
+        .all(|pid| members.iter().any(|member| member["pid"] == *pid))
+}
+
 /// The cleanup verdict recorded for a launch that failed after its start.
+#[cfg(target_os = "linux")]
 fn launch_failure_verdict(home: &Path, id: &AgentId) -> String {
     let store = agent_run_store::fixture::open(home).unwrap();
     let data: String = store
@@ -1959,6 +1990,7 @@ fn launch_failure_verdict(home: &Path, id: &AgentId) -> String {
 /// A launch whose wrapping fails after the engine forked is never certified
 /// never-spawned: the root is recorded, the whole tree (child and daemon) is
 /// killed by the ordinary cleanup and only a confirmed proof is recorded.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_launch_failing_after_start_cleans_its_tree_and_is_not_never_spawned() {
     let (_temp, home) = home();
@@ -1980,6 +2012,12 @@ async fn a_launch_failing_after_start_cleans_its_tree_and_is_not_never_spawned()
     let proof: serde_json::Value = serde_json::from_str(&proof.unwrap()).unwrap();
     assert_eq!(proof["confirmed"], true, "{proof}");
     assert!(proof.get("never_spawned").is_none(), "{proof}");
+    let receipt = recovery_receipt(&home, &id);
+    assert!(
+        receipt_holds(&receipt, &fork_before_wrap_pids(&home)),
+        "{receipt}"
+    );
+    assert_eq!(receipt["cleanup"]["confirmed"], true, "{receipt}");
     for pid in fork_before_wrap_pids(&home) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !ended(pid) {
@@ -1995,6 +2033,7 @@ async fn a_launch_failing_after_start_cleans_its_tree_and_is_not_never_spawned()
 /// When the started root cannot be identified nothing can be proven: the
 /// outcome is `cleanup unconfirmed`, ownership stays active for recovery and
 /// the attempt is not certified never-spawned.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_unprovable_started_launch_keeps_ownership() {
     let (_temp, home) = home();
@@ -2012,6 +2051,44 @@ async fn an_unprovable_started_launch_keeps_ownership() {
     assert!(alive, "an unverified tree was signalled");
     let store = agent_run_store::fixture::open(&home).unwrap();
     assert!(!store.get(&id).unwrap().status.terminal());
+}
+
+/// When the writer refuses the captured tree, the confirmed cleanup cannot be
+/// relied on for release: ownership stays active and the outcome is
+/// `cleanup unconfirmed`, while the local recovery receipt still holds every
+/// captured identity of the tree.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_ownership_write_keeps_the_started_launch_owned() {
+    let (_temp, home) = home();
+    agent_run_store::fixture::open(&home)
+        .unwrap()
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fixture_refuse_members BEFORE INSERT ON process_members \
+             BEGIN SELECT RAISE(ABORT,'fixture ownership refusal'); END;",
+        )
+        .unwrap();
+    let (id, active, proof, process) = wrap_failure_run(&home).await;
+    assert_eq!(launch_failure_verdict(&home, &id), "unconfirmed");
+    assert!(process.is_some(), "the root itself was recorded");
+    assert_eq!(active, 1, "ownership retained");
+    assert_eq!(proof, None, "no proof without persisted ownership");
+    let receipt = recovery_receipt(&home, &id);
+    assert!(
+        receipt_holds(&receipt, &fork_before_wrap_pids(&home)),
+        "{receipt}"
+    );
+    for pid in fork_before_wrap_pids(&home) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ended(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine tree member {pid} survived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 /// A second enabled account on `glm-user` and an alias provider binding the

@@ -1020,25 +1020,15 @@ impl Drop for Process {
         // Captured orphans that exited after the last observation must not
         // outlive this owner as zombies of the supervisor.
         self.owner.reap_captured_zombies();
-        // An engine dropped before its status was collected is handed to a
-        // waiter, which releases its registration only after reaping it.
-        if let Some(mut child) = self.child.detach() {
-            let spawned = self.spawned.take();
-            if let Ok(Some(_)) = child.try_wait() {
-                if let Some(spawned) = spawned {
-                    spawned.reaped();
-                }
-            } else {
-                let _ = std::thread::Builder::new()
-                    .name("engine-reaper".into())
-                    .spawn(move || {
-                        if child.wait().is_ok()
-                            && let Some(spawned) = spawned
-                        {
-                            spawned.reaped();
-                        }
-                    });
+        // An engine whose status was collected releases its registration; one
+        // dropped before that goes to the process-wide reaper, which releases
+        // the registration only after collecting the status.
+        if self.child.exited() {
+            if let Some(spawned) = self.spawned.take() {
+                spawned.reaped();
             }
+        } else if let Some(child) = self.child.detach() {
+            process::reap_later(child, self.spawned.take());
         }
     }
 }

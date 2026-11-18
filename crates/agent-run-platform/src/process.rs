@@ -796,7 +796,8 @@ fn with_program(mut identity: Identity) -> Identity {
 mod adoption;
 pub use adoption::{
     DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnedChild, become_subreaper,
-    durable_refresh_interval, pin_durable_refresh_interval, spawn_registered, subreaper_active,
+    durable_refresh_interval, pin_durable_refresh_interval, reap_later, spawn_registered,
+    subreaper_active,
 };
 
 /// Per-refresh memo of [`observe`] verdicts for captured parents.
@@ -1025,9 +1026,13 @@ impl OwnedProcess {
         #[cfg(target_os = "linux")]
         let admission = subreaper_active().then(adoption::lock);
         #[cfg(target_os = "linux")]
+        // Nothing is adopted while a spawn is being admitted: its forked child
+        // may exist before it is registered.
         let adopting = admission.as_ref().is_some_and(|state| {
-            self.exclusive
-                .is_some_and(|generation| generation == state.generation())
+            !state.admitting()
+                && self
+                    .exclusive
+                    .is_some_and(|generation| generation == state.generation())
         });
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {

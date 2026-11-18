@@ -23,7 +23,7 @@
 
 use std::{
     sync::{
-        Mutex, MutexGuard, PoisonError,
+        Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -36,7 +36,16 @@ static SUBREAPER: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<State> = Mutex::new(State {
     spawned: Vec::new(),
     generation: 0,
+    admitting: false,
 });
+
+/// Signalled whenever an admission ends.
+#[cfg(target_os = "linux")]
+static ADMITTED: Condvar = Condvar::new();
+
+/// Bound for waiting until another admission ends.
+#[cfg(target_os = "linux")]
+const ADMISSION_WAIT: Duration = Duration::from_secs(30);
 
 /// Lock-free mirror of [`State::generation`] for cadence decisions only.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +71,10 @@ pub(super) struct State {
     /// Advanced by every registered spawn.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     generation: u64,
+    /// A spawn is between its clean-boundary check and its registration: its
+    /// forked child may exist unregistered, so nothing is adopted meanwhile.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    admitting: bool,
 }
 
 /// One registered direct child.
@@ -84,6 +97,17 @@ impl State {
     /// The current admission generation.
     pub(super) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether a spawn is being admitted right now (adoption must wait).
+    pub(super) fn admitting(&self) -> bool {
+        self.admitting
+    }
+
+    /// End the current admission and wake waiting spawners.
+    fn end_admission(&mut self) {
+        self.admitting = false;
+        ADMITTED.notify_all();
     }
 }
 
@@ -251,16 +275,39 @@ fn spawn_registered_linux(
     unsafe {
         command.pre_exec(move || child_handshake(fds));
     }
-    let mut state = lock();
-    let clean = clean_boundary();
+    // Admission: wait for any other admission, then mark this one and check
+    // the clean boundary under the lock. The lock itself is NOT held across
+    // the spawn; the `admitting` mark keeps observers from adopting the
+    // forked child until the registrar registers it and ends the admission.
+    let clean = {
+        let deadline = std::time::Instant::now() + ADMISSION_WAIT;
+        let mut state = lock();
+        while state.admitting {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::other("another spawn admission is stuck"));
+            }
+            state = ADMITTED
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state.admitting = true;
+        clean_boundary()
+    };
     let (spawned, registered) = std::thread::scope(|scope| {
-        let state = &mut *state;
-        let registrar = scope.spawn(move || register(report_read, release_write, state, clean));
+        let registrar = scope.spawn(move || register(report_read, release_write, clean));
         let spawned = command.spawn();
         // Without the parent's copies the registrar sees EOF if no child reports.
         drop(report_write);
         drop(release_read);
-        (spawned, registrar.join().ok().flatten())
+        let registered = registrar.join().ok().flatten();
+        // The registrar ends the admission on every path; a panic must too.
+        let mut state = lock();
+        if state.admitting {
+            state.end_admission();
+        }
+        (spawned, registered)
     });
     drop(command);
     match (spawned, registered) {
@@ -270,21 +317,8 @@ fn spawn_registered_linux(
         (Ok(mut child), key) => {
             // Unreachable by the handshake (no release means no exec), but if
             // the program runs unregistered it is ended here, never trusted.
-            drop(state);
             let _ = child.kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            let reaped = loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break true,
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    _ => break false,
-                }
-            };
-            if reaped && let Some(key) = key {
-                lock().release(&key);
-            }
+            reap_later(child, Some(SpawnedChild(key)));
             Err(std::io::Error::other(
                 "spawned child could not be registered",
             ))
@@ -292,7 +326,7 @@ fn spawn_registered_linux(
         (Err(error), key) => {
             // The standard library already waited for the failed child.
             if let Some(key) = key {
-                state.release(&key);
+                lock().release(&key);
             }
             Err(error)
         }
@@ -359,19 +393,44 @@ fn child_handshake(
 }
 
 /// Parent side: read the blocked child's PID, register its exact identity in
-/// a new generation, then release it. Returns the key, or `None` (leaving the
-/// child unreleased, so it never execs) on any failure.
+/// a new generation, end the admission, then release the child. Returns the
+/// key, or `None` (leaving the child unreleased, so it never execs) on any
+/// failure; every path ends the admission.
+///
+/// The wait for the PID report is bounded, so a child stuck before reporting
+/// cannot stall other spawns or adoption. Its own launching thread can still
+/// wait inside `Command::spawn` until that child exits or execs: the standard
+/// library offers no bound there, and the PID needed to end it was never
+/// reported. The admission lock is never held during that wait.
 #[cfg(target_os = "linux")]
 fn register(
     report_read: std::os::fd::OwnedFd,
     release_write: std::os::fd::OwnedFd,
-    state: &mut State,
     clean: bool,
 ) -> Option<(i32, String)> {
-    use std::io::{Read, Write};
+    let key = report(report_read);
+    let mut state = lock();
+    let Some(key) = key else {
+        state.end_admission();
+        return None;
+    };
+    state.admit(key.clone(), clean);
+    state.end_admission();
+    drop(state);
+    use std::io::Write;
+    if std::fs::File::from(release_write).write_all(&[1]).is_err() {
+        // The child cannot exec without the byte; its spawn fails and is reaped.
+        lock().release(&key);
+        return None;
+    }
+    Some(key)
+}
+
+/// Read and verify the forked child's PID report within [`REPORT_BOUND`].
+#[cfg(target_os = "linux")]
+fn report(report_read: std::os::fd::OwnedFd) -> Option<(i32, String)> {
+    use std::io::Read;
     use std::os::fd::AsRawFd;
-    // The child reports right after fork; bound the wait so a stuck child can
-    // never hold the admission lock. Unreleased, it refuses its exec.
     let mut ready = libc::pollfd {
         fd: report_read.as_raw_fd(),
         events: libc::POLLIN,
@@ -393,21 +452,19 @@ fn register(
     std::fs::File::from(report_read).read_exact(&mut pid).ok()?;
     let pid = i32::from_ne_bytes(pid);
     #[cfg(all(test, target_os = "linux"))]
-    if tests::FAIL_REGISTRATION.load(Ordering::SeqCst) {
-        return None;
+    {
+        if tests::FAIL_REGISTRATION.load(Ordering::SeqCst) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(
+            tests::REGISTRAR_DELAY_MS.load(Ordering::SeqCst),
+        ));
     }
     let identity = super::inspect(pid).ok()?;
     if identity.ppid != std::process::id() as i32 || identity.zombie {
         return None;
     }
-    let key = (identity.pid, identity.token);
-    state.admit(key.clone(), clean);
-    if std::fs::File::from(release_write).write_all(&[1]).is_err() {
-        // The child cannot exec without the byte; its spawn fails and is reaped.
-        state.release(&key);
-        return None;
-    }
-    Some(key)
+    Some((identity.pid, identity.token))
 }
 
 /// Whether this process has no child at all, live or zombie, right now.
@@ -435,6 +492,77 @@ fn clean_boundary() -> bool {
     }
 }
 
+/// Children waiting for their exit status, with their registrations.
+static LATER: Mutex<Vec<(std::process::Child, Option<SpawnedChild>)>> = Mutex::new(Vec::new());
+
+/// Signalled when [`LATER`] gains an entry.
+static LATER_READY: Condvar = Condvar::new();
+
+/// Whether the reaper thread is running.
+static REAPER: AtomicBool = AtomicBool::new(false);
+
+/// Collect `child`'s exit status whenever it exits, then release `claim`.
+///
+/// The single managed reaping path for children whose owner went away before
+/// their status was collected (a dropped engine transport, an unconfirmed
+/// started launch). The child is never killed and never dropped: one
+/// process-wide reaper thread polls queued children every 100 ms while any are
+/// queued and sleeps otherwise. If that thread cannot be created, the queue is
+/// kept and every later call retries it and polls the queue itself.
+pub fn reap_later(child: std::process::Child, claim: Option<SpawnedChild>) {
+    LATER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((child, claim));
+    LATER_READY.notify_one();
+    poll_later();
+    if !REAPER.swap(true, Ordering::SeqCst)
+        && std::thread::Builder::new()
+            .name("agent-run-reaper".into())
+            .spawn(reaper)
+            .is_err()
+    {
+        REAPER.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Reap every queued child that has exited; releases happen outside the queue lock.
+fn poll_later() -> bool {
+    let mut done = Vec::new();
+    let empty = {
+        let mut queue = LATER.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut index = 0;
+        while index < queue.len() {
+            match queue[index].0.try_wait() {
+                Ok(None) => index += 1,
+                // Exited, or no longer this process's child: nothing to wait for.
+                Ok(Some(_)) | Err(_) => done.push(queue.swap_remove(index).1),
+            }
+        }
+        queue.is_empty()
+    };
+    for claim in done.into_iter().flatten() {
+        claim.reaped();
+    }
+    empty
+}
+
+/// The reaper thread: poll while children are queued, sleep otherwise.
+fn reaper() {
+    loop {
+        if poll_later() {
+            let queue = LATER.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                LATER_READY
+                    .wait_while(queue, |queue| queue.is_empty())
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(super) mod tests {
     use super::*;
@@ -442,6 +570,9 @@ pub(super) mod tests {
 
     /// Makes the registrar fail after reading the child's PID.
     pub(in crate::process) static FAIL_REGISTRATION: AtomicBool = AtomicBool::new(false);
+    /// Delays the registrar after reading the child's PID, in milliseconds.
+    pub(in crate::process) static REGISTRAR_DELAY_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     /// Names the case a re-executed unit-test process must run.
     const CASE: &str = "AGENT_RUN_ADOPTION_UNIT_CASE";
@@ -532,6 +663,58 @@ pub(super) mod tests {
                 child.wait().unwrap();
                 claim.reaped();
                 assert!(lock().spawned.is_empty());
+            },
+        );
+    }
+
+    /// The admission lock is not held across the spawn: while a forked child
+    /// waits for registration, the lock is free and marks an admission in
+    /// flight (so nothing is adopted), and the mark ends with registration.
+    #[test]
+    fn the_admission_lock_is_free_while_a_spawn_is_in_flight() {
+        isolated(
+            "the_admission_lock_is_free_while_a_spawn_is_in_flight",
+            || {
+                REGISTRAR_DELAY_MS.store(500, Ordering::SeqCst);
+                let launch = std::thread::spawn(|| gated(command("/bin/sleep", &["30"])));
+                std::thread::sleep(Duration::from_millis(150));
+                let asked = std::time::Instant::now();
+                let state = lock();
+                assert!(asked.elapsed() < Duration::from_millis(100), "lock held");
+                assert!(state.admitting(), "admission in flight");
+                drop(state);
+                let (mut child, claim) = launch.join().unwrap().unwrap();
+                REGISTRAR_DELAY_MS.store(0, Ordering::SeqCst);
+                let identity = super::super::inspect(child.id() as i32).unwrap();
+                let state = lock();
+                assert!(!state.admitting());
+                assert!(state.registered(&identity));
+                drop(state);
+                child.kill().unwrap();
+                child.wait().unwrap();
+                claim.reaped();
+            },
+        );
+    }
+
+    /// A registered child handed to the reaper keeps its registration until
+    /// the reaper collected its status, then releases it.
+    #[test]
+    fn the_reaper_releases_a_registration_after_collecting_the_status() {
+        isolated(
+            "the_reaper_releases_a_registration_after_collecting_the_status",
+            || {
+                let (child, claim) = gated(command("/bin/sh", &["-c", "sleep 0.3"])).unwrap();
+                let identity = super::super::inspect(child.id() as i32).unwrap();
+                reap_later(child, Some(claim));
+                assert!(lock().registered(&identity), "registered while running");
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !lock().spawned.is_empty() {
+                    assert!(std::time::Instant::now() < deadline, "never released");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(super::super::inspect(identity.pid).is_err(), "reaped");
+                assert!(clean_boundary());
             },
         );
     }

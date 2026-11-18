@@ -232,45 +232,79 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
 
 /// End an engine whose launch failed after its program started.
 ///
-/// The exact registered root is recorded as the attempt's process first, so
-/// the attempt can never be certified as never spawned, and the captured tree
-/// is persisted for recovery. The standard bounded cleanup then runs; only a
-/// confirmed proof with the engine's status collected releases ownership.
-/// Otherwise ownership is retained and the distinct `cleanup unconfirmed`
-/// outcome is reported for recovery to finish.
+/// Recovery evidence comes first and does not depend on the writer: the same
+/// private per-attempt recovery receipt ordinary cleanup seals is written with
+/// the captured identities before cleanup and again with the cleanup result.
+/// The exact root is recorded as the attempt's process (so the attempt can
+/// never be certified as never spawned) and the captured tree is persisted,
+/// each independently of the others' success. The standard bounded cleanup
+/// then runs. Ownership is released only when every piece of evidence was
+/// written, the tree is proven gone and the engine's status was collected;
+/// otherwise it is retained and `cleanup unconfirmed` is reported.
 async fn abandon_started_launch(
     store: &mut Persist,
     id: &AgentId,
     attempt: &str,
+    (agent_dir, system): (&Path, bool),
     started: adapters::engine_launch::StartedLaunch,
 ) -> Error {
-    let recorded = match started.owner.leader.clone() {
+    let failure = || Error::Runtime("engine launch failed after the program started".into());
+    let launch: Result<adapters::EngineResult> = Err(failure());
+    let pending: Result<agent_run_platform::process::Cleanup> =
+        Err(Error::Runtime("engine launch cleanup pending".into()));
+    let initial = started.owner.snapshot();
+    let mut receipt = retain_cleanup_evidence(
+        agent_dir,
+        attempt,
+        initial.clone(),
+        &pending,
+        &launch,
+        None,
+        system,
+    )
+    .is_ok();
+    let root = match started.owner.leader.clone() {
         Some(leader) => store
             .provider_process(id, attempt, &leader, None, None)
             .await
             .is_ok(),
         None => false,
     };
-    if recorded && let Some(snapshot) = started.owner.snapshot() {
-        let _ = persist::ownership_future(
+    let mut persisted = match initial {
+        Some(snapshot) => persist::ownership_future(
             store.producer(),
             attempt.to_owned(),
             snapshot,
             persist::CRITICAL_BUDGET,
         )
-        .await;
-    }
+        .await
+        .is_ok(),
+        None => false,
+    };
     let outcome = started.cleanup(Duration::from_secs(2)).await;
-    if recorded && let Some(snapshot) = outcome.snapshot.clone() {
-        let _ = persist::ownership_future(
+    if let Some(snapshot) = outcome.snapshot.clone() {
+        persisted &= persist::ownership_future(
             store.producer(),
             attempt.to_owned(),
             snapshot,
             persist::CRITICAL_BUDGET,
         )
-        .await;
+        .await
+        .is_ok();
     }
-    let released = recorded
+    receipt &= retain_cleanup_evidence(
+        agent_dir,
+        attempt,
+        outcome.snapshot.clone(),
+        &outcome.proof,
+        &launch,
+        None,
+        system,
+    )
+    .is_ok();
+    let released = root
+        && persisted
+        && receipt
         && outcome.confirmed
         && match &outcome.proof {
             Ok(proof) => store.provider_cleanup(id, attempt, proof).await.is_ok(),
@@ -281,7 +315,8 @@ async fn abandon_started_launch(
         .event_durable(
             id,
             "provider_launch_failed_after_start_v1",
-            &json!({"cleanup": verdict}),
+            &json!({"cleanup": verdict, "root_recorded": root,
+                "ownership_persisted": persisted, "receipt_sealed": receipt}),
         )
         .await;
     Error::Runtime(format!(
@@ -616,7 +651,7 @@ fn seal_execution_answer(
 fn retain_cleanup_evidence(
     agent_dir: &Path,
     attempt: &str,
-    process: &Process,
+    ownership: Option<process::OwnershipSnapshot>,
     cleanup: &Result<agent_run_platform::process::Cleanup>,
     execution: &Result<adapters::EngineResult>,
     exit: Option<i32>,
@@ -646,7 +681,7 @@ fn retain_cleanup_evidence(
     };
     let diagnostic = execution.as_ref().err().map(execution_error_metadata);
     let data = json!({"version":1,"attempt":attempt,"recorded_at":domain::now(),
-        "terminal_commit":"not_proven_by_receipt","ownership":process.owner.snapshot(),
+        "terminal_commit":"not_proven_by_receipt","ownership":ownership,
         "cleanup":cleanup,"engine_result_available":execution.is_ok(),
         "native_status":execution.as_ref().ok().map(|result|result.outcome.status),
         "candidate":candidate.as_ref().ok().and_then(|proof|proof.as_ref()),
@@ -995,7 +1030,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
     retain_cleanup_evidence(
         &agent_dir,
         &format!("{id}:1"),
-        &process,
+        process.owner.snapshot(),
         &cleanup,
         &execution,
         exit,
@@ -2227,7 +2262,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
             Err(SpawnError::NotStarted(error)) => return Err(error),
             Err(SpawnError::Started(started)) => {
-                return Err(abandon_started_launch(store, id, &attempt_id, *started).await);
+                let system = identity.system_route.is_some();
+                return Err(abandon_started_launch(
+                    store,
+                    id,
+                    &attempt_id,
+                    (&agent_dir, system),
+                    *started,
+                )
+                .await);
             }
         };
         let switched = continuing.is_some();
@@ -2433,7 +2476,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         retain_cleanup_evidence(
             &agent_dir,
             &attempt_id,
-            &process,
+            process.owner.snapshot(),
             &cleanup,
             &execution,
             exit,

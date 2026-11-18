@@ -420,6 +420,7 @@ fn main() {
     // starts one child in its own group and one double-forked, setsid daemon,
     // records all three PIDs, then releases the supervisor's injected launch
     // wrapping failure and keeps running until it is killed.
+    #[cfg(target_os = "linux")]
     if std::path::Path::new("fixture-fork-before-wrap").exists() {
         let exe = std::env::current_exe().expect("fixture exe path");
         #[allow(clippy::zombie_processes)]
