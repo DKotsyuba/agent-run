@@ -253,7 +253,7 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     // Read raw bytes: the parenthesized command name inherits the executable's
     // filename bytes and is not guaranteed UTF-8 (psutil reads bytes for the
     // same reason), so the line must never be validated as a String.
-    let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+    let stat = read_proc_stat(pid)?;
     let parts = stat_fields(&stat)?;
     let num = |i: usize| {
         std::str::from_utf8(parts.get(i).ok_or_else(proc_field_error)?)
@@ -262,9 +262,40 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
             .map_err(|_| proc_field_error())
     };
     let ticks = num(19)?;
+    let clock = boot_clock()?;
+    Ok(Identity {
+        pid,
+        ppid: num(1)? as i32,
+        group: num(2)? as i32,
+        birth: clock.btime + ticks as f64 / clock.hz,
+        token: format!("linux:{}:{ticks}", clock.boot_id),
+        program: None,
+        zombie: parts
+            .first()
+            .is_some_and(|state| *state == b"Z" || *state == b"X"),
+    })
+}
+/// Boot-constant Linux facts behind every process token and birth time.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq)]
+struct BootClock {
+    /// Trimmed `/proc/sys/kernel/random/boot_id`, the token's boot fence.
+    boot_id: String,
+    /// `btime` from `/proc/stat`: boot time in Unix seconds.
+    btime: f64,
+    /// `_SC_CLK_TCK`, the unit of the stat start-time field.
+    hz: f64,
+}
+
+/// Read the boot identity, boot time and clock tick rate from procfs.
+///
+/// Errors are returned unchanged so callers keep treating unavailable evidence
+/// as unknown rather than death.
+#[cfg(target_os = "linux")]
+fn read_boot_clock() -> std::io::Result<BootClock> {
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let clock = std::fs::read_to_string("/proc/stat")?;
-    let epoch = clock
+    let btime = clock
         .lines()
         .find_map(|s| s.strip_prefix("btime "))
         .and_then(|s| s.parse::<f64>().ok())
@@ -274,17 +305,38 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     if hz <= 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(Identity {
-        pid,
-        ppid: num(1)? as i32,
-        group: num(2)? as i32,
-        birth: epoch + ticks as f64 / hz as f64,
-        token: format!("linux:{}:{ticks}", boot.trim()),
-        program: None,
-        zombie: parts
-            .first()
-            .is_some_and(|state| *state == b"Z" || *state == b"X"),
+    Ok(BootClock {
+        boot_id: boot.trim().to_owned(),
+        btime,
+        hz: hz as f64,
     })
+}
+
+/// Return the boot facts read once per process; they cannot change before reboot.
+///
+/// Before this cache every [`inspect`] re-read the whole kernel-generated
+/// `/proc/stat` (several KiB) and `boot_id`, which dominated the cost of the
+/// supervisor's process snapshots. A failed read is not cached and is retried.
+/// Within one process this also keeps `birth` stable for a PID generation even
+/// if the wall clock is stepped, so exact `birth` comparisons stay consistent.
+#[cfg(target_os = "linux")]
+fn boot_clock() -> std::io::Result<&'static BootClock> {
+    static CLOCK: std::sync::OnceLock<BootClock> = std::sync::OnceLock::new();
+    if let Some(clock) = CLOCK.get() {
+        return Ok(clock);
+    }
+    let clock = read_boot_clock()?;
+    Ok(CLOCK.get_or_init(|| clock))
+}
+
+/// Read one `/proc/<pid>/stat` line with one open and two reads, without the
+/// size probe and repeated small reads `std::fs::read` performs on procfs.
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: i32) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut stat = Vec::with_capacity(1024);
+    std::fs::File::open(format!("/proc/{pid}/stat"))?.read_to_end(&mut stat)?;
+    Ok(stat)
 }
 /// Split one `/proc/<pid>/stat` line into the fields after the command name.
 ///
@@ -741,6 +793,29 @@ fn with_program(mut identity: Identity) -> Identity {
     identity
 }
 
+/// Per-refresh memo of [`observe`] verdicts for captured parents.
+///
+/// Keys are the captured `(pid, token)`, so a recycled PID with a different
+/// token is a distinct key and is probed (and rejected) on its own.
+#[derive(Default)]
+struct ParentLiveness(BTreeMap<(i32, String), bool>);
+impl ParentLiveness {
+    /// Record one verdict already obtained for this exact identity.
+    fn record(&mut self, pid: i32, token: &str, alive: bool) {
+        self.0.insert((pid, token.to_owned()), alive);
+    }
+    /// Return whether `parent` observes alive, probing it at most once per memo.
+    fn alive(&mut self, parent: &Identity) -> bool {
+        if let Some(alive) = self.0.get(&(parent.pid, parent.token.clone())) {
+            return *alive;
+        }
+        let alive = observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
+            == ProcessState::Alive;
+        self.record(parent.pid, &parent.token, alive);
+        alive
+    }
+}
+
 /// PID-reuse-aware ownership evidence for one child process group.
 pub struct OwnedProcess {
     /// Captured identity of the group leader, when readable at spawn time.
@@ -899,6 +974,15 @@ impl OwnedProcess {
         let Ok(all) = processes() else {
             return;
         };
+        self.refresh_from(&all);
+    }
+    /// Expand captured ownership from one complete native snapshot.
+    ///
+    /// Each known parent is observed at most once per call, after the snapshot,
+    /// exactly as [`observe`] would report it; the verdict is keyed by the
+    /// parent's `(pid, token)`, so a reused PID carrying another token is a
+    /// different key and never inherits a live verdict.
+    fn refresh_from(&mut self, all: &[Identity]) {
         let leader_state = self
             .leader
             .as_ref()
@@ -910,20 +994,31 @@ impl OwnedProcess {
         let leader_owned = leader_state == Some(ProcessState::Alive);
         #[cfg(not(target_os = "linux"))]
         let leader_owned = matches!(leader_state, Some(ProcessState::Alive | ProcessState::Dead));
+        let mut parents = ParentLiveness::default();
+        if let (Some(leader), Some(state)) = (&self.leader, leader_state)
+            && self
+                .known
+                .get(&(leader.pid, leader.token.clone()))
+                .is_some_and(|root| root.birth == leader.birth)
+        {
+            // The leader's own observation is the same probe with the same evidence.
+            parents.record(leader.pid, &leader.token, state == ProcessState::Alive);
+        }
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {
             let mut changed = false;
-            for p in &all {
-                let child = self
-                    .known
-                    .range((p.ppid, String::new())..)
-                    .take_while(|((pid, _), _)| *pid == p.ppid)
-                    .any(|(_, parent)| {
-                        observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
-                            == ProcessState::Alive
-                    });
+            for p in all {
+                if self.knows(p) {
+                    continue;
+                }
                 let in_group = leader_owned && p.group == self.pid;
-                if (child || in_group) && !self.known.contains_key(&(p.pid, p.token.clone())) {
+                let child = in_group
+                    || self
+                        .known
+                        .range((p.ppid, String::new())..)
+                        .take_while(|((pid, _), _)| *pid == p.ppid)
+                        .any(|(_, parent)| parents.alive(parent));
+                if child {
                     let key = (p.pid, p.token.clone());
                     self.captured.push(key.clone());
                     self.known.insert(key, with_program(p.clone()));
@@ -934,6 +1029,13 @@ impl OwnedProcess {
                 break;
             }
         }
+    }
+    /// Return whether this exact PID generation is already captured, without allocating a key.
+    fn knows(&self, process: &Identity) -> bool {
+        self.known
+            .range((process.pid, String::new())..)
+            .take_while(|((pid, _), _)| *pid == process.pid)
+            .any(|((_, token), _)| *token == process.token)
     }
     /// Signal only a currently verified owned process group.
     pub fn signal(&mut self, sig: i32) -> Result<bool> {
@@ -1016,9 +1118,17 @@ impl OwnedProcess {
     }
     /// Refresh parentage and check whether group and descendant evidence can settle.
     /// An absent descendant snapshot cannot confirm cleanup but needs no extra wait.
+    ///
+    /// One native snapshot serves both the parentage refresh and the group
+    /// check. This only decides when waiting may stop: the final cleanup proof
+    /// in [`Self::evidence`] still takes its own fresh snapshot.
     fn settled(&mut self) -> bool {
-        self.refresh();
-        self.gone() && self.descendants_gone() != Some(false)
+        let all = processes().ok();
+        if let Some(all) = &all {
+            self.refresh_from(all);
+        }
+        self.group_observation_with(all.as_deref()) == GroupObservation::Gone
+            && self.descendants_gone() != Some(false)
     }
     /// Return whether the leader and its original group are both proven absent.
     pub fn gone(&self) -> bool {
@@ -1026,6 +1136,11 @@ impl OwnedProcess {
     }
     /// Observe the captured leader and its original group without sending a signal.
     fn group_observation(&self) -> GroupObservation {
+        self.group_observation_with(None)
+    }
+    /// Observe the leader freshly, then judge the group from `snapshot` when
+    /// given, otherwise from a new native snapshot taken after the leader probe.
+    fn group_observation_with(&self, snapshot: Option<&[Identity]>) -> GroupObservation {
         match &self.leader {
             Some(p) => {
                 let state = observe(Some(p.pid), Some(&p.token), Some(p.birth));
@@ -1047,7 +1162,15 @@ impl OwnedProcess {
         if self.pid <= 1 {
             return GroupObservation::Unknown;
         }
-        if let Ok(processes) = processes() {
+        let fresh;
+        let processes = match snapshot {
+            Some(snapshot) => Ok(snapshot),
+            None => {
+                fresh = processes();
+                fresh.as_deref()
+            }
+        };
+        if let Ok(processes) = processes {
             return if processes
                 .iter()
                 .any(|process| process.group == self.pid && !process.zombie)
@@ -1201,6 +1324,91 @@ mod tests {
         );
         leader.token.push('0');
         assert!(kernel_incarnation(&leader).is_err());
+    }
+
+    /// Boot facts are read once, match a fresh procfs read and keep the token format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_boot_clock_matches_procfs_and_token_format() {
+        let cached = boot_clock().unwrap();
+        assert!(std::ptr::eq(cached, boot_clock().unwrap()), "read once");
+        let fresh = read_boot_clock().unwrap();
+        assert_eq!(*cached, fresh);
+        assert_eq!(
+            fresh.boot_id,
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+        );
+        let me = inspect(std::process::id() as i32).unwrap();
+        let stat = std::fs::read(format!("/proc/{}/stat", me.pid)).unwrap();
+        let ticks: u64 = std::str::from_utf8(stat_fields(&stat).unwrap()[19])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(me.token, format!("linux:{}:{ticks}", fresh.boot_id));
+        assert_eq!(me.birth, fresh.btime + ticks as f64 / fresh.hz);
+        assert_eq!(read_proc_stat(me.pid).unwrap(), stat);
+    }
+
+    /// A memoized parent verdict is keyed by the exact generation: a recycled
+    /// PID carrying another token is probed separately and never alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memoized_parent_liveness_rejects_a_reused_pid() {
+        let live = inspect(std::process::id() as i32).unwrap();
+        let mut stale = live.clone();
+        stale.token = format!("{}:1", live.token.rsplit_once(':').unwrap().0);
+        let mut parents = ParentLiveness::default();
+        assert!(parents.alive(&live));
+        assert!(!parents.alive(&stale), "same PID, older generation");
+        assert!(parents.alive(&live), "the live verdict is unchanged");
+        // A recorded verdict is reused for its own key only.
+        let mut parents = ParentLiveness::default();
+        parents.record(live.pid, &live.token, true);
+        assert!(!parents.alive(&stale));
+    }
+
+    /// Children of a captured parent whose PID now names another generation
+    /// are not captured; the same children are captured from the live parent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_expands_only_from_the_exact_live_parent_generation() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let child_pid = child.0.id() as i32;
+        let child_identity = inspect(child_pid).unwrap();
+        let live = inspect(std::process::id() as i32).unwrap();
+        let mut stale = live.clone();
+        stale.token = format!("{}:1", live.token.rsplit_once(':').unwrap().0);
+        let captured = |root: &Identity| {
+            let mut owner = OwnedProcess::restore(OwnershipSnapshot {
+                leader: root.clone(),
+                members: vec![root.clone()],
+                descendants_observed: false,
+            })
+            .unwrap();
+            owner.refresh();
+            owner
+                .snapshot()
+                .unwrap()
+                .members
+                .iter()
+                .any(|p| p.pid == child_pid && p.token == child_identity.token)
+        };
+        assert!(!captured(&stale), "a reused parent PID granted ownership");
+        assert!(captured(&live), "the exact live parent owns its child");
     }
 
     /// Procfs init and wildcard-like names never enter a process snapshot.
