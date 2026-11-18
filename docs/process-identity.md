@@ -61,19 +61,32 @@ its ownership and records a bounded cleanup diagnostic for investigation.
 
 On Linux each supervisor makes itself the child subreaper
 (`PR_SET_CHILD_SUBREAPER`) before it spawns anything. Engine descendants which
-double-fork, `setsid` or `nohup` then reparent to the supervisor instead of
-init, so every termination point (primary exit, group or descendant signals,
-cleanup settling) reaches them by parentage. An orphan is attributed to an
-engine only while that engine is the supervisor's single live spawned owner;
-the supervisor's own spawned leaders and same-process-group helpers are never
-adopted. Captured adopted zombies are reaped with `waitpid(pid, WNOHANG)` on
-their exact PID after a PID and token match; `waitpid(-1)` and the engine's own
-exit status are never used. Because orphans stay reachable, the mid-run
-descendant refresh slows from 200 ms to 10 s (`AGENT_RUN_DESCENDANT_REFRESH_MS`,
-200 to 600000); it only keeps the durable crash-recovery capture and zombie
-reaping current. Without a subreaper (macOS, or `prctl` refused) the 200 ms
-polling remains. A Pool peer whose ancestry includes a recorded supervisor
-identity (PID and exact start token) is refused as a Run descendant.
+double-fork, `setsid`, `nohup` or join another process group then reparent to
+the supervisor instead of init, so every termination point (primary exit,
+group or descendant signals, cleanup settling) reaches them by parentage.
+
+The supervisor tells its own spawns from adopted orphans only by an explicit
+registry: every spawn is registered by exact PID and start token under an
+admission lock and stays registered until its spawner collected the exit
+status. Process groups are never used for that distinction. An orphan cannot
+name its tree, so it is attributed to an engine only when two snapshots taken
+right after that engine's spawn showed it as the supervisor's only live child;
+every later living descendant then belongs to that tree until another spawn is
+admitted. Without that proof nothing is attributed and the engine keeps the
+200 ms polling refresh. Zombie orphans are reaped with `waitpid(pid, WNOHANG)`
+after a fresh check that the exact PID and token are an unregistered zombie
+child; `waitpid(-1)` is never used.
+
+With an exclusive engine the mid-run refresh slows to 2 s
+(`AGENT_RUN_DESCENDANT_REFRESH_MS`, 200 to 600000): it keeps the durable
+crash-recovery capture and orphan reaping current. Without a subreaper (macOS,
+or `prctl` refused) the 200 ms polling remains. A Pool peer whose ancestry
+includes a recorded supervisor identity (PID and exact start token) is refused
+as a Run descendant.
+
+Captured descendants are compared by their native start token; `birth` decides
+only for legacy evidence without one. Linux birth is derived from the wall-clock
+boot time, so a clock step changes it for a process that computes it later.
 
 macOS uses native process APIs and a start-time-only sysctl fallback when
 same-user relationship fields are unavailable. Linux reads `/proc`; its boot ID

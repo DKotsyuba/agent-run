@@ -4,6 +4,27 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- A per-agent supervisor no longer spends about a fifth of a CPU watching its
+  engine. Every process inspection re-read `/proc/stat` and the boot ID, and the
+  200 ms descendant refresh re-probed each parent once per child; boot facts
+  are now read once per process and each parent at most once per refresh. On
+  Linux the supervisor is the child subreaper of its engine tree: orphaned,
+  double-forked or `setsid` descendants reparent to it, are captured at every
+  termination point and killed by cleanup, and orphan zombies are reaped by
+  exact PID. Its own spawns are tracked in an explicit registry until reaped and
+  are never adopted or reaped. When the engine spawn is provably the only live
+  tree, the mid-run refresh slows to 2 s (`AGENT_RUN_DESCENDANT_REFRESH_MS`,
+  200 to 600000) for durable crash-recovery evidence; otherwise, and on macOS,
+  the 200 ms polling remains. On a ~600-process host a watched engine fell from
+  21.5% to under 1% of one CPU.
+- Cleanup proofs compare a captured Linux or macOS descendant by its native
+  start token; `birth` decides only for legacy evidence without one, so a wall
+  clock step can no longer make a live descendant look reused and gone.
+- A Pool peer whose ancestry includes a recorded supervisor (PID and exact
+  start token) is refused as a Run descendant.
+
 ## 0.31.7
 
 ### Fixed
