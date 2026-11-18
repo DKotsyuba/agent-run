@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.8
+
 ### Fixed
 
 - A per-agent supervisor no longer spends about a fifth of a CPU watching its
