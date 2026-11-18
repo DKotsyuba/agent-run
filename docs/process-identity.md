@@ -66,16 +66,24 @@ the supervisor instead of init, so every termination point (primary exit,
 group or descendant signals, cleanup settling) reaches them by parentage.
 
 The supervisor tells its own spawns from adopted orphans only by an explicit
-registry: every spawn is registered by exact PID and start token under an
-admission lock and stays registered until its spawner collected the exit
-status. Process groups are never used for that distinction. An orphan cannot
-name its tree, so it is attributed to an engine only when two snapshots taken
-right after that engine's spawn showed it as the supervisor's only live child;
-every later living descendant then belongs to that tree until another spawn is
-admitted. Without that proof nothing is attributed and the engine keeps the
-200 ms polling refresh. Zombie orphans are reaped with `waitpid(pid, WNOHANG)`
-after a fresh check that the exact PID and token are an unregistered zombie
-child; `waitpid(-1)` is never used.
+registry. Every child is forked through a spawn gate: before `exec` the child
+reports its PID and waits until the supervisor has registered its exact PID and
+start token under an admission lock. A child that cannot be registered never
+runs its program; the spawn fails and is reaped. A registration stays until the
+spawner collected the exit status. Process groups and PID listings never decide
+ownership. An orphan cannot name its tree, so it is attributed to an engine only
+when that engine was spawned at a clean boundary: under the same lock and
+before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT)` reported that the supervisor
+had no child at all, so every later orphan descends from that engine until
+another spawn is admitted. Any other engine attributes nothing and keeps the
+200 ms polling refresh. Only captured orphans are reaped, with
+`waitpid(pid, WNOHANG)` after a fresh check that the exact PID and token are an
+unregistered zombie child; `waitpid(-1)` is never used. Orphans that were never
+captured are not reaped and remain zombies of the supervisor until it exits.
+
+The engine itself is not made a subreaper: Bun-based (Claude, OpenCode) and
+tokio-based (Codex) engines reap only children they spawned, so adopted
+orphans would stay zombies inside the engine for its whole lifetime.
 
 With an exclusive engine the mid-run refresh slows to 2 s
 (`AGENT_RUN_DESCENDANT_REFRESH_MS`, 200 to 600000): it keeps the durable
