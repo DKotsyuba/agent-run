@@ -14,7 +14,7 @@ impl Service {
         let fingerprint = request.fingerprint()?;
         self.read(move |store| {
             let receipt = store
-                .replay_batch_scoped(
+                .lookup_batch_receipt(
                     &request.request_id,
                     &fingerprint,
                     request.expected_store_id.as_ref(),

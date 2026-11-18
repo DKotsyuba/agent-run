@@ -650,15 +650,18 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                     inputs: inputs(&job.inputs),
                 })
                 .collect();
-            out(store.admit_batch(crate::batch_admission::BatchAdmission {
-                request_id: &op.request_id,
-                fingerprint: &op.fingerprint,
-                retain_history: op.retain_history,
-                expected_store_id: op.expected_store_id.as_ref(),
-                preconditions: op.preconditions.as_deref(),
-                catalog: &op.catalog,
-                jobs,
-            })?)
+            out(store.admit_batch_with_pin_digest(
+                crate::batch_admission::BatchAdmission {
+                    request_id: &op.request_id,
+                    fingerprint: &op.fingerprint,
+                    retain_history: op.retain_history,
+                    expected_store_id: op.expected_store_id.as_ref(),
+                    preconditions: op.preconditions.as_deref(),
+                    catalog: &op.catalog,
+                    jobs,
+                },
+                op.pin_digest.as_ref(),
+            )?)
         }
         L::PrepareManagedEnrollment(op) => {
             out(store.managed_enrollment_prepare(&op.key, &op.grant, &op.request)?)
@@ -695,7 +698,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
         L::ReleaseHistoryPin(op) => out(store.release_history_pin_scoped(
             &op.pin_id,
             op.expected_store_id.as_ref(),
-            &op.owner_request_id,
+            &op.authority,
         )?),
         L::AcquireLineageHold(op) => out(store.acquire_lineage_hold(&op.acquire)?),
         L::ReleaseLineageHold(op) => {

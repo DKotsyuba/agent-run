@@ -173,11 +173,14 @@ stays replayable, so an older binary still opens the database. No code path
 inserts or updates the legacy pool tables. Their writer operations are removed
 from the closed inventory and their wire ids (4-7, 47-51, 95) stay reserved:
 a frame naming one is refused as an unknown kind and the id is never reused.
-Historical rows decode tolerantly: a pending pool completion or enrollment
-attention notice ends `failed` with `legacy_pool_retired` at claim, a queued
-`pool` command completes without a push (`unsupported_command`, or
-`agent_terminal` once the run ended), a historical pool-loop steer
-is refused as stale, and stored health snapshots carrying old pool wait
+A due notice with historical native attempts and no Bridge intent ends
+`failed` with `legacy_delivery_held`. Other due legacy pool completion and
+enrollment attention notices end `failed` with `legacy_pool_retired` at claim.
+Unbound terminal agent notices expire after one hour on a claim sweep, with
+legacy pool completion rows excluded. A queued `pool` command completes
+without a push (`unsupported_command`, or `agent_terminal` once the run
+ended). Legacy pool-loop and enrollment steers are refused before native
+input, and stored health snapshots carrying old pool wait
 evidence still decode. Pool membership no longer suppresses individual
 completion notices. The `pool_membership_ever` independence fence (and its
 immutability trigger) remains durable; managed Agent Pool enrollment still

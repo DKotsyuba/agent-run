@@ -903,6 +903,12 @@ impl Service {
             return Ok(replay);
         }
         request.validate_new_lookup_frame()?;
+        let release_token = request
+            .retain_history
+            .then(agent_run_domain::batch::PinReleaseToken::mint);
+        let pin_digest = release_token
+            .as_ref()
+            .map(agent_run_domain::batch::PinReleaseToken::digest);
         if let Some(restart_id) = agent_run_store::service_restart::active_service_restart(
             &Store::open(&self.home)?.conn,
         )? {
@@ -979,6 +985,7 @@ impl Service {
                         request_id: request.request_id.clone(),
                         fingerprint: fingerprint.clone(),
                         retain_history: request.retain_history,
+                        pin_digest,
                         expected_store_id: request.expected_store_id.clone(),
                         preconditions: request.preconditions.clone(),
                         catalog: catalog.clone(),
@@ -1011,7 +1018,13 @@ impl Service {
                         source: Box::new(error),
                     });
                 }
-                result => return result,
+                Ok(mut result) => {
+                    if !result.replayed {
+                        result.release_token = release_token;
+                    }
+                    return Ok(result);
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1195,6 +1208,7 @@ impl Service {
                             request_id: batch.request_id.clone(),
                             fingerprint: batch_fingerprint.clone(),
                             retain_history: true,
+                            pin_digest: None,
                             expected_store_id: batch.expected_store_id.clone(),
                             preconditions: batch.preconditions.clone(),
                             catalog: catalog.clone(),
@@ -1813,13 +1827,24 @@ impl Service {
         if display_name.is_some() {
             request.display_name = display_name;
         }
+        let allow_legacy_replay = orchestrator.is_none();
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
         }
         request.validate_intent()?;
-        // Replay of the original resume intent precedes every mutable read.
-        if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
-            let store = Store::open(&self.home)?;
+        // Replay the historical shared destination only for an existing child.
+        // New admissions use the ordinary request, so retirement cannot bind them.
+        let store = Store::open(&self.home)?;
+        let legacy = if allow_legacy_replay {
+            store.replay_legacy_pool_resume(parent, &request)?
+        } else {
+            None
+        };
+        let replay = match legacy {
+            Some(replay) => Some(replay),
+            None => store.replay_provider_request(&request)?,
+        };
+        if let Some(replay) = replay {
             let row = store.get(&replay.agent_id)?;
             if row.parent_agent_id.as_ref() != Some(&parent.id) {
                 return Err(Error::Conflict);
@@ -1829,6 +1854,7 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        drop(store);
         match (&self.system_launcher, &frozen.system_route) {
             (None, None) => {}
             (Some(launcher), Some(route)) => {
@@ -2297,7 +2323,7 @@ impl Service {
     }
 
     /// Lists operator history pins in one bounded read; never discloses the
-    /// admitting batch key that proves release ownership.
+    /// batch release credential.
     pub async fn history_pins_list(
         &self,
         request: agent_run_domain::batch::HistoryPinsListRequest,
@@ -2316,27 +2342,26 @@ impl Service {
         .map_err(|_| Error::Runtime("history pins read failed".into()))?
     }
 
-    /// Idempotently releases one pin for the owner of its admitting public
-    /// batch. The store refuses another batch key, a managed-enrollment pin
-    /// and an actively held pin with `RequestConflict`; unknown is PinNotFound.
+    /// Releases one public pin using its batch credential; wrong credentials,
+    /// absent pins and active holds produce the same conflict.
     pub async fn history_pins_release(
         &self,
         request: agent_run_domain::batch::HistoryPinReleaseRequest,
     ) -> Result<Value> {
-        request.validate()?;
         let result = self
             .release_owned_pin(
                 request.pin_id,
                 request.expected_store_id,
-                request.request_id,
+                agent_run_store::history_pins::ReleaseAuthority::Credential(
+                    request.release_token.digest(),
+                ),
             )
             .await?;
         Ok(serde_json::to_value(result)?)
     }
 
     /// Releases a pin minted by an Agent Pool managed enrollment. Only the
-    /// authenticated Pool route reaches this: the owner key is derived from
-    /// that route exactly as admission derived it, never taken from input.
+    /// authenticated Pool route and its original enrollment can authorize it.
     pub(crate) async fn managed_pin_release(
         &self,
         grant: &crate::attempt_binding::PeerGrant,
@@ -2352,7 +2377,10 @@ impl Service {
         if pool_store_id != route.pool_route.component_store_id {
             return Err(invalid("route mismatch"));
         }
-        let owner = managed_batch_key(&route.pool_route, pool_store_id, request_id);
+        let owner = agent_run_store::history_pins::ReleaseAuthority::ManagedEnrollment {
+            route: route.pool_route,
+            request_id: request_id.to_owned(),
+        };
         self.release_owned_pin(pin_id, Some(expected_store_id), owner)
             .await
     }
@@ -2362,14 +2390,14 @@ impl Service {
         &self,
         pin_id: agent_run_domain::batch::PinId,
         expected_store_id: Option<agent_run_domain::StoreId>,
-        owner_request_id: String,
+        authority: agent_run_store::history_pins::ReleaseAuthority,
     ) -> Result<agent_run_domain::batch::HistoryPinRelease> {
         self.lane("retention")?
             .local(
                 agent_run_store::ops::ReleaseHistoryPin {
                     pin_id: pin_id.clone(),
                     expected_store_id,
-                    owner_request_id,
+                    authority,
                 },
                 crate::broker_writer::BROKER_BUDGET,
             )

@@ -267,25 +267,35 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
             .unwrap();
         assert_eq!(count, 0, "mismatch cannot admit {table}");
     }
+    use agent_run_store::history_pins::ReleaseAuthority;
+    let foreign = ReleaseAuthority::Credential([42; 32]);
     assert!(matches!(
-        store.release_history_pin_scoped(&pins[0], Some(&other_id), &request.request_id),
+        store.release_history_pin_scoped(&pins[0], Some(&other_id), &foreign),
         Err(Error::StoreIdentityMismatch)
     ));
-    // Ownership: only the admitting batch key releases; any other key,
-    // including an internal managed-enrollment key, conflicts without effect.
-    for foreign in ["other-batch", "p3_0000"] {
+    // Existing random public pins have no bearer credential or durable Pool
+    // enrollment, even when the caller knows their exact batch key.
+    for authority in [
+        foreign.clone(),
+        ReleaseAuthority::ManagedEnrollment {
+            route: agent_run_domain::attempt_binding::Route {
+                component_store_id: "pool-fixture".into(),
+                route_id: "fixture".into(),
+                worker_uid: 0,
+            },
+            request_id: request.request_id.clone(),
+        },
+    ] {
         assert!(matches!(
-            store.release_history_pin_scoped(&pins[0], Some(&store_id), foreign),
+            store.release_history_pin_scoped(&pins[0], Some(&store_id), &authority),
             Err(Error::Conflict)
         ));
     }
     let unknown = agent_run_domain::batch::PinId::new();
-    assert!(
-        store
-            .release_history_pin_scoped(&unknown, Some(&store_id), &request.request_id)
-            .unwrap()
-            .is_none()
-    );
+    assert!(matches!(
+        store.release_history_pin_scoped(&unknown, Some(&store_id), &foreign),
+        Err(Error::Conflict)
+    ));
     assert!(matches!(
         store.history_pins_scoped(
             agent_run_domain::batch::HistoryPinFilter::All,
@@ -412,15 +422,8 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
                 .already_released
         );
     }
-    // The owner's idempotent replay succeeds; a tombstone never reveals or
-    // changes ownership for another key.
-    let owner_replay = store
-        .release_history_pin_scoped(&pins[0], Some(&store_id), &request.request_id)
-        .unwrap()
-        .unwrap();
-    assert!(owner_replay.already_released);
     assert!(matches!(
-        store.release_history_pin_scoped(&pins[0], Some(&store_id), "other-batch"),
+        store.release_history_pin_scoped(&pins[0], Some(&store_id), &foreign),
         Err(Error::Conflict)
     ));
     assert_eq!(
@@ -902,12 +905,35 @@ mod p3 {
         assert!(
             matches!(store.managed_enrollment_admit(&late_key,&grant,&revision,&digests,submit()),Err(Error::Validation(ref text)) if text == "enrollment aborted")
         );
-        assert!(
-            store
-                .release_history_pin(&accepted.receipt.jobs[0].pin_id)
-                .unwrap()
-                .is_some()
-        );
+        // A historical enrollment may use a different internal batch key.
+        // Release uses the durable Pool enrollment and its original route.
+        use agent_run_store::history_pins::ReleaseAuthority;
+        let pin = &accepted.receipt.jobs[0].pin_id;
+        let mut wrong_route = grant.pool_route.clone();
+        wrong_route.route_id.push_str("-changed");
+        assert!(matches!(
+            store.release_history_pin_scoped(
+                pin,
+                Some(&key.expected_store_id),
+                &ReleaseAuthority::ManagedEnrollment {
+                    route: wrong_route,
+                    request_id: key.request_id.clone(),
+                }
+            ),
+            Err(Error::Conflict)
+        ));
+        let released = store
+            .release_history_pin_scoped(
+                pin,
+                Some(&key.expected_store_id),
+                &ReleaseAuthority::ManagedEnrollment {
+                    route: grant.pool_route.clone(),
+                    request_id: key.request_id.clone(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!released.already_released);
         // The external-independence fence survives pin release.
         assert_eq!(
             store

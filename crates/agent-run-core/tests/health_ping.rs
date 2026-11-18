@@ -261,6 +261,40 @@ printf '%s\n' "$unexpected" > unexpected.json
                 .is_some_and(|v| v["phase"] == "idle")
         })
         .await;
+        // Rows left pending by an older broker must be completed without
+        // starting a native turn on either supported loop.
+        for (tag, reason) in [
+            ("pool_enrollment", "legacy_pool_retired"),
+            ("pool_read_guard", "stale_pool_read_guard"),
+        ] {
+            let marker = if tag == "pool_enrollment" {
+                json!(id)
+            } else {
+                json!({})
+            };
+            let payload = json!({"text":"retired steer",(tag):marker});
+            store.conn.execute(
+                "INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,'steer',?,'pending',?)",
+                rusqlite::params![id.as_str(), payload.to_string(), agent_run_core::domain::now()],
+            ).unwrap();
+            let command = store.conn.last_insert_rowid();
+            let result = || {
+                store.conn.query_row(
+                    "SELECT result_json FROM commands WHERE id=? AND state='completed'",
+                    [command],
+                    |r| r.get::<_, String>(0),
+                )
+            };
+            observed(|| result().is_ok()).await;
+            assert_eq!(
+                serde_json::from_str::<Value>(&result().unwrap()).unwrap(),
+                json!({"accepted":false,"reason":reason})
+            );
+            assert!(
+                !home.path.join("wake.json").exists(),
+                "retired steer wrote native input"
+            );
+        }
         // Fixture clock only: represent a five-minute-old idle boundary after
         // the real native stream has acknowledged the actual turn completion.
         store

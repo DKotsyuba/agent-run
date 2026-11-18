@@ -822,6 +822,11 @@
           ],
           "type": "object"
         },
+        "release_token": {
+          "description": "Bearer credential returned once when a public retained batch commits. Keep private.",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
         "replayed": {
           "type": "boolean"
         }

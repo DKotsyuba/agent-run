@@ -72,11 +72,22 @@ matching CLI commands, `bind --pool` and `agent-run-tui`. Use Agent Pool for
 groups with shared membership, messages and consensus; Run still starts,
 resumes and reports each member. Nothing was migrated into Agent Pool.
 
-Old pool rows stay in `state.db` unchanged (no schema change, no DROP) and are
-never written again; ordinary retention may still release a whole old pool once
-every member lineage expired. Pending old pool notices end `failed` with
-`legacy_pool_retired`; queued old pool commands are never pushed.
-The `pool_membership_ever` independence fence stays durable.
+Old pool rows stay in `state.db` for archival reads. Ordinary retention may
+release a whole old pool once every member lineage expires. The
+`pool_membership_ever` independence fence stays durable.
+
+On a delivery claim, an eligible row with historical native attempts and no
+Bridge intent becomes `failed` with `legacy_delivery_held`. Remaining due
+legacy pool completion or enrollment attention rows become `failed` with
+`legacy_pool_retired`. A claim sweep expires unbound terminal agent notices
+after one hour and excludes legacy pool completion rows from expiry. Binary
+rollback keeps schema compatibility. Rows already held, retired or expired
+keep their stored states across the binary switch.
+
+Queued old pool commands and tagged pool-loop or enrollment steers are
+completed without native input. New resumes should pass an explicit destination
+if they previously used the shared pool binding. Exact historical provider
+resume retries can use the durable binding to find the original child.
 
 Archival reads are read-only SQL, run as the service owner against a backup
 or a read-only connection (`file:<home>/state.db?mode=ro`, `uri=True` in

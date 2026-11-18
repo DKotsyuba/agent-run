@@ -2739,7 +2739,7 @@ async fn provider_resume_continues_the_proven_native_session() {
             .unwrap(),
     );
     let orchestrator: agent_run::domain::OrchestratorRef = serde_json::from_value(
-        serde_json::json!({"transport":"codex_queue","external_session_id":"test-session"}),
+        serde_json::json!({"transport":"codex_queue","external_session_id":"legacy-pool-session","external_turn_id":"original-turn"}),
     )
     .unwrap();
     let resume = async |request_id: &str| {
@@ -2841,6 +2841,59 @@ async fn provider_resume_continues_the_proven_native_session() {
     let replay = resume("resume-1").await.unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], child["agent_id"]);
+    // Simulate the persisted state left by a pre-upgrade implicit Pool
+    // destination. The provider resume above committed the identical intent.
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let pool_id = "pool-20260901-120000-0123456789";
+    store.conn.execute(
+        "INSERT INTO pools(id,request_namespace,request_id,request_sha256,orchestrator_session_id,goal,acceptance_json,state,roster_revision,created_at)
+         SELECT ?1,'fixture','legacy',?2,orchestrator_session_id,'fixture','[]','open',1,1 FROM agents WHERE id=?3",
+        rusqlite::params![pool_id, "a".repeat(64), child_id.as_str()],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,1,'member','role','task',1)",
+        rusqlite::params![id.as_str(), pool_id],
+    ).unwrap();
+    store.conn.execute(
+        "UPDATE orchestrator_sessions SET external_turn_id='later-turn' WHERE external_session_id='legacy-pool-session'",
+        [],
+    ).unwrap();
+    let parent_row = store.get(&id).unwrap();
+    assert_ne!(
+        parent_row
+            .request
+            .orchestrator
+            .as_ref()
+            .unwrap()
+            .external_session_id,
+        orchestrator.external_session_id
+    );
+    drop(store);
+    let replay = service
+        .resume(
+            &id,
+            "fixture:answer".into(),
+            Some("resume-1".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], child["agent_id"]);
+    assert_eq!(replay["attempt_id"], child["attempt_id"]);
+    assert!(matches!(
+        service
+            .admit_provider_resume(
+                &parent_row,
+                "changed".into(),
+                Some("resume-1".into()),
+                None,
+                None,
+            )
+            .await,
+        Err(agent_run::Error::Conflict)
+    ));
     let second = resume("resume-2").await.unwrap_err().to_string();
     assert!(second.contains("already been resumed"), "{second}");
     assert_eq!(children(), 1);

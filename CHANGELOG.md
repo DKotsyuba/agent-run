@@ -29,17 +29,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   `schemas/tools.json` now exports the orchestrator MCP discovery only. The MCP
   `answer` text points large-answer retrieval to the file or
   `agent-run answer-chunk`.
-- `history_pins` is split into `history_pins_list` (read-only) and
-  `history_pins_release`; the old method returns method-not-found. Release
-  requires ownership proof: the `request_id` of the `start_batch` whose
-  permanent receipt minted the pin. Another key, a pin minted by an Agent Pool
-  managed enrollment, or an actively held pin is refused with
-  `RequestConflict`; reserved internal keys are a `ValidationError`. There is
-  no operator override; `agent-run history-pins release` requires
-  `--request-id`. Agent Pool releases its managed-enrollment pins through the
-  new authenticated attempt-channel method `_managed_pin_release_v1`
-  (capability `managed_pin_release_v1`). Agent Pool must adopt the new calls
-  before this release is installed.
+- `history_pins_list` lists pins. Public `history_pins_release` requires the
+  batch bearer token (`release_token`) issued only by the original retained
+  `start_batch` response. CLI release reads it from a file or stdin. Read-only batch
+  receipt lookup returns `found:false` for unused keys and mismatched intents.
+  Agent Pool continues to release managed enrollment pins with
+  `_managed_pin_release_v1` on its authenticated route. Legacy public pins
+  and pins with a lost token require an explicit offline database-owner
+  release. See the [Agent Pool migration note](docs/api.md#agent-pool-migration-for-history-pins).
 - Legacy Run cooperative pools are removed (owner decision; Agent Pool owns
   groups, membership, messages and consensus). Gone: the orchestrator tools
   `start_pool`, `pool`, `pool_post`, `pool_replace` and `list_pools`; the worker
@@ -76,17 +73,24 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 ### Data
 
 - No schema change and no DROP migration: legacy pool tables and the
-  `pool_membership_ever` fence stay readable and replayable, so rollback is a
-  binary swap at the same schema. No code path inserts or updates the legacy
-  pool tables; ordinary retention may still release a whole expired pool.
+  `pool_membership_ever` fence stay readable. Binary rollback keeps schema
+  compatibility. Delivery rows already held, retired or expired keep those
+  states after switching binaries. Ordinary retention may still release a
+  whole expired legacy pool.
 - Writer operations 4-7, 47-51 and 95 are removed and their wire ids are
   reserved (`ops::RESERVED_WIRE_IDS`); a frame naming one is refused as an
   unknown kind.
-- Historical rows decode tolerantly: pending pool notices end `failed` with
-  `legacy_pool_retired` at claim, queued `pool` commands complete without a
-  push, historical pool-loop steers are refused as stale, and stored health
-  snapshots with old pool evidence still decode. Pool membership no longer
-  suppresses individual completion notices.
+- A due delivery with native attempts and no Bridge intent ends `failed` with
+  `legacy_delivery_held` and retained evidence. Other due legacy pool
+  completion and enrollment attention notices end `failed` with
+  `legacy_pool_retired`. Unbound terminal agent notices expire after one hour
+  on a claim sweep, with legacy pool completion rows excluded. Queued legacy
+  `pool` commands and tagged pool-loop or enrollment steers complete without
+  native input. Stored health snapshots with old pool evidence still decode.
+- An exact historical provider resume can replay through its durable legacy
+  pool binding. For a new resume that relied on that shared destination,
+  supply it explicitly. Pool membership no longer suppresses individual
+  completion notices.
 - Archival access is read-only SQL documented in `agent-run doc completion`.
 
 ## 0.31.8

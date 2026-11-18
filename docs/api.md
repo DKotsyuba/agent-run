@@ -185,10 +185,10 @@ Discover the authoritative surface at runtime:
 ordinary provider start requests. A job must omit its own `request_id` or set
 it to null. Optional `retain_history` defaults to false and is part of the
 batch identity. When true, each job receives a distinct `pin_id` in its
-receipt and the pins commit with all jobs and the receipt. All jobs and one
-permanent batch receipt commit together, or no
-job is admitted. The shared key is scoped to this Run home, not to a caller
-identity. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
+receipt and a batch `release_token` in the original admission response. All
+jobs, pins and the permanent receipt commit together. A retained socket
+`start_batch` requires a JSON-RPC ID so the broker can acknowledge admission.
+The shared key is scoped to this Run home. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
 Pool enrollment namespace; `start_batch` and `batch_receipt` refuse them as
 invalid input, so a public caller can neither pre-claim nor read such a key. Exact replay requires the same durable database; replacing it under
 the same socket or restoring an older copy cannot preserve absent receipts or
@@ -234,47 +234,61 @@ Separate CLI/MCP processes do not remember earlier outcomes for the caller.
 An active history pin retains the database execution and attempt rows, including
 cleanup proofs, for its entire lineage and future resumes, against both age and
 count retention. It does not prevent resume or promise to retain process files.
-Only the pin's owner releases it, through the operator socket (never MCP):
-`history_pins_release {"pin_id":"...","request_id":"..."}`, where `request_id`
-is the `start_batch` request ID that admitted the pin. The release transaction
-reads the permanent batch receipt and refuses with `RequestConflict` when that
-receipt did not mint the pin (any other key, including after release, so a
-tombstone does not reveal ownership), when the pin was minted by an Agent Pool
-managed enrollment, or while an active lineage hold protects it. Reserved
-internal keys (`p3_`, `p3c_`) are a `ValidationError`. Agent Pool releases
-pins of its managed enrollments over its authenticated attempt channel with
-`_managed_pin_release_v1 {"version":1,"expected_store_id","pool_store_id",
-"request_id","pin_id"}` (its own enrollment key; Run derives the internal batch
-key from the authenticated Pool route), advertised by
-`_attempt_capabilities_v1` as `managed_pin_release_v1`. Both
-`already_released:false` and `true` confirm release. The permanent released
-tombstone prevents an old batch replay from reviving it. `PinNotFound`,
-timeout or an absent reply does not confirm release and does not restore a
-missing tombstone. Retry the same pin ID and key to reconcile an uncertain
-release. A pin ID alone grants no authority.
-
-There is no operator override. An operator who lost the batch request ID cannot
-release the pin through Run: the key is the only ownership proof Run holds, and
-an override would let any operator-group caller (including an orchestrator
-shell) bypass Pool's after-close rule. Such a pin keeps its lineage history
-until an owner releases it; this is the deliberate fail-closed outcome. The
-owner can recover the key from its own records (for Pool, its member binding).
+Release public pins through the operator socket with
+`history_pins_release {"pin_id":"...","release_token":"...","expected_store_id":"..."}`.
+Run mints the 64-character bearer token for the batch and returns it only in
+the original successful `start_batch` response, outside `receipt`. The
+public pin ID contains a one-way verifier bound to the lineage. Pin listings,
+receipt reads and admission replays omit the token. A missing pin, a mismatched
+credential or an active lineage hold returns `RequestConflict`. Both
+`already_released:false` and `true` confirm release. The released tombstone
+prevents old batch replays from reviving the pin. After a timeout or missing
+reply, retry the same pin and credential to reconcile release.
 
 `history_pins_list` lists active and released pins, with optional
 `status` (`active`, `released` or `all`), `limit` (default 100, maximum 1000),
 and exclusive `after_pin_id`. Continue with `next_after_pin_id`; null marks the
-last page. The ordering is by pin ID; concurrent new pins can require a fresh
-scan. The listing never discloses the admitting batch request ID. CLI
-equivalents are `agent-run history-pins list` and
-`agent-run history-pins release --pin-id PIN_ID --request-id BATCH_REQUEST_ID`.
-The removed combined `history_pins` method returns method-not-found.
-Both list and release also accept optional `expected_store_id`; their database
-scope check shares the list snapshot or release transaction respectively.
-CLI supplies it with `--expected-store-id` and obtains an ID with
-`agent-run capabilities --include-store-id`.
+last page. Both methods accept optional `expected_store_id`, checked inside
+the same list snapshot or release transaction. Discover the ID with
+`agent-run capabilities --include-store-id`. The removed `history_pins`
+method returns method-not-found.
 
-The receipt proves admission, not process launch or task completion. Supervisor
-handoffs happen separately, and a lost reply, timeout, or uncertain commit must
+The CLI equivalents are `agent-run history-pins list` and
+`agent-run history-pins release --pin-id PIN_ID --release-token-file FILE`.
+Supply `-` for standard input. Use a private file or a pipe for the token.
+Use `--expected-store-id` to fence either command.
+
+#### Agent Pool migration for history pins
+
+Update Pool before switching Run. The socket `tools` schema for
+`history_pins_release` advertises the required `release_token` field.
+
+- For new **public** retained batches, capture the top-level `release_token`
+  from the first successful `start_batch` response. Persist it privately
+  with the Run store ID and admitted pins before marking the local admission
+  resolved. Keep it until every pin in that batch is released. Send it as
+  `release_token` with the pin and recorded `expected_store_id` after close.
+  Remove `request_id` from the online release request. Keep the batch
+  request ID and exact intent for admission reconciliation.
+- For **managed enrollment** pins, including ones admitted before 0.32, keep
+  using the pinned, authenticated Pool attempt channel. The call is
+  `_managed_pin_release_v1 {"version":1,"expected_store_id":"...","pool_store_id":"...","request_id":"...","pin_id":"..."}`.
+  Use Pool's original enrollment key. Run checks the pin against the permanent
+  managed enrollment receipt on the same authenticated Pool route.
+  Discover support as `managed_pin_release_v1` in `_attempt_capabilities_v1`.
+- **Legacy public pins** have no online release credential. Treat a committed
+  public batch with a lost first response the same way. Keep the pin and
+  batch binding and coordinate release after close with the Run database owner.
+  With the broker, service manager and all recorded workers stopped, the owner
+  can run `agent-run --home HOME history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id ORIGINAL_BATCH_ID`.
+  This command checks the exact store and original public receipt, retains the
+  hold fence, and supports idempotent retries. It refuses managed receipts.
+  Without the original receipt association, keep the pin active.
+
+#### Batch admission reconciliation
+
+The receipt records durable admission. Supervisor handoffs happen separately,
+and a lost reply, timeout, or uncertain commit must
 be reconciled using the same key and exact intent. `BatchOutcomeUnknown` is the
 stable error code when admission may have committed; a missing or malformed
 response remains unknown even if no code arrives. Batch transport loss is not
@@ -291,16 +305,19 @@ state database cannot preserve a receipt absent from that database.
 intent, including `request_id`, ordered `jobs`, `retain_history`, optional
 ordered `preconditions`, and a required non-null `expected_store_id`. It uses the same strict decoder and fingerprint,
 without loading workdirs, configuration or quota. A committed exact match
-returns `{"found":true,"receipt":{...}}`; an absent receipt returns only
-`{"found":false}`. Absence is a snapshot fact: an earlier in-flight request
-may still commit. Wrong database or conflicting intent returns the existing
-typed error and does not establish the outcome of an earlier unknown request.
+returns `{"found":true,"receipt":{...}}`. An unused key and a mismatched intent
+both return `{"found":false}`. Absence describes the exact intent in that
+snapshot. An earlier in-flight request may still commit. A wrong database
+returns `StoreIdentityMismatch`. A mutating `start_batch` with reused key and
+different intent still returns `RequestConflict`.
 CLI uses `agent-run batch-receipt --spec FILE` (or `--spec -`).
 For a new scoped batch, admission checks that its normalized lookup fits a
 compact MCP JSON-RPC frame with an encoded ID of up to 1024 bytes and a trailing
 LF; the same bound covers the shorter socket envelope. Extra metadata, whitespace
 or noncompact escaping still consume frame space. Existing exact replays are
 checked first. Unscoped batches cannot use the scoped receipt lookup.
+
+#### Exact status
 
 `status` reads one to twenty exact selectors in one SQLite snapshot:
 `{"version":1,"expected_store_id":"store_…","targets":[{"agent_id":"ag-…","sequence":1,"execution_ref":"ex1_…","pin_id":"pin_…"}]}`.
@@ -338,14 +355,14 @@ automatic PostToolUse binding can pin its exact admission. The numeric counter
 is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
-The additive `capabilities`, `answer_chunk`, and `start_batch` methods return
-their exact structured result in MCP `structuredContent`, with a fixed text summary.
+`start_batch` returns its structured result in MCP `structuredContent`, with
+a fixed text summary.
 When an answer exceeds the MCP text budget, `answer` returns a bounded summary
 with the verified artifact size, SHA-256 and execution sequence, plus a link to
 the existing local answer file where its managed path permits one. Access to
-that file follows operating-system permissions; `answer_chunk` provides the
-content over MCP without direct filesystem access. The artifact remains subject
-to the existing history retention policy.
+that file follows operating-system permissions. The CLI and operator socket
+provide verified chunks through `answer-chunk` and `answer_chunk` respectively.
+The artifact remains subject to the existing history retention policy.
 
 The current MCP contract, byte/row budgets, protocol-versus-business error
 channels, and status-preserving presentation fallback are documented in
@@ -497,8 +514,8 @@ Stable failures are `ExecutionChanged` (sequence changed, including after resume
 answer), `AnswerIntegrityError` (corrupt/missing artifact, invalid UTF-8 or seal),
 and `PathEscapeError` (unsafe/no-follow path). These are JSON-RPC `-32000`, except
 path rejection is `-32602`. Invalid ranges/boundaries/budgets/arguments use
-`ValidationError` / `-32602`. Unknown agents retain `AgentNotFound`. CLI and MCP
-preserve the same machine categories. Filesystem/store errors remain typed.
+`ValidationError` / `-32602`. Unknown agents retain `AgentNotFound`. The CLI
+preserves the socket machine categories. Filesystem/store errors remain typed.
 
 The CLI equivalent is `agent-run answer-chunk AGENT_ID --sequence N
 --expected-sha256 HASH --offset-bytes N [--max-bytes N]`.
@@ -756,12 +773,12 @@ rendered as `RuntimeError`.
 
 ## Versioning and compatibility
 
-- The tool surface is pinned to the MCP surface by a parity test; new
-  tools appear in both transports simultaneously. Re-read `tools` after
-  an agent-run upgrade instead of caching schemas across versions.
+- The shared registry records which tools are available on each transport.
+  Re-read socket `tools` or MCP `tools/list` after an upgrade to get the
+  current schemas for that transport.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 40, reached through the paired
+- The current database schema is version 42, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.
 
@@ -773,11 +790,10 @@ without a bound leader is unresolved; recovery must not infer that no child ran.
 
 ### Exact pinned transcript export (v1)
 
-`transcript_exact` is a read-only public tool on the same CLI/socket/MCP registry.
+`transcript_exact` is a read-only operator socket method.
 `capabilities.read_methods` publishes its input and output schemas. The CLI reads
 one page with `agent-run transcript-exact --spec request.json` (`--spec -` uses stdin).
-MCP returns the same complete JSON result in `structuredContent`, with a fixed text
-label; transcript text is not interpreted or rendered as instructions.
+Both return transcript text as JSON data.
 
 ```json
 {
@@ -852,14 +868,12 @@ and stays empty when its watermark is echoed after later appends.
 
 ### Exact initial task (v1)
 
-`initial_task` is a read-only public tool on the same CLI/socket/MCP registry
-(one dispatcher entry). It returns the exact initial task text of one retained
-**root** execution (sequence 1), in verified pages, or a typed `unavailable`
+`initial_task` is a read-only operator socket method. It returns the exact
+initial task text of one retained **root** execution (sequence 1), in verified pages, or a typed `unavailable`
 state. It never reconstructs a system prompt, a Pool binding or any text from
 another string, never truncates, and does not change retention. The CLI reads one
 page with `agent-run initial-task --spec request.json` (`--spec -` uses stdin).
-MCP returns the same complete JSON in `structuredContent` with a fixed text
-label; the task is data, not instructions or authority.
+Both return the task as JSON data.
 
 **Capability.** `capabilities` with `{"include_initial_task":true}` (CLI:
 `agent-run capabilities --include-initial-task`) adds

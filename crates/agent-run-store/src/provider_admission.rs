@@ -621,6 +621,55 @@ impl Store<'_> {
         replay(self, request)
     }
 
+    /// Replays an exact historical child admitted with its legacy pool's
+    /// durable session family and original turn. A missing child or different session grants no replay;
+    /// the shared destination is never returned to a new admission.
+    pub fn replay_legacy_pool_resume(
+        &self,
+        parent: &Record,
+        request: &ProviderStartRequest,
+    ) -> Result<Option<ProviderAdmission>> {
+        let Some(request_id) = &request.request_id else {
+            return Ok(None);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let binding = tx.query_row(
+            "SELECT s.transport,s.external_session_id FROM pool_members m \
+             JOIN pools p ON p.id=m.pool_id JOIN orchestrator_sessions s ON s.id=p.orchestrator_session_id \
+             WHERE m.agent_id=?",
+            [parent.root_agent_id.as_str()],
+            |row| Ok(agent_run_domain::domain::OrchestratorRef {
+                transport: row.get(0)?,
+                external_session_id: row.get(1)?,
+                external_turn_id: None,
+            }),
+        ).optional()?;
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        let child = tx.query_row(
+            "SELECT a.* FROM agents a JOIN orchestrator_sessions s ON s.id=a.orchestrator_session_id \
+             WHERE a.parent_agent_id=?1 AND a.request_id=?2 AND s.external_session_id=?3 AND s.transport IN (?4,?5)",
+            params![parent.id.as_str(), request_id, binding.external_session_id, binding.canonical_transport()?, binding.legacy_transport()?],
+            Record::read,
+        ).optional()?;
+        child
+            .map(|child| {
+                let mut request = request.clone();
+                let mut binding = binding;
+                // Session rows advance after later turns. Replay the receipt's
+                // original destination within the proven session family.
+                binding.external_turn_id = child
+                    .request
+                    .orchestrator
+                    .as_ref()
+                    .and_then(|original| original.external_turn_id.clone());
+                request.orchestrator = Some(binding);
+                replayed(&tx, &child, &request)
+            })
+            .transpose()
+    }
+
     /// Atomically validates the committed candidate rank, current registry,
     /// account scope, global/harness caps and reservations, then creates one
     /// logical agent, owned attempt, exact physical keys, and initial events.

@@ -181,7 +181,6 @@ impl ToolDefinition {
             "batch_receipt" => &[
                 MachineCode::ValidationError,
                 MachineCode::StoreIdentityMismatch,
-                MachineCode::RequestConflict,
                 MachineCode::Unsupported,
                 MachineCode::AnswerIntegrityError,
                 MachineCode::RuntimeError,
@@ -198,7 +197,6 @@ impl ToolDefinition {
             ],
             "history_pins_release" => &[
                 MachineCode::ValidationError,
-                MachineCode::PinNotFound,
                 MachineCode::RequestConflict,
                 MachineCode::StoreIdentityMismatch,
                 MachineCode::BrokerUnavailable,

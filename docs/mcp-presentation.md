@@ -46,17 +46,16 @@ revisions are recorded independently of host qualification in `family.toml`.
 
 ## Presentation policy
 
-The additive `capabilities` and `answer_chunk` observation methods return typed
-full `structuredContent` plus a fixed text summary. Their registered output
-schemas describe the same CLI/socket values. They do not duplicate answer text
-in both channels. Chunk content is capped at 128 KiB before escaping; the complete
-encoded MCP result still passes the existing wire reserve check. Existing tools
-retain the text-first presentation policy below.
+`start_batch` returns its typed response in `structuredContent` with a fixed
+text summary. The original retained public admission includes a private
+`release_token` there. The operator socket and CLI expose `capabilities`
+and `answer_chunk`. Answer chunks are capped at 128 KiB before escaping.
 
 An oversized verified `answer` instead returns bounded metadata, including its
 execution sequence and answer SHA-256, and links the existing local artifact
 when its managed path is recognizable. The file link requires host filesystem
-access; `answer_chunk` retrieves the same verified bytes over MCP. No new file
+access. The CLI `agent-run answer-chunk` command and operator socket
+`answer_chunk` method retrieve the same verified bytes. No new file
 or separate retention policy is introduced. A single oversized transcript block
 is marked incomplete and carries a bounded UTF-8 preview and its cursor.
 

@@ -55,6 +55,10 @@ CLI and MCP retry a lost broker acknowledgement once using the same admission
 key; this cannot create a second native turn. There is no automatic replay of an
 ambiguous native turn or fallback to a new conversation. An explicit caller binding replaces the inherited one;
 omitting `orchestrator` retains the previous request's binding.
+For a new resume that previously relied on legacy Run pool binding, pass the
+destination explicitly. An exact retry of a historical provider resume can
+still find its committed child through the durable legacy pool binding.
+
 
 ## Runtime history and compatibility
 

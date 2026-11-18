@@ -29,20 +29,23 @@ fn removed_quota_commands_are_unknown() {
     assert!(parse(&["delegation-guide", "--provider", "codex"]).is_ok());
 }
 
-/// History pin release always carries the admitting batch request_id; there
-/// is no operator form without the ownership proof.
+/// Online history pin release requires a credential source and rejects
+/// the old request-id proof or a token passed directly on the command line.
 #[test]
-fn history_pin_release_requires_the_batch_request_id() {
+fn history_pin_release_requires_a_token_file_or_stdin() {
     let pin = "pin_550e8400e29b41d4a716446655440000";
     assert!(parse(&["history-pins", "release", "--pin-id", pin]).is_err());
+    for (flag, value) in [("--request-id", "batch-1"), ("--release-token", "token")] {
+        assert!(parse(&["history-pins", "release", "--pin-id", pin, flag, value]).is_err());
+    }
     assert!(
         parse(&[
             "history-pins",
             "release",
             "--pin-id",
             pin,
-            "--request-id",
-            "batch-1"
+            "--release-token-file",
+            "-"
         ])
         .is_ok()
     );

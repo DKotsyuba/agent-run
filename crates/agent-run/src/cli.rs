@@ -566,19 +566,29 @@ pub enum HistoryPinsCommand {
         #[arg(long)]
         expected_store_id: Option<String>,
     },
-    /// Release one exact pin idempotently, as the owner of its admitting batch.
+    /// Release one exact pin idempotently with its batch release credential.
     Release {
         /// Canonical pin identifier from a batch receipt.
         #[arg(long)]
         pin_id: String,
-        /// Ownership proof: the start-batch request_id that admitted the pin.
-        /// There is no override; pins from Agent Pool managed enrollments are
-        /// released through Agent Pool.
+        /// File containing the release token, or '-' for standard input.
         #[arg(long)]
-        request_id: String,
+        release_token_file: PathBuf,
         /// Refuse a database different from the recorded store identity.
         #[arg(long)]
         expected_store_id: Option<String>,
+    },
+    /// Recover a public batch pin as the offline database owner.
+    ReleaseOffline {
+        /// Canonical pin identifier from the original batch receipt.
+        #[arg(long)]
+        pin_id: agent_run_domain::batch::PinId,
+        /// Public idempotency key of the exact original batch.
+        #[arg(long)]
+        request_id: String,
+        /// Store identity from that batch's permanent receipt.
+        #[arg(long)]
+        expected_store_id: agent_run_domain::StoreId,
     },
 }
 
@@ -1697,7 +1707,9 @@ fn client_command(command: &Command) -> bool {
             | Command::Status { .. }
             | Command::TranscriptExact { .. }
             | Command::InitialTask { .. }
-            | Command::HistoryPins { .. }
+            | Command::HistoryPins {
+                command: HistoryPinsCommand::List { .. } | HistoryPinsCommand::Release { .. }
+            }
             | Command::Restart(_)
             | Command::Resume(_)
             | Command::Capabilities { .. }
@@ -2489,13 +2501,23 @@ async fn run_client_command(
                 ),
                 HistoryPinsCommand::Release {
                     pin_id,
-                    request_id,
+                    release_token_file,
                     expected_store_id,
-                } => (
-                    "history_pins_release",
-                    json!({"pin_id":pin_id, "request_id":request_id}),
-                    expected_store_id,
-                ),
+                } => {
+                    let text = if release_token_file == Path::new("-") {
+                        read_stdin(128)?
+                    } else {
+                        read_input(&release_token_file, 128)?
+                    };
+                    (
+                        "history_pins_release",
+                        json!({"pin_id":pin_id, "release_token":text.trim()}),
+                        expected_store_id,
+                    )
+                }
+                HistoryPinsCommand::ReleaseOffline { .. } => {
+                    return Err(unsupported_operator_command());
+                }
             };
             if let Some(id) = expected_store_id {
                 params["expected_store_id"] = json!(id);
@@ -2508,10 +2530,10 @@ async fn run_client_command(
                     return Err(invalid("history pin limit must be 1..=1000"));
                 }
             } else {
-                let request: agent_run_domain::batch::HistoryPinReleaseRequest =
-                    serde_json::from_value(params.clone())
-                        .map_err(|_| invalid("invalid history pin request"))?;
-                request.validate()?;
+                serde_json::from_value::<agent_run_domain::batch::HistoryPinReleaseRequest>(
+                    params.clone(),
+                )
+                .map_err(|_| invalid("invalid history pin request"))?;
             }
             let result = broker.call(method, params.clone()).await?;
             if !transport::socket::valid_history_pin_response(method, &result, &params) {
@@ -2706,6 +2728,20 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
         .await;
     }
     match cli.command {
+        Command::HistoryPins {
+            command:
+                HistoryPinsCommand::ReleaseOffline {
+                    pin_id,
+                    request_id,
+                    expected_store_id,
+                },
+        } => {
+            let released = crate::offline::acquire(&home)?
+                .guard
+                .release_history_pin(&pin_id, &expected_store_id, &request_id)?
+                .ok_or_else(|| Error::PinNotFound(pin_id.to_string()))?;
+            (dependencies.output)(&serde_json::to_value(released)?)?;
+        }
         Command::Init => (dependencies.output)(&crate::init::initialize(&home)?)?,
         Command::Doctor { .. } => {
             let report = (dependencies.doctor)(&home)?;

@@ -1038,12 +1038,13 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
             Some(err(id, -32602, "params must be an object", None))
         };
     }
-    // Do not create an unacknowledged hold or release through a notification.
+    // A retained batch needs a reply to deliver its new release credential.
     if notification
-        && matches!(
+        && (matches!(
             method,
             "_lineage_hold_acquire" | "_lineage_hold_release" | "history_pins_release"
-        )
+        ) || (method == "start_batch"
+            && params.get("retain_history") == Some(&Value::Bool(true))))
     {
         return None;
     }
@@ -1345,6 +1346,10 @@ fn valid_start_frame(raw: &[u8], method: &str) -> bool {
         "batch_receipt" => {
             serde_json::from_slice::<Frame<agent_run_domain::batch::StartBatchRequest>>(raw)
                 .map(|frame| frame.params)
+                .is_ok()
+        }
+        "history_pins_release" => {
+            serde_json::from_slice::<Frame<agent_run_domain::batch::HistoryPinReleaseRequest>>(raw)
                 .is_ok()
         }
         "transcript_exact" => serde_json::from_slice::<
@@ -2941,7 +2946,7 @@ pub(crate) fn valid_batch_response(value: &Value, params: &Value) -> bool {
     else {
         return false;
     };
-    result.validate_for_request(&request).is_ok()
+    result.validate_admission_response(&request).is_ok()
 }
 
 /// Validates a read-only receipt lookup against its exact scoped batch intent.
@@ -3175,7 +3180,7 @@ mod tests {
         let first = "pin_550e8400e29b41d4a716446655440000";
         let next = "pin_550e8400e29b41d4a716446655440001";
         let release = "history_pins_release";
-        let request = json!({"pin_id":first,"request_id":"batch-1"});
+        let request = json!({"pin_id":first,"release_token":"a".repeat(64)});
         let mut result = json!({"pin_id":first,"status":"released","already_released":false});
         assert!(valid_history_pin_response(release, &result, &request));
         // The removed combined method and the old action shape never validate.
@@ -3209,7 +3214,7 @@ mod tests {
         assert!(!valid_history_pin_response(list, &result, &request));
     }
 
-    /// A batch receipt must provide exactly the requested set of pin IDs.
+    /// A new retained batch needs a token that verifies every exact pin.
     #[test]
     fn batch_pin_receipt_matches_requested_retention() {
         let job = json!({"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"});
@@ -3221,13 +3226,34 @@ mod tests {
         assert!(valid_batch_response(&result, &request));
         request["retain_history"] = json!(true);
         assert!(!valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][0]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440000");
+        use agent_run_domain::batch::{PinId, PinReleaseToken};
+        let token = PinReleaseToken::mint();
+        let pins: Vec<_> = result["receipt"]["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| {
+                let root = serde_json::from_value(job["agent_id"].clone()).unwrap();
+                PinId::from_release_digest(&token.digest(), &root)
+            })
+            .collect();
+        result["release_token"] = json!(token);
+        result["receipt"]["jobs"][0]["pin_id"] = json!(pins[0]);
         assert!(!valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][1]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440001");
+        result["receipt"]["jobs"][1]["pin_id"] = json!(pins[1]);
         assert!(valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][1]["pin_id"] = result["receipt"]["jobs"][0]["pin_id"].clone();
+        result["receipt"]["jobs"][1]["pin_id"] = json!(pins[0]);
         assert!(!valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][1]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440001");
+        result["receipt"]["jobs"][1]["pin_id"] = json!(pins[1]);
+        result["release_token"] = json!(PinReleaseToken::mint());
+        assert!(!valid_batch_response(&result, &request));
+        result.as_object_mut().unwrap().remove("release_token");
+        assert!(!valid_batch_response(&result, &request));
+        result["replayed"] = json!(true);
+        assert!(valid_batch_response(&result, &request));
+        result["release_token"] = json!(token);
+        assert!(!valid_batch_response(&result, &request));
+        result.as_object_mut().unwrap().remove("release_token");
         request["expected_store_id"] = json!("store_0123456789abcdef0123456789abcdef");
         assert!(valid_batch_response(&result, &request));
         result["receipt"]["store_id"] = json!("store_ffffffffffffffffffffffffffffffff");

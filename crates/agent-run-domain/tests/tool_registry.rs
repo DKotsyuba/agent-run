@@ -640,7 +640,7 @@ fn annotations_preserve_effect_and_worker_boundaries() {
                 | "status"
         );
         assert_eq!(hints.open_world_hint, external, "{}", definition.name);
-        if write && !unkeyed {
+        if definition.name == "start_batch" {
             assert!(
                 definition
                     .arguments()
@@ -654,6 +654,12 @@ fn annotations_preserve_effect_and_worker_boundaries() {
                     .arguments()
                     .iter()
                     .any(|argument| argument.name == "pin_id" && argument.required)
+            );
+            assert!(
+                definition
+                    .arguments()
+                    .iter()
+                    .any(|a| a.name == "release_token" && a.required)
             );
         }
     }

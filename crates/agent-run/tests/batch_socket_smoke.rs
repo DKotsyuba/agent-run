@@ -327,6 +327,36 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     );
     assert_mcp_refuses(&broker.home, "batch_receipt", &request).await;
 
+    // A retained notification cannot admit a batch that has no reply channel
+    // for the release credential. The following request observes the same socket.
+    let mut notification = request.clone();
+    notification["request_id"] = json!("retained-notification");
+    notification["jobs"].as_array_mut().unwrap().truncate(1);
+    let mut raw = tokio::net::UnixStream::connect(broker.home.join("api.sock"))
+        .await
+        .unwrap();
+    raw.write_all(
+        format!(
+            "{}\n{}\n",
+            json!({"jsonrpc":"2.0","method":"start_batch","params":notification}),
+            json!({"jsonrpc":"2.0","id":1,"method":"batch_receipt","params":notification}),
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::io::BufReader::new(raw).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let lookup: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(lookup["id"], 1);
+    assert_eq!(lookup["result"], json!({"found":false}));
+
     // The first job fits; the second reaches the writer's one-slot cap.
     let (status, _, error) = cli(&broker.home, &args).await;
     assert_eq!(status.code(), Some(2), "{error}");
@@ -461,46 +491,45 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
         serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
         "RequestConflict"
     );
-    let error = socket
-        .call("batch_receipt", Some(changed.clone()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.machine_code().as_str(), "RequestConflict");
-    let (status, _, error) = cli(
+    assert_eq!(
+        socket.call("batch_receipt", Some(changed)).await.unwrap(),
+        json!({"found":false})
+    );
+    let (status, output, error) = cli(
         &broker.home,
         &["batch-receipt", "--spec", spec.to_str().unwrap()],
     )
     .await;
-    assert_eq!(status.code(), Some(2), "{error}");
+    assert!(status.success(), "{error}");
     assert_eq!(
-        serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
-        "RequestConflict"
+        serde_json::from_str::<Value>(&output).unwrap(),
+        json!({"found":false})
     );
+    assert!(lookup.get("release_token").is_none());
+    assert!(replay.get("release_token").is_none());
 
-    // Release needs the admitting batch key; another key is refused unchanged.
-    let (status, _, error) = cli(
-        &broker.home,
-        &[
-            "history-pins",
-            "release",
-            "--pin-id",
-            pins[0].as_str(),
-            "--request-id",
-            "other-batch",
-        ],
-    )
-    .await;
-    assert_eq!(status.code(), Some(2), "{error}");
-    assert_eq!(
-        serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
-        "RequestConflict"
-    );
+    // The known public batch idempotency key does not authorize release.
+    let old_request = json!({"pin_id":pins[0],"request_id":"socket-batch"});
+    let error = socket
+        .call("history_pins_release", Some(old_request))
+        .await
+        .unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "ValidationError");
+    let wrong = json!({"pin_id":pins[0],"release_token":"a".repeat(64)});
+    let error = socket
+        .call("history_pins_release", Some(wrong))
+        .await
+        .unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "RequestConflict");
+    let credential = first["release_token"].as_str().unwrap();
     assert_mcp_refuses(
         &broker.home,
         "history_pins_release",
-        &json!({"pin_id":pins[0],"request_id":"socket-batch"}),
+        &json!({"pin_id":pins[0],"release_token":credential}),
     )
     .await;
+    let token_file = tempfile::NamedTempFile::new_in(&broker.home).unwrap();
+    std::fs::write(token_file.path(), format!("{credential}\n")).unwrap();
     for already in [false, true] {
         let (status, output, error) = cli(
             &broker.home,
@@ -509,8 +538,8 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
                 "release",
                 "--pin-id",
                 pins[0].as_str(),
-                "--request-id",
-                "socket-batch",
+                "--release-token-file",
+                token_file.path().to_str().unwrap(),
                 "--expected-store-id",
                 store_id.as_str(),
             ],
@@ -521,6 +550,16 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
         assert_eq!(release["pin_id"], pins[0].as_str());
         assert_eq!(release["status"], "released");
         assert_eq!(release["already_released"], already);
+    }
+    for path in ["state.db", "state.db-wal", "broker.stderr"] {
+        if let Ok(contents) = std::fs::read(broker.home.join(path)) {
+            assert!(
+                !contents
+                    .windows(credential.len())
+                    .any(|window| window == credential.as_bytes()),
+                "{path} contains a release credential"
+            );
+        }
     }
     let (status, output, error) = cli(
         &broker.home,
@@ -539,15 +578,15 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
             "release",
             "--pin-id",
             missing.as_str(),
-            "--request-id",
-            "socket-batch",
+            "--release-token-file",
+            token_file.path().to_str().unwrap(),
         ],
     )
     .await;
     assert_eq!(status.code(), Some(2), "{error}");
     assert_eq!(
         serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
-        "PinNotFound"
+        "RequestConflict"
     );
     let released_page = socket
         .call("history_pins_list", Some(json!({"status":"released"})))
@@ -610,6 +649,119 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     let home = broker.home.clone();
     drop(broker);
     assert!(!home.exists(), "owned fixture home was not removed");
+}
+
+/// The local owner can recover a public legacy pin offline, with an exact
+/// store and receipt match. Durable managed enrollments remain Pool-owned.
+#[tokio::test]
+async fn legacy_pin_recovery_requires_offline_owner_and_exact_receipt() {
+    use agent_run_domain::batch::PinId;
+    let broker = Broker::start().await;
+    let store_id = BrokerClient::new(broker.home.join("api.sock"))
+        .call("capabilities", Some(json!({"include_store_id":true})))
+        .await
+        .unwrap()["store_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let public_pin = PinId::new();
+    let managed_pin = PinId::new();
+    let args = |pin: &PinId, request_id: &str| {
+        [
+            "history-pins",
+            "release-offline",
+            "--pin-id",
+            pin.as_str(),
+            "--request-id",
+            request_id,
+            "--expected-store-id",
+            &store_id,
+        ]
+        .map(str::to_owned)
+    };
+    let live_args = args(&public_pin, "old-public");
+    let (status, _, error) = cli(
+        &broker.home,
+        &live_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    assert!(!status.success());
+    assert!(error.contains("stop the resident broker"), "{error}");
+    drop(broker);
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    std::fs::create_dir(home.join("tmp")).unwrap();
+    let (status, _, error) = cli(home, &["init"]).await;
+    assert!(status.success(), "{error}");
+    let db = agent_run_store::fixture::open(home).unwrap();
+    let store_id = agent_run_store::store_identity::read(&db.conn)
+        .unwrap()
+        .to_string();
+    let public_root = AgentId::new();
+    let managed_root = AgentId::new();
+    for (pin, key, root) in [
+        (&public_pin, "old-public", &public_root),
+        (&managed_pin, "old-managed", &managed_root),
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                (pin.as_str(), root.as_str()),
+            )
+            .unwrap();
+        db.conn.execute(
+            "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+            (key, "a".repeat(64), json!({"jobs":[{"pin_id":pin}]}).to_string()),
+        ).unwrap();
+    }
+    db.conn.execute(
+        "INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,grant_json,receipt_id,receipt_json)
+         VALUES('{}','pool','owned',1,?,'admitted','{}','receipt',?)",
+        ("a".repeat(64), json!({"jobs":[{"pin_id":managed_pin}]}).to_string()),
+    ).unwrap();
+    db.conn.execute(
+        "INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index)
+         VALUES(?,'{}','pool','fixture','owned','member',0)",
+        [managed_root.as_str()],
+    ).unwrap();
+    drop(db);
+    let release = |pin, key| {
+        let store_id = &store_id;
+        async move {
+            cli(
+                home,
+                &[
+                    "history-pins",
+                    "release-offline",
+                    "--pin-id",
+                    pin,
+                    "--request-id",
+                    key,
+                    "--expected-store-id",
+                    store_id,
+                ],
+            )
+            .await
+        }
+    };
+    for (pin, key) in [
+        (&public_pin, "foreign"),
+        (&managed_pin, "old-public"),
+        (&managed_pin, "old-managed"),
+        (&managed_pin, "p3_managed"),
+    ] {
+        let (status, _, _) = release(pin.as_str(), key).await;
+        assert!(!status.success());
+    }
+    for already in [false, true] {
+        let (status, output, error) = release(public_pin.as_str(), "old-public").await;
+        assert!(status.success(), "{error}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap()["already_released"],
+            already
+        );
+    }
 }
 
 /// A key or pin from one database cannot replay, admit, list or release in another.
@@ -678,7 +830,7 @@ async fn store_identity_fences_batch_and_pin_across_distinct_homes() {
     let error = client_b
         .call(
             "history_pins_release",
-            Some(json!({"pin_id":pin_a,"request_id":"shared-key","expected_store_id":store_a})),
+            Some(json!({"pin_id":pin_a,"release_token":receipt_a["release_token"],"expected_store_id":store_a})),
         )
         .await
         .unwrap_err();
@@ -733,7 +885,17 @@ async fn batch_preconditions_cross_all_public_transports() {
         .clone();
     let job = json!({"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"fixture:answer","workdir":broker.home.clone()});
     let seed = json!({"request_id":"precondition-seed","expected_store_id":store_id.clone(),"retain_history":true,"jobs":[job.clone()]});
-    let seed_result = socket.call("start_batch", Some(seed)).await.unwrap();
+    let seed_response = mcp_call(&broker.home, "start_batch", &seed).await;
+    let seed_result = &seed_response["result"]["structuredContent"];
+    let token = seed_result["release_token"]
+        .as_str()
+        .expect("original admission token");
+    assert!(
+        !seed_response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(token)
+    );
     let previous = &seed_result["receipt"]["jobs"][0];
     let condition = json!({"agent_id":previous["agent_id"],"sequence":previous["sequence"],
         "execution_ref":previous["execution_ref"],"pin_id":previous["pin_id"]});
@@ -767,7 +929,7 @@ async fn batch_preconditions_cross_all_public_transports() {
         assert!(Instant::now() < deadline, "dependent fixture did not stop");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    socket.call("history_pins_release", Some(json!({"pin_id":condition["pin_id"],"request_id":"precondition-seed","expected_store_id":store_id}))).await.unwrap();
+    socket.call("history_pins_release", Some(json!({"pin_id":condition["pin_id"],"release_token":seed_result["release_token"],"expected_store_id":store_id}))).await.unwrap();
     let replay = socket
         .call("start_batch", Some(dependent.clone()))
         .await
@@ -977,7 +1139,7 @@ async fn transcript_exact_crosses_live_socket_and_mcp_with_pin_fences() {
         .unwrap_err();
     assert_eq!(wrong.machine_code().as_str(), "StoreIdentityMismatch");
 
-    socket.call("history_pins_release", Some(json!({"expected_store_id":store_id,"request_id":"exact-transcript-seed","pin_id":selector["pin_id"]}))).await.unwrap();
+    socket.call("history_pins_release", Some(json!({"expected_store_id":store_id,"release_token":admitted["release_token"],"pin_id":selector["pin_id"]}))).await.unwrap();
     let continuation = serde_json::to_value(request).unwrap();
     let released = socket
         .call("transcript_exact", Some(continuation.clone()))
@@ -1103,7 +1265,7 @@ async fn lineage_hold_socket_keeps_proof_private_and_replays_safely() {
         socket
             .call(
                 "history_pins_release",
-                Some(json!({"request_id":"hold-seed",
+                Some(json!({"release_token":admitted["release_token"],
         "expected_store_id":store_id,"pin_id":job["pin_id"]}))
             )
             .await
@@ -1165,7 +1327,7 @@ async fn lineage_hold_socket_keeps_proof_private_and_replays_safely() {
     socket
         .call(
             "history_pins_release",
-            Some(json!({"request_id":"hold-seed",
+            Some(json!({"release_token":admitted["release_token"],
         "expected_store_id":store_id,"pin_id":job["pin_id"]})),
         )
         .await
@@ -1360,7 +1522,7 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
         .call(
             "history_pins_release",
             Some(
-                json!({"request_id":"initial-task-seed","expected_store_id":store_id,"pin_id":receipt["pin_id"]}),
+                json!({"release_token":admitted["release_token"],"expected_store_id":store_id,"pin_id":receipt["pin_id"]}),
             ),
         )
         .await

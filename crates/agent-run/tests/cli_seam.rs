@@ -209,9 +209,12 @@ async fn batch_cli_rejects_missing_or_malformed_execution_ref_as_unknown() {
     }
 }
 
-/// The CLI uses the split pin methods; release always carries the owner proof.
+/// The CLI uses the split pin methods; release reads the credential from a file.
 #[tokio::test]
 async fn history_pins_cli_uses_exact_release_key_and_list_page() {
+    let token_file = tempfile::NamedTempFile::new().unwrap();
+    let token = "a".repeat(64);
+    std::fs::write(token_file.path(), format!("{token}\n")).unwrap();
     let pin = "pin_550e8400e29b41d4a716446655440000";
     let first = json!({"pin_id":pin,"status":"released","already_released":false});
     let second = json!({"pin_id":pin,"status":"released","already_released":true});
@@ -228,16 +231,16 @@ async fn history_pins_cli_uses_exact_release_key_and_list_page() {
             "release",
             "--pin-id",
             pin,
-            "--request-id",
-            "batch-1",
+            "--release-token-file",
+            token_file.path().to_str().unwrap(),
         ],
         vec![
             "history-pins",
             "release",
             "--pin-id",
             pin,
-            "--request-id",
-            "batch-1",
+            "--release-token-file",
+            token_file.path().to_str().unwrap(),
         ],
         vec!["history-pins", "list", "--status", "released"],
     ] {
@@ -255,7 +258,7 @@ async fn history_pins_cli_uses_exact_release_key_and_list_page() {
     assert_eq!(output.lock().unwrap().as_slice(), &[first, second, page]);
     let calls = broker.calls.lock().unwrap();
     assert_eq!(calls[0].0, "history_pins_release");
-    assert_eq!(calls[0].1, json!({"pin_id":pin,"request_id":"batch-1"}));
+    assert_eq!(calls[0].1, json!({"pin_id":pin,"release_token":token}));
     assert_eq!(calls[1], calls[0]);
     assert_eq!(calls[2].0, "history_pins_list");
     assert_eq!(

@@ -747,6 +747,7 @@
             "jobs"
           ]
         },
+        "release_token": {"type":"string","pattern":"^[0-9a-f]{64}$","description":"Bearer credential returned once when a public retained batch commits. Keep private."},
         "replayed": {
           "type": "boolean"
         }
@@ -1061,15 +1062,15 @@
   {
     "name": "history_pins_release",
     "surface": "socket",
-    "description": "Operator-socket only. Idempotently release one exact pin as its owner. request_id must be the start_batch request_id that admitted the pin; the release transaction refuses any other key, any pin admitted by an Agent Pool managed enrollment (release those through Agent Pool) and any pin still protected by an active lineage hold, all with RequestConflict. A PinNotFound, timeout or missing response does not confirm release or recreate a tombstone. The pin ID alone grants no authority.",
+    "description": "Idempotently release one public batch pin using the bearer token from its original admission. Missing pins, mismatched tokens and active lineage holds return RequestConflict. Agent Pool releases managed-enrollment pins on its authenticated attempt channel.",
     "inputSchema": {
       "type": "object", "additionalProperties": false,
       "properties": {
         "pin_id": {"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"},
-        "request_id": {"type":"string","minLength":1,"maxLength":512},
+        "release_token": {"type":"string","pattern":"^[0-9a-f]{64}$"},
         "expected_store_id": {"type":["string","null"],"pattern":"^store_[0-9a-f]{32}$"}
       },
-      "required": ["pin_id","request_id"]
+      "required": ["pin_id","release_token"]
     },
     "outputSchema": {
       "type":"object","additionalProperties":false,"properties":{

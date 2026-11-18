@@ -2011,18 +2011,21 @@ mod tests {
             1
         );
         drop(stored);
-        // A managed-enrollment pin is never releasable through the public
-        // owner-proof method, whatever key is supplied.
+        // Managed pins require the existing authenticated route.
         let pin = first["jobs"][0]["pin_id"].clone();
-        for (key, code) in [("good", "RequestConflict"), ("p3_x", "ValidationError")] {
-            let error = crate::dispatch::call(
-                &service,
-                "history_pins_release",
-                json!({"pin_id":pin,"request_id":key}),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(error.machine_code().as_str(), code, "{key}");
+        for (proof, code) in [
+            (json!({"request_id":"good"}), "ValidationError"),
+            (
+                json!({"release_token":agent_run_domain::batch::PinReleaseToken::mint()}),
+                "RequestConflict",
+            ),
+        ] {
+            let mut request = proof;
+            request["pin_id"] = pin.clone();
+            let error = crate::dispatch::call(&service, "history_pins_release", request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.machine_code().as_str(), code);
         }
         // Another Pool request key on the same authenticated route is not the owner.
         let release = |request_id: &str| json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"request_id":request_id,"pin_id":pin});

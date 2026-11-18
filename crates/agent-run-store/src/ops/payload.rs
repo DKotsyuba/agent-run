@@ -189,6 +189,8 @@ pub struct AdmitBatch {
     pub fingerprint: String,
     /// Whether each new lineage receives a durable retention pin.
     pub retain_history: bool,
+    /// Broker-minted digest used to bind public pins to their release credential.
+    pub pin_digest: Option<[u8; 32]>,
     /// Database identity the writer must verify before replay or mutation.
     pub expected_store_id: Option<agent_run_domain::StoreId>,
     /// Ordered prerequisites enforced in the admission transaction.
@@ -229,9 +231,8 @@ pub struct ReleaseHistoryPin {
     pub pin_id: agent_run_domain::batch::PinId,
     /// Optional database identity checked in the same release transaction.
     pub expected_store_id: Option<agent_run_domain::StoreId>,
-    /// Ownership proof: the request_id of the batch whose receipt minted the
-    /// pin (an internal managed key only after Pool route authentication).
-    pub owner_request_id: String,
+    /// Proof obtained by the broker from the public credential or pinned Pool route.
+    pub authority: crate::history_pins::ReleaseAuthority,
 }
 
 /// Atomically hold the exact successful lineage tails under broker authority.
