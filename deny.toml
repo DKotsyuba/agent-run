@@ -1,8 +1,8 @@
 # Committed dependency policy. Advisory refresh belongs to `cargo xtask prepare`;
-# the offline gate never invents advisory/license exceptions.
+# Owner-approved, dated advisory/license exceptions are listed here.
 [advisories]
 db-urls = ["https://github.com/RustSec/advisory-db"]
-ignore = []
+ignore = [{ id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no vulnerability); required by rmcp; re-check by 2027-02-01" }] # Owner approved 2026-11-18.
 maximum-db-staleness = "P1D"
 
 [licenses]
