@@ -4,6 +4,27 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- The per-agent supervisor refresh is about four times cheaper. The Linux boot
+  clock is read once instead of on every process inspection, and the parent
+  liveness verdict is memoized per exact process generation, so a recycled PID
+  is never judged by a stale verdict. One refresh fell from 47 ms to about
+  11 ms of CPU and from 10.4k to 1.2k reads; a supervisor on the 200 ms cadence
+  fell from about 21% to about 5% of one core. The cadence is unchanged.
+- A captured descendant is identified by its native `linux:`/`darwin:` start
+  token; birth time decides only for legacy evidence without a native token.
+  Linux birth depends on the wall-clock boot time, so a clock step could make a
+  recovery process judge a live descendant reused and confirm cleanup while it
+  still ran.
+- The installer waits (bounded) for a backgrounded child to exec before
+  capturing its identity. Until the exec, `ps` reports the shell's own
+  arguments, so the captured watchdog identity never matched later and cleanup
+  could stay unconfirmed with the scratch directory and `sleep` orphaned.
+- Host-load-sensitive tests scale their budgets by a measured host stall, so
+  outside load no longer fails them while an idle-host regression still does,
+  and the boot-clock test compares only stable `/proc/<pid>/stat` fields.
+
 ## 0.31.7
 
 ### Fixed
