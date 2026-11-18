@@ -11,14 +11,15 @@ pub const SERVER_NAME: &str = "agent_run_worker";
 /// Private native handshake; it is not an advertised operator or worker tool.
 pub const CATALOG_METHOD: &str = "worker/catalog";
 
-/// The reviewed version of the five-tool private pool-capable server contract.
-pub const POOL_CATALOG_VERSION: u32 = 1;
-/// Reviewed explicit-completion catalog; legacy pool/research catalogs stay v1.
+/// The reviewed version of the ordinary (legacy-completion) private worker
+/// contract. Its digest pins the exact pool-free surface of this binary.
+pub const WORKER_CATALOG_VERSION: u32 = 1;
+/// Reviewed explicit-completion catalog; ordinary/research catalogs stay v1.
 pub const FINISH_CATALOG_VERSION: u32 = 4;
 
 /// Fingerprints the actual embedded private catalog served by this binary.
 /// The digest includes schemas/effect hints, not runtime capability material.
-pub fn pool_catalog_digest() -> String {
+pub fn worker_catalog_digest() -> String {
     crate::canonical::sha256_hex(&serde_json::json!(crate::tools::worker_tools_json()), true)
 }
 
@@ -143,29 +144,15 @@ pub struct FinishReceipt {
     pub duplicate: bool,
 }
 
-/// Frozen v3 explicit catalog, including its read-only pool_read hint. Used
-/// only to verify historical v2/v3 proofs; never silently upgraded in storage.
-fn finish_tools_json_v3(research: bool) -> Vec<Value> {
+/// Current explicit-completion catalog: the ordinary (or research) worker
+/// tools followed by `health_reply` and `finish`. Legacy Run pool tools were
+/// removed; catalogs registered by earlier binaries are no longer recognized.
+pub fn finish_tools_json(research: bool) -> Vec<Value> {
     let mut tools = if research {
         research_tools_json()
     } else {
         crate::tools::worker_tools_json()
     };
-    for tool in &mut tools {
-        match tool["name"].as_str() {
-            Some("pool_read") => {
-                tool["description"] = serde_json::json!(
-                    "Read your pool's bounded durable log and status using its sequence cursor. In explicit-completion mode, use an immediate read after an event, then end the turn while waiting. Peer entries are pushed to your existing session. Do not repeatedly poll, sleep or hold a turn open. A read is not approval or proof that another member consumed your message."
-                );
-            }
-            Some("pool_vote") => {
-                let description = tool["description"].as_str().unwrap_or_default();
-                tool["description"] = serde_json::json!(description.replace("Voting ready is not the pool's completion and does not end your run: keep coordinating until the pool completes or you must block.",
-                    "Voting ready is not pool completion. When your assigned work is verified and your ready vote is recorded, call finish. Do not wait for pool completion before finishing: completion requires each member's own successful finish and cleanup."));
-            }
-            _ => {}
-        }
-    }
     tools.push(serde_json::json!({
         "name":"health_reply",
         "description":"Reply once to an exact agent-run/health-ping challenge using its ping_id and your current working, waiting or blocked state. The broker verifies actual task activity independently. This reply does not finish the task, create waiting work, change permissions or authorize cancellation. Continue the original task when possible; use finish only for its true final outcome.",
@@ -188,23 +175,6 @@ fn finish_tools_json_v3(research: bool) -> Vec<Value> {
     tools
 }
 
-/// Current v4 catalog declares automatic empty-read protection truthfully:
-/// pool_read may emit a fixed attention notice and an active-turn correction.
-/// Legacy v1/v2/v3 bytes/digests remain separately recognized and unchanged.
-pub fn finish_tools_json(research: bool) -> Vec<Value> {
-    let mut tools = finish_tools_json_v3(research);
-    for tool in &mut tools {
-        if tool["name"] == "pool_read" {
-            tool["annotations"]["readOnlyHint"] = serde_json::json!(false);
-            let description = tool["description"].as_str().unwrap_or("");
-            tool["description"] = serde_json::json!(format!(
-                "{description} Repeated empty reads of an unchanged log trigger one durable attention notice and an active-turn corrective message, with bounded backpressure. This never finishes or cancels your logical run."
-            ));
-        }
-    }
-    tools
-}
-
 /// Fingerprint the real mode/role-bound completion catalog, excluding secrets.
 pub fn finish_catalog_digest(research: bool) -> String {
     crate::canonical::sha256_hex(&serde_json::json!(finish_tools_json(research)), true)
@@ -212,7 +182,7 @@ pub fn finish_catalog_digest(research: bool) -> String {
 
 /// The managed-role explicit catalog: the current completion definitions of
 /// `health_reply` and `finish` only. A no-shell managed participant reaches
-/// its Pool through the pinned Pool server, never through worker pool tools.
+/// its Pool through the pinned Agent Pool server.
 pub fn managed_tools_json() -> Vec<Value> {
     finish_tools_json(false)
         .into_iter()
@@ -229,17 +199,21 @@ pub fn managed_catalog_digest() -> String {
     crate::canonical::sha256_hex(&serde_json::json!(managed_tools_json()), true)
 }
 
-/// Every catalog a worker may register: the reviewed pool-capable catalogs
-/// and the managed completion catalog. The managed catalog has no pool tools,
-/// so it never satisfies [`known_pool_catalog`] or legacy pool enrollment;
-/// it is health-capable at [`FINISH_CATALOG_VERSION`].
+/// Every catalog a worker of this binary may register: the ordinary and
+/// research catalogs at [`WORKER_CATALOG_VERSION`], and the explicit,
+/// explicit-research and managed completion catalogs at
+/// [`FINISH_CATALOG_VERSION`] (health-capable). Unknown digests never verify.
 pub fn known_worker_catalog(version: u32, digest: &str) -> bool {
-    known_pool_catalog(version, digest)
-        || (version == FINISH_CATALOG_VERSION && digest == managed_catalog_digest())
+    (version == WORKER_CATALOG_VERSION
+        && (digest == worker_catalog_digest() || digest == research_catalog_digest()))
+        || (version == FINISH_CATALOG_VERSION
+            && (digest == finish_catalog_digest(false)
+                || digest == finish_catalog_digest(true)
+                || digest == managed_catalog_digest()))
 }
 
-/// The research surface retains safe completion/pool messages and adds only a
-/// confined filesystem tool. The ordinary five-tool surface stays unchanged.
+/// The research surface retains the ordinary worker report and adds only a
+/// confined filesystem tool.
 pub fn research_tools_json() -> Vec<Value> {
     let mut tools = crate::tools::worker_tools_json();
     tools.push(serde_json::json!({
@@ -257,30 +231,6 @@ pub fn research_tools_json() -> Vec<Value> {
 /// Fingerprints the exact research worker schemas without capability secrets.
 pub fn research_catalog_digest() -> String {
     crate::canonical::sha256_hex(&serde_json::json!(research_tools_json()), true)
-}
-
-/// Accepts only reviewed pool-capable catalogs. The research catalog includes
-/// every ordinary pool tool; an unknown catalog never satisfies enrollment.
-pub fn known_pool_catalog(version: u32, digest: &str) -> bool {
-    (version == POOL_CATALOG_VERSION
-        && (digest == pool_catalog_digest() || digest == research_catalog_digest()))
-        || (version == 2
-            && [false, true].into_iter().any(|research| {
-                let old: Vec<_> = finish_tools_json_v3(research)
-                    .into_iter()
-                    .filter(|tool| tool["name"] != "health_reply")
-                    .collect();
-                crate::canonical::sha256_hex(&serde_json::json!(old), true) == digest
-            }))
-        || (version == 3
-            && [false, true].into_iter().any(|research| {
-                crate::canonical::sha256_hex(
-                    &serde_json::json!(finish_tools_json_v3(research)),
-                    true,
-                ) == digest
-            }))
-        || (version == FINISH_CATALOG_VERSION
-            && (digest == finish_catalog_digest(false) || digest == finish_catalog_digest(true)))
 }
 
 /// A bounded report request. Its directory comes from frozen authority; a
@@ -470,14 +420,6 @@ pub enum WorkerTool {
     Notify,
     /// Atomically save a report within frozen research workdir authority.
     SaveReport,
-    /// Ordinary informational chat to the pool.
-    PoolPost,
-    /// Bounded read of the pool log and derived status.
-    PoolRead,
-    /// Propose one result snapshot for unanimous agreement.
-    PoolPropose,
-    /// Vote ready, block, or revoke on the current proposal.
-    PoolVote,
 }
 
 impl WorkerTool {
@@ -488,10 +430,6 @@ impl WorkerTool {
             Self::HealthReply => "health_reply",
             Self::Notify => "notify_orchestrator",
             Self::SaveReport => "save_report",
-            Self::PoolPost => "pool_post",
-            Self::PoolRead => "pool_read",
-            Self::PoolPropose => "pool_propose",
-            Self::PoolVote => "pool_vote",
         }
     }
 
@@ -502,10 +440,6 @@ impl WorkerTool {
             (Self::HealthReply.as_str(), Self::HealthReply),
             (Self::Notify.as_str(), Self::Notify),
             (Self::SaveReport.as_str(), Self::SaveReport),
-            (Self::PoolPost.as_str(), Self::PoolPost),
-            (Self::PoolRead.as_str(), Self::PoolRead),
-            (Self::PoolPropose.as_str(), Self::PoolPropose),
-            (Self::PoolVote.as_str(), Self::PoolVote),
         ]
         .into_iter()
         .find(|(candidate, _)| *candidate == name)
@@ -648,47 +582,34 @@ mod tests {
 }
 
 #[cfg(test)]
-mod completion_catalog_history_tests {
+mod completion_catalog_tests {
     use super::*;
-    /// Previously admitted catalog fingerprints retain their original effect hints.
+
+    /// No worker catalog of this binary serves a legacy Run pool tool.
     #[test]
-    fn guarded_reads_preserve_v2_v3_catalog_fingerprints() {
-        assert!(known_pool_catalog(
-            2,
-            "a7ca2499ed9d72fa957780418d2bd45674db3ca9394b5d97fe0270012e6a3089"
-        ));
-        for research in [false, true] {
-            let old = finish_tools_json_v3(research);
-            let digest = crate::canonical::sha256_hex(&serde_json::json!(old), true);
-            assert_eq!(
-                digest,
-                if research {
-                    "d8ffbe5925a0cb29b7d0ff1a0dcfeb3e5c610de586d3cb0fee40c1964d382a14"
-                } else {
-                    "57ba0c3ed7f3a689488e78456180031c8ca1df57e8a62e43466f5d0c5549a212"
-                },
-                "previous compiled native catalog fingerprint must remain exact"
-            );
-            assert!(known_pool_catalog(3, &digest));
-            assert_ne!(digest, finish_catalog_digest(research));
-            assert_eq!(
-                old.iter().find(|t| t["name"] == "pool_read").unwrap()["annotations"]["readOnlyHint"],
-                true
-            );
-            assert_eq!(
-                finish_tools_json(research)
+    fn worker_catalogs_carry_no_legacy_pool_tools() {
+        let mut catalogs = vec![
+            crate::tools::worker_tools_json(),
+            research_tools_json(),
+            managed_tools_json(),
+        ];
+        catalogs.extend([false, true].map(finish_tools_json));
+        for catalog in catalogs {
+            assert!(
+                catalog
                     .iter()
-                    .find(|t| t["name"] == "pool_read")
-                    .unwrap()["annotations"]["readOnlyHint"],
-                false
+                    .all(|tool| !tool["name"].as_str().unwrap().starts_with("pool_"))
             );
+        }
+        for name in ["pool_post", "pool_read", "pool_propose", "pool_vote"] {
+            assert_eq!(WorkerTool::parse(name), None);
         }
     }
 
-    /// The managed catalog is exactly health_reply and finish, registers as a
-    /// health-capable worker catalog and never as a pool-capable one.
+    /// The managed catalog is exactly health_reply and finish and registers
+    /// only as a health-capable worker catalog.
     #[test]
-    fn managed_catalog_is_completion_only_and_not_pool_capable() {
+    fn managed_catalog_is_completion_only() {
         let names: Vec<_> = managed_tools_json()
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
@@ -700,8 +621,7 @@ mod completion_catalog_history_tests {
         }
         let digest = managed_catalog_digest();
         assert!(known_worker_catalog(FINISH_CATALOG_VERSION, &digest));
-        assert!(!known_pool_catalog(FINISH_CATALOG_VERSION, &digest));
-        assert!(!known_worker_catalog(POOL_CATALOG_VERSION, &digest));
+        assert!(!known_worker_catalog(WORKER_CATALOG_VERSION, &digest));
         assert!(!known_worker_catalog(3, &digest));
         for research in [false, true] {
             assert!(known_worker_catalog(
@@ -709,6 +629,10 @@ mod completion_catalog_history_tests {
                 &finish_catalog_digest(research)
             ));
         }
+        assert!(known_worker_catalog(
+            WORKER_CATALOG_VERSION,
+            &worker_catalog_digest()
+        ));
         assert!(!known_worker_catalog(
             FINISH_CATALOG_VERSION,
             &"0".repeat(64)

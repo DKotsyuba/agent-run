@@ -350,10 +350,6 @@ enum Payload {
     Completion(Notice),
     /// Untrusted worker report with no lifecycle effect.
     Worker(WorkerNotice),
-    /// The broker's one common conclusion of a completed pool.
-    Pool(agent_run_domain::pool::PoolNotice),
-    /// Broker-authored enrollment failure, with no completion/lifecycle claim.
-    PoolAttention(agent_run_domain::pool::PoolNotice),
     /// Broker-authored service restart notice, not tied to an agent.
     Restart(String),
 }
@@ -455,15 +451,7 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let notice = payload["notice"].take();
     let payload = match payload["kind"].as_str() {
         Some("completion") => Payload::Completion(serde_json::from_value(notice)?),
-        Some("worker") => {
-            let mut notice: WorkerNotice = serde_json::from_value(notice)?;
-            if let Some(entry) = claimed["payload"]["pool_entry"].as_str() {
-                notice.message = pool_decorated(entry);
-            }
-            Payload::Worker(notice)
-        }
-        Some("pool") => Payload::Pool(pool_notice(&notice)?),
-        Some("pool_attention") => Payload::PoolAttention(pool_notice(&notice)?),
+        Some("worker") => Payload::Worker(serde_json::from_value(notice)?),
         Some("restart") => Payload::Restart(
             notice
                 .as_str()
@@ -514,17 +502,6 @@ fn required(value: &Value, field: &str) -> Result<String> {
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| invalid("invalid claimed delivery field"))
-}
-
-/// Decode and validate the package-owned pool notice fields, excluding other JSON.
-fn pool_notice(value: &Value) -> Result<agent_run_domain::pool::PoolNotice> {
-    let notice = agent_run_domain::pool::PoolNotice {
-        notification_id: required(value, "notification_id")?,
-        pool_id: required(value, "pool_id")?.parse()?,
-        message: required(value, "message")?,
-    };
-    notice.validate()?;
-    Ok(notice)
 }
 
 /// Copy validated delivery policy for SQL; never load files in a transaction.
@@ -682,25 +659,6 @@ pub async fn dispatch_with_batch(home: &Path, max_batch: usize) -> Result<Dispat
 /// Drains the due delivery outbox using the default bounded batch size.
 pub async fn dispatch(home: &Path) -> Result<DispatchResult> {
     dispatch_with_batch(home, DEFAULT_MAX_BATCH).await
-}
-
-/// Fits a rendered pool entry into the worker notice's fixed 2048-byte bound
-/// by shortening only the untrusted body, never the stamped header. The full
-/// body stays in the pool log and the stored report.
-fn pool_decorated(rendered: &str) -> String {
-    const LIMIT: usize = 2048;
-    const MARKER: &str = "\n[truncated; the full text is in the pool log]";
-    if rendered.len() <= LIMIT {
-        return rendered.to_owned();
-    }
-    let split = rendered
-        .find("untrusted body:\n")
-        .map_or(0, |i| i + "untrusted body:\n".len());
-    let mut end = LIMIT.saturating_sub(MARKER.len()).max(split);
-    while !rendered.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{MARKER}", &rendered[..end])
 }
 
 #[cfg(test)]

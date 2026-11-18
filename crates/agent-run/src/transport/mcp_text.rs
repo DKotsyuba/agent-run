@@ -6,8 +6,7 @@
 //! CLI keep their structured JSON contracts; only the MCP presentation is
 //! text. `start`/`resume` additionally keep a tiny structured
 //! `{"agent_id": ..., "sequence": ...}` so the PostToolUse binding hook can
-//! bind the exact execution from JSON (see `hooks::bind`); `start_pool` keeps
-//! only its stable pool id for the common-notice binding. Expected failures use typed
+//! bind the exact execution from JSON (see `hooks::bind`). Expected failures use typed
 //! errors; presentation degradation preserves independent execution receipts.
 //! Whole pages either fit their byte/row/content budgets or publish no rows.
 
@@ -23,40 +22,7 @@ const TEMPLATES: &[(&str, &str)] = &[
         "notify_orchestrator",
         include_str!("../../../../assets/mcp/notify_orchestrator.txt.j2"),
     ),
-    (
-        "pool_post",
-        include_str!("../../../../assets/mcp/pool_post.txt.j2"),
-    ),
-    (
-        "pool_read",
-        include_str!("../../../../assets/mcp/pool_read.txt.j2"),
-    ),
-    (
-        "pool_propose",
-        include_str!("../../../../assets/mcp/pool_propose.txt.j2"),
-    ),
-    (
-        "pool_vote",
-        include_str!("../../../../assets/mcp/pool_vote.txt.j2"),
-    ),
     ("start", include_str!("../../../../assets/mcp/start.txt.j2")),
-    (
-        "start_pool",
-        include_str!("../../../../assets/mcp/start_pool.txt.j2"),
-    ),
-    (
-        "operator_pool_post",
-        include_str!("../../../../assets/mcp/operator_pool_post.txt.j2"),
-    ),
-    (
-        "pool_replace",
-        include_str!("../../../../assets/mcp/pool_replace.txt.j2"),
-    ),
-    ("pool", include_str!("../../../../assets/mcp/pool.txt.j2")),
-    (
-        "list_pools",
-        include_str!("../../../../assets/mcp/list_pools.txt.j2"),
-    ),
     (
         "resume",
         include_str!("../../../../assets/mcp/resume.txt.j2"),
@@ -147,63 +113,25 @@ struct ExecutionReceipt {
     sequence: Option<u32>,
     /// Exact queued steering command, retained on formatting failure.
     command_id: Option<i64>,
-    /// Exact durable pool-log sequence, retained independently of its layout.
-    pool_seq: Option<u64>,
-    /// Newly admitted replacement identity, retained on presentation failure.
-    replacement_id: Option<String>,
 }
 
 impl ExecutionReceipt {
     /// Captures acknowledged effects before any projection/rendering. Only a
     /// successful mutation with a valid identity is confirmed as accepted.
     fn capture(tool: &str, value: &Value, request_id: Option<&str>) -> Self {
-        let pool = matches!(
-            tool,
-            "start_pool"
-                | "pool_replace"
-                | "operator_pool_post"
-                | "pool_post"
-                | "pool_propose"
-                | "pool_vote"
-        );
         let identity = value[if tool == "notify_orchestrator" {
             "notification_id"
-        } else if pool {
-            "pool_id"
         } else {
             "agent_id"
         }]
         .as_str()
         .filter(|id| reference(id))
         .map(str::to_owned);
-        let pool_seq = value["seq"]
-            .as_u64()
-            .filter(|n| *n > 0 && *n <= i64::MAX as u64);
-        let replacement_id = value["member"]["agent_id"]
-            .as_str()
-            .filter(|id| reference(id))
-            .map(str::to_owned);
         let accepted = identity.is_some()
-            && match tool {
-                "start" | "resume" | "cancel" | "steer" | "notify_orchestrator" => true,
-                "pool_replace" => {
-                    value["created"].is_boolean()
-                        && value["roster_revision"].as_u64().is_some_and(|n| n > 0)
-                        && replacement_id.is_some()
-                        && value["replaced"]["agent_id"]
-                            .as_str()
-                            .is_some_and(reference)
-                }
-                "start_pool" => {
-                    value["created"].is_boolean()
-                        && value["roster_revision"].as_u64().is_some_and(|n| n > 0)
-                }
-                "operator_pool_post" => pool_seq.is_some() && value["created"].is_boolean(),
-                "pool_post" | "pool_propose" | "pool_vote" => {
-                    pool_seq.is_some() && value["duplicate"].is_boolean()
-                }
-                _ => false,
-            };
+            && matches!(
+                tool,
+                "start" | "resume" | "cancel" | "steer" | "notify_orchestrator"
+            );
         let sequence = value
             .get("sequence")
             .or_else(|| value["agent"].get("sequence"))
@@ -212,8 +140,6 @@ impl ExecutionReceipt {
             .filter(|n| *n > 0);
         Self {
             accepted,
-            pool_seq,
-            replacement_id,
             identity,
             sequence,
             command_id: value["command_id"].as_i64().filter(|n| *n > 0),
@@ -233,18 +159,7 @@ impl ExecutionReceipt {
             )
         } else if matches!(
             tool,
-            "start"
-                | "start_batch"
-                | "resume"
-                | "cancel"
-                | "steer"
-                | "notify_orchestrator"
-                | "start_pool"
-                | "pool_replace"
-                | "operator_pool_post"
-                | "pool_post"
-                | "pool_propose"
-                | "pool_vote"
+            "start" | "start_batch" | "resume" | "cancel" | "steer" | "notify_orchestrator"
         ) {
             "OUTCOME_UNKNOWN\nPresentation: degraded (presentation_failed).\nReconcile the original request before any retry; do not create replacement work.\n".into()
         } else {
@@ -254,12 +169,6 @@ impl ExecutionReceipt {
             && let Some(id) = &self.identity
         {
             text.push_str(&format!("Target agent: {id}\n"));
-        }
-        if let Some(id) = &self.replacement_id {
-            text.push_str(&format!("Replacement agent: {id}\n"));
-        }
-        if let Some(seq) = self.pool_seq {
-            text.push_str(&format!("Pool entry: {seq}\n"));
         }
         if let Some(command) = self.command_id {
             text.push_str(&format!("Command: {command}\n"));
@@ -488,273 +397,6 @@ struct ReportTextView {
     duplicate: bool,
 }
 
-/// Public enrollment overlay; private ACK key is present only for the
-/// authenticated recipient's pool_read. No attempt/token/native-session data.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolEnrollmentTextView {
-    /// Pending, joined or needs_action; validated before rendering.
-    state: String,
-    /// Optional exact opaque broker-issued request key for the recipient ACK.
-    request_id: Option<String>,
-    /// Fixed safe failure reason, absent while healthy/pending.
-    reason: Option<String>,
-}
-
-/// Pool admission roster, without provider, account, attempt or capability fields.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolAdmissionMemberTextView {
-    /// Stable actionable member identity.
-    agent_id: String,
-    /// Broker-assigned display label.
-    name: String,
-    /// Descriptive role; conveys no permission.
-    role: String,
-    /// Current lifecycle; null means an original member was replaced or pruned.
-    status: Option<crate::domain::Status>,
-    /// Existing worker enrollment, absent for backward-compatible new-only seats.
-    enrollment: Option<PoolEnrollmentTextView>,
-}
-
-/// Public admission and binding facts of a committed cooperative pool.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolAdmissionTextView {
-    /// Stable pool receipt identity.
-    pool_id: String,
-    /// Newly admitted versus exact request replay.
-    created: bool,
-    /// Durable common-notice binding.
-    bound: bool,
-    /// Positive current roster revision.
-    roster_revision: u32,
-    /// Every admitted member, in roster order.
-    members: Vec<PoolAdmissionMemberTextView>,
-}
-
-/// Stable identity and labels of a retired member in a replacement receipt.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolReplacedTextView {
-    /// Original stable member identity.
-    agent_id: String,
-    /// Recorded member display label.
-    name: String,
-    /// Recorded descriptive role.
-    role: String,
-}
-
-/// Durable replacement receipt, independent of launch or completion claims.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolReplacementTextView {
-    /// Stable target pool.
-    pool_id: String,
-    /// New replacement versus an exact replay.
-    created: bool,
-    /// Positive committed roster revision.
-    roster_revision: u32,
-    /// Retired seat identity and labels.
-    replaced: PoolReplacedTextView,
-    /// Newly admitted seat and observed status.
-    member: PoolAdmissionMemberTextView,
-}
-
-/// Operator log acknowledgement; no message body enters its template.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct OperatorPoolPostTextView {
-    /// Positive durable pool-log sequence.
-    seq: u64,
-    /// New entry versus an exact request replay.
-    created: bool,
-}
-
-/// Private log acknowledgement; the caller's key is retained outside this view.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolWriteTextView {
-    /// Positive durable pool-log sequence.
-    seq: u64,
-    /// Exact idempotency replay indicator.
-    duplicate: bool,
-}
-
-/// Compact discovery roster member with no execution-private metadata.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolListMemberTextView {
-    /// Stable one-based roster position.
-    slot: u8,
-    /// Broker-assigned display name.
-    name: String,
-    /// Descriptive role.
-    role: String,
-    /// Stable join identity for agent discovery.
-    agent_id: String,
-    /// Validated current lifecycle.
-    tip_status: crate::domain::Status,
-}
-
-/// One compact pool discovery row, preserving every current member.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolListTextView {
-    /// Stable pool identity.
-    pool_id: String,
-    /// Stored open/completed lifecycle.
-    state: agent_run_domain::pool::PoolState,
-    /// Faithful bounded goal excerpt.
-    goal: String,
-    /// Whether the goal omits bytes.
-    goal_truncated: bool,
-    /// Positive roster revision.
-    roster_revision: u32,
-    /// Greatest retained log sequence, zero when empty.
-    last_seq: u64,
-    /// Current roster size.
-    members_count: usize,
-    /// Current valid-ready members, never a raw vote count.
-    ready: usize,
-    /// Current proposal sequence, absent before any proposal.
-    current_proposal_seq: Option<u64>,
-    /// Whole ordered current roster.
-    members: Vec<PoolListMemberTextView>,
-}
-
-/// Whole discovery page; source continuation is never advanced past unseen rows.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolListPageTextView {
-    /// Every returned source row.
-    items: Vec<PoolListTextView>,
-    /// Exact matching total.
-    total: u64,
-    /// Exact source offset.
-    offset: u64,
-    /// Actual next offset, absent at the end.
-    next_offset: Option<u64>,
-    /// Explicit matching-page completeness.
-    complete: bool,
-    /// Number of all rendered rows.
-    returned: usize,
-}
-
-/// Current proposal framing and faithful immutable snapshot.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolProposalTextView {
-    /// Positive proposal log sequence.
-    seq: u64,
-    /// Roster revision at proposal time.
-    roster_revision: u32,
-    /// Faithful snapshot; never normalized or silently shortened.
-    snapshot: String,
-}
-
-/// Vote decision only; private vote provenance and checks are omitted.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolVoteTextView {
-    /// Validated optional readiness decision; absent for revocation.
-    decision: Option<agent_run_domain::pool::VoteDecision>,
-}
-
-/// Current member status and public vote validity, excluding internal run ids.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolStatusMemberTextView {
-    /// Stable actionable member identity.
-    agent_id: String,
-    /// Broker-assigned display name.
-    name: String,
-    /// Descriptive role.
-    role: String,
-    /// Validated current lifecycle.
-    tip_status: crate::domain::Status,
-    /// Whether all lineage cleanup is proven.
-    cleanup_complete: bool,
-    /// Public vote decision when present.
-    vote: Option<PoolVoteTextView>,
-    /// Display-safe validity reason.
-    why: String,
-    /// Optional enrollment overlay, absent on legacy/new-only status rows.
-    enrollment: Option<PoolEnrollmentTextView>,
-}
-
-/// Retired public roster labels; no replacement launch details are exposed.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolRetiredTextView {
-    /// Retired stable identity.
-    agent_id: String,
-    /// Recorded display label.
-    name: String,
-    /// Recorded descriptive role.
-    role: String,
-    /// Stable replacement identity.
-    replaced_by: String,
-}
-
-/// Derived status with faithful goal, criteria and proposal context.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolStatusTextView {
-    /// Stored open/completed lifecycle.
-    state: agent_run_domain::pool::PoolState,
-    /// Positive current roster revision.
-    roster_revision: u32,
-    /// Faithful bounded goal.
-    goal: String,
-    /// Every acceptance criterion, without dropped rows.
-    criteria: Vec<agent_run_domain::pool::AcceptanceCriterion>,
-    /// Current immutable proposal when present.
-    current_proposal: Option<PoolProposalTextView>,
-    /// Every current member.
-    members: Vec<PoolStatusMemberTextView>,
-    /// Every returned retired member.
-    replaced_members: Vec<PoolRetiredTextView>,
-    /// Formal agreement; independent of completion.
-    agreed: bool,
-    /// Public bounded explanatory text.
-    note: String,
-}
-
-/// Secret-free common delivery facts; session, messages and raw evidence are absent.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolDeliveryTextView {
-    /// Validated durable delivery lifecycle.
-    state: String,
-    /// Durable binding availability.
-    bound: bool,
-    /// Observed attempt count.
-    attempts: u32,
-    /// Whether transport acknowledgement is ambiguous.
-    ambiguous: bool,
-    /// Optional fixed delivery classification.
-    last_classification: Option<String>,
-}
-
-/// Whole pool read page, with every log entry rendered by the shared formatter.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PoolPageTextView {
-    /// Broker hint for an empty explicit-mode page, never completion evidence.
-    #[serde(default)]
-    suspend_inference: bool,
-    /// Stable target pool.
-    pool_id: String,
-    /// Optional validated read-time activity, independent of stored lifecycle.
-    activity: Option<String>,
-    /// Derived public status.
-    status: PoolStatusTextView,
-    /// Secret-free common-notice delivery.
-    delivery: PoolDeliveryTextView,
-    /// Exact lower exclusive cursor.
-    after_seq: u64,
-    /// Exact optional upper exclusive cursor.
-    before_seq: Option<u64>,
-    /// Actual direction-specific continuation.
-    next_cursor: Option<u64>,
-    /// Explicit source completeness.
-    complete: bool,
-    /// Every rendered shared-entry string in source order.
-    entries: Vec<String>,
-    /// Exact number of all displayed entries.
-    entry_count: usize,
-    /// Whether goal and criteria belong on this read.
-    show_goal: bool,
-    /// Whether the proposal snapshot is new or explicitly requested.
-    show_proposal: bool,
-    /// Recipient-only structured challenge; never present on operator reads.
-    enrollment: Option<PoolEnrollmentTextView>,
-}
-
 /// Routine expected error carries only public sanitized diagnostics.
 #[derive(serde::Serialize)]
 struct ErrorTextView {
@@ -782,26 +424,6 @@ fn budget(tool: &str) -> Budget {
             bytes: 4096,
             rows: 8,
             content: 0,
-        },
-        "start_pool" | "pool_replace" => Budget {
-            bytes: 8192,
-            rows: 5,
-            content: 0,
-        },
-        "operator_pool_post" | "pool_post" | "pool_propose" | "pool_vote" => Budget {
-            bytes: 8192,
-            rows: 0,
-            content: 0,
-        },
-        "pool" | "pool_read" => Budget {
-            bytes: 600 * 1024,
-            rows: 50,
-            content: 550 * 1024,
-        },
-        "list_pools" => Budget {
-            bytes: 512 * 1024,
-            rows: 200,
-            content: 512 * 1024,
         },
         "cancel" | "steer" | "notify_orchestrator" | "error" => Budget {
             bytes: 2048,
@@ -1111,9 +733,6 @@ pub fn success_result_with_request(
     {
         result.structured_content = Some(json!({"agent_id": id, "sequence": sequence}));
     }
-    if tool == "start_pool" && receipt.accepted {
-        result.structured_content = Some(json!({"pool_id": receipt.identity}));
-    }
     let mut wire = BoundedWriter {
         bytes: Vec::new(),
         limit: MAX_RESULT_WIRE_BYTES,
@@ -1353,18 +972,7 @@ pub fn failure_result(
     }
     let write = matches!(
         tool,
-        "start"
-            | "start_batch"
-            | "resume"
-            | "cancel"
-            | "steer"
-            | "notify_orchestrator"
-            | "start_pool"
-            | "pool_replace"
-            | "operator_pool_post"
-            | "pool_post"
-            | "pool_propose"
-            | "pool_vote"
+        "start" | "start_batch" | "resume" | "cancel" | "steer" | "notify_orchestrator"
     );
     let uncertain = matches!(error, Error::Runtime(_) | Error::Io(_) | Error::Json(_))
         || (tool == "start_batch"
@@ -1387,12 +995,6 @@ pub fn failure_result(
     error_result(public.kind, &public.message)
 }
 
-/// Renders compact pool discovery for CLI using the same closed view and budgets.
-pub fn list_pools_text(value: &Value) -> Result<String> {
-    validate_result("list_pools", value)?;
-    render("list_pools", value, budget("list_pools").bytes)
-}
-
 /// Presents one operator result through shared text views or the two additive
 /// typed structured observation views.
 #[must_use]
@@ -1400,53 +1002,15 @@ pub fn public_success_result(tool: &str, value: &Value) -> CallToolResult {
     public_success_result_with_request(tool, value, None)
 }
 
-/// Keeps operator pool formatting and retry receipts independent of presentation.
-/// The public pool_post uses its own framing; start_pool retains the binding id.
-/// Observation methods retain their complete typed structured content.
+/// Keeps retry receipts independent of presentation. Observation methods
+/// retain their complete typed structured content.
 #[must_use]
 pub fn public_success_result_with_request(
     tool: &str,
     value: &Value,
     request_id: Option<&str>,
 ) -> CallToolResult {
-    success_result_with_request(
-        if tool == "pool_post" {
-            "operator_pool_post"
-        } else {
-            tool
-        },
-        value,
-        request_id,
-    )
-}
-
-/// Prepares a whole read page through validated shared entries and a closed
-/// typed context. Every entry either renders or the entire page fails; private
-/// metadata is dropped before serialization. Cursors never skip unread rows.
-pub fn pool_page(mut page: Value) -> std::result::Result<Value, String> {
-    let mut prepare = || -> Result<Value> {
-        validate_pool_page(&page)?;
-        let entries = required_rows(&page, "entries", budget("pool").rows)?;
-        let rendered = entries
-            .iter()
-            .map(|entry| {
-                let entry = pool_entry(entry)?;
-                agent_run_domain::pool::render_entry(&entry)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let after = page["after_seq"].as_u64().ok_or_else(shape_error)?;
-        let from_start = after == 0 && page["before_seq"].is_null();
-        let newer = page["status"]["current_proposal"]["seq"]
-            .as_u64()
-            .is_some_and(|seq| seq > after);
-        page["entry_count"] = json!(rendered.len());
-        page["entries"] = json!(rendered);
-        page["show_goal"] = json!(from_start);
-        page["show_proposal"] = json!(from_start || newer);
-        let view: PoolPageTextView = projected(page.clone())?;
-        serde_json::to_value(view).map_err(|_| shape_error())
-    };
-    prepare().map_err(|_| "pool presentation failed".to_owned())
+    success_result_with_request(tool, value, request_id)
 }
 
 /// Expected failures remain errors even when their presentation fails.
@@ -1713,29 +1277,6 @@ fn validate_agent(value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Validates a bounded enrollment overlay before any ACK key can be printed.
-/// State remains exact, and an opaque challenge is never shortened.
-fn validate_enrollment(value: &Value) -> Result<()> {
-    if !matches!(
-        value["state"].as_str(),
-        Some("pending" | "joined" | "needs_action")
-    ) {
-        return Err(shape_error());
-    }
-    if let Some(key) = value.get("request_id") {
-        let key = key.as_str().ok_or_else(shape_error)?;
-        if key.is_empty()
-            || key.len() > 128
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        {
-            return Err(shape_error());
-        }
-    }
-    Ok(())
-}
-
 /// Checks source shapes, all page rows/cursors and faithful content before
 /// allocating projected rows. Unknown states never become success or empty pages.
 fn validate_result(tool: &str, value: &Value) -> Result<()> {
@@ -1778,41 +1319,6 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
                 return Err(shape_error());
             }
         }
-        "start_pool" => {
-            required_reference(value, "pool_id")?;
-            required_bool(value, "created")?;
-            required_bool(value, "bound")?;
-            positive_counter(value, "roster_revision")?;
-            for member in required_rows(value, "members", 5)? {
-                validate_pool_member(member)?;
-                if !member["status"].is_null() {
-                    serde_json::from_value::<crate::domain::Status>(member["status"].clone())
-                        .map_err(|_| shape_error())?;
-                }
-            }
-        }
-        "pool_replace" => {
-            required_reference(value, "pool_id")?;
-            required_bool(value, "created")?;
-            positive_counter(value, "roster_revision")?;
-            validate_pool_member(&value["replaced"])?;
-            validate_pool_member(&value["member"])?;
-            serde_json::from_value::<crate::domain::Status>(value["member"]["status"].clone())
-                .map_err(|_| shape_error())?;
-        }
-        "operator_pool_post" | "pool_post" | "pool_propose" | "pool_vote" => {
-            required_reference(value, "pool_id")?;
-            positive_counter(value, "seq")?;
-            required_bool(
-                value,
-                if tool == "operator_pool_post" {
-                    "created"
-                } else {
-                    "duplicate"
-                },
-            )?;
-        }
-        "pool" | "pool_read" => validate_pool_page(value)?,
         "notify_orchestrator" => {
             required_reference(value, "notification_id")?;
             required_bool(value, "duplicate")?;
@@ -1823,14 +1329,10 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
                 return Err(shape_error());
             }
         }
-        "list_agents" | "list_pools" => {
+        "list_agents" => {
             let rows = required_rows(value, "items", policy.rows)?;
             for row in rows {
-                if tool == "list_agents" {
-                    validate_agent(row)?;
-                } else {
-                    validate_pool_summary(row)?;
-                }
+                validate_agent(row)?;
             }
             let total = value["total"].as_u64().ok_or_else(shape_error)?;
             let offset = value["offset"].as_u64().ok_or_else(shape_error)?;
@@ -2076,164 +1578,6 @@ fn positive_counter(value: &Value, key: &str) -> Result<u64> {
         .ok_or_else(shape_error)
 }
 
-/// Validates pool roster labels and stable identity before they become framing.
-fn validate_pool_member(value: &Value) -> Result<()> {
-    if let Some(enrollment) = value.get("enrollment") {
-        validate_enrollment(enrollment)?;
-    }
-    required_reference(value, "agent_id")?;
-    for key in ["name", "role"] {
-        let text = required_reference(value, key)?;
-        if text.len() > 1024 || text.chars().any(|c| c.is_control()
-            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
-            return Err(shape_error());
-        }
-    }
-    Ok(())
-}
-
-/// Checks one bounded whole discovery row; readiness cannot exceed its roster.
-fn validate_pool_summary(value: &Value) -> Result<()> {
-    let view: PoolListTextView = projected(value.clone())?;
-    required_reference(value, "pool_id")?;
-    positive_counter(value, "roster_revision")?;
-    if view.goal.len() > 512 || view.members.len() > 5 || view.ready > view.members_count {
-        return Err(shape_error());
-    }
-    for member in required_rows(value, "members", 5)? {
-        validate_pool_member(member)?;
-    }
-    Ok(())
-}
-
-/// Projects exactly the domain entry fields before its strict decoder runs.
-/// Extra broker metadata cannot reach the shared formatter or its validated body.
-fn pool_entry(value: &Value) -> Result<agent_run_domain::pool::PoolEntryView> {
-    projected(json!({
-        "seq": value["seq"], "roster_revision": value["roster_revision"],
-        "author_kind": value["author_kind"], "author_agent_id": value["author_agent_id"],
-        "author_name": value["author_name"], "author_role": value["author_role"],
-        "direction": value["direction"], "kind": value["kind"], "severity": value["severity"],
-        "proposal_seq": value["proposal_seq"], "decision": value["decision"], "body": value["body"],
-    }))
-}
-
-/// Validates every pool log row, direction-specific continuation and context
-/// before rendering. Oversize or malformed pages publish no partial entries.
-fn validate_pool_page(value: &Value) -> Result<()> {
-    if let Some(enrollment) = value.get("enrollment") {
-        validate_enrollment(enrollment)?;
-    }
-    let policy = budget("pool");
-    required_reference(value, "pool_id")?;
-    let after = value["after_seq"]
-        .as_u64()
-        .filter(|n| *n <= i64::MAX as u64)
-        .ok_or_else(shape_error)?;
-    let before = value["before_seq"].as_u64();
-    if (!value["before_seq"].is_null() && before.is_none())
-        || before.is_some_and(|n| n == 0 || n > i64::MAX as u64 || after > 0)
-    {
-        return Err(shape_error());
-    }
-    let complete = required_bool(value, "complete")?;
-    let rows = required_rows(value, "entries", policy.rows)?;
-    let mut bytes = 0usize;
-    let mut previous = after;
-    for row in rows {
-        let entry = pool_entry(row)?;
-        entry.validate()?;
-        if entry.seq <= previous || before.is_some_and(|n| entry.seq >= n) {
-            return Err(shape_error());
-        }
-        previous = entry.seq;
-        bytes = bytes.saturating_add(entry.body.len());
-    }
-    let continuation = if before.is_some() {
-        rows.first()
-    } else {
-        rows.last()
-    }
-    .and_then(|row| row["seq"].as_u64());
-    if (complete && !value["next_cursor"].is_null())
-        || (!complete && (continuation.is_none() || value["next_cursor"].as_u64() != continuation))
-    {
-        return Err(shape_error());
-    }
-    let status = &value["status"];
-    positive_counter(status, "roster_revision")?;
-    serde_json::from_value::<agent_run_domain::pool::PoolState>(status["state"].clone())
-        .map_err(|_| shape_error())?;
-    let goal = status["goal"].as_str().ok_or_else(shape_error)?;
-    if goal.len() > agent_run_domain::pool::MAX_GOAL_BYTES {
-        return Err(shape_error());
-    }
-    bytes = bytes.saturating_add(goal.len());
-    for criterion in required_rows(status, "criteria", agent_run_domain::pool::MAX_CRITERIA)? {
-        required_reference(criterion, "id")?;
-        bytes = bytes.saturating_add(required_reference(criterion, "text")?.len());
-    }
-    if !status["current_proposal"].is_null() {
-        positive_counter(&status["current_proposal"], "seq")?;
-        positive_counter(&status["current_proposal"], "roster_revision")?;
-        let snapshot = status["current_proposal"]["snapshot"]
-            .as_str()
-            .ok_or_else(shape_error)?;
-        if snapshot.len() > agent_run_domain::pool::MAX_SNAPSHOT_BYTES {
-            return Err(shape_error());
-        }
-        bytes = bytes.saturating_add(snapshot.len());
-    }
-    for member in required_rows(status, "members", 5)? {
-        validate_pool_member(member)?;
-    }
-    for member in required_rows(status, "replaced_members", 200)? {
-        validate_pool_member(member)?;
-        required_reference(member, "replaced_by")?;
-    }
-    if !value["activity"].is_null()
-        && !matches!(
-            value["activity"].as_str(),
-            Some(
-                "running"
-                    | "stopping"
-                    | "settling"
-                    | "needs_action"
-                    | "cancelled"
-                    | "completed"
-                    | "open"
-                    | "idle"
-                    | "starting"
-            )
-        )
-    {
-        return Err(shape_error());
-    }
-    if !matches!(
-        value["delivery"]["state"].as_str(),
-        Some(
-            "not_created"
-                | "waiting_binding"
-                | "pending"
-                | "sending"
-                | "delivered"
-                | "retry_wait"
-                | "failed"
-                | "cancelled"
-                | "expired"
-                | "unknown"
-                | "custody_accepted"
-                | "outcome_unknown"
-        )
-    ) {
-        return Err(shape_error());
-    }
-    if bytes > policy.content {
-        return Err(Error::Runtime("presentation_budget_exceeded".into()));
-    }
-    Ok(())
-}
-
 /// Preserves bounded printable display labels while escaping invisible formatting.
 fn display_label(text: &str) -> String {
     if text.len() <= 1024 && text.chars().all(|c| !c.is_control()
@@ -2348,33 +1692,6 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
             },
             limit,
         ),
-        "start_pool" => render_view(
-            name,
-            &projected::<PoolAdmissionTextView>(value.clone())?,
-            limit,
-        ),
-        "pool_replace" => render_view(
-            name,
-            &projected::<PoolReplacementTextView>(value.clone())?,
-            limit,
-        ),
-        "operator_pool_post" => render_view(
-            name,
-            &projected::<OperatorPoolPostTextView>(value.clone())?,
-            limit,
-        ),
-        "pool_post" | "pool_propose" | "pool_vote" => {
-            render_view(name, &projected::<PoolWriteTextView>(value.clone())?, limit)
-        }
-        "list_pools" => {
-            let mut page = value.clone();
-            page["returned"] = json!(required_rows(value, "items", budget(name).rows)?.len());
-            render_view(name, &projected::<PoolListPageTextView>(page)?, limit)
-        }
-        "pool" | "pool_read" => {
-            let page = pool_page(value.clone()).map_err(|_| shape_error())?;
-            render_view(name, &projected::<PoolPageTextView>(page)?, limit)
-        }
         "models" => render_catalog_coverage(name, models_context(value), value, limit),
         "capacity_order" => render_catalog_coverage(name, order_context(value), value, limit),
         _ => Err(shape_error()),

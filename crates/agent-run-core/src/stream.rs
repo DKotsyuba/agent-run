@@ -488,10 +488,6 @@ fn native_init_inventory(frame: &Value) -> Value {
         "TodoWrite",
         "AskUserQuestion",
         "mcp__agent_run_worker__notify_orchestrator",
-        "mcp__agent_run_worker__pool_post",
-        "mcp__agent_run_worker__pool_read",
-        "mcp__agent_run_worker__pool_propose",
-        "mcp__agent_run_worker__pool_vote",
         "mcp__agent_run_worker__save_report",
         "mcp__agent_run_worker__finish",
     ];
@@ -1253,47 +1249,6 @@ async fn run_inner(
                                 cid,
                                 &json!({"accepted":false,"reason":"empty_steer_text"}),
                             ))
-                            .await?;
-                    }
-                } else if command == "pool" {
-                    // Same stdin path and deadline as steer. A successful
-                    // write is `written` only — never engine acceptance or
-                    // consumption — and any error may follow a partial write,
-                    // so it is `unknown`, not "not delivered". The durable log
-                    // keeps the entry either way.
-                    let mut written = false;
-                    let result = match commands::pool_push_text(store, &record.id, &payload) {
-                        Ok(text) => {
-                            let id = uuid::Uuid::new_v4().to_string();
-                            let open = process.input.is_some();
-                            if send_user_text(process, &text, &id, deadline).await {
-                                native_idle = false;
-                                inputs.sent(id, false);
-                                written = true;
-                                commands::pool_result("written", "stdin_write")
-                            } else {
-                                inputs.uncertain_write |= open;
-                                commands::pool_result("unknown", "stdin_write_failed")
-                            }
-                        }
-                        Err(refusal) => refusal,
-                    };
-                    if written {
-                        // Observed stdin write: result and worker turn are one atomic
-                        // operation (transport evidence only, not consumption).
-                        process
-                            .observing(store.observed_command_result(
-                                &record.id,
-                                cid,
-                                &result,
-                                "stdin_written",
-                                Some(false),
-                                Vec::new(),
-                            ))
-                            .await?;
-                    } else {
-                        process
-                            .observing(store.complete_command(&record.id, cid, &result))
                             .await?;
                     }
                 } else {

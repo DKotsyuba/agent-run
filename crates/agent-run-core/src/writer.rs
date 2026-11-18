@@ -245,8 +245,6 @@ impl WriterHandle {
                     | OpKindRef::PrepareManagedEnrollment
                     | OpKindRef::AdmitManagedEnrollment
                     | OpKindRef::AdmitProviderResume
-                    | OpKindRef::AdmitPool
-                    | OpKindRef::ReplacePoolMember
             )
         {
             let header = envelope.header();

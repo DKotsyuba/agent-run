@@ -15,7 +15,6 @@ use agent_run_domain::{
         ResolvedLaunchAuthority,
     },
     domain::{AgentId, OrchestratorRef, Outcome, StartRequest},
-    pool::{AcceptanceCriterion, PoolDenial, PoolId, PoolMessage, PoolPropose, PoolVote},
     provider_start::ProviderStartRequest,
     storage::{OperationId, PayloadDigest},
     worker::{FinishGuard, FinishRequest, NotifyRequest, WorkerCatalogProof},
@@ -310,106 +309,6 @@ pub struct AdmitProviderResume {
     /// Internal restart identity; absent for ordinary operator resumes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_id: Option<i64>,
-}
-
-/// Owned pool member admission source.
-#[derive(Clone, Serialize)]
-pub enum PoolMemberSource {
-    /// Ordinary new admission (boxed).
-    New(Box<AdmissionSpec>),
-    /// Existing running worker pinned by preflight facts (boxed).
-    Existing(Box<crate::pool_enrollment::ExistingMember>),
-}
-
-/// Owned pool member admission.
-#[derive(Clone, Serialize)]
-pub struct PoolMemberSpec {
-    /// Stable identity reserved before any row exists.
-    pub id: AgentId,
-    /// One-based slot.
-    pub slot: u8,
-    /// Unique member name.
-    pub name: String,
-    /// Role label.
-    pub role: String,
-    /// The member's own task before the pool preamble.
-    pub personal_task: String,
-    /// Admission source.
-    pub source: PoolMemberSource,
-}
-
-/// 4 — admit one whole pool atomically (broker).
-#[derive(Clone, Serialize)]
-pub struct AdmitPool {
-    /// Pre-minted pool identity.
-    pub pool_id: PoolId,
-    /// Replay namespace.
-    pub request_namespace: String,
-    /// Client idempotency key.
-    pub request_id: String,
-    /// Digest of the normalized outer request.
-    pub request_sha256: String,
-    /// Shared goal.
-    pub goal: String,
-    /// Acceptance criteria.
-    pub acceptance: Vec<AcceptanceCriterion>,
-    /// Shared resolved catalog.
-    pub catalog: ProviderCatalog,
-    /// Members in slot order.
-    pub members: Vec<PoolMemberSpec>,
-    /// Effective shared binding.
-    pub orchestrator: Option<OrchestratorRef>,
-}
-
-/// 5 — replace one pool member atomically (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct ReplacePoolMember {
-    /// Pool identity.
-    pub pool_id: PoolId,
-    /// Member being replaced.
-    pub old: AgentId,
-    /// Operator idempotency key.
-    pub request_id: String,
-    /// Digest of the normalized outer request.
-    pub request_sha256: String,
-    /// Roster revision the new task was composed against.
-    pub expected_roster_revision: u32,
-    /// Pre-minted identity of the new member.
-    pub new_id: AgentId,
-    /// New member name.
-    pub name: String,
-    /// New member's own task.
-    pub personal_task: String,
-    /// Resolved catalog.
-    pub catalog: ProviderCatalog,
-    /// Admission inputs carrying the composed task.
-    pub inputs: AdmissionSpec,
-}
-
-/// Result of pool replacement or pool writes that may be typed refusals.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", content = "value", rename_all = "snake_case")]
-pub enum PoolOutcome<T> {
-    /// Durable success.
-    Done(T),
-    /// Typed pool refusal (no mutation).
-    Denied(PoolDenial),
-}
-
-/// 6 — enrollment acknowledgement; an internal unit of pool writes, refused standalone.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AcknowledgeEnrollment {
-    /// Lineage root.
-    pub root: AgentId,
-    /// Acknowledged log sequence.
-    pub seq: u64,
-}
-
-/// 7 — reconcile enrollments of one pool (broker background).
-#[derive(Debug, Clone, Serialize)]
-pub struct ReconcilePoolEnrollments {
-    /// Pool identity.
-    pub pool: PoolId,
 }
 
 /// 8 — record the supervisor launch capability hash before spawn (broker).
@@ -946,7 +845,7 @@ pub struct AppendJournal {
 pub struct EnqueueCommand {
     /// Execution.
     pub execution: AgentId,
-    /// Command kind (`cancel`, `steer`, `pool`).
+    /// Command kind (`cancel`, `steer`).
     pub kind: String,
     /// Payload (steer text <= 256 KiB).
     pub payload: Value,
@@ -1175,103 +1074,6 @@ pub struct NotifyOrchestrator {
     /// Report.
     pub input: NotifyRequest,
     /// Report time.
-    pub at: f64,
-}
-
-/// Owned pool write.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "write", content = "value", rename_all = "snake_case")]
-pub enum PoolWriteSpec {
-    /// Chat message.
-    Message(PoolMessage),
-    /// Proposal.
-    Proposal(PoolPropose),
-    /// Vote.
-    Vote(PoolVote),
-}
-
-/// 47 — authenticated pool write (worker authority).
-#[derive(Debug, Clone, Serialize)]
-pub struct PoolWrite {
-    /// Execution.
-    pub execution: AgentId,
-    /// Attempt.
-    pub attempt: String,
-    /// Worker token.
-    pub token: String,
-    /// Write.
-    pub write: PoolWriteSpec,
-}
-
-/// Result of pool writes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PoolWriteOutput {
-    /// Pool.
-    pub pool_id: PoolId,
-    /// Entry sequence.
-    pub seq: u64,
-    /// Whether an existing entry replayed.
-    pub duplicate: bool,
-}
-
-/// 48 — operator post to a pool (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct PoolOperatorPost {
-    /// Pool.
-    pub pool_id: PoolId,
-    /// Idempotency key.
-    pub request_id: String,
-    /// Message.
-    pub message: String,
-}
-
-/// 49 — pool fan-out; an internal unit of pool writes, refused standalone.
-#[derive(Debug, Clone, Serialize)]
-pub struct FanoutEntry {
-    /// Pool.
-    pub pool_id: PoolId,
-    /// Entry sequence.
-    pub seq: u64,
-}
-
-/// Settlement selector of row 50.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "target", rename_all = "snake_case")]
-pub enum SettleTarget {
-    /// One pool.
-    Pool {
-        /// Pool.
-        pool_id: PoolId,
-    },
-    /// The pool of one member.
-    Of {
-        /// Member execution.
-        agent_id: AgentId,
-    },
-    /// A bounded batch of open pools.
-    Open {
-        /// Maximum pools (<= 64).
-        limit: usize,
-        /// Rotation seed.
-        seed: usize,
-    },
-}
-
-/// 50 — proof-gated pool settlement (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct SettlePool {
-    /// Target.
-    pub target: SettleTarget,
-}
-
-/// 51 — bind a pool to an orchestrator session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BindPool {
-    /// Pool.
-    pub pool_id: PoolId,
-    /// Orchestrator reference.
-    pub reference: OrchestratorRef,
-    /// Binding time.
     pub at: f64,
 }
 
@@ -1949,21 +1751,5 @@ pub struct AcceptHealthReply {
     /// Closed bounded response; no arbitrary prose or credentials.
     pub input: agent_run_domain::health::PingReply,
     /// Finite nonnegative observation time in Unix seconds.
-    pub at: f64,
-}
-
-/// 95 — fixed broker-generated polling attention under exact worker authority.
-/// This is local-only; no prose, outcome declaration or native action crosses SQL.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReportPoolReadLoop {
-    /// Exact logical execution owning the observed reads.
-    pub execution: AgentId,
-    /// Exact active capability-bound attempt.
-    pub attempt: String,
-    /// Transient private capability; persisted only as its existing hash.
-    pub token: String,
-    /// Actual indexed pool revision, not a worker-supplied cursor.
-    pub revision: u64,
-    /// Finite nonnegative broker observation time in Unix seconds.
     pub at: f64,
 }

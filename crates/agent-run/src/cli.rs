@@ -368,48 +368,6 @@ pub enum Command {
         command: HistoryPinsCommand,
     },
     Resume(Resume),
-    /// Start a cooperative pool from one JSON request (`-` reads stdin).
-    StartPool {
-        /// JSON file or `-`: request_id, goal, optional acceptance, members.
-        #[arg(long)]
-        spec: String,
-        #[command(flatten)]
-        session: SessionArgs,
-    },
-    /// Post a message, stamped as from the operator, to every pool member.
-    PoolPost {
-        #[arg(long)]
-        pool_id: String,
-        #[arg(long)]
-        request_id: String,
-        /// Message text; `-` reads standard input.
-        #[arg(long)]
-        text: String,
-    },
-    /// Replace one terminal, fully cleaned pool member.
-    PoolReplace {
-        #[arg(long)]
-        pool_id: String,
-        /// Stable agent id of the current member.
-        #[arg(long)]
-        agent_id: String,
-        #[arg(long)]
-        request_id: String,
-        /// Optional JSON file or `-` with an explicit replacement start.
-        #[arg(long)]
-        spec: Option<String>,
-    },
-    /// Read a pool's status and one cursor page of its log.
-    Pool {
-        #[arg(long)]
-        pool_id: String,
-        #[arg(long)]
-        after_seq: Option<u64>,
-        #[arg(long)]
-        before_seq: Option<u64>,
-        #[arg(long)]
-        limit: Option<u32>,
-    },
     Bind(Bind),
     Cancel {
         /// Stable agent id, or a historical run alias for that agent.
@@ -428,22 +386,6 @@ pub enum Command {
         text: String,
     },
     Agents(Agents),
-    /// Discover pools through the resident broker, newest-created first.
-    #[command(alias = "list-pools")]
-    Pools {
-        /// Optional exact state filter.
-        #[arg(long, value_parser = ["open", "completed"])]
-        state: Option<String>,
-        /// Matching pools to skip.
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
-        /// Page size, 1..=200.
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        /// Print a compact human page instead of structured JSON.
-        #[arg(long)]
-        text: bool,
-    },
     /// Report the resident broker's versioned read schemas and transport limits.
     Capabilities {
         /// Explicitly read the current database identity.
@@ -809,11 +751,7 @@ pub struct Resume {
 #[derive(Args, Debug)]
 pub struct Bind {
     /// Stable agent whose selected execution should be bound.
-    #[arg(required_unless_present = "pool", conflicts_with = "pool")]
-    pub agent_id: Option<AgentId>,
-    /// Bind a whole pool and every current member together instead of one agent.
-    #[arg(long)]
-    pub pool: Option<String>,
+    pub agent_id: AgentId,
     /// Legacy execution selector, retained for older callers.
     #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
@@ -1169,26 +1107,6 @@ fn read_stdin(max: usize) -> Result<String> {
         return Err(invalid("stdin exceeds the maximum input size"));
     }
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
-}
-
-/// Reads one bounded JSON object from a file, or from standard input for `-`.
-fn spec_json(source: &str) -> Result<Value> {
-    const MAX: usize = 1024 * 1024;
-    let text = if source == "-" {
-        read_stdin(MAX)?
-    } else {
-        let bytes = std::fs::read(source).map_err(|_| invalid("spec file is unreadable"))?;
-        if bytes.len() > MAX {
-            return Err(invalid("spec file exceeds the maximum input size"));
-        }
-        String::from_utf8(bytes).map_err(|_| invalid("spec must be UTF-8"))?
-    };
-    let value: Value =
-        serde_json::from_str(&text).map_err(|_| invalid("spec must be a JSON object"))?;
-    if !value.is_object() {
-        return Err(invalid("spec must be a JSON object"));
-    }
-    Ok(value)
 }
 
 /// Reads a task argument, interpreting exactly `-` as bounded standard input.
@@ -1816,11 +1734,6 @@ fn client_command(command: &Command) -> bool {
             | Command::HistoryPins { .. }
             | Command::Restart(_)
             | Command::Resume(_)
-            | Command::StartPool { .. }
-            | Command::PoolPost { .. }
-            | Command::PoolReplace { .. }
-            | Command::Pool { .. }
-            | Command::Pools { .. }
             | Command::Capabilities { .. }
             | Command::AnswerChunk { .. }
             | Command::Doc { .. }
@@ -2420,9 +2333,6 @@ async fn run_client_command(
                 if let Some(turn) = normalized.reference.external_turn_id {
                     safe["external_turn_id"] = json!(turn);
                 }
-                if let Some(pool) = normalized.pool_id {
-                    safe["pool_id"] = json!(pool);
-                }
                 if let Some(agent) = normalized.agent_id {
                     safe["agent_id"] = json!(agent);
                 }
@@ -2642,79 +2552,6 @@ async fn run_client_command(
                 ));
             }
             (output)(&result)?;
-        }
-        Command::StartPool { spec, session } => {
-            let mut request = spec_json(&spec)?;
-            if let Some(reference) = session.resolve()? {
-                request["orchestrator"] = serde_json::to_value(reference)?;
-            }
-            let result = broker.call("start_pool", request).await?;
-            (output)(&result)?;
-        }
-        Command::PoolPost {
-            pool_id,
-            request_id,
-            text,
-        } => {
-            let message = task_text(&text, agent_run_domain::pool::MAX_BODY_BYTES)?;
-            let result = broker
-                .call(
-                    "pool_post",
-                    json!({"pool_id": pool_id, "request_id": request_id, "message": message}),
-                )
-                .await?;
-            (output)(&result)?;
-        }
-        Command::PoolReplace {
-            pool_id,
-            agent_id,
-            request_id,
-            spec,
-        } => {
-            let start = spec.as_deref().map(spec_json).transpose()?;
-            let result = broker
-                .call(
-                    "pool_replace",
-                    json!({"pool_id": pool_id, "agent_id": agent_id, "request_id": request_id, "start": start}),
-                )
-                .await?;
-            (output)(&result)?;
-        }
-        Command::Pool {
-            pool_id,
-            after_seq,
-            before_seq,
-            limit,
-        } => {
-            let result = broker
-                .call(
-                    "pool",
-                    json!({"pool_id": pool_id, "after_seq": after_seq, "before_seq": before_seq, "limit": limit}),
-                )
-                .await?;
-            (output)(&result)?;
-        }
-        Command::Pools {
-            state,
-            offset,
-            limit,
-            text,
-        } => {
-            let query: agent_run_domain::pool::ListPoolsQuery =
-                serde_json::from_value(json!({"state": state, "offset": offset, "limit": limit}))
-                    .map_err(|_| invalid("invalid pool list arguments"))?;
-            query.validate()?;
-            let result = broker
-                .call("list_pools", serde_json::to_value(query)?)
-                .await?;
-            if text {
-                (text_output)(&format!(
-                    "{}\n",
-                    crate::transport::mcp_text::list_pools_text(&result)?
-                ))?;
-            } else {
-                (output)(&result)?;
-            }
         }
         Command::Capabilities {
             include_store_id,
@@ -2966,26 +2803,8 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_turn_id: a.session_turn_id,
             };
             let store = Store::open(&home)?;
-            if let Some(pool) = &a.pool {
-                let pool: agent_run_domain::pool::PoolId = pool.parse()?;
-                operator(&home)
-                    .call(
-                        agent_run_store::ops::BindPool {
-                            pool_id: pool.clone(),
-                            reference: reference.clone(),
-                            at: crate::domain::now(),
-                        },
-                        agent_run_core::broker_writer::BROKER_BUDGET,
-                    )
-                    .await?;
-                (dependencies.output)(&json!({"pool_id": pool, "bound": true}))?;
-                return Ok(0);
-            }
-            let agent_id = a
-                .agent_id
-                .ok_or_else(|| invalid("agent id or --pool is required"))?;
             let run =
-                agent_run_core::agent_identity::resolve(&store, &agent_id, a.run_id.as_ref())?;
+                agent_run_core::agent_identity::resolve(&store, &a.agent_id, a.run_id.as_ref())?;
             hooks::bind::bind(&home, run.id.clone(), reference, crate::domain::now()).await?;
             (dependencies.output)(&agent_run_core::agent_identity::result(
                 &run,
@@ -3031,8 +2850,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                         return Ok(0);
                     }
                     let result =
-                        hooks::bind::run_hook_bound(&home, &payload, &transport.transport, None)
-                            .await?;
+                        hooks::bind::run_hook(&home, &payload, &transport.transport, None).await?;
                     (dependencies.output)(
                         &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
                     )?;
