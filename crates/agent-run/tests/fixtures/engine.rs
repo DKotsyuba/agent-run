@@ -176,7 +176,7 @@ fn worker_report(args: &[String]) {
             let roster: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
             let mut names: Vec<&str>=roster["result"]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect();
             names.sort_unstable();
-            assert_eq!(names,["notify_orchestrator","pool_post","pool_propose","pool_read","pool_vote"]);
+            assert_eq!(names,["notify_orchestrator"]);
             frame::write(&mut input,&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"notify_orchestrator","arguments":{"request_id":"fixture-report","kind":"risk","message":"Fixture material finding"}}}),socket::MAX_FRAME).await.unwrap();
             let reply: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
             assert_ne!(reply["result"]["isError"],true,"{reply}");
@@ -187,147 +187,6 @@ fn worker_report(args: &[String]) {
         }).await.expect("bounded worker MCP fixture");
     });
 }
-/// Scripted pool member over the real private worker MCP boundary: confirms the
-/// five-tool catalog, reads the pool log, the lead proposes, every member votes
-/// ready on the current proposal, and the child then exits. Bounded to twenty
-/// seconds so a lost peer still ends this child finitely.
-fn pool_script(args: &[String], lead: bool) {
-    let config: Value = serde_json::from_str(
-        &std::fs::read_to_string(argument(args, "--mcp-config").expect("worker config path"))
-            .unwrap(),
-    )
-    .unwrap();
-    let server = &config["mcpServers"]["agent_run_worker"];
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        use agent_run::transport::{frame, socket};
-        use std::process::Stdio;
-        use tokio::io::BufReader;
-        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap()).envs(server_env(server))
-            .args(server["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut input = child.stdin.take().unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        tokio::time::timeout(Duration::from_secs(20), async {
-            let mut next_id = 0u64;
-            let mut request = |method: &str, params: Value| {
-                next_id += 1;
-                json!({"jsonrpc":"2.0","id":next_id,"method":method,"params":params})
-            };
-            frame::write(&mut input, &request("initialize", json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pool-fixture","version":"1"}})), socket::MAX_FRAME).await.unwrap();
-            frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap();
-            frame::write(&mut input, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}), socket::MAX_FRAME).await.unwrap();
-            frame::write(&mut input, &request("tools/list", json!({})), socket::MAX_FRAME).await.unwrap();
-            let roster: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-            let mut names: Vec<_> = roster["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
-            names.sort();
-            assert_eq!(names, ["notify_orchestrator", "pool_post", "pool_propose", "pool_read", "pool_vote"]);
-            let mut call = |name: &str, arguments: Value| {
-                request("tools/call", json!({"name":name,"arguments":arguments}))
-            };
-            let (mut proposed, mut voted) = (false, false);
-            let mut transcript = String::new();
-            while !voted {
-                frame::write(&mut input, &call("pool_read", json!({"after_seq":0,"limit":50,"wait_seconds":1})), socket::MAX_FRAME).await.unwrap();
-                let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-                let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
-                transcript.push_str(&text);
-                let proposal = text.split("Current proposal #").nth(1).and_then(|rest| {
-                    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok()
-                });
-                match proposal {
-                    None if lead && !proposed => {
-                        frame::write(&mut input, &call("pool_propose", json!({"request_id":"fixture-proposal","message":"fixture result is ready","snapshot":"commit abc123"})), socket::MAX_FRAME).await.unwrap();
-                        let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-                        assert_ne!(reply["result"]["isError"], true, "{reply}");
-                        proposed = true;
-                    }
-                    Some(seq) => {
-                        frame::write(&mut input, &call("pool_vote", json!({"request_id":"fixture-vote","proposal_seq":seq,"decision":"ready","checks":[{"criterion_id":"goal","status":"met","evidence":"fixture verified"}]})), socket::MAX_FRAME).await.unwrap();
-                        let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-                        assert_ne!(reply["result"]["isError"], true, "{reply}");
-                        voted = true;
-                    }
-                    None => {}
-                }
-            }
-            std::fs::write(if lead { "pool-script-lead.txt" } else { "pool-script-peer.txt" }, transcript).unwrap();
-            drop(input);
-            assert!(child.wait().await.unwrap().success());
-        })
-        .await
-        .expect("bounded pool member fixture");
-    });
-}
-
-/// Keeps an independent fixture active across mixed admission, reads its new
-/// live membership through the already running private MCP, and posts the exact
-/// broker challenge with a useful summary. The native work/session is unchanged.
-/// All I/O and the owned MCP child lifetime are finite; only test markers persist.
-fn pool_enroll(args: &[String]) {
-    let config: Value = serde_json::from_str(
-        &std::fs::read_to_string(argument(args, "--mcp-config").expect("worker config path"))
-            .unwrap(),
-    )
-    .unwrap();
-    let server = &config["mcpServers"]["agent_run_worker"];
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        use agent_run::transport::{frame,socket};
-        use std::process::Stdio;
-        let mut child=tokio::process::Command::new(server["command"].as_str().unwrap()).envs(server_env(server))
-            .args(server["args"].as_array().unwrap().iter().map(|a|a.as_str().unwrap()))
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
-        let mut input=child.stdin.take().unwrap();
-        let mut output=tokio::io::BufReader::new(child.stdout.take().unwrap());
-        let result=tokio::time::timeout(Duration::from_secs(20),async {
-            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"enrollment-fixture","version":"1"}}}),socket::MAX_FRAME).await.unwrap();
-            frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap();
-            frame::write(&mut input,&json!({"jsonrpc":"2.0","method":"notifications/initialized"}),socket::MAX_FRAME).await.unwrap();
-            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),socket::MAX_FRAME).await.unwrap();
-            let listed:Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(),5);
-            std::fs::write("enrollment-worker-ready","five-tool MCP initialized").unwrap();
-            let mut id=2;
-            loop {
-                id+=1;
-                frame::write(&mut input,&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"pool_read","arguments":{"after_seq":0,"limit":50}}}),socket::MAX_FRAME).await.unwrap();
-                let reply:Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-                let text=reply["result"]["content"][0]["text"].as_str().unwrap_or_default();
-                // This is an offline model emulator interpreting its private
-                // tool result, never a production broker control parser.
-                let key=text.split("request_id=").nth(1).map(|s|s.split_whitespace().next().unwrap());
-                if let Some(key)=key {
-                    id+=1;
-                    frame::write(&mut input,&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"pool_post","arguments":{"request_id":key,"message":"I read the pool context and continue the original independent review."}}}),socket::MAX_FRAME).await.unwrap();
-                    let ack:Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-                    assert_ne!(ack["result"]["isError"],true,"{ack}");
-                    assert!(ack.get("error").is_none(),"{ack}");
-                    std::fs::write("enrollment-acked","current attempt acknowledged").unwrap();
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(40)).await;
-            }
-            while !std::path::Path::new("enrollment-release").exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }).await;
-        drop(input);
-        if result.is_err() { let _=child.kill().await; }
-        if tokio::time::timeout(Duration::from_secs(2),child.wait()).await.is_err() {
-            child.kill().await.unwrap();child.wait().await.unwrap();
-        }
-        result.expect("bounded active enrollment fixture");
-    });
-}
-
 /// Blocks until the marker file exists in the current workdir, bounded to
 /// twenty seconds so a lost test driver still ends this child finitely.
 fn wait_marker(name: &str) {
@@ -362,8 +221,7 @@ fn control_input() -> Value {
 /// statement refusal stops only its own execution; no provider/model is called.
 /// Runs offline Codex/Claude protocol scenarios selected by CLI or streamed task input.
 /// Reads synthetic MCP configuration, emits flushed native frames, and creates owned
-/// fixture markers/children with finite scenario waits. Pool text becomes visible only
-/// after its entire staging file is written. Invalid input or fixture I/O panics;
+/// fixture markers/children with finite scenario waits. Invalid input or fixture I/O panics;
 /// no provider endpoint is contacted and task text is never executed.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -483,22 +341,6 @@ fn main() {
         .cloned()
         .unwrap_or(Value::Null);
     let initial_input_id = result_input.clone();
-    // Pool fixtures record the exact first-turn text this child received, as
-    // proof that every peer identity was already committed when it started.
-    if task.contains("fixture:pool-observe") {
-        // Publish only a complete record; parallel peers use separate staging names.
-        let pending = format!(".pool-observed-{}.pending", uuid::Uuid::new_v4());
-        let mut record = std::fs::File::create(&pending).expect("fixture pool record");
-        if task.contains("fixture:pool-observe-publication-barrier") {
-            std::fs::write("pool-publication-staged", "record opened").unwrap();
-            wait_marker("pool-publication-release");
-        }
-        record
-            .write_all(task.as_bytes())
-            .expect("fixture pool text");
-        drop(record);
-        std::fs::rename(pending, "pool-observed.txt").expect("fixture pool publication");
-    }
     // Finite cohort barrier for the real-broker load fixture. No paid turn,
     // external signal, credential read or unrelated process is involved.
     if task == "fixture:load-barrier" {
@@ -736,18 +578,6 @@ fn main() {
     }
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
-    }
-    if task == "fixture:pool-enroll" {
-        pool_enroll(&args);
-    }
-    if task.contains("fixture:pool-script") {
-        pool_script(&args, task.contains("fixture:pool-script lead"));
-        // The test releases both workers only after their pool inputs drain.
-        wait_marker("pool-script-release");
-        assert!(
-            std::path::Path::new("pool-script-release").exists(),
-            "pool fixture was not released"
-        );
     }
     if task == "fixture:worker-notify" {
         record_tool_environment();
