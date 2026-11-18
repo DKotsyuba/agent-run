@@ -1026,13 +1026,9 @@ impl OwnedProcess {
         #[cfg(target_os = "linux")]
         let admission = subreaper_active().then(adoption::lock);
         #[cfg(target_os = "linux")]
-        // Nothing is adopted while a spawn is being admitted: its forked child
-        // may exist before it is registered.
         let adopting = admission.as_ref().is_some_and(|state| {
-            !state.admitting()
-                && self
-                    .exclusive
-                    .is_some_and(|generation| generation == state.generation())
+            self.exclusive
+                .is_some_and(|generation| generation == state.generation())
         });
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {

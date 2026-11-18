@@ -234,7 +234,10 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
 ///
 /// Recovery evidence comes first and does not depend on the writer: the same
 /// private per-attempt recovery receipt ordinary cleanup seals is written with
-/// the captured identities before cleanup and again with the cleanup result.
+/// the captured identities before cleanup and again with the cleanup result,
+/// each before the corresponding SQLite write is awaited. As for ordinary
+/// cleanup, the receipt is investigation evidence; broker recovery acts only
+/// on SQLite ownership rows (see docs/process-identity.md).
 /// The exact root is recorded as the attempt's process (so the attempt can
 /// never be certified as never spawned) and the captured tree is persisted,
 /// each independently of the others' success. The standard bounded cleanup
@@ -282,16 +285,8 @@ async fn abandon_started_launch(
         None => false,
     };
     let outcome = started.cleanup(Duration::from_secs(2)).await;
-    if let Some(snapshot) = outcome.snapshot.clone() {
-        persisted &= persist::ownership_future(
-            store.producer(),
-            attempt.to_owned(),
-            snapshot,
-            persist::CRITICAL_BUDGET,
-        )
-        .await
-        .is_ok();
-    }
+    // The final receipt is sealed before any further SQLite write is awaited,
+    // so the cleanup result survives an unavailable or hanging writer.
     receipt &= retain_cleanup_evidence(
         agent_dir,
         attempt,
@@ -302,6 +297,16 @@ async fn abandon_started_launch(
         system,
     )
     .is_ok();
+    if let Some(snapshot) = outcome.snapshot.clone() {
+        persisted &= persist::ownership_future(
+            store.producer(),
+            attempt.to_owned(),
+            snapshot,
+            persist::CRITICAL_BUDGET,
+        )
+        .await
+        .is_ok();
+    }
     let released = root
         && persisted
         && receipt

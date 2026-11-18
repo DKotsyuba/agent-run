@@ -1969,6 +1969,36 @@ fn receipt_holds(receipt: &serde_json::Value, pids: &[i32]) -> bool {
         .all(|pid| members.iter().any(|member| member["pid"] == *pid))
 }
 
+/// Run broker recovery for a finished supervisor; returns the attempt's
+/// `ownership_active` and its recorded unresolved-cleanup reasons.
+#[cfg(target_os = "linux")]
+async fn recover(home: &Path, id: &AgentId) -> (i64, Vec<String>) {
+    let service = fixture_service(home.to_path_buf()).await;
+    service.reconcile().await.unwrap();
+    service.reconcile().await.unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let active = store
+        .conn
+        .query_row(
+            "SELECT ownership_active FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reasons = store
+        .conn
+        .prepare(
+            "SELECT json_extract(data_json,'$.reason') FROM events \
+             WHERE agent_id=? AND kind='attempt_cleanup_unresolved'",
+        )
+        .unwrap()
+        .query_map([id.as_str()], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    (active, reasons)
+}
+
 /// The cleanup verdict recorded for a launch that failed after its start.
 #[cfg(target_os = "linux")]
 fn launch_failure_verdict(home: &Path, id: &AgentId) -> String {
@@ -2028,6 +2058,10 @@ async fn a_launch_failing_after_start_cleans_its_tree_and_is_not_never_spawned()
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+    // Recovery honours the recorded confirmed proof and releases ownership.
+    let (active, reasons) = recover(&home, &id).await;
+    assert_eq!(active, 0, "{reasons:?}");
+    assert!(reasons.is_empty(), "{reasons:?}");
 }
 
 /// When the started root cannot be identified nothing can be proven: the
@@ -2051,6 +2085,11 @@ async fn an_unprovable_started_launch_keeps_ownership() {
     assert!(alive, "an unverified tree was signalled");
     let store = agent_run_store::fixture::open(&home).unwrap();
     assert!(!store.get(&id).unwrap().status.terminal());
+    // Without a recorded identity recovery can prove nothing: it keeps the
+    // attempt owned with a typed blocker instead of releasing it.
+    let (active, reasons) = recover(&home, &id).await;
+    assert_eq!(active, 1);
+    assert_eq!(reasons, vec!["no_process_evidence".to_owned()]);
 }
 
 /// When the writer refuses the captured tree, the confirmed cleanup cannot be
@@ -2089,6 +2128,20 @@ async fn a_refused_ownership_write_keeps_the_started_launch_owned() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+    // Recovery acts on SQLite rows only. With the root recorded but no member
+    // rows it cannot verify descendants after the leader is gone, so it keeps
+    // the attempt owned with a typed blocker; the receipt is for investigation.
+    let (active, reasons) = recover(&home, &id).await;
+    assert_eq!(active, 1, "{reasons:?}");
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        [
+            "leader_gone_descendants_unverifiable",
+            "no_process_evidence"
+        ]
+        .contains(&reasons[0].as_str()),
+        "{reasons:?}"
+    );
 }
 
 /// A second enabled account on `glm-user` and an alias provider binding the

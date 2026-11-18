@@ -36,16 +36,7 @@ static SUBREAPER: AtomicBool = AtomicBool::new(false);
 static STATE: Mutex<State> = Mutex::new(State {
     spawned: Vec::new(),
     generation: 0,
-    admitting: false,
 });
-
-/// Signalled whenever an admission ends.
-#[cfg(target_os = "linux")]
-static ADMITTED: Condvar = Condvar::new();
-
-/// Bound for waiting until another admission ends.
-#[cfg(target_os = "linux")]
-const ADMISSION_WAIT: Duration = Duration::from_secs(30);
 
 /// Lock-free mirror of [`State::generation`] for cadence decisions only.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -53,6 +44,16 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Bound for a forked child to report its PID during registration.
 #[cfg(target_os = "linux")]
 const REPORT_BOUND: Duration = Duration::from_secs(10);
+
+/// The PID-report bound in effect (shortened only by unit tests).
+#[cfg(target_os = "linux")]
+fn report_bound() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = std::num::NonZeroU64::new(tests::REPORT_BOUND_MS.load(Ordering::SeqCst)) {
+        return Duration::from_millis(ms.get());
+    }
+    REPORT_BOUND
+}
 
 /// Default mid-run durable refresh period for an exclusive owner.
 pub const DURABLE_REFRESH: Duration = Duration::from_secs(2);
@@ -71,10 +72,6 @@ pub(super) struct State {
     /// Advanced by every registered spawn.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     generation: u64,
-    /// A spawn is between its clean-boundary check and its registration: its
-    /// forked child may exist unregistered, so nothing is adopted meanwhile.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    admitting: bool,
 }
 
 /// One registered direct child.
@@ -97,17 +94,6 @@ impl State {
     /// The current admission generation.
     pub(super) fn generation(&self) -> u64 {
         self.generation
-    }
-
-    /// Whether a spawn is being admitted right now (adoption must wait).
-    pub(super) fn admitting(&self) -> bool {
-        self.admitting
-    }
-
-    /// End the current admission and wake waiting spawners.
-    fn end_admission(&mut self) {
-        self.admitting = false;
-        ADMITTED.notify_all();
     }
 }
 
@@ -275,40 +261,26 @@ fn spawn_registered_linux(
     unsafe {
         command.pre_exec(move || child_handshake(fds));
     }
-    // Admission: wait for any other admission, then mark this one and check
-    // the clean boundary under the lock. The lock itself is NOT held across
-    // the spawn; the `admitting` mark keeps observers from adopting the
-    // forked child until the registrar registers it and ends the admission.
-    let clean = {
-        let deadline = std::time::Instant::now() + ADMISSION_WAIT;
-        let mut state = lock();
-        while state.admitting {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                return Err(std::io::Error::other("another spawn admission is stuck"));
-            }
-            state = ADMITTED
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-        state.admitting = true;
-        clean_boundary()
-    };
+    // The admission lock is held from the clean-boundary check through the
+    // fork to the registration, so no observer can see the new child
+    // unregistered and no other spawn can interleave. The registrar's bounded
+    // wait for the PID report refuses a child that never reports, which then
+    // never execs, so the spawn returns.
+    let mut state = lock();
+    let clean = clean_boundary();
     let (spawned, registered) = std::thread::scope(|scope| {
-        let registrar = scope.spawn(move || register(report_read, release_write, clean));
+        let registrar_state = &mut *state;
+        let registrar = std::thread::Builder::new()
+            .name("agent-run-registrar".into())
+            .spawn_scoped(scope, move || {
+                register(report_read, release_write, registrar_state, clean)
+            })?;
         let spawned = command.spawn();
         // Without the parent's copies the registrar sees EOF if no child reports.
         drop(report_write);
         drop(release_read);
-        let registered = registrar.join().ok().flatten();
-        // The registrar ends the admission on every path; a panic must too.
-        let mut state = lock();
-        if state.admitting {
-            state.end_admission();
-        }
-        (spawned, registered)
-    });
+        Ok::<_, std::io::Error>((spawned, registrar.join().ok().flatten()))
+    })?;
     drop(command);
     match (spawned, registered) {
         (Ok(child), Some(key)) if u32::try_from(key.0).ok() == Some(child.id()) => {
@@ -317,6 +289,7 @@ fn spawn_registered_linux(
         (Ok(mut child), key) => {
             // Unreachable by the handshake (no release means no exec), but if
             // the program runs unregistered it is ended here, never trusted.
+            drop(state);
             let _ = child.kill();
             reap_later(child, Some(SpawnedChild(key)));
             Err(std::io::Error::other(
@@ -326,7 +299,7 @@ fn spawn_registered_linux(
         (Err(error), key) => {
             // The standard library already waited for the failed child.
             if let Some(key) = key {
-                lock().release(&key);
+                state.release(&key);
             }
             Err(error)
         }
@@ -364,6 +337,12 @@ fn child_handshake(
         libc::close(release_write);
         let pid = libc::getpid().to_ne_bytes();
         let mut sent = 0;
+        // Test-only: a child that never reports (an atomic load is
+        // async-signal-safe).
+        #[cfg(test)]
+        if tests::SKIP_REPORT.load(Ordering::SeqCst) {
+            sent = pid.len();
+        }
         while sent < pid.len() {
             let n = libc::write(report_write, pid[sent..].as_ptr().cast(), pid.len() - sent);
             if n > 0 {
@@ -392,35 +371,29 @@ fn child_handshake(
     }
 }
 
-/// Parent side: read the blocked child's PID, register its exact identity in
-/// a new generation, end the admission, then release the child. Returns the
-/// key, or `None` (leaving the child unreleased, so it never execs) on any
-/// failure; every path ends the admission.
+/// Parent side, under the admission lock: read the blocked child's PID,
+/// register its exact identity in a new generation, then release it. Returns
+/// the key, or `None` (leaving the child unreleased, so it never execs) on any
+/// failure.
 ///
-/// The wait for the PID report is bounded, so a child stuck before reporting
-/// cannot stall other spawns or adoption. Its own launching thread can still
-/// wait inside `Command::spawn` until that child exits or execs: the standard
-/// library offers no bound there, and the PID needed to end it was never
-/// reported. The admission lock is never held during that wait.
+/// The wait for the PID report is bounded ([`REPORT_BOUND`]): a child that
+/// never reports is refused and the spawn returns. A child *stopped* before
+/// exec (for example by SIGSTOP or a tracer) keeps the standard library's
+/// exec-status pipe open, so `Command::spawn` and therefore the admission lock
+/// wait until it continues or dies; the supervisor never stops its children.
 #[cfg(target_os = "linux")]
 fn register(
     report_read: std::os::fd::OwnedFd,
     release_write: std::os::fd::OwnedFd,
+    state: &mut State,
     clean: bool,
 ) -> Option<(i32, String)> {
-    let key = report(report_read);
-    let mut state = lock();
-    let Some(key) = key else {
-        state.end_admission();
-        return None;
-    };
+    let key = report(report_read)?;
     state.admit(key.clone(), clean);
-    state.end_admission();
-    drop(state);
     use std::io::Write;
     if std::fs::File::from(release_write).write_all(&[1]).is_err() {
         // The child cannot exec without the byte; its spawn fails and is reaped.
-        lock().release(&key);
+        state.release(&key);
         return None;
     }
     Some(key)
@@ -436,7 +409,7 @@ fn report(report_read: std::os::fd::OwnedFd) -> Option<(i32, String)> {
         events: libc::POLLIN,
         revents: 0,
     };
-    let deadline = std::time::Instant::now() + REPORT_BOUND;
+    let deadline = std::time::Instant::now() + report_bound();
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         // SAFETY: one valid pollfd for a descriptor this function owns.
@@ -505,10 +478,11 @@ static REAPER: AtomicBool = AtomicBool::new(false);
 ///
 /// The single managed reaping path for children whose owner went away before
 /// their status was collected (a dropped engine transport, an unconfirmed
-/// started launch). The child is never killed and never dropped: one
-/// process-wide reaper thread polls queued children every 100 ms while any are
-/// queued and sleeps otherwise. If that thread cannot be created, the queue is
-/// kept and every later call retries it and polls the queue itself.
+/// started launch). The child is never killed and never dropped while its
+/// exit is uncertain: one process-wide reaper thread polls queued children
+/// every 100 ms while any are queued and sleeps otherwise. If that thread
+/// cannot be created, a task on the current async runtime polls instead (and
+/// keeps retrying the thread); without either, every later call retries.
 pub fn reap_later(child: std::process::Child, claim: Option<SpawnedChild>) {
     LATER
         .lock()
@@ -516,27 +490,78 @@ pub fn reap_later(child: std::process::Child, claim: Option<SpawnedChild>) {
         .push((child, claim));
     LATER_READY.notify_one();
     poll_later();
-    if !REAPER.swap(true, Ordering::SeqCst)
-        && std::thread::Builder::new()
-            .name("agent-run-reaper".into())
-            .spawn(reaper)
-            .is_err()
+    ensure_reaper();
+}
+
+/// Start the reaper thread, or a runtime fallback when it cannot be created.
+fn ensure_reaper() {
+    if REAPER.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("agent-run-reaper".into())
+        .spawn(reaper)
+        .is_ok()
     {
-        REAPER.store(false, Ordering::SeqCst);
+        return;
+    }
+    REAPER.store(false, Ordering::SeqCst);
+    if let Ok(runtime) = tokio::runtime::Handle::try_current()
+        && !FALLBACK.swap(true, Ordering::SeqCst)
+    {
+        runtime.spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let empty = poll_later();
+                if REAPER.load(Ordering::SeqCst) || empty {
+                    break;
+                }
+                ensure_reaper();
+            }
+            FALLBACK.store(false, Ordering::SeqCst);
+        });
     }
 }
 
-/// Reap every queued child that has exited; releases happen outside the queue lock.
+/// Whether a runtime task is polling in place of the reaper thread.
+static FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Whether a queued child's exit is established and its entry may go.
+///
+/// A collected status establishes it. `ECHILD` (another waiter collected the
+/// status) establishes it only when the registered identity is provably gone
+/// (the PID is absent or names another start token); an unregistered entry
+/// then has nothing left to protect. Any other error keeps the entry.
+fn exit_established(child: &mut std::process::Child, claim: Option<&SpawnedChild>) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+            match claim.and_then(|claim| claim.0.as_ref()) {
+                None => true,
+                Some((pid, token)) => super::inspect(*pid).map_or_else(
+                    |error| matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)),
+                    |now| now.token != *token,
+                ),
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Reap every queued child whose exit is established; releases happen outside
+/// the queue lock. Returns whether the queue is empty.
 fn poll_later() -> bool {
     let mut done = Vec::new();
     let empty = {
         let mut queue = LATER.lock().unwrap_or_else(PoisonError::into_inner);
         let mut index = 0;
         while index < queue.len() {
-            match queue[index].0.try_wait() {
-                Ok(None) => index += 1,
-                // Exited, or no longer this process's child: nothing to wait for.
-                Ok(Some(_)) | Err(_) => done.push(queue.swap_remove(index).1),
+            let (child, claim) = &mut queue[index];
+            if exit_established(child, claim.as_ref()) {
+                done.push(queue.swap_remove(index).1);
+            } else {
+                index += 1;
             }
         }
         queue.is_empty()
@@ -570,6 +595,11 @@ pub(super) mod tests {
 
     /// Makes the registrar fail after reading the child's PID.
     pub(in crate::process) static FAIL_REGISTRATION: AtomicBool = AtomicBool::new(false);
+    /// Makes the forked child skip its PID report.
+    pub(in crate::process) static SKIP_REPORT: AtomicBool = AtomicBool::new(false);
+    /// Overrides the PID-report bound, in milliseconds (0 keeps the default).
+    pub(in crate::process) static REPORT_BOUND_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     /// Delays the registrar after reading the child's PID, in milliseconds.
     pub(in crate::process) static REGISTRAR_DELAY_MS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
@@ -667,32 +697,56 @@ pub(super) mod tests {
         );
     }
 
-    /// The admission lock is not held across the spawn: while a forked child
-    /// waits for registration, the lock is free and marks an admission in
-    /// flight (so nothing is adopted), and the mark ends with registration.
+    /// The admission lock is held through the registration: an observer that
+    /// asks for it while a forked child waits to be registered only gets it
+    /// once that child is registered, so it never sees the child unregistered.
     #[test]
-    fn the_admission_lock_is_free_while_a_spawn_is_in_flight() {
+    fn an_observer_never_sees_a_forked_child_unregistered() {
+        isolated("an_observer_never_sees_a_forked_child_unregistered", || {
+            REGISTRAR_DELAY_MS.store(300, Ordering::SeqCst);
+            let launch = std::thread::spawn(|| gated(command("/bin/sleep", &["30"])));
+            std::thread::sleep(Duration::from_millis(100));
+            let state = lock();
+            let registered = state.spawned.len();
+            drop(state);
+            let (mut child, claim) = launch.join().unwrap().unwrap();
+            REGISTRAR_DELAY_MS.store(0, Ordering::SeqCst);
+            assert_eq!(registered, 1, "the observer ran before the registration");
+            let identity = super::super::inspect(child.id() as i32).unwrap();
+            assert!(lock().registered(&identity));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            claim.reaped();
+        });
+    }
+
+    /// A child that never reports its PID is refused within the report bound:
+    /// it never execs, the spawn returns an error, it is reaped and nothing
+    /// stays registered or admitted.
+    #[test]
+    fn a_child_that_never_reports_is_refused_and_the_spawn_returns() {
         isolated(
-            "the_admission_lock_is_free_while_a_spawn_is_in_flight",
+            "a_child_that_never_reports_is_refused_and_the_spawn_returns",
             || {
-                REGISTRAR_DELAY_MS.store(500, Ordering::SeqCst);
-                let launch = std::thread::spawn(|| gated(command("/bin/sleep", &["30"])));
-                std::thread::sleep(Duration::from_millis(150));
-                let asked = std::time::Instant::now();
-                let state = lock();
-                assert!(asked.elapsed() < Duration::from_millis(100), "lock held");
-                assert!(state.admitting(), "admission in flight");
-                drop(state);
-                let (mut child, claim) = launch.join().unwrap().unwrap();
-                REGISTRAR_DELAY_MS.store(0, Ordering::SeqCst);
-                let identity = super::super::inspect(child.id() as i32).unwrap();
-                let state = lock();
-                assert!(!state.admitting());
-                assert!(state.registered(&identity));
-                drop(state);
-                child.kill().unwrap();
-                child.wait().unwrap();
-                claim.reaped();
+                let marker = std::env::temp_dir().join(format!("silent-{}", std::process::id()));
+                SKIP_REPORT.store(true, Ordering::SeqCst);
+                REPORT_BOUND_MS.store(300, Ordering::SeqCst);
+                let started = std::time::Instant::now();
+                let result = gated(command(
+                    "/bin/sh",
+                    &["-c", &format!("touch '{}'", marker.display())],
+                ));
+                SKIP_REPORT.store(false, Ordering::SeqCst);
+                REPORT_BOUND_MS.store(0, Ordering::SeqCst);
+                assert!(result.is_err(), "the silent child was not refused");
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "spawn not bounded"
+                );
+                assert!(!marker.exists(), "the program ran unregistered");
+                assert!(clean_boundary(), "the refused child was not reaped");
+                assert!(lock().spawned.is_empty());
+                assert_eq!(generation(), 0);
             },
         );
     }
@@ -717,6 +771,35 @@ pub(super) mod tests {
                 assert!(clean_boundary());
             },
         );
+    }
+
+    /// When another waiter took a child's status (`ECHILD`), a registered
+    /// entry stays queued while its registered identity is still alive and is
+    /// released only once that identity is provably gone.
+    #[test]
+    fn an_uncertain_exit_keeps_the_registration_until_the_identity_is_gone() {
+        let mut stolen = command("/bin/sh", &["-c", "exit 0"]).spawn().unwrap();
+        let mut status = 0;
+        let pid = stolen.id() as i32;
+        // SAFETY: waits for this test's own exact child, taking its status.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(
+            stolen.try_wait().is_err(),
+            "ECHILD after the status was taken"
+        );
+        let mut live = command("/bin/sleep", &["30"]).spawn().unwrap();
+        let alive = super::super::inspect(live.id() as i32).unwrap();
+        let claim = SpawnedChild(Some((alive.pid, alive.token.clone())));
+        assert!(
+            !exit_established(&mut stolen, Some(&claim)),
+            "identity still alive"
+        );
+        live.kill().unwrap();
+        live.wait().unwrap();
+        assert!(exit_established(&mut stolen, Some(&claim)), "identity gone");
+        assert!(exit_established(&mut stolen, None), "nothing registered");
+        std::mem::forget(claim);
     }
 
     /// Exclusivity follows the kernel's child list, not timing: only a spawn
