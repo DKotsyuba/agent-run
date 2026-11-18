@@ -493,8 +493,10 @@ fn bootstrap_identity_waits_for_exec_of_forked_children() {
         "#!/bin/sh\ncase $1 in -s) echo Darwin ;; -m) echo arm64 ;; esac\n",
     );
     executable(&tools.join("curl"), "#!/bin/sh\nexit 9\n");
-    // Release lookup yields no JSON, so the bootstrap fails after one bounded call.
-    executable(&tools.join("gh"), "#!/bin/sh\nexit 0\n");
+    // The release lookup yields a JSON object that is not a published stable
+    // release, so the bootstrap fails after one bounded call. Empty output is
+    // not used: `jq -e` on empty input exits 0 on older jq versions.
+    executable(&tools.join("gh"), "#!/bin/sh\nprintf '{}\\n'\n");
     let real_ps = ["/bin/ps", "/usr/bin/ps"]
         .into_iter()
         .find(|path| Path::new(path).is_file())
