@@ -17,7 +17,11 @@ mod lifecycle_tail;
 mod process_identity;
 #[path = "../publish.rs"]
 mod publish;
+#[path = "../refresh_cost.rs"]
+mod refresh_cost;
 #[path = "../release.rs"]
 mod release;
 #[path = "../safe_fs.rs"]
 mod safe_fs;
+#[path = "../subreaper.rs"]
+mod subreaper;

@@ -253,7 +253,7 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     // Read raw bytes: the parenthesized command name inherits the executable's
     // filename bytes and is not guaranteed UTF-8 (psutil reads bytes for the
     // same reason), so the line must never be validated as a String.
-    let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+    let stat = read_proc_stat(pid)?;
     let parts = stat_fields(&stat)?;
     let num = |i: usize| {
         std::str::from_utf8(parts.get(i).ok_or_else(proc_field_error)?)
@@ -262,9 +262,40 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
             .map_err(|_| proc_field_error())
     };
     let ticks = num(19)?;
+    let clock = boot_clock()?;
+    Ok(Identity {
+        pid,
+        ppid: num(1)? as i32,
+        group: num(2)? as i32,
+        birth: clock.btime + ticks as f64 / clock.hz,
+        token: format!("linux:{}:{ticks}", clock.boot_id),
+        program: None,
+        zombie: parts
+            .first()
+            .is_some_and(|state| *state == b"Z" || *state == b"X"),
+    })
+}
+/// Boot-constant Linux facts behind every process token and birth time.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq)]
+struct BootClock {
+    /// Trimmed `/proc/sys/kernel/random/boot_id`, the token's boot fence.
+    boot_id: String,
+    /// `btime` from `/proc/stat`: boot time in Unix seconds.
+    btime: f64,
+    /// `_SC_CLK_TCK`, the unit of the stat start-time field.
+    hz: f64,
+}
+
+/// Read the boot identity, boot time and clock tick rate from procfs.
+///
+/// Errors are returned unchanged so callers keep treating unavailable evidence
+/// as unknown rather than death.
+#[cfg(target_os = "linux")]
+fn read_boot_clock() -> std::io::Result<BootClock> {
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let clock = std::fs::read_to_string("/proc/stat")?;
-    let epoch = clock
+    let btime = clock
         .lines()
         .find_map(|s| s.strip_prefix("btime "))
         .and_then(|s| s.parse::<f64>().ok())
@@ -274,17 +305,38 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     if hz <= 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(Identity {
-        pid,
-        ppid: num(1)? as i32,
-        group: num(2)? as i32,
-        birth: epoch + ticks as f64 / hz as f64,
-        token: format!("linux:{}:{ticks}", boot.trim()),
-        program: None,
-        zombie: parts
-            .first()
-            .is_some_and(|state| *state == b"Z" || *state == b"X"),
+    Ok(BootClock {
+        boot_id: boot.trim().to_owned(),
+        btime,
+        hz: hz as f64,
     })
+}
+
+/// Return the boot facts read once per process; they cannot change before reboot.
+///
+/// Before this cache every [`inspect`] re-read the whole kernel-generated
+/// `/proc/stat` (several KiB) and `boot_id`, which dominated the cost of the
+/// supervisor's process snapshots. A failed read is not cached and is retried.
+/// Within one process this also keeps `birth` stable for a PID generation even
+/// if the wall clock is stepped, so exact `birth` comparisons stay consistent.
+#[cfg(target_os = "linux")]
+fn boot_clock() -> std::io::Result<&'static BootClock> {
+    static CLOCK: std::sync::OnceLock<BootClock> = std::sync::OnceLock::new();
+    if let Some(clock) = CLOCK.get() {
+        return Ok(clock);
+    }
+    let clock = read_boot_clock()?;
+    Ok(CLOCK.get_or_init(|| clock))
+}
+
+/// Read one `/proc/<pid>/stat` line with one open and two reads, without the
+/// size probe and repeated small reads `std::fs::read` performs on procfs.
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: i32) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut stat = Vec::with_capacity(1024);
+    std::fs::File::open(format!("/proc/{pid}/stat"))?.read_to_end(&mut stat)?;
+    Ok(stat)
 }
 /// Split one `/proc/<pid>/stat` line into the fields after the command name.
 ///
@@ -741,6 +793,36 @@ fn with_program(mut identity: Identity) -> Identity {
     identity
 }
 
+mod adoption;
+pub use adoption::{
+    DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnedChild, become_subreaper,
+    durable_refresh_interval, pin_durable_refresh_interval, reap_later, spawn_registered,
+    subreaper_active,
+};
+
+/// Per-refresh memo of [`observe`] verdicts for captured parents.
+///
+/// Keys are the captured `(pid, token)`, so a recycled PID with a different
+/// token is a distinct key and is probed (and rejected) on its own.
+#[derive(Default)]
+struct ParentLiveness(BTreeMap<(i32, String), bool>);
+impl ParentLiveness {
+    /// Record one verdict already obtained for this exact identity.
+    fn record(&mut self, pid: i32, token: &str, alive: bool) {
+        self.0.insert((pid, token.to_owned()), alive);
+    }
+    /// Return whether `parent` observes alive, probing it at most once per memo.
+    fn alive(&mut self, parent: &Identity) -> bool {
+        if let Some(alive) = self.0.get(&(parent.pid, parent.token.clone())) {
+            return *alive;
+        }
+        let alive = observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
+            == ProcessState::Alive;
+        self.record(parent.pid, &parent.token, alive);
+        alive
+    }
+}
+
 /// PID-reuse-aware ownership evidence for one child process group.
 pub struct OwnedProcess {
     /// Captured identity of the group leader, when readable at spawn time.
@@ -756,6 +838,10 @@ pub struct OwnedProcess {
     /// False means no descendant set was ever verified, so cleanup reports the
     /// descendant scope as unknown rather than clean.
     descendants_observed: bool,
+    /// Admission generation in which this owner's leader was spawned as the
+    /// only live tree of a subreaper process; orphans are adopted only while
+    /// it is still the current generation.
+    exclusive: Option<u64>,
 }
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
@@ -775,6 +861,10 @@ impl OwnedProcess {
             .collect();
         let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
         Self {
+            exclusive: leader
+                .as_ref()
+                .filter(|_| subreaper_active())
+                .and_then(adoption::exclusive_generation),
             leader,
             pid,
             captured: known.keys().cloned().collect(),
@@ -795,6 +885,7 @@ impl OwnedProcess {
             leader: Some(leader),
             pid,
             descendants_observed: false,
+            exclusive: None,
         }
     }
     /// Exports captured identities without probing or changing the tree; absent root evidence returns None.
@@ -879,6 +970,7 @@ impl OwnedProcess {
             captured: known.keys().cloned().collect(),
             known,
             descendants_observed: snapshot.descendants_observed,
+            exclusive: None,
         })
     }
     /// Record descendants visible from a complete native process snapshot.
@@ -899,6 +991,15 @@ impl OwnedProcess {
         let Ok(all) = processes() else {
             return;
         };
+        self.refresh_from(&all);
+    }
+    /// Expand captured ownership from one complete native snapshot.
+    ///
+    /// Each known parent is observed at most once per call, after the snapshot,
+    /// exactly as [`observe`] would report it; the verdict is keyed by the
+    /// parent's `(pid, token)`, so a reused PID carrying another token is a
+    /// different key and never inherits a live verdict.
+    fn refresh_from(&mut self, all: &[Identity]) {
         let leader_state = self
             .leader
             .as_ref()
@@ -910,20 +1011,47 @@ impl OwnedProcess {
         let leader_owned = leader_state == Some(ProcessState::Alive);
         #[cfg(not(target_os = "linux"))]
         let leader_owned = matches!(leader_state, Some(ProcessState::Alive | ProcessState::Dead));
+        let mut parents = ParentLiveness::default();
+        if let (Some(leader), Some(state)) = (&self.leader, leader_state)
+            && self
+                .known
+                .get(&(leader.pid, leader.token.clone()))
+                .is_some_and(|root| root.birth == leader.birth)
+        {
+            // The leader's own observation is the same probe with the same evidence.
+            parents.record(leader.pid, &leader.token, state == ProcessState::Alive);
+        }
+        // Adoption, expansion and reaping hold the admission lock, so no spawn
+        // is admitted (and mistaken for an orphan) while they decide.
+        #[cfg(target_os = "linux")]
+        let admission = subreaper_active().then(adoption::lock);
+        #[cfg(target_os = "linux")]
+        let adopting = admission.as_ref().is_some_and(|state| {
+            self.exclusive
+                .is_some_and(|generation| generation == state.generation())
+        });
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {
             let mut changed = false;
-            for p in &all {
-                let child = self
-                    .known
-                    .range((p.ppid, String::new())..)
-                    .take_while(|((pid, _), _)| *pid == p.ppid)
-                    .any(|(_, parent)| {
-                        observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
-                            == ProcessState::Alive
-                    });
+            for p in all {
+                if self.knows(p) {
+                    continue;
+                }
                 let in_group = leader_owned && p.group == self.pid;
-                if (child || in_group) && !self.known.contains_key(&(p.pid, p.token.clone())) {
+                // An exclusive owner's adopted orphan is reachable by parentage from
+                // this process; registered spawns are never orphans.
+                #[cfg(target_os = "linux")]
+                let in_group = in_group
+                    || (adopting
+                        && p.ppid == std::process::id() as i32
+                        && admission.as_ref().is_some_and(|state| !state.registered(p)));
+                let child = in_group
+                    || self
+                        .known
+                        .range((p.ppid, String::new())..)
+                        .take_while(|((pid, _), _)| *pid == p.ppid)
+                        .any(|(_, parent)| parents.alive(parent));
+                if child {
                     let key = (p.pid, p.token.clone());
                     self.captured.push(key.clone());
                     self.known.insert(key, with_program(p.clone()));
@@ -934,6 +1062,96 @@ impl OwnedProcess {
                 break;
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(state) = &admission {
+            self.reap_captured(state, all);
+        }
+    }
+    /// Reap this owner's captured zombies that are adopted children of this process.
+    ///
+    /// Runs under the admission lock. Only an exact captured `(pid, token)` is
+    /// reaped, after re-inspection shows it is still a zombie child of this
+    /// process and not a registered spawn, with `waitpid(pid, WNOHANG)` on that
+    /// exact PID. Its original parent is gone and a registered spawn's status
+    /// belongs to its spawner, so no other waiter exists; an unreaped child's
+    /// PID cannot be reused. `waitpid(-1)` is never used, and orphans this
+    /// owner never captured are left alone. A reaped member observes as dead.
+    #[cfg(target_os = "linux")]
+    fn reap_captured(&self, state: &adoption::State, all: &[Identity]) {
+        let me = std::process::id() as i32;
+        for p in all.iter().filter(|p| p.ppid == me && p.zombie) {
+            if self.knows(p) {
+                self.reap_if_adopted_zombie(state, p);
+            }
+        }
+    }
+    /// Reap every captured member that is now an adopted zombie of this process.
+    ///
+    /// The final step before this owner is released; cleanup ends with it and
+    /// an owner dropped without cleanup should call it first:
+    /// a member can exit after the last settling snapshot, observe as dead in
+    /// the cleanup proof and would otherwise stay an unreaped zombie child,
+    /// which blocks the next spawn's clean boundary. Same exact checks as
+    /// `reap_captured`, driven by the captured identities instead of a
+    /// process snapshot.
+    /// Without an active subreaper (and on macOS) this does nothing.
+    pub fn reap_captured_zombies(&self) {
+        #[cfg(target_os = "linux")]
+        if subreaper_active() {
+            self.reap_captured_zombies_linux();
+        }
+    }
+    /// Linux body of [`Self::reap_captured_zombies`].
+    #[cfg(target_os = "linux")]
+    fn reap_captured_zombies_linux(&self) {
+        let state = adoption::lock();
+        for member in self.known.values() {
+            self.reap_if_adopted_zombie(&state, member);
+        }
+    }
+    /// Reap `member` iff it is exactly a captured, unregistered zombie child of
+    /// this process and not this owner's leader. Runs under the admission lock.
+    #[cfg(target_os = "linux")]
+    fn reap_if_adopted_zombie(&self, state: &adoption::State, member: &Identity) {
+        let me = std::process::id() as i32;
+        if member.pid <= 1
+            || self
+                .leader
+                .as_ref()
+                .is_some_and(|leader| leader.pid == member.pid && leader.token == member.token)
+        {
+            return;
+        }
+        let Ok(now) = inspect(member.pid) else {
+            return;
+        };
+        if now.zombie && now.ppid == me && now.token == member.token && !state.registered(&now) {
+            let mut status = 0;
+            // SAFETY: exact positive PID of an unreaped, captured, unregistered zombie child; WNOHANG never blocks.
+            unsafe { libc::waitpid(member.pid, &mut status, libc::WNOHANG) };
+        }
+    }
+    /// Period until the next mid-run refresh of this owner.
+    ///
+    /// An exclusive owner of a subreaper process reaches every orphan of its
+    /// tree at termination points, so its mid-run refresh only keeps durable
+    /// crash-recovery evidence and zombie reaping current
+    /// ([`durable_refresh_interval`]). Every other owner keeps
+    /// [`POLLING_REFRESH`], because a descendant which orphans before a refresh
+    /// cannot be attributed to it later.
+    pub fn refresh_interval(&self) -> std::time::Duration {
+        if subreaper_active() && self.exclusive.is_some_and(|g| g == adoption::generation()) {
+            durable_refresh_interval()
+        } else {
+            POLLING_REFRESH
+        }
+    }
+    /// Return whether this exact PID generation is already captured, without allocating a key.
+    fn knows(&self, process: &Identity) -> bool {
+        self.known
+            .range((process.pid, String::new())..)
+            .take_while(|((pid, _), _)| *pid == process.pid)
+            .any(|((_, token), _)| *token == process.token)
     }
     /// Signal only a currently verified owned process group.
     pub fn signal(&mut self, sig: i32) -> Result<bool> {
@@ -953,7 +1171,8 @@ impl OwnedProcess {
         }
         Ok(signalled)
     }
-    /// Observe a captured descendant by its exact PID, native token and birth time.
+    /// Observe a captured descendant by its exact PID and native token (birth
+    /// time only for legacy evidence without a native token).
     /// Missing evidence stays unknown; a matching zombie is dead, not signallable.
     fn descendant_state(process: &Identity) -> ProcessState {
         if process.pid <= 1 || process.token.is_empty() || !process.birth.is_finite() {
@@ -961,12 +1180,11 @@ impl OwnedProcess {
         }
         match inspect(process.pid) {
             Ok(actual) if actual.pid != process.pid => ProcessState::Unknown,
-            Ok(actual) if actual.token != process.token || actual.birth != process.birth => {
-                ProcessState::Reused
-            }
-            Ok(actual) if actual.zombie => ProcessState::Dead,
-            Ok(_) => ProcessState::Alive,
-            Err(error) => verdict(Err(error), Some(&process.token), Some(process.birth)),
+            // A native token is the exact identity; `birth` decides only for
+            // legacy evidence without one. Linux birth depends on the wall-clock
+            // boot time, which another process can compute differently after a
+            // clock step, and must not turn a live exact match into reuse.
+            observed => verdict(observed, Some(&process.token), Some(process.birth)),
         }
     }
     /// Signal each still-live captured descendant after a fresh exact identity check.
@@ -1016,9 +1234,17 @@ impl OwnedProcess {
     }
     /// Refresh parentage and check whether group and descendant evidence can settle.
     /// An absent descendant snapshot cannot confirm cleanup but needs no extra wait.
+    ///
+    /// One native snapshot serves both the parentage refresh and the group
+    /// check. This only decides when waiting may stop: the final cleanup proof
+    /// in [`Self::evidence`] still takes its own fresh snapshot.
     fn settled(&mut self) -> bool {
-        self.refresh();
-        self.gone() && self.descendants_gone() != Some(false)
+        let all = processes().ok();
+        if let Some(all) = &all {
+            self.refresh_from(all);
+        }
+        self.group_observation_with(all.as_deref()) == GroupObservation::Gone
+            && self.descendants_gone() != Some(false)
     }
     /// Return whether the leader and its original group are both proven absent.
     pub fn gone(&self) -> bool {
@@ -1026,6 +1252,11 @@ impl OwnedProcess {
     }
     /// Observe the captured leader and its original group without sending a signal.
     fn group_observation(&self) -> GroupObservation {
+        self.group_observation_with(None)
+    }
+    /// Observe the leader freshly, then judge the group from `snapshot` when
+    /// given, otherwise from a new native snapshot taken after the leader probe.
+    fn group_observation_with(&self, snapshot: Option<&[Identity]>) -> GroupObservation {
         match &self.leader {
             Some(p) => {
                 let state = observe(Some(p.pid), Some(&p.token), Some(p.birth));
@@ -1047,7 +1278,15 @@ impl OwnedProcess {
         if self.pid <= 1 {
             return GroupObservation::Unknown;
         }
-        if let Ok(processes) = processes() {
+        let fresh;
+        let processes = match snapshot {
+            Some(snapshot) => Ok(snapshot),
+            None => {
+                fresh = processes();
+                fresh.as_deref()
+            }
+        };
+        if let Ok(processes) = processes {
             return if processes
                 .iter()
                 .any(|process| process.group == self.pid && !process.zombie)
@@ -1110,6 +1349,7 @@ impl OwnedProcess {
                 .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
                 || std::time::Instant::now() >= settle_deadline
             {
+                self.reap_captured_zombies();
                 return result;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1152,6 +1392,7 @@ impl OwnedProcess {
                 .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
                 || tokio::time::Instant::now() >= settle_deadline
             {
+                self.reap_captured_zombies();
                 return result;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1201,6 +1442,152 @@ mod tests {
         );
         leader.token.push('0');
         assert!(kernel_incarnation(&leader).is_err());
+    }
+
+    /// After a wall-clock step another process computes a different Linux
+    /// birth for the same PID generation; the exact native token still proves
+    /// the descendant alive, so cleanup is never confirmed while it runs.
+    /// Legacy evidence without a native token keeps the exact birth comparison.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_native_token_outranks_a_stepped_birth() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let leader = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let helper = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let mut stepped = inspect(helper.0.id() as i32).unwrap();
+        let exact_birth = stepped.birth;
+        stepped.birth += 3600.0;
+        assert_eq!(
+            OwnedProcess::descendant_state(&stepped),
+            ProcessState::Alive
+        );
+        let mut owned = OwnedProcess::capture(leader.0.id() as i32);
+        assert!(owned.descendants_observed);
+        owned
+            .known
+            .insert((stepped.pid, stepped.token.clone()), stepped.clone());
+        assert_eq!(
+            owned.descendants_gone(),
+            Some(false),
+            "a live descendant is not gone"
+        );
+
+        let mut legacy = stepped;
+        legacy.token = "legacy-psutil".into();
+        legacy.birth = exact_birth;
+        assert_eq!(OwnedProcess::descendant_state(&legacy), ProcessState::Alive);
+        legacy.birth += 3600.0;
+        assert_eq!(
+            OwnedProcess::descendant_state(&legacy),
+            ProcessState::Reused
+        );
+    }
+
+    /// Boot facts are read once, match a fresh procfs read and keep the token format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_boot_clock_matches_procfs_and_token_format() {
+        let cached = boot_clock().unwrap();
+        assert!(std::ptr::eq(cached, boot_clock().unwrap()), "read once");
+        let fresh = read_boot_clock().unwrap();
+        assert_eq!(*cached, fresh);
+        assert_eq!(
+            fresh.boot_id,
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+        );
+        let me = inspect(std::process::id() as i32).unwrap();
+        let stat = std::fs::read(format!("/proc/{}/stat", me.pid)).unwrap();
+        let ticks: u64 = std::str::from_utf8(stat_fields(&stat).unwrap()[19])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(me.token, format!("linux:{}:{ticks}", fresh.boot_id));
+        assert_eq!(me.birth, fresh.btime + ticks as f64 / fresh.hz);
+        // Counters in the line change between reads; compare identity fields only.
+        let again = read_proc_stat(me.pid).unwrap();
+        let identity = |line: &[u8]| {
+            let fields = stat_fields(line).unwrap();
+            [1, 2, 19].map(|i| fields[i].to_vec())
+        };
+        assert_eq!(identity(&again), identity(&stat));
+    }
+
+    /// A memoized parent verdict is keyed by the exact generation: a recycled
+    /// PID carrying another token is probed separately and never alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memoized_parent_liveness_rejects_a_reused_pid() {
+        let live = inspect(std::process::id() as i32).unwrap();
+        let mut stale = live.clone();
+        stale.token = format!("{}:1", live.token.rsplit_once(':').unwrap().0);
+        let mut parents = ParentLiveness::default();
+        assert!(parents.alive(&live));
+        assert!(!parents.alive(&stale), "same PID, older generation");
+        assert!(parents.alive(&live), "the live verdict is unchanged");
+        // A recorded verdict is reused for its own key only.
+        let mut parents = ParentLiveness::default();
+        parents.record(live.pid, &live.token, true);
+        assert!(!parents.alive(&stale));
+    }
+
+    /// Children of a captured parent whose PID now names another generation
+    /// are not captured; the same children are captured from the live parent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_expands_only_from_the_exact_live_parent_generation() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let child_pid = child.0.id() as i32;
+        let child_identity = inspect(child_pid).unwrap();
+        let live = inspect(std::process::id() as i32).unwrap();
+        let mut stale = live.clone();
+        stale.token = format!("{}:1", live.token.rsplit_once(':').unwrap().0);
+        let captured = |root: &Identity| {
+            let mut owner = OwnedProcess::restore(OwnershipSnapshot {
+                leader: root.clone(),
+                members: vec![root.clone()],
+                descendants_observed: false,
+            })
+            .unwrap();
+            owner.refresh();
+            owner
+                .snapshot()
+                .unwrap()
+                .members
+                .iter()
+                .any(|p| p.pid == child_pid && p.token == child_identity.token)
+        };
+        assert!(!captured(&stale), "a reused parent PID granted ownership");
+        assert!(captured(&live), "the exact live parent owns its child");
     }
 
     /// Procfs init and wildcard-like names never enter a process snapshot.
@@ -1482,7 +1869,9 @@ mod tests {
         assert!(!owned.signal_descendants(libc::SIGTERM));
         assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
 
+        // Legacy evidence without a native token is matched by birth time.
         identity = captured;
+        identity.token = "legacy-psutil".into();
         identity.birth += 1.0;
         assert_eq!(
             OwnedProcess::descendant_state(&identity),

@@ -230,6 +230,105 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
         .map_err(launch_error)
 }
 
+/// End an engine whose launch failed after its program started.
+///
+/// Recovery evidence comes first and does not depend on the writer: the same
+/// private per-attempt recovery receipt ordinary cleanup seals is written with
+/// the captured identities before cleanup and again with the cleanup result,
+/// each before the corresponding SQLite write is awaited. As for ordinary
+/// cleanup, the receipt is investigation evidence; broker recovery acts only
+/// on SQLite ownership rows (see docs/process-identity.md).
+/// The exact root is recorded as the attempt's process (so the attempt can
+/// never be certified as never spawned) and the captured tree is persisted,
+/// each independently of the others' success. The standard bounded cleanup
+/// then runs. Ownership is released only when every piece of evidence was
+/// written, the tree is proven gone and the engine's status was collected;
+/// otherwise it is retained and `cleanup unconfirmed` is reported.
+async fn abandon_started_launch(
+    store: &mut Persist,
+    id: &AgentId,
+    attempt: &str,
+    (agent_dir, system): (&Path, bool),
+    started: adapters::engine_launch::StartedLaunch,
+) -> Error {
+    let failure = || Error::Runtime("engine launch failed after the program started".into());
+    let launch: Result<adapters::EngineResult> = Err(failure());
+    let pending: Result<agent_run_platform::process::Cleanup> =
+        Err(Error::Runtime("engine launch cleanup pending".into()));
+    let initial = started.owner.snapshot();
+    let mut receipt = retain_cleanup_evidence(
+        agent_dir,
+        attempt,
+        initial.clone(),
+        &pending,
+        &launch,
+        None,
+        system,
+    )
+    .is_ok();
+    let root = match started.owner.leader.clone() {
+        Some(leader) => store
+            .provider_process(id, attempt, &leader, None, None)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    let mut persisted = match initial {
+        Some(snapshot) => persist::ownership_future(
+            store.producer(),
+            attempt.to_owned(),
+            snapshot,
+            persist::CRITICAL_BUDGET,
+        )
+        .await
+        .is_ok(),
+        None => false,
+    };
+    let outcome = started.cleanup(Duration::from_secs(2)).await;
+    // The final receipt is sealed before any further SQLite write is awaited,
+    // so the cleanup result survives an unavailable or hanging writer.
+    receipt &= retain_cleanup_evidence(
+        agent_dir,
+        attempt,
+        outcome.snapshot.clone(),
+        &outcome.proof,
+        &launch,
+        None,
+        system,
+    )
+    .is_ok();
+    if let Some(snapshot) = outcome.snapshot.clone() {
+        persisted &= persist::ownership_future(
+            store.producer(),
+            attempt.to_owned(),
+            snapshot,
+            persist::CRITICAL_BUDGET,
+        )
+        .await
+        .is_ok();
+    }
+    let released = root
+        && persisted
+        && receipt
+        && outcome.confirmed
+        && match &outcome.proof {
+            Ok(proof) => store.provider_cleanup(id, attempt, proof).await.is_ok(),
+            Err(_) => false,
+        };
+    let verdict = if released { "confirmed" } else { "unconfirmed" };
+    let _ = store
+        .event_durable(
+            id,
+            "provider_launch_failed_after_start_v1",
+            &json!({"cleanup": verdict, "root_recorded": root,
+                "ownership_persisted": persisted, "receipt_sealed": receipt}),
+        )
+        .await;
+    Error::Runtime(format!(
+        "engine launch failed after the program started; cleanup {verdict}"
+    ))
+}
+
 /// Cleans up a spawned but unauthenticated supervisor off the async runtime.
 async fn abandon(
     started: launch::StartedLaunch,
@@ -292,6 +391,22 @@ fn launch_error(error: launch::LaunchError) -> Error {
 /// class without persisting task text or credentials, including errors whose
 /// owned process prevents finish.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -> Result<()> {
+    // Before any child exists: orphaned engine descendants (double fork,
+    // setsid, nohup) reparent here instead of init, so termination-point
+    // captures reach them and mid-run polling can slow to the durable-evidence
+    // cadence. Refusal (or macOS) keeps the original 200 ms polling. Every
+    // child of this process must be spawned through `process::spawn_registered`
+    // (engine transports do): an unregistered child would look like an orphan.
+    let _ = process::become_subreaper();
+    // Test-only: `<home>/fixture-descendant-refresh-ms` pins the durable
+    // mid-run refresh so cadence-sensitive fixtures stay deterministic.
+    #[cfg(feature = "test-fixtures")]
+    if let Some(ms) = std::fs::read_to_string(home.join("fixture-descendant-refresh-ms"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        process::pin_durable_refresh_interval(Duration::from_millis(ms));
+    }
     if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none() {
         crate::logging::configure(home, "supervisor");
     }
@@ -541,7 +656,7 @@ fn seal_execution_answer(
 fn retain_cleanup_evidence(
     agent_dir: &Path,
     attempt: &str,
-    process: &Process,
+    ownership: Option<process::OwnershipSnapshot>,
     cleanup: &Result<agent_run_platform::process::Cleanup>,
     execution: &Result<adapters::EngineResult>,
     exit: Option<i32>,
@@ -571,7 +686,7 @@ fn retain_cleanup_evidence(
     };
     let diagnostic = execution.as_ref().err().map(execution_error_metadata);
     let data = json!({"version":1,"attempt":attempt,"recorded_at":domain::now(),
-        "terminal_commit":"not_proven_by_receipt","ownership":process.owner.snapshot(),
+        "terminal_commit":"not_proven_by_receipt","ownership":ownership,
         "cleanup":cleanup,"engine_result_available":execution.is_ok(),
         "native_status":execution.as_ref().ok().map(|result|result.outcome.status),
         "candidate":candidate.as_ref().ok().and_then(|proof|proof.as_ref()),
@@ -920,7 +1035,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
     retain_cleanup_evidence(
         &agent_dir,
         &format!("{id}:1"),
-        &process,
+        process.owner.snapshot(),
         &cleanup,
         &execution,
         exit,
@@ -2118,22 +2233,50 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .await;
             }
         }
-        // Process::spawn yields Io only when the OS refused Command::spawn,
-        // before a child exists; other failures retain ownership for recovery.
-        let spawned = if managed_selection.is_some() {
-            Process::spawn_managed(&planned.launch, managed_owner_v2)
+        // Only `NotStarted` proves no engine program runs: an Io error there is
+        // the OS refusing the launch, which may reset the attempt as never
+        // spawned. A launch that failed after the program started is owned:
+        // its root is recorded and its tree cleaned before the error returns.
+        use adapters::engine_launch::{LaunchKind, SpawnError};
+        let kind = if managed_selection.is_some() {
+            LaunchKind::Managed(managed_owner_v2.map(Box::new))
         } else if identity.authority.harness == HarnessId::OpenCode {
-            Process::spawn_lease(&planned.launch)
+            LaunchKind::Lease
         } else {
-            Process::spawn(&planned.launch)
+            LaunchKind::Rpc
         };
-        let mut process = match spawned {
+        // Test-only seams: fail the harness wrapping after the engine started
+        // (once its `wrap-release` marker exists), optionally with an
+        // unidentifiable root.
+        #[cfg(feature = "test-fixtures")]
+        {
+            if home.join("fixture-wrap-failure").exists() {
+                adapters::engine_launch::fixture::fail_next_wrap(
+                    planned.launch.cwd.join("wrap-release"),
+                );
+            }
+            adapters::engine_launch::fixture::hide_next_owner(
+                home.join("fixture-hide-started-owner").exists(),
+            );
+        }
+        let mut process = match Process::launch(&planned.launch, kind) {
             Ok(process) => process,
-            Err(error @ Error::Io(_)) => {
+            Err(SpawnError::NotStarted(error @ Error::Io(_))) => {
                 store.provider_spawn_failed(id, &attempt_id).await?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(SpawnError::NotStarted(error)) => return Err(error),
+            Err(SpawnError::Started(started)) => {
+                let system = identity.system_route.is_some();
+                return Err(abandon_started_launch(
+                    store,
+                    id,
+                    &attempt_id,
+                    (&agent_dir, system),
+                    *started,
+                )
+                .await);
+            }
         };
         let switched = continuing.is_some();
         let execution = async {
@@ -2338,7 +2481,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         retain_cleanup_evidence(
             &agent_dir,
             &attempt_id,
-            &process,
+            process.owner.snapshot(),
             &cleanup,
             &execution,
             exit,

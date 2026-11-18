@@ -57,6 +57,22 @@ temporary=$(mktemp -d "${TMPDIR:-/tmp}/agent-run-install.XXXXXXXX")
 tool_pid= tool_identity= timer_pid= timer_identity= cleanup_unconfirmed=0
 # process_identity PID prints its PPID/birth/command string, or empty if absent.
 process_identity() { LC_ALL=C ps -p "$1" -o stat= -o ppid= -o lstart= -o args= 2>/dev/null | LC_ALL=C awk '$1 !~ /^Z/ { $1=""; sub(/^ /,""); print }'; }
+# exec_identity PID is process_identity for a child just forked as `cmd &`: until
+# the fork execs, ps reports this shell's own args, so capturing at once would bind
+# the stale pre-exec string and later refuse to signal the real command. Poll
+# (bounded, ~5 s) until the child's args differ from this shell's or the child is
+# gone; if the bound expires the pre-exec identity is kept and signalling fails closed.
+exec_identity() {
+    own_args=$(LC_ALL=C ps -p "$$" -o args= 2>/dev/null || :)
+    settle=0
+    while [ "$settle" -lt 250 ]; do
+        child_args=$(LC_ALL=C ps -p "$1" -o args= 2>/dev/null || :)
+        [ "$child_args" = "$own_args" ] || break
+        settle=$((settle + 1))
+        sleep 0.02
+    done
+    process_identity "$1"
+}
 # signal_owned PID IDENTITY SIGNAL signals only an unchanged captured identity.
 # Empty/mismatching identity refuses signalling; this is a local best-effort guard.
 signal_owned() {
@@ -104,7 +120,7 @@ trap 'cleanup_unconfirmed=1; fail "child identity unavailable/changed; cleanup u
 # watchdog also owns/reaps its sleep; cancellation unwinds through cleanup.
 bounded() {
     (ulimit -f 524288; if [ "$1" = gh ]; then GH_HOST=github.com; export GH_HOST; fi; exec "$@") & tool_pid=$!
-    tool_identity=$(process_identity "$tool_pid" || :)
+    tool_identity=$(exec_identity "$tool_pid" || :)
     parent_identity=$(process_identity "$$" || :)
     (
         # Reap only this watchdog's captured sleep child on controlled shutdown.
@@ -122,12 +138,12 @@ bounded() {
         }
         trap timer_cleanup TERM INT HUP
         sleep 180 & sleep_pid=$!
-        sleep_identity=$(process_identity "$sleep_pid" || :)
+        sleep_identity=$(exec_identity "$sleep_pid" || :)
         wait "$sleep_pid"
         sleep_pid=
         if signal_owned "$tool_pid" "$tool_identity" TERM; then
             sleep 1 & sleep_pid=$!
-            sleep_identity=$(process_identity "$sleep_pid" || :)
+            sleep_identity=$(exec_identity "$sleep_pid" || :)
             wait "$sleep_pid"
             sleep_pid=
             if ! child_terminated "$tool_pid"; then

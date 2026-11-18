@@ -370,7 +370,7 @@ fn main() {
     let script = temp.path().join("short-install.sh");
     let shortened=original.replace("sleep 180 &","sleep 1 &")
         .replace("timer_identity=$(process_identity \"$timer_pid\" || :)","timer_identity=$(process_identity \"$timer_pid\" || :)\nprintf '%s\\n' \"$timer_pid\" > \"$TEST_TIMER_PID\"")
-        .replace("sleep_identity=$(process_identity \"$sleep_pid\" || :)","sleep_identity=$(process_identity \"$sleep_pid\" || :)\nprintf '%s\\n' \"$sleep_pid\" >> \"$TEST_SLEEP_PIDS\"");
+        .replace("sleep_identity=$(exec_identity \"$sleep_pid\" || :)","sleep_identity=$(exec_identity \"$sleep_pid\" || :)\nprintf '%s\\n' \"$sleep_pid\" >> \"$TEST_SLEEP_PIDS\"");
     fs::write(&script, shortened).unwrap();
     for cancel in [false, true] {
         let tool_id = temp.path().join(if cancel {
@@ -475,6 +475,84 @@ fn main() {
             assert!(!status.success());
         }
     }
+}
+
+/// Backlog #22: right after `cmd &` and before the exec, `ps` reports the forking
+/// shell's args. A mock `ps` makes the first query of every PID return that stale
+/// pre-exec string (and later queries the real one); the bootstrap must still own,
+/// stop and reap its watchdog sleep instead of retaining scratch as unconfirmed.
+#[test]
+fn bootstrap_identity_waits_for_exec_of_forked_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let tools = temp.path().join("tools");
+    let state = temp.path().join("ps-state");
+    fs::create_dir(&tools).unwrap();
+    fs::create_dir(&state).unwrap();
+    executable(
+        &tools.join("uname"),
+        "#!/bin/sh\ncase $1 in -s) echo Darwin ;; -m) echo arm64 ;; esac\n",
+    );
+    executable(&tools.join("curl"), "#!/bin/sh\nexit 9\n");
+    // The release lookup yields a JSON object that is not a published stable
+    // release, so the bootstrap fails after one bounded call. Empty output is
+    // not used: `jq -e` on empty input exits 0 on older jq versions.
+    executable(&tools.join("gh"), "#!/bin/sh\nprintf '{}\\n'\n");
+    let real_ps = ["/bin/ps", "/usr/bin/ps"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("host ps");
+    executable(
+        &tools.join("ps"),
+        &format!(
+            r#"#!/bin/sh
+real={real_ps}
+case "$*" in
+  "-p $2 -o stat= -o ppid= -o lstart= -o args="|"-p $2 -o args=") ;;
+  *) exec "$real" "$@" ;;
+esac
+if [ -e "{state}/$2" ]; then exec "$real" "$@"; fi
+: > "{state}/$2"
+# First look at a PID: the caller's shell (this mock's parent) has the pre-exec args.
+stale=$("$real" -p "$PPID" -o args=)
+if [ "$3" = -o ] && [ "$4" = args= ]; then printf '%s\n' "$stale"; exit 0; fi
+"$real" "$@" | LC_ALL=C awk -v stale="$stale" '{{ print $1, $2, $3, $4, $5, $6, $7, stale }}'
+"#,
+            state = state.display()
+        ),
+    );
+    let original =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../install.sh")).unwrap();
+    let script = temp.path().join("short-install.sh");
+    // Finite watchdog: a regression orphans only a five-second sleep.
+    fs::write(&script, original.replace("sleep 180 &", "sleep 5 &")).unwrap();
+    let output = Command::new("sh")
+        .arg(&script)
+        .args(["--version", "1.0.0", "--downloader", "curl", "--home"])
+        .arg(temp.path().join("home"))
+        .arg("--bin-dir")
+        .arg(temp.path().join("bin"))
+        .env(
+            "PATH",
+            format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("TMPDIR", temp.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("published stable exact release required"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("cleanup unconfirmed"),
+        "stale pre-exec identity must not block cleanup: {stderr}"
+    );
+    let retained = retained_install_scratch(temp.path());
+    assert!(
+        retained.is_empty(),
+        "installer scratch retained: {retained:?}"
+    );
 }
 
 /// Exercises both downloaders without network access, including integrity and archive rejection.
