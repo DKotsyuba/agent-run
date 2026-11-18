@@ -18,29 +18,89 @@ async fn history_pins_dispatch_lists_and_releases_exact_key() {
     let store = agent_run_store::fixture::initialize(root).unwrap();
     let agent = AgentId::new();
     let pin = PinId::new();
-    store
-        .conn
-        .execute(
-            "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
-            rusqlite::params![pin.as_str(), agent.as_str()],
-        )
-        .unwrap();
+    let managed = PinId::new();
+    // Each pin is minted inside its admitting batch's permanent receipt; the
+    // second belongs to a reserved internal (Pool managed-enrollment) batch.
+    for (request_id, pin) in [("batch-1", &pin), ("p3_internal", &managed)] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                rusqlite::params![pin.as_str(), agent.as_str()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+                rusqlite::params![
+                    request_id,
+                    "a".repeat(64),
+                    json!({"jobs":[{"pin_id":pin}]}).to_string()
+                ],
+            )
+            .unwrap();
+    }
     let writer = common::writer::Harness::start(root);
     let service = Service::new(root.to_owned()).with_writer(writer.broker());
-    let first = agent_run_core::dispatch::call(
+    let first =
+        agent_run_core::dispatch::call(&service, "history_pins_list", json!({"status":"active"}))
+            .await
+            .unwrap();
+    assert_eq!(first["pins"].as_array().unwrap().len(), 2);
+    assert!(
+        !first.to_string().contains("batch-1"),
+        "list hides the proof"
+    );
+    // The removed combined method and its action shape are unknown.
+    let removed = agent_run_core::dispatch::call(
         &service,
         "history_pins",
-        json!({"action":"list","status":"active"}),
+        json!({"action":"release","pin_id":pin}),
     )
     .await
-    .unwrap();
-    assert_eq!(first["pins"].as_array().unwrap().len(), 1);
-    assert_eq!(first["pins"][0]["pin_id"], pin.as_str());
+    .unwrap_err();
+    assert!(removed.to_string().contains("unknown tool"), "{removed}");
+    // No proof, a foreign key, or a reserved internal key never releases.
+    let missing_proof =
+        agent_run_core::dispatch::call(&service, "history_pins_release", json!({"pin_id":pin}))
+            .await
+            .unwrap_err();
+    assert_eq!(missing_proof.machine_code().as_str(), "ValidationError");
+    let foreign = agent_run_core::dispatch::call(
+        &service,
+        "history_pins_release",
+        json!({"pin_id":pin,"request_id":"batch-2"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(foreign.machine_code().as_str(), "RequestConflict");
+    for key in ["p3_internal", "p3c_x"] {
+        let reserved = agent_run_core::dispatch::call(
+            &service,
+            "history_pins_release",
+            json!({"pin_id":managed,"request_id":key}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reserved.machine_code().as_str(), "ValidationError", "{key}");
+    }
+    let managed_by_public_key = agent_run_core::dispatch::call(
+        &service,
+        "history_pins_release",
+        json!({"pin_id":managed,"request_id":"batch-1"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        managed_by_public_key.machine_code().as_str(),
+        "RequestConflict"
+    );
     for already in [false, true] {
         let response = agent_run_core::dispatch::call(
             &service,
-            "history_pins",
-            json!({"action":"release","pin_id":pin}),
+            "history_pins_release",
+            json!({"pin_id":pin,"request_id":"batch-1"}),
         )
         .await
         .unwrap();
@@ -48,36 +108,35 @@ async fn history_pins_dispatch_lists_and_releases_exact_key() {
         assert_eq!(response["status"], "released");
         assert_eq!(response["already_released"], already);
     }
-    let list = agent_run_core::dispatch::call(
-        &service,
-        "history_pins",
-        json!({"action":"list","status":"released"}),
-    )
-    .await
-    .unwrap();
+    let list =
+        agent_run_core::dispatch::call(&service, "history_pins_list", json!({"status":"released"}))
+            .await
+            .unwrap();
+    assert_eq!(list["pins"].as_array().unwrap().len(), 1);
     assert_eq!(list["pins"][0]["agent_id"], agent.as_str());
+    let active =
+        agent_run_core::dispatch::call(&service, "history_pins_list", json!({"status":"active"}))
+            .await
+            .unwrap();
+    assert_eq!(active["pins"][0]["pin_id"], managed.as_str());
     let missing = agent_run_core::dispatch::call(
         &service,
-        "history_pins",
-        json!({"action":"release","pin_id":PinId::new()}),
+        "history_pins_release",
+        json!({"pin_id":PinId::new(),"request_id":"batch-1"}),
     )
     .await
     .unwrap_err();
     assert!(matches!(missing, Error::PinNotFound(_)));
     assert_eq!(missing.machine_code().as_str(), "PinNotFound");
     assert!(
-        agent_run_core::dispatch::call(
-            &service,
-            "history_pins",
-            json!({"action":"list","limit":1001})
-        )
-        .await
-        .is_err()
+        agent_run_core::dispatch::call(&service, "history_pins_list", json!({"limit":1001}))
+            .await
+            .is_err()
     );
     assert!(
         !agent_run_domain::tools::worker_registry()
             .iter()
-            .any(|tool| tool.name == "history_pins")
+            .any(|tool| tool.name.starts_with("history_pins"))
     );
 }
 

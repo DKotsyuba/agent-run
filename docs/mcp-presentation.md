@@ -80,10 +80,8 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 | start, resume | 4096 | 8 displayed MCP selections, plus explicit omitted count | none |
 | cancel, steer, notify_orchestrator, routine errors | 2048 | 8 | none |
 | list_agents | 8192 | 20 | none |
-| limits | 8192 | 20 windows; ranking retains 100 providers and 100 models total | none |
 | transcript | 16384 | 100 | 14336 |
 | answer, doc, delegation_guide | 16384 | none | 14336 |
-| models, capacity_order (call-only compatibility methods) | 16384 | 100 providers and 100 models in total | none |
 
 Admission replies reserve the original request key, whose existing contract
 allows 512 characters; reversible quoting can expand it beyond 2 KiB. These
@@ -99,7 +97,7 @@ writer. Every page row is displayed in source order or the entire page is
 refused, except for the explicitly marked single-block transcript preview.
 No partial buffer, shortened critical value or upstream continuation
 for undisplayed rows is published. Narrow delegation guidance with exact
-provider/model/profile filters (also retained by the call-only models method);
+provider/model/profile filters;
 request smaller list/transcript limits; use CLI/socket for full documents or
 answer artifacts. No new detail-reference service is invented.
 

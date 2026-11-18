@@ -1,4 +1,12 @@
 //! Permanent pin keys and bounded operator observation for retained lineages.
+//!
+//! Release authority: every pin is minted inside the permanent
+//! `start_batch_receipts` row of the batch that admitted it, so the admitting
+//! batch `request_id` (a caller-chosen key that no listing discloses) is the
+//! owner's proof. Pins minted by an Agent Pool managed enrollment carry a
+//! reserved internal key derived from the authenticated Pool route; public
+//! callers cannot name those keys, so only the authenticated Pool channel can
+//! release them. An active lineage hold still blocks every release.
 
 use crate::Store;
 use agent_run_domain::{
@@ -89,16 +97,34 @@ impl Store<'_> {
         })
     }
 
-    /// Releases a known pin once; its permanent tombstone is never reactivated.
+    /// Releases a known pin once without an ownership proof. Test fixtures
+    /// only: production release always goes through
+    /// [`Store::release_history_pin_scoped`] with the owning batch key.
+    #[cfg(feature = "test-fixtures")]
     pub fn release_history_pin(&mut self, pin_id: &PinId) -> Result<Option<HistoryPinRelease>> {
-        self.release_history_pin_scoped(pin_id, None)
+        self.release_history_pin_checked(pin_id, None, None)
     }
 
-    /// Checks database scope and conflicts while any active hold protects the exact pin.
+    /// Releases a pin as the owner of the batch `owner_request_id` that
+    /// admitted it. Checks database scope, refuses a pin minted by any other
+    /// batch with [`Error::Conflict`] (also once released, so ownership is not
+    /// probed through tombstones), and conflicts while any active hold
+    /// protects the exact pin. An unknown pin returns `None`.
     pub fn release_history_pin_scoped(
         &mut self,
         pin_id: &PinId,
         expected: Option<&StoreId>,
+        owner_request_id: &str,
+    ) -> Result<Option<HistoryPinRelease>> {
+        self.release_history_pin_checked(pin_id, expected, Some(owner_request_id))
+    }
+
+    /// Shared release transaction; `owner` is mandatory outside test fixtures.
+    fn release_history_pin_checked(
+        &mut self,
+        pin_id: &PinId,
+        expected: Option<&StoreId>,
+        owner: Option<&str>,
     ) -> Result<Option<HistoryPinRelease>> {
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if expected.is_some() {
@@ -115,6 +141,17 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(None);
         };
+        if let Some(owner) = owner {
+            let owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM start_batch_receipts r, json_each(r.receipt_json,'$.jobs') j \
+                 WHERE r.request_id=?1 AND json_extract(j.value,'$.pin_id')=?2)",
+                params![owner, pin_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !owned {
+                return Err(Error::Conflict);
+            }
+        }
         let already_released = match state {
             0 => false,
             1 => true,

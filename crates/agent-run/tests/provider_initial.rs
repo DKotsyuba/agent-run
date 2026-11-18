@@ -6097,7 +6097,8 @@ async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
 }
 
 /// Local legacy quota samples and latches do not supply quota to schema-2 Run.
-/// When Quota is unavailable, public views and admission preserve unknown.
+/// When Quota is unavailable, the guide carries no standing and admission
+/// preserves unknown.
 #[tokio::test]
 async fn legacy_quota_samples_do_not_drive_new_admission() {
     let (_temp, home) = home_with("", &[]);
@@ -6119,17 +6120,17 @@ async fn legacy_quota_samples_do_not_drive_new_admission() {
         .unwrap();
     assert_eq!(latches, 1);
     let service = fixture_service(home.clone()).await;
-    let order = service
-        .capacity_order(serde_json::from_value(serde_json::json!({})).unwrap())
+    let guide = service
+        .delegation_guide_filtered(
+            serde_json::from_value(serde_json::json!({"provider":"glm-user"})).unwrap(),
+        )
         .await
         .unwrap();
-    assert!(order.to_string().contains("glm-user"), "{order}");
-    let models = service
-        .models(serde_json::from_value(serde_json::json!({"provider":"glm-user"})).unwrap())
-        .await
-        .unwrap();
-    assert!(models.to_string().contains("\"unknown\""), "{models}");
-    assert_eq!(models["quota_coverage"]["state"], "unknown");
+    let guide = guide.as_str().unwrap();
+    assert!(guide.contains("provider glm-user"), "{guide}");
+    assert!(!guide.contains("quota unknown"), "{guide}");
+    assert!(!guide.contains("evidence"), "{guide}");
+    assert!(!guide.contains("resets in"), "{guide}");
     let mut request = request(&home);
     request.account = None;
     request.request_id = Some("legacy-membership-unknown".into());

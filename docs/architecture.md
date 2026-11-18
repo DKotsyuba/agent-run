@@ -235,15 +235,15 @@ acknowledgement or its evidence.
 
 ## Capacity and diagnostics
 
-Agent Quota collects observations and computes quota standings independently.
-With schema 2, Run reads one Quota snapshot and combines it with its own local
-account, cooldown and reservation snapshot. `delegation_guide` provides compact
-routing guidance with exact provider/model/profile filters; `limits`, `models`
-and `capacity_order` expose the corresponding standings and completeness. The
-Quota evaluation time and Run's local ranking time are separate, and the read
-does not make the two services atomic. Schema-1 `limits` and `capacity_order`
-require migration to schema 2. Missing, stale or unavailable quota is unknown,
-not an invented zero; Run may still attempt a launch.
+Agent Quota collects observations, computes quota standings and presents
+quota windows and capacity to operators and orchestrators. With schema 2, Run
+keeps only the read its admission needs: each admission decision reads one
+fresh Quota snapshot, combines it with its own local account, cooldown,
+multiplier and reservation snapshot, selects the account, and refuses an
+exhausted choice with `QuotaExhausted`. Run presents no quota: since 0.32.0
+`delegation_guide` is a configuration-only catalog and the UserPromptSubmit
+context carries only active agents. Missing, stale or unavailable quota is
+unknown, not an invented zero; Run may still attempt a launch.
 
 `agent-run doctor` checks configuration, binaries, role assets, state,
 schema-2 provider bindings against a read-only account-registry snapshot,

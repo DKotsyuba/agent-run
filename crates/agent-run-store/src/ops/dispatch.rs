@@ -692,9 +692,11 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 },
             )?)
         }
-        L::ReleaseHistoryPin(op) => {
-            out(store.release_history_pin_scoped(&op.pin_id, op.expected_store_id.as_ref())?)
-        }
+        L::ReleaseHistoryPin(op) => out(store.release_history_pin_scoped(
+            &op.pin_id,
+            op.expected_store_id.as_ref(),
+            &op.owner_request_id,
+        )?),
         L::AcquireLineageHold(op) => out(store.acquire_lineage_hold(&op.acquire)?),
         L::ReleaseLineageHold(op) => {
             out(store.release_lineage_hold(&op.hold_id, &op.expected_store_id, op.signature())?)

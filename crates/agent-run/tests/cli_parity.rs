@@ -132,7 +132,22 @@ fn python_cli_spec_command_surface_is_present() {
         let path = row["command"].as_str().expect("command name");
         // The archived Python capture is immutable; collection and its
         // launchd job moved out of the current Agent Run CLI.
-        if matches!(path, "capacity collect" | "capacity launchd") {
+        // Quota presentation (`limits`, `models`, `capacity order`) moved to
+        // Agent Quota in 0.32.0.
+        if matches!(
+            path,
+            "capacity"
+                | "capacity collect"
+                | "capacity launchd"
+                | "capacity order"
+                | "limits"
+                | "models"
+        ) {
+            assert!(
+                Cli::try_parse_from(std::iter::once("agent-run").chain(path.split_whitespace()))
+                    .is_err(),
+                "{path} must stay removed"
+            );
             continue;
         }
         let mut command = command_at(&root, path);

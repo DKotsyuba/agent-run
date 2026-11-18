@@ -1,9 +1,8 @@
 agent-run delegation guide
 
-Choose provider, model and profile; the broker selects the account.
-Provider order reflects capacity; guidance comes from configuration.
-For optional quota percentages, reset times and numeric priority details, use limits.
-Read this guide before each delegation; choose the first compatible available provider and a sufficient model/effort.
+Choose provider, model and profile; the broker selects the account and refuses an exhausted choice with QuotaExhausted.
+Providers appear in configured order; guidance comes from configuration. Read current quota and capacity from Agent Quota.
+Read this guide before each delegation; choose a compatible provider with available capacity and a sufficient model/effort.
 Brief one bounded task with role, paths, permissions and checks. Respect a request to work personally.
 Use start for new work, resume for continuation, and keep the same agent_id across resumes. Follow each tool's delivery contract; verify the answer before accepting it.
 
@@ -14,7 +13,7 @@ provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profil
   provider guidance: {{ entry }}
 {% endfor %}
 {% for model in provider.models %}
-  - {{ model.id }}: quota {{ model.status }}, evidence {{ model.evidence }}{% if model.resets %}, resets in {{ model.resets }}{% endif %}{% if model.age %}, sample age {{ model.age }}{% endif %}{{ "" }}
+  - {{ model.id }}
 {% if model.profiles %}
     profiles: {{ model.profiles }}
 {% endif %}
@@ -33,4 +32,4 @@ provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profil
 No providers are currently configured.
 {% endif %}
 
-Cooperative pools: Agent Run has no pool tools (start_pool was removed). For several agents with one goal, use start_batch and coordinate their results yourself, or use Agent Pool where its MCP server is available.
+Cooperative pools: Agent Run has no pool tools. Pools of agents pursuing one goal belong to Agent Pool, led through a pool-leader Run profile on hosts that configure one. For independent parallel jobs, use start_batch and coordinate their results yourself.

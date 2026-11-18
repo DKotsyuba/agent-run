@@ -725,7 +725,11 @@ async fn python_test_service_binding_and_limits_share_durable_state() {
     home.store()
         .bind_orchestrator(&id, &reference, 1.0)
         .unwrap();
-    let error = Service::new(home.path.clone()).limits().await.unwrap_err();
+    // Quota presentation moved to Agent Quota; the schema-1 guide is Unsupported.
+    let error = Service::new(home.path.clone())
+        .delegation_guide()
+        .await
+        .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "Unsupported");
 }
 
@@ -760,49 +764,6 @@ fn python_test_service_delivery_view_exposes_typed_evidence() {
         .delivery_status(&id)
         .unwrap();
     assert_eq!(view["last_attempt"]["classifier"], "relay_accepted");
-}
-
-/// Mirrors `tests/test_service.py::AgentServiceTests::test_empty_roster_still_lists_the_runtime_with_a_reason`.
-#[tokio::test]
-async fn python_test_service_empty_roster_has_reason() {
-    let home = common::Home::new();
-    let config = std::fs::read_to_string(home.path.join("config.toml"))
-        .unwrap()
-        .replace("binary=\"/usr/bin/true\"", "binary=\"/does/not/exist\"");
-    std::fs::write(home.path.join("config.toml"), config).unwrap();
-    let value = Service::new(home.path.clone())
-        .models(Default::default())
-        .await
-        .unwrap();
-    assert!(value["mock"]["models"].is_array());
-    assert!(value["mock"]["reason"].is_string());
-}
-
-/// Mirrors `tests/test_service.py::AgentServiceTests::test_empty_roster_prefers_the_adapters_own_unavailable_reason`.
-#[tokio::test]
-async fn python_test_service_roster_reason_is_bounded() {
-    let home = common::Home::new();
-    let config = std::fs::read_to_string(home.path.join("config.toml"))
-        .unwrap()
-        .replace("binary=\"/usr/bin/true\"", "binary=\"/does/not/exist\"");
-    std::fs::write(home.path.join("config.toml"), config).unwrap();
-    let value = Service::new(home.path.clone())
-        .models(Default::default())
-        .await
-        .unwrap();
-    assert!(value["mock"]["reason"].as_str().unwrap_or_default().len() <= 128);
-}
-
-/// Mirrors `tests/test_service.py::AgentServiceTests::test_codex_models_bootstrap_from_config_without_isolated_cache`.
-#[tokio::test]
-async fn python_test_service_models_do_not_create_isolated_cache() {
-    let home = common::Home::new();
-    let value = Service::new(home.path.clone())
-        .models(Default::default())
-        .await
-        .unwrap();
-    assert!(!home.path.join("runtimes/mock/cache/models.json").exists());
-    assert!(value["mock"]["models"].is_array());
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_from_home_is_the_single_composition_root`.

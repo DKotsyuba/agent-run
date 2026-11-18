@@ -268,9 +268,24 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
         assert_eq!(count, 0, "mismatch cannot admit {table}");
     }
     assert!(matches!(
-        store.release_history_pin_scoped(&pins[0], Some(&other_id)),
+        store.release_history_pin_scoped(&pins[0], Some(&other_id), &request.request_id),
         Err(Error::StoreIdentityMismatch)
     ));
+    // Ownership: only the admitting batch key releases; any other key,
+    // including an internal managed-enrollment key, conflicts without effect.
+    for foreign in ["other-batch", "p3_0000"] {
+        assert!(matches!(
+            store.release_history_pin_scoped(&pins[0], Some(&store_id), foreign),
+            Err(Error::Conflict)
+        ));
+    }
+    let unknown = agent_run_domain::batch::PinId::new();
+    assert!(
+        store
+            .release_history_pin_scoped(&unknown, Some(&store_id), &request.request_id)
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         store.history_pins_scoped(
             agent_run_domain::batch::HistoryPinFilter::All,
@@ -397,6 +412,17 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
                 .already_released
         );
     }
+    // The owner's idempotent replay succeeds; a tombstone never reveals or
+    // changes ownership for another key.
+    let owner_replay = store
+        .release_history_pin_scoped(&pins[0], Some(&store_id), &request.request_id)
+        .unwrap()
+        .unwrap();
+    assert!(owner_replay.already_released);
+    assert!(matches!(
+        store.release_history_pin_scoped(&pins[0], Some(&store_id), "other-batch"),
+        Err(Error::Conflict)
+    ));
     assert_eq!(
         store
             .replay_batch(&request.request_id, &fingerprint)

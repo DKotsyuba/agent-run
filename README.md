@@ -167,7 +167,7 @@ socket, credential and shared-service setup for other installations.
 ```bash
 agent-run delegation-guide             # read before choosing a delegation route
 agent-run delegation-guide --provider codex --profile review  # exact optional filters
-agent-run limits                       # optional quota/reset/priority diagnosis
+
 agent-run start --provider codex --model gpt-6.1-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
@@ -195,10 +195,10 @@ the Claude runtime journals assistant fragments and the completion tail of one
 message under its native message id (or one producer-owned fallback per
 message boundary when the engine omits ids), so each message renders as one
 continuous row and distinct messages stay distinct. Other commands
-include `steer`, `cancel`, `delivery status`, and `doc`. The legacy
-`models` and `capacity order` CLI commands remain compatibility reads with
-their original structured responses; ordinary routing uses `delegation-guide`
-and optional `limits` diagnostics.
+include `steer`, `cancel`, `delivery status`, and `doc`. Quota windows,
+reset times and capacity standing are presented by Agent Quota (for example
+`agent-quota limits`), not by Run; Run keeps only the Quota read its admission
+needs and refuses an exhausted choice with `QuotaExhausted`.
 
 ## Use the MCP server
 
@@ -208,13 +208,16 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It advertises 19 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
-`answer`, `transcript`, `transcript_exact`, `initial_task`, `doc`, `delegation_guide`, `limits`, `agent_integration`,
-`capabilities`, and `answer_chunk`. Use `delegation_guide`
-with optional exact `provider`, `model`, and `profile` filters for routing;
-use `limits` for quota windows plus numerical provider/model standing.
-`models` and `capacity_order` remain callable compatibility methods with their
-original CLI/socket JSON shapes, but do not appear in MCP discovery.
+It advertises the orchestrator tools `start`, `start_batch`, `resume`,
+`cancel`, `steer`, `list_agents`, `answer`, `transcript`, `delegation_guide`
+and `doc`. Use `delegation_guide` with optional exact `provider`, `model`, and
+`profile` filters for routing; it carries no quota standing. Service
+integration methods used by Agent Pool and Hub — `status`, `batch_receipt`,
+`capabilities`, `transcript_exact`, `initial_task`, `answer_chunk`,
+`agent_integration`, `history_pins_list` and `history_pins_release` — are
+served only by the operator socket and CLI; the socket `tools` method lists
+them with `"surface":"socket"`. See
+[the API reference](docs/api.md#transport-surfaces).
 
 `start_batch` atomically admits 1–20 independent jobs and returns a permanent
 receipt of their stable IDs, execution sequences and opaque execution references. An identical request ID
@@ -225,7 +228,8 @@ multi-agent hook binding is not provided: pass an explicit `orchestrator` for
 each job that needs its own completion notice.
 
 Set `retain_history:true` to keep each admitted lineage's database history until
-its returned pin is released with `agent-run history-pins release --pin-id PIN_ID`.
+its returned pin is released by its owner with
+`agent-run history-pins release --pin-id PIN_ID --request-id BATCH_REQUEST_ID`.
 Active pins also retain process-ownership evidence and recovery details for the
 lineage. They do not grant additional authority.
 

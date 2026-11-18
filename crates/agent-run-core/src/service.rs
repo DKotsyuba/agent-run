@@ -1122,13 +1122,7 @@ impl Service {
             jobs.push(prepared);
         }
         // Namespace the existing batch replay key by the authenticated Pool route.
-        let internal = format!(
-            "p3_{}",
-            agent_run_domain::canonical::sha256_hex(
-                &json!([route.pool_route, key.pool_store_id, key.request_id]),
-                true
-            )
-        );
+        let internal = managed_batch_key(&route.pool_route, &key.pool_store_id, &key.request_id);
         let mut batch = StartBatchRequest {
             request_id: internal,
             jobs: normalized,
@@ -2302,50 +2296,85 @@ impl Service {
         Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
     }
 
-    /// Lists or idempotently releases operator history pins without worker authority.
-    pub async fn history_pins(
+    /// Lists operator history pins in one bounded read; never discloses the
+    /// admitting batch key that proves release ownership.
+    pub async fn history_pins_list(
         &self,
-        request: agent_run_domain::batch::HistoryPinsRequest,
+        request: agent_run_domain::batch::HistoryPinsListRequest,
     ) -> Result<Value> {
-        use agent_run_domain::batch::HistoryPinsRequest;
-        match request {
-            HistoryPinsRequest::Release {
-                pin_id,
-                expected_store_id,
-            } => {
-                let result = self
-                    .lane("retention")?
-                    .local(
-                        agent_run_store::ops::ReleaseHistoryPin {
-                            pin_id: pin_id.clone(),
-                            expected_store_id,
-                        },
-                        crate::broker_writer::BROKER_BUDGET,
-                    )
-                    .await?
-                    .ok_or_else(|| Error::PinNotFound(pin_id.to_string()))?;
-                Ok(serde_json::to_value(result)?)
-            }
-            HistoryPinsRequest::List {
-                status,
-                limit,
-                after_pin_id,
-                expected_store_id,
-            } => {
-                let home = self.home.clone();
-                tokio::task::spawn_blocking(move || {
-                    let store = Store::open(&home)?;
-                    Ok(serde_json::to_value(store.history_pins_scoped(
-                        status,
-                        limit,
-                        after_pin_id.as_ref(),
-                        expected_store_id.as_ref(),
-                    )?)?)
-                })
-                .await
-                .map_err(|_| Error::Runtime("history pins read failed".into()))?
-            }
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = Store::open(&home)?;
+            Ok(serde_json::to_value(store.history_pins_scoped(
+                request.status,
+                request.limit,
+                request.after_pin_id.as_ref(),
+                request.expected_store_id.as_ref(),
+            )?)?)
+        })
+        .await
+        .map_err(|_| Error::Runtime("history pins read failed".into()))?
+    }
+
+    /// Idempotently releases one pin for the owner of its admitting public
+    /// batch. The store refuses another batch key, a managed-enrollment pin
+    /// and an actively held pin with `RequestConflict`; unknown is PinNotFound.
+    pub async fn history_pins_release(
+        &self,
+        request: agent_run_domain::batch::HistoryPinReleaseRequest,
+    ) -> Result<Value> {
+        request.validate()?;
+        let result = self
+            .release_owned_pin(
+                request.pin_id,
+                request.expected_store_id,
+                request.request_id,
+            )
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// Releases a pin minted by an Agent Pool managed enrollment. Only the
+    /// authenticated Pool route reaches this: the owner key is derived from
+    /// that route exactly as admission derived it, never taken from input.
+    pub(crate) async fn managed_pin_release(
+        &self,
+        grant: &crate::attempt_binding::PeerGrant,
+        expected_store_id: agent_run_domain::StoreId,
+        pool_store_id: &str,
+        request_id: &str,
+        pin_id: agent_run_domain::batch::PinId,
+    ) -> Result<agent_run_domain::batch::HistoryPinRelease> {
+        let route = self.managed_enrollment_grant(grant)?;
+        route.pool_route.validate()?;
+        agent_run_domain::attempt_binding::validate_uuid(pool_store_id)?;
+        agent_run_domain::attempt_binding::validate_id(request_id)?;
+        if pool_store_id != route.pool_route.component_store_id {
+            return Err(invalid("route mismatch"));
         }
+        let owner = managed_batch_key(&route.pool_route, pool_store_id, request_id);
+        self.release_owned_pin(pin_id, Some(expected_store_id), owner)
+            .await
+    }
+
+    /// Runs the single ownership-checked release writer operation.
+    async fn release_owned_pin(
+        &self,
+        pin_id: agent_run_domain::batch::PinId,
+        expected_store_id: Option<agent_run_domain::StoreId>,
+        owner_request_id: String,
+    ) -> Result<agent_run_domain::batch::HistoryPinRelease> {
+        self.lane("retention")?
+            .local(
+                agent_run_store::ops::ReleaseHistoryPin {
+                    pin_id: pin_id.clone(),
+                    expected_store_id,
+                    owner_request_id,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?
+            .ok_or_else(|| Error::PinNotFound(pin_id.to_string()))
     }
     /// List execution history, optionally waiting for a newer durable revision.
     pub async fn list(&self, query: Query) -> Result<Value> {
@@ -2620,106 +2649,20 @@ impl Service {
             .ok_or_else(|| Error::Runtime("configuration cache is empty".into()))
     }
 
-    /// Public `models` read.
-    ///
-    /// Schema 2 combines one fresh Quota response with one local read snapshot;
-    /// unavailable quota is unknown. Schema 1 keeps its runtime roster.
-    pub async fn models(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
-        let active = self.active_config()?;
-        match active.value {
-            CachedConfigValue::Providers(config) => {
-                let snapshot =
-                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
-                let home = self.home.clone();
-                self.read(move |store| {
-                    crate::capacity::quota_projection::models_at(
-                        store,
-                        &home,
-                        &config,
-                        &active.revision,
-                        &query,
-                        snapshot.as_ref(),
-                        now(),
-                    )
-                })
-                .await
-            }
-            CachedConfigValue::Legacy(_) if query.is_empty() => {
-                crate::capacity::models(&self.home).await
-            }
-            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
-                "models filters require schema_version 2".into(),
-            )),
-        }
-    }
-    /// Projects Quota windows and ranking with explicit completeness. Schema 1
-    /// requires migration to schema 2; no collector or engine is launched.
-    pub async fn limits(&self) -> Result<Value> {
-        let active = self.active_config()?;
-        match active.value {
-            CachedConfigValue::Providers(config) => {
-                let snapshot =
-                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
-                self.read(move |store| {
-                    crate::capacity::quota_projection::limits_at(
-                        store,
-                        &config,
-                        &active.revision,
-                        snapshot.as_ref(),
-                        now(),
-                    )
-                })
-                .await
-            }
-            CachedConfigValue::Legacy(_) => {
-                crate::capacity::quota_projection::legacy_limits_unavailable()
-            }
-        }
-    }
-
-    /// Returns provider order over one Quota response and local snapshot.
-    /// Schema 1 requires an explicit migration to schema 2.
-    pub async fn capacity_order(
-        &self,
-        query: agent_run_domain::CapacityOrderQuery,
-    ) -> Result<Value> {
-        let active = self.active_config()?;
-        match active.value {
-            CachedConfigValue::Providers(config) => {
-                let snapshot =
-                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
-                self.read(move |store| {
-                    crate::capacity::quota_projection::order_at(
-                        store,
-                        &config,
-                        &active.revision,
-                        &query,
-                        snapshot.as_ref(),
-                        now(),
-                    )
-                })
-                .await
-            }
-            CachedConfigValue::Legacy(_) => {
-                crate::capacity::quota_projection::legacy_order_unavailable()
-            }
-        }
-    }
-
-    /// Public `delegation_guide` read: compact routing text over the same
-    /// single committed snapshot [`Service::models`] would return for the
-    /// default query, rendered by [`crate::delegation_guide::render`] without
-    /// any new quota read, collection, or ranking. A schema-1 config has no
-    /// provider catalog, so the whole read is `Unsupported` there.
+    /// Public `delegation_guide` read: compact account-free routing text over
+    /// one committed catalog snapshot, rendered by
+    /// [`crate::delegation_guide::render`] without any quota read, collection
+    /// or ranking (Agent Quota owns capacity presentation). A schema-1 config
+    /// has no provider catalog, so the whole read is `Unsupported` there.
     pub async fn delegation_guide(&self) -> Result<Value> {
         self.delegation_guide_filtered(agent_run_domain::ModelsQuery::default())
             .await
     }
 
-    /// Renders the same compact account-free guidance for exact provider/model/
-    /// profile filters, using the catalog's admission rules and one committed
+    /// Renders the same compact guidance for exact provider/model/profile
+    /// filters, using the catalog's admission rules and one committed
     /// snapshot. Unknown filters are typed ValidationError; schema 1 remains
-    /// Unsupported. Omitted filters retain the historical default guidance.
+    /// Unsupported. Omitted filters retain the default guidance.
     pub async fn delegation_guide_filtered(
         &self,
         query: agent_run_domain::ModelsQuery,
@@ -2727,18 +2670,14 @@ impl Service {
         let active = self.active_config()?;
         match active.value {
             CachedConfigValue::Providers(config) => {
-                let snapshot =
-                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await;
                 let home = self.home.clone();
                 self.read(move |store| {
-                    crate::capacity::quota_projection::delegation_guide_at(
+                    crate::capacity::provider_catalog::delegation_guide_at(
                         store,
                         &home,
                         &config,
                         &active.revision,
                         &query,
-                        snapshot.as_ref(),
-                        now(),
                     )
                 })
                 .await
@@ -2748,6 +2687,22 @@ impl Service {
             )),
         }
     }
+}
+
+/// Derives the reserved internal batch key of one Pool managed enrollment
+/// from its authenticated route, Pool store and Pool request key.
+fn managed_batch_key(
+    pool_route: &agent_run_domain::attempt_binding::Route,
+    pool_store_id: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "p3_{}",
+        agent_run_domain::canonical::sha256_hex(
+            &json!([pool_route, pool_store_id, request_id]),
+            true
+        )
+    )
 }
 
 /// Identifies a possibly committed writer operation or unreadable committed result.

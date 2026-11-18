@@ -4,8 +4,42 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-### Removed (breaking)
+### Breaking
 
+- Quota presentation moved out of Run to Agent Quota. The orchestrator MCP
+  tools `limits`, `capacity_order` and `models`, their socket methods and the
+  CLI commands `agent-run limits`, `agent-run models` and
+  `agent-run capacity order` are removed and return unknown-method errors.
+  `delegation_guide` is now a configuration-only catalog: providers in
+  configured order with models, admissible profiles, params, restrictions and
+  recommendations, without quota standing, capacity order or a `limits`
+  pointer. The UserPromptSubmit `_hook_context` carries only the active-agent
+  block; its "Provider capacity order" block is gone (Agent Quota provides its
+  own hook context). Admission keeps its minimal Quota read: one fresh
+  snapshot per decision, account ranking with Run's configured multipliers
+  and the `QuotaExhausted` refusal.
+- The orchestrator MCP surface is now `start`, `start_batch`, `resume`,
+  `cancel`, `steer`, `list_agents`, `answer`, `transcript`,
+  `delegation_guide` and `doc`. The service integration methods `status`, `batch_receipt`,
+  `capabilities`, `transcript_exact`, `initial_task`, `answer_chunk`,
+  `agent_integration` and the history-pin methods are served only by the
+  operator socket and CLI: MCP discovery omits them and MCP calls reject them
+  as unknown tools. The socket `tools` method still lists them, marked
+  `"surface":"socket"`, so Hub feature detection keeps working.
+  `schemas/tools.json` now exports the orchestrator MCP discovery only. The
+  MCP `answer` text points large-answer retrieval to the file or
+  `agent-run answer-chunk`.
+- `history_pins` is split into `history_pins_list` (read-only) and
+  `history_pins_release`; the old method returns method-not-found. Release
+  requires ownership proof: the `request_id` of the `start_batch` whose
+  permanent receipt minted the pin. Another key, a pin minted by an Agent Pool
+  managed enrollment, or an actively held pin is refused with
+  `RequestConflict`; reserved internal keys are a `ValidationError`. There is
+  no operator override; `agent-run history-pins release` requires
+  `--request-id`. Agent Pool releases its managed-enrollment pins through the
+  new authenticated attempt-channel method `_managed_pin_release_v1`
+  (capability `managed_pin_release_v1`). Agent Pool must adopt the new calls
+  before this release is installed.
 - Legacy Run cooperative pools are removed (owner decision; Agent Pool owns
   groups, membership, messages and consensus). Gone: the orchestrator tools
   `start_pool`, `pool`, `pool_post`, `pool_replace` and `list_pools`; the worker
@@ -13,8 +47,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   commands `start-pool`, `pool-post`, `pool-replace`, `pool`, `pools`/`list-pools`
   and `bind --pool`; whole-pool hook binding; pool settlement, push commands,
   read guards, health wait evidence and the `agent-run.pool-completion` /
-  `agent-run.pool-attention` notices. MCP discovery now lists 19 tools; the
-  socket answers removed methods as unknown (`-32601`). Nothing is migrated
+  `agent-run.pool-attention` notices. The socket answers removed methods as
+  unknown (`-32601`). Nothing is migrated
   into Agent Pool.
 - The `agent-run-tui` crate and binary are removed. Native releases seal the
   fixed `assets/tui-compat.sh` shim as `bin/agent-run-tui`, so an installed

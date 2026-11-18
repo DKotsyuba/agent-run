@@ -13,22 +13,26 @@ fn service() -> Service {
         "/nonexistent-agent-run-protocol-fixture",
     ))
 }
-/// Pins the shared nineteen-entry discovery projection while compatibility
-/// calls retain their schemas in the same domain-owned registry.
+/// Pins the orchestrator discovery projection: exactly the ten execution tools,
+/// guide and doc; the socket `tools` listing additionally carries the nine
+/// socket-only service methods.
 #[test]
-fn packaged_table_has_exactly_the_shared_nineteen_tools() {
+fn packaged_table_has_exactly_the_ten_orchestrator_tools() {
     let tools = dispatch::tools();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 10);
     let names: std::collections::BTreeSet<_> =
         tools.iter().map(|v| v["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
         agent_run_domain::registry()
             .iter()
-            .filter(|tool| tool.legacy_for.is_none())
+            .filter(|tool| tool.legacy_for.is_none() && tool.surface.is_none())
             .map(|tool| tool.name.as_str())
             .collect()
     );
+    let socket = agent_run_domain::tools::socket_tools_json();
+    assert_eq!(socket.len(), agent_run_domain::registry().len());
+    assert_eq!(socket.len() - tools.len(), 9, "nine socket-only methods");
     for tool in tools {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
     }

@@ -209,37 +209,28 @@ fn extend_start_description(value: &mut Value) {
     }
 }
 
+/// Socket-only service methods never appear in orchestrator MCP discovery.
 /// The additive `delegation_guide` definition in its exact wire form: the
 /// registry entry with null result declarations omitted, as the SDK omits
 /// nulls on the wire. The frozen Python fixture has no such tool; parity
 /// expectations account for the addition explicitly instead of editing it.
 fn additive_wires() -> Vec<Value> {
-    [
-        "delegation_guide",
-        "start_batch",
-        "batch_receipt",
-        "history_pins",
-        "status",
-        "agent_integration",
-        "capabilities",
-        "answer_chunk",
-        "transcript_exact",
-        "initial_task",
-    ]
-    .into_iter()
-    .map(|name| {
-        let mut value = serde_json::to_value(agent_run_domain::tool(name).unwrap()).unwrap();
-        value.as_object_mut().unwrap().retain(|key, value| {
-            !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
-        });
-        value
-    })
-    .collect()
+    ["delegation_guide", "start_batch"]
+        .into_iter()
+        .map(|name| {
+            let mut value = serde_json::to_value(agent_run_domain::tool(name).unwrap()).unwrap();
+            value.as_object_mut().unwrap().retain(|key, value| {
+                !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
+            });
+            value
+        })
+        .collect()
 }
 
-/// A real MCP proxy and temporary resident broker preserve exact observation
-/// schemas/content in structuredContent, including worst-case JSON escaping.
-/// CLI/socket read results agree and the synthetic execution is never launched.
+/// A real MCP proxy refuses the socket-only observation reads, its answer
+/// recovery facts lead to the operator CLI chunk reads, which reconstruct the
+/// exact content including worst-case JSON escaping. The synthetic execution
+/// is never launched.
 #[test]
 fn observation_live_mcp_and_cli_preserve_structured_read_results() {
     let mut harness = Harness::new();
@@ -284,10 +275,15 @@ fn observation_live_mcp_and_cli_preserve_structured_read_results() {
     harness.start_broker();
     let mut mcp = harness.mcp();
     let _ = mcp.send(initialize("2025-11-25"));
-    let response = mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capabilities","arguments":{}}})).unwrap();
-    assert_ne!(response["result"]["isError"], true, "{response}");
-    let caps = &response["result"]["structuredContent"];
-    assert_eq!(caps, &agent_run_core::observation::capabilities());
+    // Service reads are operator-socket/CLI only; orchestrator MCP refuses them.
+    for (id, name) in [(2, "capabilities"), (8, "answer_chunk")] {
+        let refused = mcp
+            .send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}}))
+            .unwrap();
+        assert!(refused.get("result").is_none(), "{refused}");
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    }
+    let caps = &agent_run_core::observation::capabilities();
     let cli_caps = Command::new(env!("CARGO_BIN_EXE_agent-run"))
         .arg("--home")
         .arg(&harness.home)
@@ -314,13 +310,47 @@ fn observation_live_mcp_and_cli_preserve_structured_read_results() {
             .iter()
             .any(|item| item["type"] == "resource_link")
     );
+    // Large answers are retrieved with the operator CLI the MCP text names.
+    let chunk_cli = |id: &str, sequence: &Value, sha: &Value, offset: u64, max: u64| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(&harness.home)
+            .args([
+                "answer-chunk",
+                id,
+                "--sequence",
+                &sequence.to_string(),
+                "--expected-sha256",
+                sha.as_str().unwrap(),
+                "--offset-bytes",
+                &offset.to_string(),
+                "--max-bytes",
+                &max.to_string(),
+            ])
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            serde_json::from_slice::<Value>(if output.status.success() {
+                &output.stdout
+            } else {
+                &output.stderr
+            })
+            .unwrap_or(Value::Null),
+        )
+    };
     let mut medium = String::new();
     let mut medium_offset = 0;
     loop {
-        let args = json!({"agent_id":medium_id,"sequence":metadata["sequence"],"expected_sha256":metadata["sha256"],"offset_bytes":medium_offset,"max_bytes":4096});
-        let response = mcp.send(json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"answer_chunk","arguments":args}})).unwrap();
-        assert_ne!(response["result"]["isError"], true, "{response}");
-        let chunk = &response["result"]["structuredContent"];
+        let (ok, chunk) = chunk_cli(
+            medium_id.as_str(),
+            &metadata["sequence"],
+            &metadata["sha256"],
+            medium_offset,
+            4096,
+        );
+        assert!(ok, "{chunk}");
+        let chunk = &chunk;
         medium.push_str(chunk["content"].as_str().unwrap());
         medium_offset = chunk["next_offset"].as_u64().unwrap();
         if chunk["complete"] == true {
@@ -340,13 +370,12 @@ fn observation_live_mcp_and_cli_preserve_structured_read_results() {
     let mut offset = 0;
     let mut full = String::new();
     loop {
-        let args = json!({"agent_id":id,"sequence":1,"expected_sha256":proof.sha256,"offset_bytes":offset,"max_bytes":131072});
-        let response = mcp.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"answer_chunk","arguments":args}})).unwrap();
-        assert_ne!(response["result"]["isError"], true, "{response}");
+        let (ok, chunk) = chunk_cli(id.as_str(), &json!(1), &json!(proof.sha256), offset, 131072);
+        assert!(ok, "{chunk}");
         assert!(
-            serde_json::to_vec(&response).unwrap().len() < agent_run::transport::socket::MAX_FRAME
+            serde_json::to_vec(&chunk).unwrap().len() < agent_run::transport::socket::MAX_FRAME
         );
-        let chunk = &response["result"]["structuredContent"];
+        let chunk = &chunk;
         assert_eq!(chunk["sequence"], 1);
         assert_eq!(chunk["sha256"], proof.sha256);
         full.push_str(chunk["content"].as_str().unwrap());
@@ -360,14 +389,9 @@ fn observation_live_mcp_and_cli_preserve_structured_read_results() {
         agent_run_platform::fs::sha256(full.as_bytes()),
         proof.sha256
     );
-    let error = mcp.send(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"answer_chunk","arguments":{"agent_id":id,"sequence":2,"expected_sha256":proof.sha256,"offset_bytes":0}}})).unwrap();
-    assert_eq!(error["result"]["isError"], true);
-    assert!(
-        error["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("ExecutionChanged")
-    );
+    let (ok, error) = chunk_cli(id.as_str(), &json!(2), &json!(proof.sha256), 0, 65536);
+    assert!(!ok);
+    assert!(error.to_string().contains("ExecutionChanged"), "{error}");
     assert_eq!(
         agent_run_store::writer::StoreReader::open(&harness.home)
             .unwrap()
@@ -385,11 +409,12 @@ fn append_delegation_guide(value: &mut Value) {
     match value {
         Value::Object(object) => {
             if let Some(Value::Array(tools)) = object.get_mut("tools") {
+                // Removed quota tools (no registry entry) and call-only
+                // legacy methods disappear from discovery.
                 tools.retain(|entry| {
                     entry["name"]
                         .as_str()
-                        .and_then(agent_run_domain::tool)
-                        .is_none_or(|definition| definition.legacy_for.is_none())
+                        .is_some_and(agent_run_domain::tools::is_orchestrator_tool)
                 });
                 tools.extend(additive_wires());
             }
@@ -460,7 +485,12 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
         for index in [3usize, 4, 5] {
             let reply = mcp.send(expected[index]["request"].clone()).unwrap();
             let captured = &expected[index]["response"];
-            if expected[index]["request"]["params"]["name"] == "not_a_tool" {
+            // Removed quota tools (`models`, `limits`) now answer exactly
+            // like an unknown tool.
+            if expected[index]["request"]["params"]["name"]
+                .as_str()
+                .is_some_and(|name| !agent_run_domain::tools::is_orchestrator_tool(name))
+            {
                 assert_eq!(reply["error"]["code"], -32602);
                 assert!(reply.get("result").is_none());
                 continue;
@@ -533,8 +563,7 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     expected.as_array_mut().unwrap().retain(|entry| {
         entry["name"]
             .as_str()
-            .and_then(agent_run_domain::tool)
-            .is_none_or(|definition| definition.legacy_for.is_none())
+            .is_some_and(agent_run_domain::tools::is_orchestrator_tool)
     });
     expected.as_array_mut().unwrap().extend(additive_wires());
     for tool in expected.as_array_mut().unwrap() {
@@ -562,7 +591,11 @@ fn mcp_broker_unavailable_matches_python_tool_error() {
         expected[0]["response"]
     );
     assert_eq!(mcp.send(expected[1]["request"].clone()), None);
-    let reply = mcp.send(expected[2]["request"].clone()).unwrap();
+    // The captured call named `models`, removed in 0.32.0; the same call to
+    // its successor read proves the unavailable-broker presentation.
+    let mut request = expected[2]["request"].clone();
+    request["params"]["name"] = json!("delegation_guide");
+    let reply = mcp.send(request).unwrap();
     assert_eq!(reply["id"], expected[2]["response"]["id"]);
     assert_eq!(reply["result"]["isError"], true, "{reply}");
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
