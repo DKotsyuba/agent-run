@@ -1832,17 +1832,12 @@ impl Service {
             request.orchestrator = orchestrator;
         }
         request.validate_intent()?;
-        // Replay the historical shared destination only for an existing child.
-        // New admissions use the ordinary request, so retirement cannot bind them.
+        // Ordinary replay also covers children bound after admission. Consult
+        // the retired pool destination only when ordinary replay finds no row.
         let store = Store::open(&self.home)?;
-        let legacy = if allow_legacy_replay {
-            store.replay_legacy_pool_resume(parent, &request)?
-        } else {
-            None
-        };
-        let replay = match legacy {
-            Some(replay) => Some(replay),
-            None => store.replay_provider_request(&request)?,
+        let replay = match store.replay_provider_request(&request)? {
+            None if allow_legacy_replay => store.replay_legacy_pool_resume(parent, &request)?,
+            replay => replay,
         };
         if let Some(replay) = replay {
             let row = store.get(&replay.agent_id)?;

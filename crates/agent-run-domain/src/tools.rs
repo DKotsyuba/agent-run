@@ -362,8 +362,19 @@ pub fn tools_json() -> Vec<Value> {
         .iter()
         .filter(|definition| definition.legacy_for.is_none() && definition.surface.is_none())
         .cloned()
-        .map(|definition| serde_json::to_value(definition).expect("tool definition is JSON"))
+        .map(orchestrator_tool_json)
         .collect()
+}
+
+/// Projects one MCP definition with the same receipt shape as tool discovery.
+pub fn orchestrator_tool_json(mut definition: ToolDefinition) -> Value {
+    if definition.name == "start_batch"
+        && let Some(schema) = &mut definition.output_schema
+        && let Some(properties) = schema["properties"].as_object_mut()
+    {
+        properties.remove("release_token");
+    }
+    serde_json::to_value(definition).expect("tool definition is JSON")
 }
 
 /// Renders the operator-socket `tools` listing: every advertised method,

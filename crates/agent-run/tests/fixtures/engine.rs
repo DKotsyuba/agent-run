@@ -632,6 +632,27 @@ fn main() {
     {
         worker_finish(&args, &session, "fixture callback answer");
     }
+    if task == "fixture:batch-token-canary" {
+        emit(
+            json!({"type":"assistant","session_id":session,"message":{"id":"batch-canary-call","role":"assistant","content":[
+                {"type":"tool_use","id":"batch-canary","name":"shell","input":{"cmd":"start-batch"}}
+            ]}}),
+        );
+        let cli = std::fs::read_to_string("batch-canary-cli").expect("fixture CLI path");
+        let workdir = std::env::current_dir().expect("fixture workdir");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"umask 077; exec "$1" --home "$2" start-batch --spec batch-canary-spec.json --release-token-fd 3 3>batch-canary-token"#, "batch-canary", &cli])
+            .arg(workdir)
+            .output()
+            .expect("fixture CLI output");
+        let mut captured = String::from_utf8_lossy(&output.stdout).into_owned();
+        captured.push_str(&String::from_utf8_lossy(&output.stderr));
+        emit(
+            json!({"type":"user","session_id":session,"message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"batch-canary","content":captured,"is_error":!output.status.success()}
+            ]}}),
+        );
+    }
     if task == "fixture:follow-tools" {
         // Phase one waits for the driver's marker, then one native tool
         // invocation is streamed so a follow viewer observes a tool-count

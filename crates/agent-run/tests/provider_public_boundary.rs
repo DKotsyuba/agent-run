@@ -1491,6 +1491,23 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
     let socket_tools = socket_tools.as_array().unwrap();
     assert_eq!(socket_tools.len(), tools.len() + socket_only.len());
+    let start_schema = |tools: &[Value]| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == "start_batch")
+            .unwrap()["outputSchema"]
+            .clone()
+    };
+    assert!(
+        start_schema(tools)["properties"]
+            .get("release_token")
+            .is_none()
+    );
+    assert!(
+        start_schema(socket_tools)["properties"]
+            .get("release_token")
+            .is_some()
+    );
     for name in socket_only {
         let entry = socket_tools
             .iter()

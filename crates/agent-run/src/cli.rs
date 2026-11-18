@@ -18,6 +18,10 @@ use serde_json::{Value, json};
 use std::{
     future::Future,
     io::Write,
+    os::{
+        fd::{AsFd, FromRawFd},
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -324,6 +328,12 @@ pub enum Command {
         /// JSON file or `-`: request_id and ordered jobs.
         #[arg(long)]
         spec: String,
+        /// Write the new release token to a private file created exclusively.
+        #[arg(long, conflicts_with = "release_token_fd", value_name = "PATH")]
+        release_token_file: Option<PathBuf>,
+        /// Write the new release token to an inherited writable descriptor above 2.
+        #[arg(long, value_name = "N")]
+        release_token_fd: Option<i32>,
     },
     /// Look up the permanent receipt for an exact scoped batch intent.
     BatchReceipt {
@@ -1071,6 +1081,67 @@ fn read_input(p: &Path, max: usize) -> Result<String> {
     let bytes = fs::Dir::open(parent)?.read(Path::new(name), max)?;
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
 }
+/// Reserve the output name before admission so filesystem collisions cannot leave
+/// an admitted pin without its requested credential sink.
+fn create_release_token_file(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(absolute(path)?)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// Duplicates a private inherited descriptor without taking over the caller's
+/// descriptor. Rejects stdio aliases, terminal devices and runtime-owned FDs.
+fn duplicate_release_token_fd(fd: i32) -> Result<std::fs::File> {
+    if fd <= 2 {
+        return Err(invalid("release token descriptor must be above 2"));
+    }
+    // SAFETY: F_GETFD inspects a raw descriptor with no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    // SAFETY: F_GETFL returns the raw file status flags or an error.
+    let access = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::FD_CLOEXEC != 0
+        || access < 0
+        || !matches!(access & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+    {
+        return Err(invalid(
+            "release token descriptor must be inherited and writable",
+        ));
+    }
+    // SAFETY: F_DUPFD_CLOEXEC creates our own fd or returns -1 with errno.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if copy < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: the successful fcntl result is a newly owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(copy) };
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
+    if !(kind.is_file() || kind.is_fifo() || kind.is_socket()) {
+        return Err(invalid(
+            "release token descriptor must refer to a file, pipe or socket",
+        ));
+    }
+    for stdio in [
+        std::io::stdin().as_fd(),
+        std::io::stdout().as_fd(),
+        std::io::stderr().as_fd(),
+    ] {
+        let stdio = std::fs::File::from(stdio.try_clone_to_owned()?).metadata()?;
+        if (meta.dev(), meta.ino()) == (stdio.dev(), stdio.ino()) {
+            return Err(invalid(
+                "release token descriptor must be separate from standard streams",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 /// Reads bounded UTF-8 standard input for Python-compatible `-` task values.
 fn read_stdin(max: usize) -> Result<String> {
     use std::io::Read;
@@ -2402,7 +2473,11 @@ async fn run_client_command(
             let result = broker.call("resume", arguments).await?;
             (output)(&admission_output(&result)?)?;
         }
-        Command::StartBatch { spec } => {
+        Command::StartBatch {
+            spec,
+            release_token_file,
+            release_token_fd,
+        } => {
             let text = if spec == "-" {
                 read_stdin(1024 * 1024)?
             } else {
@@ -2411,12 +2486,24 @@ async fn run_client_command(
             let mut request: agent_run_domain::batch::StartBatchRequest =
                 serde_json::from_str(&text).map_err(|_| invalid("invalid batch spec"))?;
             request.validate_intent()?;
+            let mut sink = match (release_token_file, release_token_fd) {
+                (Some(path), None) => Some(create_release_token_file(&path)?),
+                (None, Some(fd)) => Some(duplicate_release_token_fd(fd)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => return Err(invalid("choose one release token destination")),
+            };
             let params = serde_json::to_value(request)?;
-            let result = broker.call("start_batch", params.clone()).await?;
+            let mut result = broker.call("start_batch", params.clone()).await?;
             if !transport::socket::valid_batch_response(&result, &params) {
                 return Err(Error::BatchOutcomeUnknown {
                     source: Box::new(invalid("invalid batch receipt")),
                 });
+            }
+            let token = result
+                .as_object_mut()
+                .and_then(|fields| fields.remove("release_token"));
+            if let (Some(sink), Some(token)) = (&mut sink, token.as_ref().and_then(Value::as_str)) {
+                writeln!(sink, "{token}")?;
             }
             (output)(&result)?;
         }

@@ -347,7 +347,8 @@ impl ServerHandler for Proxy {
     fn get_tool(&self, name: &str) -> Option<Tool> {
         dispatch::tool(name)
             .filter(|definition| dispatch::is_orchestrator_tool(&definition.name))
-            .and_then(|definition| serde_json::to_value(definition).ok())
+            .cloned()
+            .map(agent_run_domain::tools::orchestrator_tool_json)
             .and_then(|value| serde_json::from_value(value).ok())
     }
     /// Inject the host binding and forward the call through the resident broker.

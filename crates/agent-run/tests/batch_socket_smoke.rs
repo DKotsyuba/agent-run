@@ -374,10 +374,47 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     drop(db);
 
     configure(&broker.home, 3);
-    let (status, output, error) = cli(&broker.home, &args).await;
+    let token_file = broker.home.join("new-release-token");
+    let private_args = [
+        "start-batch",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--release-token-file",
+        token_file.to_str().unwrap(),
+    ];
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let occupied = broker.home.join("occupied-token");
+    std::fs::write(&occupied, "already present").unwrap();
+    for use_symlink in [false, true] {
+        if use_symlink {
+            symlink(&occupied, &token_file).unwrap();
+        } else {
+            std::fs::write(&token_file, "already present").unwrap();
+        }
+        let (status, _, _) = cli(&broker.home, &private_args).await;
+        assert!(!status.success());
+        assert_eq!(
+            std::fs::read_to_string(&token_file).unwrap(),
+            "already present"
+        );
+        std::fs::remove_file(&token_file).unwrap();
+    }
+    assert_eq!(
+        socket
+            .call("batch_receipt", Some(request.clone()))
+            .await
+            .unwrap(),
+        json!({"found":false})
+    );
+    let (status, output, error) = cli(&broker.home, &private_args).await;
     assert!(status.success(), "batch admission: {error}");
     let first: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(first["replayed"], false, "{first}");
+    assert!(first.get("release_token").is_none());
+    assert_eq!(
+        std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert_eq!(first["receipt"]["request_id"], "socket-batch");
     assert_eq!(first["receipt"]["store_id"], store_id.as_str());
     let jobs = first["receipt"]["jobs"].as_array().unwrap();
@@ -521,15 +558,15 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
         .await
         .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "RequestConflict");
-    let credential = first["release_token"].as_str().unwrap();
+    let credential = std::fs::read_to_string(&token_file).unwrap();
+    let credential = credential.trim();
+    assert_eq!(credential.len(), 64);
     assert_mcp_refuses(
         &broker.home,
         "history_pins_release",
         &json!({"pin_id":pins[0],"release_token":credential}),
     )
     .await;
-    let token_file = tempfile::NamedTempFile::new_in(&broker.home).unwrap();
-    std::fs::write(token_file.path(), format!("{credential}\n")).unwrap();
     for already in [false, true] {
         let (status, output, error) = cli(
             &broker.home,
@@ -539,7 +576,7 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
                 "--pin-id",
                 pins[0].as_str(),
                 "--release-token-file",
-                token_file.path().to_str().unwrap(),
+                token_file.to_str().unwrap(),
                 "--expected-store-id",
                 store_id.as_str(),
             ],
@@ -579,7 +616,7 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
             "--pin-id",
             missing.as_str(),
             "--release-token-file",
-            token_file.path().to_str().unwrap(),
+            token_file.to_str().unwrap(),
         ],
     )
     .await;
@@ -649,6 +686,130 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     let home = broker.home.clone();
     drop(broker);
     assert!(!home.exists(), "owned fixture home was not removed");
+}
+
+/// A supervised Claude fixture records the stdout and stderr of its nested
+/// CLI command. Only the inherited private descriptor receives the bearer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_cli_batch_bearer_stays_out_of_transcript_and_mcp() {
+    let broker = Broker::start().await;
+    configure(&broker.home, 3);
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let store_id = client
+        .call("capabilities", Some(json!({"include_store_id":true})))
+        .await
+        .unwrap()["store_id"]
+        .clone();
+    let job = json!({"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
+        "task":"fixture:answer","workdir":broker.home});
+    let request = json!({"request_id":"nested-retained-canary","expected_store_id":store_id,
+        "retain_history":true,"jobs":[job.clone()]});
+    let spec = broker.home.join("batch-canary-spec.json");
+    std::fs::write(&spec, request.to_string()).unwrap();
+    let alias = command(&broker.home);
+    let refused = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"exec "$1" --home "$2" start-batch --spec "$3" --release-token-fd 3 3>&1"#,
+            "alias-canary",
+            env!("CARGO_BIN_EXE_agent-run"),
+        ])
+        .arg(&broker.home)
+        .arg(&spec)
+        .env_clear()
+        .envs(
+            alias
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("separate from standard streams"));
+    assert_eq!(
+        client
+            .call("batch_receipt", Some(request.clone()))
+            .await
+            .unwrap(),
+        json!({"found":false})
+    );
+    std::fs::write(
+        broker.home.join("batch-canary-cli"),
+        env!("CARGO_BIN_EXE_agent-run"),
+    )
+    .unwrap();
+
+    let mut outer = job.clone();
+    outer["task"] = json!("fixture:batch-token-canary");
+    let launched = client.call("start", Some(outer)).await.unwrap();
+    let outer_id = launched["agent_id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !quiescent(&broker.home) {
+        assert!(
+            Instant::now() < deadline,
+            "nested batch fixture did not stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let token = std::fs::read_to_string(broker.home.join("batch-canary-token")).unwrap();
+    let token = token.trim();
+    assert_eq!(token.len(), 64);
+    let journal: String = read_store(&broker.home).query_row(
+        "SELECT group_concat(content, char(10)) FROM messages WHERE agent_id=? AND role='tool_result'",
+        [outer_id], |row| row.get(0),
+    ).unwrap();
+    assert!(journal.contains("nested-retained-canary"));
+    assert!(!journal.contains(token) && !journal.contains("release_token"));
+    let transcript = client
+        .call("transcript", Some(json!({"agent_id":outer_id})))
+        .await
+        .unwrap()
+        .to_string();
+    assert!(transcript.contains("nested-retained-canary"));
+    assert!(!transcript.contains(token) && !transcript.contains("release_token"));
+
+    let lookup = client
+        .call("batch_receipt", Some(request.clone()))
+        .await
+        .unwrap();
+    let pin = &lookup["receipt"]["jobs"][0]["pin_id"];
+    let released = client
+        .call(
+            "history_pins_release",
+            Some(json!({
+                "pin_id":pin,"release_token":token,"expected_store_id":store_id
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(released["status"], "released");
+
+    let mut discard = request.clone();
+    discard["request_id"] = json!("cli-discarded-canary");
+    std::fs::write(&spec, discard.to_string()).unwrap();
+    let (status, stdout, stderr) = cli(
+        &broker.home,
+        &["start-batch", "--spec", spec.to_str().unwrap()],
+    )
+    .await;
+    assert!(status.success());
+    assert!(stderr.is_empty());
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["receipt"]["request_id"], "cli-discarded-canary");
+    assert_eq!(output["replayed"], false);
+    assert!(output.get("release_token").is_none());
+
+    let mut mcp_request = request;
+    mcp_request["request_id"] = json!("mcp-retained-canary");
+    let mcp = mcp_call(&broker.home, "start_batch", &mcp_request).await;
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["receipt"]["request_id"],
+        "mcp-retained-canary"
+    );
+    assert_eq!(mcp["result"]["structuredContent"]["replayed"], false);
+    assert!(!mcp.to_string().contains("release_token"));
 }
 
 /// The local owner can recover a public legacy pin offline, with an exact
@@ -885,17 +1046,7 @@ async fn batch_preconditions_cross_all_public_transports() {
         .clone();
     let job = json!({"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"fixture:answer","workdir":broker.home.clone()});
     let seed = json!({"request_id":"precondition-seed","expected_store_id":store_id.clone(),"retain_history":true,"jobs":[job.clone()]});
-    let seed_response = mcp_call(&broker.home, "start_batch", &seed).await;
-    let seed_result = &seed_response["result"]["structuredContent"];
-    let token = seed_result["release_token"]
-        .as_str()
-        .expect("original admission token");
-    assert!(
-        !seed_response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains(token)
-    );
+    let seed_result = socket.call("start_batch", Some(seed)).await.unwrap();
     let previous = &seed_result["receipt"]["jobs"][0];
     let condition = json!({"agent_id":previous["agent_id"],"sequence":previous["sequence"],
         "execution_ref":previous["execution_ref"],"pin_id":previous["pin_id"]});

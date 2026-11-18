@@ -647,27 +647,29 @@ impl Store<'_> {
         let Some(binding) = binding else {
             return Ok(None);
         };
-        let child = tx.query_row(
-            "SELECT a.* FROM agents a JOIN orchestrator_sessions s ON s.id=a.orchestrator_session_id \
-             WHERE a.parent_agent_id=?1 AND a.request_id=?2 AND s.external_session_id=?3 AND s.transport IN (?4,?5)",
-            params![parent.id.as_str(), request_id, binding.external_session_id, binding.canonical_transport()?, binding.legacy_transport()?],
-            Record::read,
-        ).optional()?;
-        child
-            .map(|child| {
-                let mut request = request.clone();
-                let mut binding = binding;
-                // Session rows advance after later turns. Replay the receipt's
-                // original destination within the proven session family.
-                binding.external_turn_id = child
-                    .request
-                    .orchestrator
-                    .as_ref()
-                    .and_then(|original| original.external_turn_id.clone());
-                request.orchestrator = Some(binding);
-                replayed(&tx, &child, &request)
-            })
-            .transpose()
+        let child = tx
+            .query_row(
+                "SELECT * FROM agents WHERE parent_agent_id=? AND request_id=?",
+                params![parent.id.as_str(), request_id],
+                Record::read,
+            )
+            .optional()?;
+        let Some(child) = child else {
+            return Ok(None);
+        };
+        // The stored admission request is immutable. Binding later only updates
+        // orchestrator_session_id and cannot make this a legacy admission.
+        let Some(original) = &child.request.orchestrator else {
+            return Ok(None);
+        };
+        if original.external_session_id != binding.external_session_id
+            || original.canonical_transport()? != binding.canonical_transport()?
+        {
+            return Ok(None);
+        }
+        let mut request = request.clone();
+        request.orchestrator = Some(original.clone());
+        replayed(&tx, &child, &request).map(Some)
     }
 
     /// Atomically validates the committed candidate rank, current registry,

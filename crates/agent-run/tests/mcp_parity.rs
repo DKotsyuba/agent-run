@@ -219,6 +219,13 @@ fn additive_wires() -> Vec<Value> {
         .into_iter()
         .map(|name| {
             let mut value = serde_json::to_value(agent_run_domain::tool(name).unwrap()).unwrap();
+            if name == "start_batch" {
+                value["outputSchema"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("release_token")
+                    .expect("the socket schema still advertises the release token");
+            }
             value.as_object_mut().unwrap().retain(|key, value| {
                 !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
             });

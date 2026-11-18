@@ -31,7 +31,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   `agent-run answer-chunk`.
 - `history_pins_list` lists pins. Public `history_pins_release` requires the
   batch bearer token (`release_token`) issued only by the original retained
-  `start_batch` response. CLI release reads it from a file or stdin. Read-only batch
+  socket `start_batch` response. CLI admission can route it to a private
+  file or inherited descriptor. CLI standard streams and MCP omit it.
+  CLI release reads the token from a file or stdin. Read-only batch
   receipt lookup returns `found:false` for unused keys and mismatched intents.
   Agent Pool continues to release managed enrollment pins with
   `_managed_pin_release_v1` on its authenticated route. Legacy public pins

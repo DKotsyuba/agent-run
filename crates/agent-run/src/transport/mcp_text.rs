@@ -817,7 +817,7 @@ fn status_result(value: &Value) -> Result<CallToolResult> {
 
 /// Returns the complete validated durable batch receipt in structured content.
 fn batch_result(value: &Value, request_id: Option<&str>) -> Result<CallToolResult> {
-    let batch: agent_run_domain::batch::StartBatchResult =
+    let mut batch: agent_run_domain::batch::StartBatchResult =
         serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
     if batch.receipt.validate().is_err()
         || request_id.is_some_and(|request_id| request_id != batch.receipt.request_id)
@@ -827,6 +827,7 @@ fn batch_result(value: &Value, request_id: Option<&str>) -> Result<CallToolResul
     let mut result = CallToolResult::success(vec![ContentBlock::text(
         "agent-run start_batch: durable admission receipt in structuredContent. Automatic batch hook binding is not provided.",
     )]);
+    batch.release_token = None;
     result.structured_content = Some(serde_json::to_value(batch)?);
     let mut wire = BoundedWriter {
         bytes: Vec::new(),
@@ -1525,6 +1526,29 @@ fn exact_display(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A socket-only credential never crosses the MCP presentation boundary.
+    #[test]
+    fn batch_presentation_omits_socket_release_bearer() {
+        use agent_run_domain::batch::{PinId, PinReleaseToken};
+        let token = PinReleaseToken::mint();
+        let canary = serde_json::to_value(&token).unwrap();
+        let root = "ag-20260826-120000-0123456789".parse().unwrap();
+        let pin = PinId::from_release_digest(&token.digest(), &root);
+        let value = json!({"replayed":false,"release_token":canary,
+            "receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef",
+                "request_id":"retained","jobs":[{"index":0,"agent_id":root,"sequence":1,
+                    "execution_ref":format!("ex1_{}", "a".repeat(64)),"pin_id":pin}]}});
+        let result = super::success_result_with_request("start_batch", &value, Some("retained"));
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["receipt"],
+            value["receipt"]
+        );
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("release_token"));
+        assert!(!wire.contains(canary.as_str().unwrap()));
+    }
+
     /// Structured batch receipts preserve every identity; malformed or unknown outcomes retain the key.
     #[test]
     fn batch_receipt_and_uncertain_failure_are_not_replayed_as_new_work() {

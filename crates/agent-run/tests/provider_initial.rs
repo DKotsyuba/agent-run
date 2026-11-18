@@ -2711,6 +2711,72 @@ fn transcript(runtime_home: &Path, session: &str, body: &str) {
     fs::write(dir.join(format!("{session}.jsonl")), body).unwrap();
 }
 
+/// A later ordinary binding to an old Pool session cannot change the original
+/// unbound resume intent or divert its receipt to the historical fallback.
+#[tokio::test]
+async fn unbound_provider_resume_replays_after_later_legacy_pool_binding() {
+    let (_temp, home) = home();
+    let service = fixture_service(home.clone()).await;
+    let mut start = request(&home);
+    start.orchestrator = None;
+    let admitted = service
+        .admit_provider_trusted(start.clone(), candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
+    let parent = store.get(&id).unwrap();
+    let resume = || {
+        service.admit_provider_resume(
+            &parent,
+            "fixture:answer".into(),
+            Some("late-pool-bind".into()),
+            None,
+            None,
+        )
+    };
+    let child = resume().await.unwrap();
+    assert_eq!(child["created"], true);
+    let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    let before = store.get(&child_id).unwrap();
+    assert!(before.request.orchestrator.is_none());
+    assert!(before.orchestrator_session_id.is_none());
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "old-pool-session".into(),
+        external_turn_id: None,
+    };
+    let session = store
+        .bind_orchestrator(&child_id, &reference, agent_run::domain::now())
+        .unwrap();
+    let pool = "pool-20260901-120000-0123456789";
+    store.conn.execute(
+        "INSERT INTO pools(id,request_namespace,request_id,request_sha256,orchestrator_session_id,goal,acceptance_json,state,roster_revision,created_at)
+         VALUES(?1,'fixture','old-pool',?2,?3,'fixture','[]','open',1,1)",
+        rusqlite::params![pool, "a".repeat(64), session],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,1,'member','role','task',1)",
+        rusqlite::params![id.as_str(), pool],
+    ).unwrap();
+    assert!(store.get(&child_id).unwrap().request.orchestrator.is_none());
+    start.task = "fixture:answer".into();
+    start.request_id = Some("late-pool-bind".into());
+    assert!(
+        store
+            .replay_legacy_pool_resume(&parent, &start)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    let replay = resume().await.unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], child["agent_id"]);
+    assert_eq!(replay["attempt_id"], child["attempt_id"]);
+    run_to_end(&home, &child_id).await;
+}
+
 /// Explicit provider resume: unprovable native history refuses with
 /// `continuation_unavailable` and admits nothing; a proven history admits one
 /// child that keeps the parent's authority, assets, runtime home and native

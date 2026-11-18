@@ -46,9 +46,9 @@ revisions are recorded independently of host qualification in `family.toml`.
 
 ## Presentation policy
 
-`start_batch` returns its typed response in `structuredContent` with a fixed
-text summary. The original retained public admission includes a private
-`release_token` there. The operator socket and CLI expose `capabilities`
+`start_batch` returns the durable receipt and replay flag in
+`structuredContent` with a fixed text summary. The release credential is
+omitted from MCP responses. The operator socket and CLI expose `capabilities`
 and `answer_chunk`. Answer chunks are capped at 128 KiB before escaping.
 
 An oversized verified `answer` instead returns bounded metadata, including its

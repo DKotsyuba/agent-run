@@ -227,11 +227,17 @@ request still has to fit the existing transport and writer limits. Automatic
 multi-agent hook binding is not provided: pass an explicit `orchestrator` for
 each job that needs its own completion notice.
 
-Set `retain_history:true` to keep each admitted lineage's database history until
-its returned pin is released by its owner with
-`agent-run history-pins release --pin-id PIN_ID --request-id BATCH_REQUEST_ID`.
+Set `retain_history:true` to keep each admitted lineage's database history
+through an owner release. Direct socket clients receive the batch's
+`release_token` in the first admission response and pass it with the pin ID
+to `history_pins_release`. CLI callers can capture it with
+`start-batch --release-token-file PATH` or `--release-token-fd N`, then release
+with `agent-run history-pins release --pin-id PIN_ID --release-token-file PATH`.
+MCP and CLI standard output carry the receipt only. The offline database owner
+can recover legacy pins and pins with no saved token using
+`agent-run history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id BATCH_REQUEST_ID`.
 Active pins also retain process-ownership evidence and recovery details for the
-lineage. They do not grant additional authority.
+lineage. See the [pin release contract](docs/api.md#agent-pool-migration-for-history-pins).
 
 New schema-2 workers receive a separate built-in MCP: `notify_orchestrator`,
 plus `health_reply` and `finish` in explicit-completion mode (research roles

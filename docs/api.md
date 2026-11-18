@@ -185,7 +185,8 @@ Discover the authoritative surface at runtime:
 ordinary provider start requests. A job must omit its own `request_id` or set
 it to null. Optional `retain_history` defaults to false and is part of the
 batch identity. When true, each job receives a distinct `pin_id` in its
-receipt and a batch `release_token` in the original admission response. All
+receipt and the direct socket client receives a batch `release_token` in the
+original admission response. All
 jobs, pins and the permanent receipt commit together. A retained socket
 `start_batch` requires a JSON-RPC ID so the broker can acknowledge admission.
 The shared key is scoped to this Run home. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
@@ -237,9 +238,9 @@ count retention. It does not prevent resume or promise to retain process files.
 Release public pins through the operator socket with
 `history_pins_release {"pin_id":"...","release_token":"...","expected_store_id":"..."}`.
 Run mints the 64-character bearer token for the batch and returns it only in
-the original successful `start_batch` response, outside `receipt`. The
-public pin ID contains a one-way verifier bound to the lineage. Pin listings,
-receipt reads and admission replays omit the token. A missing pin, a mismatched
+the original successful socket `start_batch` response, outside `receipt`.
+The public pin ID contains a one-way verifier bound to the lineage. MCP tool
+responses, pin listings, receipt reads and admission replays omit the token. A missing pin, a mismatched
 credential or an active lineage hold returns `RequestConflict`. Both
 `already_released:false` and `true` confirm release. The released tombstone
 prevents old batch replays from reviving the pin. After a timeout or missing
@@ -257,6 +258,17 @@ The CLI equivalents are `agent-run history-pins list` and
 `agent-run history-pins release --pin-id PIN_ID --release-token-file FILE`.
 Supply `-` for standard input. Use a private file or a pipe for the token.
 Use `--expected-store-id` to fence either command.
+
+For CLI admission, choose `start-batch --spec FILE --release-token-file PATH`
+or `--release-token-fd N` to capture a newly issued token, one line of plain
+text. The file is created exclusively with mode 0600 before submission.
+Existing paths and symlinks are refused. The descriptor must be inherited,
+writable, above 2 and separate from standard streams. Use a private sink.
+CLI standard streams carry only the receipt or a closed error. With neither
+flag, admission still succeeds and discards the token. A newly created file
+will be empty if no token was available, including replays. If writing the
+token fails after admission, reconcile the durable receipt and coordinate
+offline recovery.
 
 #### Agent Pool migration for history pins
 
@@ -276,8 +288,9 @@ Update Pool before switching Run. The socket `tools` schema for
   Use Pool's original enrollment key. Run checks the pin against the permanent
   managed enrollment receipt on the same authenticated Pool route.
   Discover support as `managed_pin_release_v1` in `_attempt_capabilities_v1`.
-- **Legacy public pins** have no online release credential. Treat a committed
-  public batch with a lost first response the same way. Keep the pin and
+- **Legacy public pins** have no online release credential. The same recovery
+  applies to a public batch with a lost token, a batch admitted over MCP, or a
+  CLI admission without a credential destination. Keep the pin and
   batch binding and coordinate release after close with the Run database owner.
   With the broker, service manager and all recorded workers stopped, the owner
   can run `agent-run --home HOME history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id ORIGINAL_BATCH_ID`.
@@ -355,8 +368,8 @@ automatic PostToolUse binding can pin its exact admission. The numeric counter
 is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
-`start_batch` returns its structured result in MCP `structuredContent`, with
-a fixed text summary.
+`start_batch` returns the durable receipt and replay flag in MCP
+`structuredContent`, with a fixed text summary.
 When an answer exceeds the MCP text budget, `answer` returns a bounded summary
 with the verified artifact size, SHA-256 and execution sequence, plus a link to
 the existing local answer file where its managed path permits one. Access to
