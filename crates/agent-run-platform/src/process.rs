@@ -1193,15 +1193,14 @@ impl OwnedProcess {
     /// reused. Spawned leaders and same-group helpers are never reaped, and
     /// only `waitpid(pid, WNOHANG)` on that exact PID is used. A reaped member
     /// stays captured and later observes as dead.
+    ///
+    /// Reaping, like adoption, needs this owner to be the process's only live
+    /// spawned owner, so no two owners can race to reap one PID and then
+    /// touch its successor. While several owners live, adopted zombies wait.
     #[cfg(target_os = "linux")]
     fn reap_adopted(&self, all: &[Identity]) {
-        if !subreaper_active() {
+        let Some(adopter) = self.adopter() else {
             return;
-        }
-        let adopter = Adopter {
-            pid: std::process::id() as i32,
-            // SAFETY: getpgrp has no preconditions.
-            group: unsafe { libc::getpgrp() },
         };
         for p in all {
             let leader = self
