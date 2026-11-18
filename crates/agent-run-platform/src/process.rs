@@ -1092,7 +1092,7 @@ impl OwnedProcess {
     /// a member can exit after the last settling snapshot, observe as dead in
     /// the cleanup proof and would otherwise stay an unreaped zombie child,
     /// which blocks the next spawn's clean boundary. Same exact checks as
-    /// [`Self::reap_captured`], driven by the captured identities instead of a
+    /// `reap_captured`, driven by the captured identities instead of a
     /// process snapshot.
     /// Without an active subreaper (and on macOS) this does nothing.
     pub fn reap_captured_zombies(&self) {
