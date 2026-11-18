@@ -1858,6 +1858,258 @@ async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
     assert!(deliveries <= 1, "at most one terminal delivery record");
 }
 
+/// PIDs the fork-before-wrap fixture engine recorded in `home`.
+#[cfg(target_os = "linux")]
+fn fork_before_wrap_pids(home: &Path) -> Vec<i32> {
+    ["fork-leader.pid", "fork-child.pid", "fork-daemon.pid"]
+        .iter()
+        .map(|name| {
+            fs::read_to_string(home.join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Whether `pid` is gone or only an unreaped zombie.
+#[cfg(target_os = "linux")]
+fn ended(pid: i32) -> bool {
+    agent_run_platform::process::inspect(pid).map_or(true, |now| now.zombie)
+}
+
+/// Run one provider attempt whose engine forks a child and a daemon and then
+/// has its launch wrapping fail; returns the execution and its attempt row.
+#[cfg(target_os = "linux")]
+async fn wrap_failure_run(home: &Path) -> (AgentId, i64, Option<String>, Option<String>) {
+    fs::write(home.join("fixture-wrap-failure"), "").unwrap();
+    fs::write(home.join("fixture-fork-before-wrap"), "").unwrap();
+    let service = fixture_service(home.to_path_buf()).await;
+    let admitted = service
+        .admit_provider_trusted(request(home), candidates(committed(home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(home, &id).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let (active, proof, process): (i64, Option<String>, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json,process_identity FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    (id, active, proof, process)
+}
+
+/// The private recovery receipt sealed for the execution's only attempt.
+#[cfg(target_os = "linux")]
+fn recovery_receipt(home: &Path, id: &AgentId) -> serde_json::Value {
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let attempt: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let path = home
+        .join("agents")
+        .join(id.as_str())
+        .join(format!("recovery.{attempt}.json"));
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// Whether `receipt` captured each of `pids`.
+#[cfg(target_os = "linux")]
+fn receipt_holds(receipt: &serde_json::Value, pids: &[i32]) -> bool {
+    let members = receipt["ownership"]["members"].as_array().unwrap();
+    pids.iter()
+        .all(|pid| members.iter().any(|member| member["pid"] == *pid))
+}
+
+/// Run broker recovery for a finished supervisor; returns the attempt's
+/// `ownership_active` and its recorded unresolved-cleanup reasons.
+#[cfg(target_os = "linux")]
+async fn recover(home: &Path, id: &AgentId) -> (i64, Vec<String>) {
+    let service = fixture_service(home.to_path_buf()).await;
+    service.reconcile().await.unwrap();
+    service.reconcile().await.unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let active = store
+        .conn
+        .query_row(
+            "SELECT ownership_active FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reasons = store
+        .conn
+        .prepare(
+            "SELECT json_extract(data_json,'$.reason') FROM events \
+             WHERE agent_id=? AND kind='attempt_cleanup_unresolved'",
+        )
+        .unwrap()
+        .query_map([id.as_str()], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    (active, reasons)
+}
+
+/// The cleanup verdict recorded for a launch that failed after its start.
+#[cfg(target_os = "linux")]
+fn launch_failure_verdict(home: &Path, id: &AgentId) -> String {
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let data: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE agent_id=? AND kind='provider_launch_failed_after_start_v1'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(&data).unwrap()["cleanup"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A launch whose wrapping fails after the engine forked is never certified
+/// never-spawned: the root is recorded, the whole tree (child and daemon) is
+/// killed by the ordinary cleanup and only a confirmed proof is recorded.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_launch_failing_after_start_cleans_its_tree_and_is_not_never_spawned() {
+    let (_temp, home) = home();
+    let (id, active, proof, process) = wrap_failure_run(&home).await;
+    assert_eq!(launch_failure_verdict(&home, &id), "confirmed");
+    assert!(process.is_some(), "the started root was recorded");
+    // The confirmed proof is recorded; recovery honours it to release.
+    assert_eq!(active, 1);
+    let phase: String = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT phase FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "cleanup_complete");
+    let proof: serde_json::Value = serde_json::from_str(&proof.unwrap()).unwrap();
+    assert_eq!(proof["confirmed"], true, "{proof}");
+    assert!(proof.get("never_spawned").is_none(), "{proof}");
+    let receipt = recovery_receipt(&home, &id);
+    assert!(
+        receipt_holds(&receipt, &fork_before_wrap_pids(&home)),
+        "{receipt}"
+    );
+    assert_eq!(receipt["cleanup"]["confirmed"], true, "{receipt}");
+    for pid in fork_before_wrap_pids(&home) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ended(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine tree member {pid} survived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // Recovery honours the recorded confirmed proof and releases ownership.
+    let (active, reasons) = recover(&home, &id).await;
+    assert_eq!(active, 0, "{reasons:?}");
+    assert!(reasons.is_empty(), "{reasons:?}");
+}
+
+/// When the started root cannot be identified nothing can be proven: the
+/// outcome is `cleanup unconfirmed`, ownership stays active for recovery and
+/// the attempt is not certified never-spawned.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unprovable_started_launch_keeps_ownership() {
+    let (_temp, home) = home();
+    fs::write(home.join("fixture-hide-started-owner"), "").unwrap();
+    let (id, active, proof, _) = wrap_failure_run(&home).await;
+    let pids = fork_before_wrap_pids(&home);
+    let alive = pids.iter().all(|pid| !ended(*pid));
+    for pid in &pids {
+        // SAFETY: exact fixture PIDs recorded by this test's engine.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    assert_eq!(launch_failure_verdict(&home, &id), "unconfirmed");
+    assert_eq!(active, 1, "ownership retained");
+    assert_eq!(proof, None, "no cleanup or never-spawned proof");
+    assert!(alive, "an unverified tree was signalled");
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert!(!store.get(&id).unwrap().status.terminal());
+    // Without a recorded identity recovery can prove nothing: it keeps the
+    // attempt owned with a typed blocker instead of releasing it.
+    let (active, reasons) = recover(&home, &id).await;
+    assert_eq!(active, 1);
+    assert_eq!(reasons, vec!["no_process_evidence".to_owned()]);
+}
+
+/// When the writer refuses the captured tree, the confirmed cleanup cannot be
+/// relied on for release: ownership stays active and the outcome is
+/// `cleanup unconfirmed`, while the local recovery receipt still holds every
+/// captured identity of the tree.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_ownership_write_keeps_the_started_launch_owned() {
+    let (_temp, home) = home();
+    agent_run_store::fixture::open(&home)
+        .unwrap()
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fixture_refuse_members BEFORE INSERT ON process_members \
+             BEGIN SELECT RAISE(ABORT,'fixture ownership refusal'); END;",
+        )
+        .unwrap();
+    let (id, active, proof, process) = wrap_failure_run(&home).await;
+    assert_eq!(launch_failure_verdict(&home, &id), "unconfirmed");
+    assert!(process.is_some(), "the root itself was recorded");
+    assert_eq!(active, 1, "ownership retained");
+    assert_eq!(proof, None, "no proof without persisted ownership");
+    let receipt = recovery_receipt(&home, &id);
+    assert!(
+        receipt_holds(&receipt, &fork_before_wrap_pids(&home)),
+        "{receipt}"
+    );
+    for pid in fork_before_wrap_pids(&home) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ended(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine tree member {pid} survived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // Recovery acts on SQLite rows only. With the root recorded but no member
+    // rows it cannot verify descendants after the leader is gone, so it keeps
+    // the attempt owned with a typed blocker; the receipt is for investigation.
+    let (active, reasons) = recover(&home, &id).await;
+    assert_eq!(active, 1, "{reasons:?}");
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        [
+            "leader_gone_descendants_unverifiable",
+            "no_process_evidence"
+        ]
+        .contains(&reasons[0].as_str()),
+        "{reasons:?}"
+    );
+}
+
 /// A second enabled account on `glm-user` and an alias provider binding the
 /// first account again under another label.
 const TWO_ACCOUNTS: &str = r#"

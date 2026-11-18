@@ -2,12 +2,13 @@
 
 use crate::{
     LaunchPlan,
+    engine_launch::LaunchKind,
     redact::{DiagnosticTail, Redactor, StreamingRedactor},
 };
 use agent_run_domain::{Error, OwnershipStage, Result};
 use agent_run_platform::{
     frame,
-    process::{OwnedProcess, OwnershipSnapshot},
+    process::{self, OwnedProcess, OwnershipSnapshot},
 };
 use serde_json::{Value, json};
 use std::{
@@ -23,7 +24,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    process::ChildStdin,
     sync::mpsc,
     task::JoinHandle,
 };
@@ -165,7 +166,7 @@ fn rpc_send_uncertainty(error: &Error, input_closed: bool) -> RpcUncertain {
 
 /// Owns an app-server child, its bounded streams, and request correlation state.
 pub struct Process {
-    pub child: Child,
+    pub child: crate::engine_launch::EngineChild,
     pub input: Option<ChildStdin>,
     pub owner: OwnedProcess,
     /// Optional launch-owned reader conduit; only the core event loop may act on its requests.
@@ -187,6 +188,9 @@ pub struct Process {
     exit_kill_deadline: Option<tokio::time::Instant>,
     /// Last descendant snapshot, shared by startup RPC and streaming reads.
     observed_at: tokio::time::Instant,
+    /// Claim on the engine's exit status in the subreaper spawn registry,
+    /// released only after tokio collected that status.
+    spawned: Option<process::SpawnedChild>,
     /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
     ownership_sink: Option<OwnershipSink>,
     /// Last successfully persisted append-only capture revision.
@@ -205,7 +209,7 @@ impl Process {
     /// forged locators, and opted-in children receive only their actual endpoint
     /// locator. The core remains the sole engine writer.
     pub fn spawn(plan: &LaunchPlan) -> Result<Self> {
-        Self::spawn_with_stdout(plan, false, None, false)
+        Self::settle(Self::launch(plan, LaunchKind::Rpc))
     }
 
     /// Spawns an owned HTTP server whose stdin is a lifetime lease, not RPC.
@@ -213,7 +217,7 @@ impl Process {
     /// and discarded as native diagnostics. EOF/oversized frames still fail.
     /// All environment, ownership, stderr and reaping behavior equals `spawn`.
     pub fn spawn_lease(plan: &LaunchPlan) -> Result<Self> {
-        Self::spawn_with_stdout(plan, true, None, false)
+        Self::settle(Self::launch(plan, LaunchKind::Lease))
     }
 
     /// Spawn a managed-selected native harness. Ordinary v1 owner is always
@@ -222,7 +226,40 @@ impl Process {
         plan: &LaunchPlan,
         v2: Option<crate::native_owner_v2::Config>,
     ) -> Result<Self> {
-        Self::spawn_with_stdout(plan, false, v2, true)
+        Self::settle(Self::launch(plan, LaunchKind::Managed(v2.map(Box::new))))
+    }
+
+    /// Launch an engine, distinguishing a launch that never ran a program from
+    /// one that failed after the program started.
+    ///
+    /// `NotStarted` is positive evidence that no engine program runs. A
+    /// `Started` failure still owns the running engine and its tree; callers
+    /// that keep durable ownership records should record the root and run
+    /// [`crate::engine_launch::StartedLaunch::cleanup`] before reporting it.
+    pub fn launch(
+        plan: &LaunchPlan,
+        kind: LaunchKind,
+    ) -> std::result::Result<Self, crate::engine_launch::SpawnError> {
+        match kind {
+            LaunchKind::Rpc => Self::spawn_with_stdout(plan, false, None, false),
+            LaunchKind::Lease => Self::spawn_with_stdout(plan, true, None, false),
+            LaunchKind::Managed(v2) => Self::spawn_with_stdout(plan, false, v2.map(|v2| *v2), true),
+        }
+    }
+
+    /// Synchronous callers: a started launch is cleaned (bounded) before its
+    /// distinct error is reported; it is never reported as never started.
+    fn settle(
+        launched: std::result::Result<Self, crate::engine_launch::SpawnError>,
+    ) -> Result<Self> {
+        use crate::engine_launch::SpawnError;
+        match launched {
+            Ok(process) => Ok(process),
+            Err(SpawnError::NotStarted(error)) => Err(error),
+            Err(SpawnError::Started(started)) => Err(crate::engine_launch::started_failure(
+                &started.cleanup_blocking(Duration::from_secs(2)),
+            )),
+        }
     }
 
     /// Owns the common spawn implementation; `lease` tolerates only non-JSON
@@ -232,20 +269,22 @@ impl Process {
         lease: bool,
         v2: Option<crate::native_owner_v2::Config>,
         managed: bool,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, crate::engine_launch::SpawnError> {
+        use crate::engine_launch::{SpawnError, StartedLaunch};
+        let not_started = |error: Error| SpawnError::NotStarted(error);
         let mut environment = plan.environment.clone();
         let native_owner = if managed {
             environment.remove(crate::native_owner::LOCATOR);
             None
         } else {
-            crate::native_owner::Owner::prepare(&mut environment)?
+            crate::native_owner::Owner::prepare(&mut environment).map_err(not_started)?
         };
         let native_owner_v2 = if managed {
             match v2 {
-                Some(config) => Some(crate::native_owner_v2::Owner::prepare(
-                    &mut environment,
-                    config,
-                )?),
+                Some(config) => Some(
+                    crate::native_owner_v2::Owner::prepare(&mut environment, config)
+                        .map_err(not_started)?,
+                ),
                 None => {
                     environment.remove(crate::native_owner_v2::LOCATOR);
                     None
@@ -256,7 +295,7 @@ impl Process {
             None
         };
         let redactor = Redactor::from_environment(&environment);
-        let mut command = Command::new(&plan.binary);
+        let mut command = std::process::Command::new(&plan.binary);
         command
             .args(&plan.args)
             .current_dir(&plan.cwd)
@@ -264,25 +303,32 @@ impl Process {
             .envs(&environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
+            .stderr(Stdio::piped());
         use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-        let mut child = command.spawn()?;
-        let pid = child
-            .id()
-            .ok_or_else(|| Error::Runtime("child PID unavailable".into()))?
-            as i32;
+        command.process_group(0);
+        // The OS launch, registered by exact identity before the engine
+        // program runs; an error here proves no program is running.
+        let (child, spawned) = process::spawn_registered(command)
+            .map_err(|error| SpawnError::NotStarted(error.into()))?;
+        let pid = child.id() as i32;
+        // Wrapping is a separate step: if it fails, the started engine and its
+        // tree stay owned and go through the ordinary cleanup.
+        let crate::engine_launch::Wrapped {
+            child,
+            stdin: input,
+            stdout,
+            mut stderr,
+        } = match crate::engine_launch::wrap(child) {
+            Ok(wrapped) => wrapped,
+            Err((error, child)) => {
+                return Err(SpawnError::Started(Box::new(StartedLaunch::new(
+                    error.into(),
+                    child,
+                    spawned,
+                ))));
+            }
+        };
         let owner = OwnedProcess::capture(pid);
-        let input = child.stdin.take();
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Runtime("child stdout unavailable".into()))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::Runtime("child stderr unavailable".into()))?;
         let (send, events) = mpsc::channel(8);
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -340,6 +386,7 @@ impl Process {
             primary_exited: false,
             exit_kill_deadline: None,
             observed_at: tokio::time::Instant::now(),
+            spawned: Some(spawned),
             ownership_sink: None,
             ownership_revision: None,
             ownership_pending: None,
@@ -484,11 +531,11 @@ impl Process {
     }
 
     /// One observation step: primary exit with escalation, then a descendant
-    /// refresh when 200 ms have passed since the last one.
+    /// refresh when the refresh period has passed since the last one.
     fn observe_tick(&mut self) -> Result<()> {
         self.observe_primary_exit()?;
         let now = tokio::time::Instant::now();
-        if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+        if now.duration_since(self.observed_at) >= self.owner.refresh_interval() {
             self.owner.refresh();
             self.observed_at = now;
         }
@@ -652,6 +699,10 @@ impl Process {
     fn observe_primary_exit(&mut self) -> Result<()> {
         if !self.primary_exited && self.child.try_wait()?.is_some() {
             self.primary_exited = true;
+            // tokio collected the status; the PID may now be reused.
+            if let Some(spawned) = self.spawned.take() {
+                spawned.reaped();
+            }
             self.owner.signal_descendants(libc::SIGTERM);
             self.input.take();
             self.exit_kill_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
@@ -674,7 +725,7 @@ impl Process {
     async fn receive(&mut self) -> Event {
         loop {
             let now = tokio::time::Instant::now();
-            if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+            if now.duration_since(self.observed_at) >= self.owner.refresh_interval() {
                 self.owner.refresh();
                 self.observed_at = now;
             }
@@ -711,7 +762,7 @@ impl Process {
                     // The next iteration records exit and sends the first TERM sweep.
                 }
                 event = self.events.recv() => return event.unwrap_or(Event::Eof),
-                _ = tokio::time::sleep_until(self.observed_at + Duration::from_millis(200)) => {},
+                _ = tokio::time::sleep_until(self.observed_at + self.owner.refresh_interval()) => {},
             }
         }
     }
@@ -941,7 +992,12 @@ impl Process {
     /// Waits briefly for child exit and bounded reader cleanup before releasing pipes.
     pub async fn reap(&mut self) -> Option<i32> {
         let code = match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
-            Ok(Ok(s)) => s.code(),
+            Ok(Ok(s)) => {
+                if let Some(spawned) = self.spawned.take() {
+                    spawned.reaped();
+                }
+                s.code()
+            }
             _ => None,
         };
         for mut task in self.tasks.drain(..) {
@@ -960,6 +1016,19 @@ impl Drop for Process {
     fn drop(&mut self) {
         for t in &self.tasks {
             t.abort();
+        }
+        // Captured orphans that exited after the last observation must not
+        // outlive this owner as zombies of the supervisor.
+        self.owner.reap_captured_zombies();
+        // An engine whose status was collected releases its registration; one
+        // dropped before that goes to the process-wide reaper, which releases
+        // the registration only after collecting the status.
+        if self.child.exited() {
+            if let Some(spawned) = self.spawned.take() {
+                spawned.reaped();
+            }
+        } else if let Some(child) = self.child.detach() {
+            process::reap_later(child, self.spawned.take());
         }
     }
 }

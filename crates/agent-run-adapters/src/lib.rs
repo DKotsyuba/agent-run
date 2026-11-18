@@ -4,6 +4,7 @@ pub mod authorized_request;
 pub mod claude;
 pub mod codex;
 pub mod command_policy;
+pub mod engine_launch;
 pub mod glm;
 pub mod io;
 /// Restricted managed-role controls, kept inactive until managed admission exists.

@@ -57,6 +57,87 @@ cannot be recovered from an already-dead leader.
 If the required proof cannot be established, a provider attempt keeps
 its ownership and records a bounded cleanup diagnostic for investigation.
 
+### Linux child subreaper
+
+On Linux each supervisor makes itself the child subreaper
+(`PR_SET_CHILD_SUBREAPER`) before it spawns anything. Engine descendants which
+double-fork, `setsid`, `nohup` or join another process group then reparent to
+the supervisor instead of init, so every termination point (primary exit,
+group or descendant signals, cleanup settling) reaches them by parentage.
+
+The supervisor tells its own spawns from adopted orphans only by an explicit
+registry. Every child is forked through a spawn gate: before `exec` the child
+reports its PID and waits until the supervisor has registered its exact PID and
+start token under an admission lock. A child that cannot be registered never
+runs its program; the spawn fails and is reaped. The OS launch is a single
+standard-library spawn of a command consumed by the gate; wrapping the child
+for the async runtime is a separate step. If wrapping fails after the program
+started, the engine and its process tree stay owned: the supervisor records
+the exact root as the attempt's process (so the attempt is never certified as
+never spawned), runs the ordinary bounded cleanup and records a confirmed
+cleanup proof only when the tree is proven gone and the engine's status was
+collected. Otherwise ownership is retained and the run reports
+`cleanup unconfirmed` for recovery. Before and after that cleanup the
+captured identities are sealed into the same private per-attempt recovery
+receipt ordinary cleanup writes, so the evidence survives an unavailable
+writer. A registration stays until the spawner collected the exit status; a
+child whose owner went away first (a dropped engine transport, an unconfirmed
+started launch) is handed to one process-wide reaper thread, which never kills
+it and releases the registration only after collecting its status.
+
+The admission lock is held from the clean-boundary check through the single
+spawn to the registration, so no observer sees the new child unregistered and
+no spawns interleave. The registrar's wait for the child's PID report is
+bounded (10 s): a child that never reports is refused, never execs, and the
+spawn returns. Known limitation: a child *stopped* before exec (SIGSTOP, a
+tracer) keeps the standard library's exec-status pipe open, so the spawn, and
+with it the admission lock, waits until that child continues or dies; the
+supervisor never stops its children.
+
+The process-wide reaper drops a queued child only once its exit is
+established: its status was collected, or (when another waiter took it) its
+registered identity is provably gone. If the reaper thread cannot be created,
+a task on the current async runtime polls instead and keeps retrying.
+
+Recovery after a supervisor failure acts only on SQLite ownership rows: the
+attempt's recorded root (`process_identity`), its persisted member snapshots
+and a recorded cleanup proof. The private recovery receipt is investigation
+evidence, never a recovery input. Consequently a confirmed proof is released;
+with the root recorded but no member rows, recovery can re-adopt and clean a
+still-live root's group but cannot verify escaped descendants after the root
+is gone (`leader_gone_descendants_unverifiable`); with no recorded identity it
+reports `no_process_evidence`. In every unverifiable case the attempt stays
+owned with a typed blocker.
+
+Process groups and PID listings never decide
+ownership. An orphan cannot name its tree, so it is attributed to an engine only
+when that engine was spawned at a clean boundary: under the same lock and
+before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT | __WALL)` reported that the
+supervisor had no child at all (of any exit signal, live or zombie), so every later orphan descends from that engine until
+another spawn is admitted. Any other engine attributes nothing and keeps the
+200 ms polling refresh. Only captured orphans are reaped, with
+`waitpid(pid, WNOHANG)` after a fresh check that the exact PID and token are an
+unregistered zombie child; `waitpid(-1)` is never used. Every owner does one
+last such reap when it is released (end of cleanup, engine transport drop), so
+a member that exited after the last observation cannot linger and deny the
+next spawn its clean boundary. Orphans that were never captured are not reaped
+and remain zombies of the supervisor until it exits.
+
+The engine itself is not made a subreaper: Bun-based (Claude, OpenCode) and
+tokio-based (Codex) engines reap only children they spawned, so adopted
+orphans would stay zombies inside the engine for its whole lifetime.
+
+With an exclusive engine the mid-run refresh slows to 2 s
+(`AGENT_RUN_DESCENDANT_REFRESH_MS`, 200 to 600000): it keeps the durable
+crash-recovery capture and orphan reaping current. Without a subreaper (macOS,
+or `prctl` refused) the 200 ms polling remains. A Pool peer whose ancestry
+includes a recorded supervisor identity (PID and exact start token) is refused
+as a Run descendant.
+
+Captured descendants are compared by their native start token; `birth` decides
+only for legacy evidence without one. Linux birth is derived from the wall-clock
+boot time, so a clock step changes it for a process that computes it later.
+
 macOS uses native process APIs and a start-time-only sysctl fallback when
 same-user relationship fields are unavailable. Linux reads `/proc`; its boot ID
 prevents start-tick reuse across reboots. Both platforms fail closed when group

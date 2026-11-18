@@ -73,6 +73,40 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   Leaders are Claude Code only; Codex matcher rewriting is unchanged. See
   "Agent Pool leader profiles" in `docs/provider-config-v2.md`.
 
+### Fixed
+
+- A per-agent supervisor no longer spends about a fifth of a CPU watching its
+  engine. Every process inspection re-read `/proc/stat` and the boot ID, and the
+  200 ms descendant refresh re-probed each parent once per child; boot facts
+  are now read once per process and each parent at most once per refresh. On
+  Linux the supervisor is the child subreaper of its engine tree: orphaned,
+  double-forked or `setsid` descendants reparent to it, are captured at every
+  termination point and killed by cleanup, and captured orphan zombies are
+  reaped by exact PID. Every child is registered by exact PID and start token
+  before its program runs (a child that cannot be registered never execs) and
+  stays registered until its spawner collected the status, so the
+  supervisor's own children are never adopted or reaped. A launch that fails
+  after the engine started is no longer reported as never spawned: its root is
+  recorded, its whole tree is cleaned through the ordinary ownership cleanup,
+  and ownership is kept with a `cleanup unconfirmed` outcome unless the tree
+  is proven gone and its recovery evidence was written. Children whose owner
+  went away before their exit status was collected are reaped by one
+  process-wide reaper thread instead of a thread per child. When the engine was spawned while
+  the supervisor had no other child, the mid-run refresh slows to 2 s
+  (`AGENT_RUN_DESCENDANT_REFRESH_MS`, 200 to 600000) for durable crash-recovery
+  evidence; otherwise, and on macOS, the 200 ms polling remains. On a
+  ~600-process host a watched engine fell from 21.5% to under 1% of one CPU.
+- Cleanup proofs compare a captured Linux or macOS descendant by its native
+  start token; `birth` decides only for legacy evidence without one, so a wall
+  clock step can no longer make a live descendant look reused and gone.
+- A Pool peer whose ancestry includes a recorded supervisor (PID and exact
+  start token) is refused as a Run descendant.
+- `install.sh` waits (bounded) for its watchdog child to exec before capturing
+  the child's identity, so a slow fork can no longer leave the identity check
+  refusing the signal and orphan the scratch directory and its `sleep`.
+  Host-load-sensitive tests were made robust against scheduling delays without
+  weakening their lifecycle assertions.
+
 ### Data
 
 - No schema change and no DROP migration: legacy pool tables and the

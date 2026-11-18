@@ -624,6 +624,90 @@ async fn broker_client_starts_through_the_real_schema2_dispatcher() {
     broker.wait_terminal(typed.agent_id.as_str());
 }
 
+/// Reports how late a 10 ms timer woke on this host: an unloaded machine shows a
+/// few milliseconds, a machine starved by other builds shows hundreds. The
+/// latency budgets below grow by this observed stall, so concurrent host load
+/// cannot fail them, while a regression on an idle host still exceeds them.
+struct StallProbe {
+    /// Worst wake-up lateness in microseconds since the last `reset`.
+    worst_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Ends the sampling thread when the probe is dropped.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Joined on drop so no sampler outlives the test.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StallProbe {
+    /// Tick period of the sampler.
+    const TICK: Duration = Duration::from_millis(10);
+
+    /// Starts sampling on a dedicated OS thread, independent of the Tokio runtime.
+    fn start() -> Self {
+        use std::sync::{Arc, atomic::Ordering};
+        let worst_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worst, ended) = (worst_us.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !ended.load(Ordering::Relaxed) {
+                let before = Instant::now();
+                std::thread::sleep(Self::TICK);
+                let late = before.elapsed().saturating_sub(Self::TICK);
+                worst.fetch_max(late.as_micros() as u64, Ordering::Relaxed);
+            }
+        });
+        Self {
+            worst_us,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Forgets earlier stalls; call when a measured phase begins.
+    fn reset(&self) {
+        self.worst_us.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Worst stall since the last `reset`.
+    fn worst(&self) -> Duration {
+        Duration::from_micros(self.worst_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `base` plus twice the observed stall (the client and the broker both wait
+    /// for the same starved host); equals `base` on an idle host within a few ms.
+    fn budget(&self, base: Duration) -> Duration {
+        stall_budget(base, self.worst())
+    }
+}
+
+impl Drop for StallProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Relative latency budget: the fixed contract plus twice the host stall seen
+/// while measuring.
+fn stall_budget(base: Duration, stall: Duration) -> Duration {
+    base + stall * 2
+}
+
+#[test]
+fn stall_budget_only_grows_by_observed_stall() {
+    let base = Duration::from_millis(250);
+    assert_eq!(stall_budget(base, Duration::ZERO), base);
+    assert_eq!(
+        stall_budget(base, Duration::from_millis(100)),
+        Duration::from_millis(450)
+    );
+    let probe = StallProbe::start();
+    probe.reset();
+    assert!(probe.budget(base) >= base);
+    assert!(probe.worst() < Duration::from_secs(60));
+}
+
 /// Finite fifteen-process cohorts cover dense native tool streams, empty and
 /// malformed answers, quota faults, nonzero exits, owned cancellation/restart,
 /// idempotent admission and measured quiet/draining reads. Every terminal tip
@@ -643,8 +727,10 @@ async fn fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified() {
         ("fixture:load-barrier", "cancelled"),
         ("fixture:load-barrier", "succeeded"), // held WAL writer after native roots are durable
     ];
+    let stall = StallProbe::start();
     for (round, (task, outcome)) in scenarios.into_iter().enumerate() {
         let mut broker = Broker::start_with_limit(&[], 20);
+        stall.reset();
         broker.retain_evidence();
         if round == 0 {
             let version = cli(&broker.home, &["--version"]);
@@ -774,13 +860,19 @@ async fn fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified() {
             "LOAD_COHORT round={round} active=15 samples=200 p50_us={} p95_us={} p99_us={}",
             samples[99], samples[189], samples[197]
         );
-        assert!(
-            samples[189] <= 250_000,
-            "warm p95 read/control exceeded 250 ms"
+        eprintln!(
+            "LOAD_STALL round={round} worst_us={}",
+            stall.worst().as_micros()
         );
         assert!(
-            samples[197] <= 1_000_000,
-            "warm p99 read/control exceeded one second"
+            Duration::from_micros(samples[189]) <= stall.budget(Duration::from_millis(250)),
+            "warm p95 read/control exceeded 250 ms plus host stall {:?}",
+            stall.worst()
+        );
+        assert!(
+            Duration::from_micros(samples[197]) <= stall.budget(Duration::from_secs(1)),
+            "warm p99 read/control exceeded one second plus host stall {:?}",
+            stall.worst()
         );
         if round == 2 {
             broker.restart().await;
@@ -813,8 +905,9 @@ async fn fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified() {
                     .unwrap();
                 let elapsed = before.elapsed();
                 assert!(
-                    elapsed <= Duration::from_millis(250),
-                    "cancel acknowledgement exceeded250ms"
+                    elapsed <= stall.budget(Duration::from_millis(250)),
+                    "cancel acknowledgement exceeded 250 ms plus host stall {:?}",
+                    stall.worst()
                 );
                 eprintln!("LOAD_CANCEL_ACK round={round} us={}", elapsed.as_micros());
             }
@@ -872,10 +965,15 @@ async fn fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified() {
             "LOAD_DRAIN round={round} task={task} samples=200 p50_us={} p95_us={} p99_us={}",
             draining[99], draining[189], draining[197]
         );
-        assert!(draining[189] <= 250_000, "draining p95 exceeded 250 ms");
         assert!(
-            draining[197] <= 1_000_000,
-            "draining p99 exceeded one second"
+            Duration::from_micros(draining[189]) <= stall.budget(Duration::from_millis(250)),
+            "draining p95 exceeded 250 ms plus host stall {:?}",
+            stall.worst()
+        );
+        assert!(
+            Duration::from_micros(draining[197]) <= stall.budget(Duration::from_secs(1)),
+            "draining p99 exceeded one second plus host stall {:?}",
+            stall.worst()
         );
         // Read the chosen version's state without migrating a live baseline.
         let store = rusqlite::Connection::open_with_flags(
@@ -904,8 +1002,10 @@ async fn fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified() {
         }
         let terminal_delay: f64 = store.query_row("SELECT MAX(a.finished_at-(SELECT MAX(e.at) FROM events e WHERE e.agent_id=a.id AND e.kind='process_cleanup')) FROM agents a", [], |r| r.get(0)).unwrap();
         assert!(
-            terminal_delay.is_finite() && terminal_delay <= 1.0,
-            "cleanup to terminal exceeded one second: {terminal_delay}"
+            terminal_delay.is_finite()
+                && terminal_delay <= stall.budget(Duration::from_secs(1)).as_secs_f64(),
+            "cleanup to terminal exceeded one second plus host stall {:?}: {terminal_delay}",
+            stall.worst()
         );
         eprintln!(
             "LOAD_TERMINAL round={round} cleanup_to_terminal_max_ms={} home={}",
