@@ -8,6 +8,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ### Fixed
 
+- Document the owner-approved, time-boxed cargo-deny exception for chrono's unmaintained advisory.
 - `list_agents` no longer re-reads and re-decodes the same frozen execution
   record for every projection. Delivery, health and tool-count projections
   reuse the selected record, cumulative usage and tool counts are computed with
