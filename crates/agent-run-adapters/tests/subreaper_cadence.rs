@@ -33,6 +33,8 @@ fn isolated(name: &str, subreaper: bool, body: fn()) {
             "--exact",
             &format!("subreaper_cadence::{name}"),
             "--nocapture",
+            // Ignored probes re-run themselves too; ordinary cases are unaffected.
+            "--include-ignored",
         ])
         .env(CASE, name)
         .env_remove(process::REFRESH_ENV)
@@ -203,4 +205,54 @@ fn primary_exit_captures_and_kills_a_daemonized_descendant() {
             });
         },
     );
+}
+
+/// Returns this process's consumed user plus system CPU time.
+fn cpu_time() -> Duration {
+    // SAFETY: rusage is plain old data and getrusage only writes it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_SELF with a valid out-pointer has no other preconditions.
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+    let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    Duration::from_micros(micros(usage.ru_utime) + micros(usage.ru_stime))
+}
+
+/// Print the CPU share of a supervisor-like wait on one silent engine for ten seconds.
+fn supervisor_cpu(label: &str) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut fixture = spawn("exec sleep 60");
+        let (cpu, wall, reads) = (cpu_time(), Instant::now(), read_syscalls());
+        fixture
+            .0
+            .observing(tokio::time::sleep(Duration::from_secs(5)))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), fixture.0.next()).await;
+        println!(
+            "{label}: {:.2}% of one CPU, {} read syscalls over {:.1} s ({} host processes)",
+            (cpu_time() - cpu).as_secs_f64() * 100.0 / wall.elapsed().as_secs_f64(),
+            read_syscalls() - reads,
+            wall.elapsed().as_secs_f64(),
+            process::processes().unwrap().len(),
+        );
+    });
+}
+
+#[test]
+#[ignore = "timing probe"]
+fn supervisor_cpu_probe_subreaper() {
+    isolated("supervisor_cpu_probe_subreaper", true, || {
+        supervisor_cpu("subreaper")
+    });
+}
+
+#[test]
+#[ignore = "timing probe"]
+fn supervisor_cpu_probe_polling() {
+    isolated("supervisor_cpu_probe_polling", false, || {
+        supervisor_cpu("polling")
+    });
 }

@@ -57,6 +57,24 @@ cannot be recovered from an already-dead leader.
 If the required proof cannot be established, a provider attempt keeps
 its ownership and records a bounded cleanup diagnostic for investigation.
 
+### Linux child subreaper
+
+On Linux each supervisor makes itself the child subreaper
+(`PR_SET_CHILD_SUBREAPER`) before it spawns anything. Engine descendants which
+double-fork, `setsid` or `nohup` then reparent to the supervisor instead of
+init, so every termination point (primary exit, group or descendant signals,
+cleanup settling) reaches them by parentage. An orphan is attributed to an
+engine only while that engine is the supervisor's single live spawned owner;
+the supervisor's own spawned leaders and same-process-group helpers are never
+adopted. Captured adopted zombies are reaped with `waitpid(pid, WNOHANG)` on
+their exact PID after a PID and token match; `waitpid(-1)` and the engine's own
+exit status are never used. Because orphans stay reachable, the mid-run
+descendant refresh slows from 200 ms to 10 s (`AGENT_RUN_DESCENDANT_REFRESH_MS`,
+200 to 600000); it only keeps the durable crash-recovery capture and zombie
+reaping current. Without a subreaper (macOS, or `prctl` refused) the 200 ms
+polling remains. A Pool peer whose ancestry includes a recorded supervisor
+identity (PID and exact start token) is refused as a Run descendant.
+
 macOS uses native process APIs and a start-time-only sysctl fallback when
 same-user relationship fields are unavailable. Linux reads `/proc`; its boot ID
 prevents start-tick reuse across reboots. Both platforms fail closed when group
