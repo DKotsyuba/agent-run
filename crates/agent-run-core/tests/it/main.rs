@@ -87,8 +87,6 @@ mod quota_adapter_v1;
 mod quota_admission_v2;
 #[path = "../quota_client_v1.rs"]
 mod quota_client_v1;
-#[path = "../quota_projection_v2.rs"]
-mod quota_projection_v2;
 #[path = "../reconciliation_receipts.rs"]
 mod reconciliation_receipts;
 #[path = "../redaction.rs"]

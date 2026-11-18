@@ -124,12 +124,7 @@ pub trait CliService: Send + Sync {
             self.transcript(id, query.cursor, query.limit)
         }
     }
-    /// Return the configured model roster or schema-2 provider catalog.
-    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
-    /// Return the configured capacity limits.
-    fn limits(&self) -> CliFuture<'_>;
-    /// Return the ordered capacity view, optionally for one exact model.
-    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_>;
+
     /// Returns account-free guide text for the exact catalog filters; omitted
     /// filters retain default guidance, and invalid names preserve typed errors.
     fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> CliFuture<'_>;
@@ -198,15 +193,7 @@ impl CliService for Service {
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript_public(self, id, cursor, limit)
     }
-    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(Service::models(self, query))
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(Service::limits(self))
-    }
-    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(Service::capacity_order(self, query))
-    }
+
     /// Forwards the CLI's exact optional filters to the shared guide service.
     fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
         Box::pin(Service::delegation_guide_filtered(self, query))
@@ -362,7 +349,7 @@ pub enum Command {
         #[arg(long)]
         spec: String,
     },
-    /// List or release durable lineage history pins.
+    /// List durable lineage history pins, or release one as its owner.
     HistoryPins {
         #[command(subcommand)]
         command: HistoryPinsCommand,
@@ -509,20 +496,7 @@ pub enum Command {
         #[arg(long, value_enum)]
         format: Option<TranscriptFormat>,
     },
-    /// Model roster, or the schema-2 provider catalog with exact filters.
-    Models {
-        /// Exact configured provider id.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Exact canonical role/profile name.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Exact provider-visible model id.
-        #[arg(long)]
-        model: Option<String>,
-    },
-    Limits,
-    /// Prints compact routing guidance, with the same exact filters as models.
+    /// Prints compact routing guidance for exact provider/profile/model filters.
     DelegationGuide {
         /// Exact configured provider id.
         #[arg(long)]
@@ -556,10 +530,6 @@ pub enum Command {
     Api {
         #[command(subcommand)]
         command: Api,
-    },
-    Capacity {
-        #[command(subcommand)]
-        command: Capacity,
     },
     Delivery {
         #[command(subcommand)]
@@ -654,11 +624,16 @@ pub enum HistoryPinsCommand {
         #[arg(long)]
         expected_store_id: Option<String>,
     },
-    /// Release one exact pin idempotently.
+    /// Release one exact pin idempotently, as the owner of its admitting batch.
     Release {
         /// Canonical pin identifier from a batch receipt.
         #[arg(long)]
         pin_id: String,
+        /// Ownership proof: the start-batch request_id that admitted the pin.
+        /// There is no override; pins from Agent Pool managed enrollments are
+        /// released through Agent Pool.
+        #[arg(long)]
+        request_id: String,
         /// Refuse a database different from the recorded store identity.
         #[arg(long)]
         expected_store_id: Option<String>,
@@ -1108,15 +1083,6 @@ pub enum StorageCommand {
     Recover,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum Capacity {
-    /// Capacity order; schema 2 lists providers, optionally for one model.
-    Order {
-        /// Exact provider-visible model id.
-        #[arg(long)]
-        model: Option<String>,
-    },
-}
 /// Completion-delivery commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Delivery {
@@ -1839,13 +1805,8 @@ fn operator_client_command(command: &Command) -> bool {
                 | Command::Transcript { .. }
                 | Command::Cancel { .. }
                 | Command::Steer { .. }
-                | Command::Models { .. }
-                | Command::Limits
                 | Command::DelegationGuide { .. }
                 | Command::Hook { .. }
-                | Command::Capacity {
-                    command: Capacity::Order { .. }
-                }
         )
 }
 
@@ -2605,38 +2566,45 @@ async fn run_client_command(
             (output)(&result)?;
         }
         Command::HistoryPins { command } => {
-            let (mut params, expected_store_id) = match command {
+            let (method, mut params, expected_store_id) = match command {
                 HistoryPinsCommand::List {
                     status,
                     limit,
                     after_pin_id,
                     expected_store_id,
                 } => (
-                    json!({
-                        "action":"list", "status":status, "limit":limit, "after_pin_id":after_pin_id
-                    }),
+                    "history_pins_list",
+                    json!({"status":status, "limit":limit, "after_pin_id":after_pin_id}),
                     expected_store_id,
                 ),
                 HistoryPinsCommand::Release {
                     pin_id,
+                    request_id,
                     expected_store_id,
                 } => (
-                    json!({"action":"release", "pin_id":pin_id}),
+                    "history_pins_release",
+                    json!({"pin_id":pin_id, "request_id":request_id}),
                     expected_store_id,
                 ),
             };
             if let Some(id) = expected_store_id {
                 params["expected_store_id"] = json!(id);
             }
-            let request: agent_run_domain::batch::HistoryPinsRequest =
-                serde_json::from_value(params.clone())
-                    .map_err(|_| invalid("invalid history pin request"))?;
-            if matches!(request, agent_run_domain::batch::HistoryPinsRequest::List { limit, .. } if !(1..=1000).contains(&limit))
-            {
-                return Err(invalid("history pin limit must be 1..=1000"));
+            if method == "history_pins_list" {
+                let request: agent_run_domain::batch::HistoryPinsListRequest =
+                    serde_json::from_value(params.clone())
+                        .map_err(|_| invalid("invalid history pin request"))?;
+                if !(1..=1000).contains(&request.limit) {
+                    return Err(invalid("history pin limit must be 1..=1000"));
+                }
+            } else {
+                let request: agent_run_domain::batch::HistoryPinReleaseRequest =
+                    serde_json::from_value(params.clone())
+                        .map_err(|_| invalid("invalid history pin request"))?;
+                request.validate()?;
             }
-            let result = broker.call("history_pins", params.clone()).await?;
-            if !transport::socket::valid_history_pin_response(&result, &params) {
+            let result = broker.call(method, params.clone()).await?;
+            if !transport::socket::valid_history_pin_response(method, &result, &params) {
                 return Err(Error::Runtime(
                     "history pin result is invalid; reconcile release by pin_id".into(),
                 ));
@@ -2840,21 +2808,6 @@ async fn run_client_command(
                     .await?,
             )?;
         }
-        Command::Models {
-            provider,
-            profile,
-            model,
-        } => {
-            (output)(
-                &broker
-                    .call(
-                        "models",
-                        json!({"provider":provider,"profile":profile,"model":model}),
-                    )
-                    .await?,
-            )?;
-        }
-        Command::Limits => (output)(&broker.call("limits", json!({})).await?)?,
         Command::DelegationGuide {
             provider,
             profile,
@@ -2870,15 +2823,6 @@ async fn run_client_command(
                 .as_str()
                 .ok_or_else(|| invalid("delegation guide must be text"))?;
             (text_output)(&format!("{text}\n"))?;
-        }
-        Command::Capacity {
-            command: Capacity::Order { model },
-        } => {
-            (output)(
-                &broker
-                    .call("capacity_order", json!({"model":model}))
-                    .await?,
-            )?;
         }
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
@@ -3099,21 +3043,6 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             )
             .await?;
         }
-        Command::Models {
-            provider,
-            profile,
-            model,
-        } => (dependencies.output)(
-            &dependencies
-                .service
-                .models(agent_run_domain::ModelsQuery {
-                    provider,
-                    profile,
-                    model,
-                })
-                .await?,
-        )?,
-        Command::Limits => (dependencies.output)(&dependencies.service.limits().await?)?,
         Command::DelegationGuide {
             provider,
             profile,
@@ -3196,14 +3125,6 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 stdout_log.unwrap_or_else(|| home.join("logs/api.log")),
                 stderr_log.unwrap_or_else(|| home.join("logs/api.err.log")),
             )?)?,
-        },
-        Command::Capacity { command } => match command {
-            Capacity::Order { model } => (dependencies.output)(
-                &dependencies
-                    .service
-                    .capacity_order(agent_run_domain::CapacityOrderQuery { model })
-                    .await?,
-            )?,
         },
         Command::Delivery { command } => match command {
             Delivery::Status { agent_id, run_id } => {

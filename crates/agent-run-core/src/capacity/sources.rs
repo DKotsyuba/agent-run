@@ -12,7 +12,7 @@ use crate::{
     process::{OwnedProcess, ProcessState, observe},
     profiles::Profile,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
@@ -138,14 +138,6 @@ pub async fn codex_probe(
         ));
     }
     result
-}
-fn host_environment() -> BTreeMap<String, String> {
-    [
-        "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
-    ]
-    .iter()
-    .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-    .collect()
 }
 
 /// Bounds both sides of the pre-exec identity handshake.
@@ -630,74 +622,6 @@ pub async fn capture(
     }
     process.armed = false;
     result
-}
-/// Reads the legacy schema-1 native model roster without collecting quota.
-pub async fn models(home: &Path) -> Result<Value> {
-    let cfg = Config::load(home)?;
-    let mut result = serde_json::Map::new();
-    for (name, rt) in cfg.runtimes.iter().filter(|(_, r)| r.enabled) {
-        let kind = rt.kind()?;
-        let mut roster: BTreeMap<String, Value> = BTreeMap::new();
-        let mut accounts = Vec::new();
-        let mut reason = None;
-        if kind == Adapter::Codex {
-            let mut scopes = vec![None];
-            scopes.extend(rt.accounts.iter().map(|s| Some(s.as_str())));
-            for account in scopes {
-                match codex_probe(home, &cfg, rt, account, "model/list").await {
-                    Ok(value) => {
-                        let mut ids = Vec::new();
-                        if let Some(data) = value.get("data").and_then(Value::as_array) {
-                            for model in data {
-                                if let Some(id) = model
-                                    .get("model")
-                                    .or_else(|| model.get("id"))
-                                    .and_then(Value::as_str)
-                                    .filter(|s| rt.models.iter().any(|m| m == s))
-                                {
-                                    let efforts: Vec<_> = model
-                                        .get("supportedReasoningEfforts")
-                                        .and_then(Value::as_array)
-                                        .into_iter()
-                                        .flatten()
-                                        .filter_map(|v| {
-                                            v.get("reasoningEffort").and_then(Value::as_str)
-                                        })
-                                        .collect();
-                                    roster.insert(id.into(),json!({"id":id,"description":"configured and observed in native account roster","efforts":efforts}));
-                                    ids.push(id.to_owned());
-                                }
-                            }
-                        }
-                        accounts.push(
-                            json!({"account":account,"available":!ids.is_empty(),"models":ids}),
-                        );
-                    }
-                    Err(_) => {
-                        reason = Some("one or more account probes failed");
-                        accounts.push(json!({"account":account,"available":false,"models":[],"reason":"probe_failed"}));
-                    }
-                }
-            }
-        } else {
-            if capture(&rt.binary, &["--version".into()], 5, &host_environment())
-                .await
-                .is_ok()
-            {
-                for id in &rt.models {
-                    roster.insert(id.clone(),json!({"id":id,"description":"configured native CLI model; authentication checked on launch","efforts":["low","medium","high","xhigh","max"]}));
-                }
-            } else {
-                reason = Some("configured binary probe failed");
-            }
-        }
-        if roster.is_empty() && reason.is_none() {
-            reason = Some("roster empty");
-        }
-        let available = !roster.is_empty();
-        result.insert(name.clone(),json!({"models":roster.into_values().collect::<Vec<_>>(),"capabilities":adapters::capabilities(kind),"available":available,"reason":reason,"accounts":accounts}));
-    }
-    Ok(Value::Object(result))
 }
 
 #[cfg(test)]

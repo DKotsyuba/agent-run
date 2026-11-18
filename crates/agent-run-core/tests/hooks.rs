@@ -7,12 +7,9 @@ use agent_run_core::{
     hooks::{bind, context},
 };
 use agent_run_domain::catalog::{AccountRecord, AccountStatus};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{path::Path, time::Duration};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixListener,
-};
+use tokio::net::UnixListener;
 
 /// Configure synthetic providers with registered accounts but no Quota service.
 async fn routes(home: &common::Home, entries: &[(&str, f64)]) {
@@ -86,34 +83,6 @@ fn quota_listener() -> (tempfile::TempDir, UnixListener) {
         .unwrap();
     let listener = UnixListener::bind(dir.path().join("quota.sock")).unwrap();
     (dir, listener)
-}
-
-/// Moves every fixture timestamp by the same amount without changing quota facts.
-fn shift_quota_times(value: &mut Value, offset: f64) {
-    match value {
-        Value::Object(fields) => {
-            for (key, value) in fields {
-                if matches!(
-                    key.as_str(),
-                    "at" | "evaluated_at"
-                        | "observed_at"
-                        | "newest_observed_at"
-                        | "valid_until"
-                        | "reset_at"
-                        | "last_reset_at"
-                        | "exhausted_until"
-                ) {
-                    if let Some(time) = value.as_f64() {
-                        *value = json!(time + offset);
-                    }
-                } else {
-                    shift_quota_times(value, offset);
-                }
-            }
-        }
-        Value::Array(values) => values.iter_mut().for_each(|v| shift_quota_times(v, offset)),
-        _ => {}
-    }
 }
 
 /// Admit one active agent bound to the supplied orchestrator reference.
@@ -284,6 +253,7 @@ async fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
         external_session_id: "session-1".into(),
         external_turn_id: Some("turn-1".into()),
     };
+    active_agent(&home, &reference);
     let first = context::build(&home.path, &reference, Some(1000.0))
         .await
         .expect("first context");
@@ -292,10 +262,11 @@ async fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
         .expect("dedup context");
     assert!(first.injected);
     assert!(
-        first
-            .text
-            .contains("migrate configuration to schema_version 2")
+        first.text.starts_with("Active agents (1)"),
+        "{}",
+        first.text
     );
+    assert!(!first.text.contains("schema_version"), "{}", first.text);
     assert!(first.text.chars().count() <= context::CONTEXT_HARD_LIMIT_CHARS);
     assert!(!second.injected);
     assert!(second.text.is_empty());
@@ -317,7 +288,8 @@ async fn python_context_hook_rejects_conflicting_raw_agent_ids() {
     assert!(error.to_string().contains("conflicting agent_id"));
 }
 
-/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_active_appearance_keeps_the_same_priority_budget`.
+/// Provider configuration alone injects nothing; an active agent injects only
+/// the active block, recorded as the sole receipt component.
 #[tokio::test]
 async fn python_context_active_appearance_keeps_priority_allocation_fixed() {
     let home = common::Home::new();
@@ -331,36 +303,39 @@ async fn python_context_active_appearance_keeps_priority_allocation_fixed() {
     routes(&home, &[("alpha", 90.0)]).await;
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
-        .expect("priority context");
-    let first_priority: String = home
+        .expect("provider-only context");
+    assert!(!first.injected && first.text.is_empty(), "{}", first.text);
+    let receipts: i64 = home
         .store()
         .conn
-        .query_row("SELECT context_key FROM context_receipts", [], |row| {
+        .query_row("SELECT COUNT(*) FROM context_receipts", [], |row| {
             row.get(0)
         })
-        .expect("priority receipt");
+        .unwrap();
+    assert_eq!(receipts, 0, "nothing visible, nothing recorded");
     active_agent(&home, &reference);
     let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("active context");
-    let second_key: String = home
+    let key: String = home
         .store()
         .conn
         .query_row("SELECT context_key FROM context_receipts", [], |row| {
             row.get(0)
         })
         .expect("active receipt");
-    let first_priority = serde_json::from_str::<serde_json::Value>(&first_priority).unwrap();
-    let second_priority = serde_json::from_str::<serde_json::Value>(&second_key).unwrap();
-    assert_eq!(
-        first_priority["components"]["priority"],
-        second_priority["components"]["priority"]
-    );
-    assert!(first.injected);
-    assert!(first.text.contains("\"fixture\":unknown"));
-    assert!(!first.text.contains("acct-alpha"));
+    let key = serde_json::from_str::<serde_json::Value>(&key).unwrap();
+    let components: Vec<_> = key["components"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(components, ["active"]);
     assert!(second.injected);
+    assert!(second.text.starts_with("Active agents (1)"));
     assert!(!second.text.contains("Provider capacity order"));
+    assert!(!second.text.contains("acct-alpha"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_malformed_component_payloads_are_legacy_not_crashes`.
@@ -424,7 +399,7 @@ async fn python_context_malformed_component_receipts_are_replaced_safely() {
     );
 }
 
-/// Priority changes are delivered again when the provider configuration returns to its prior state.
+/// Provider configuration changes are not Run context: A/B/A edits inject nothing.
 #[tokio::test]
 async fn context_provider_changes_are_a_b_a_and_then_silent() {
     let home = common::Home::new();
@@ -435,25 +410,13 @@ async fn context_provider_changes_are_a_b_a_and_then_silent() {
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0)]).await;
-    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
-        .await
-        .expect("first context");
-    assert!(first.injected, "first={:?}", first);
-    routes(&home, &[("beta", 90.0)]).await;
-    let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
-        .await
-        .expect("second context");
-    assert!(second.injected && second.text.contains("beta"));
-    routes(&home, &[("alpha", 90.0)]).await;
-    let third = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
-        .await
-        .expect("third context");
-    assert!(third.injected && third.text.contains("alpha"));
-    let silent = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
-        .await
-        .expect("silent context");
-    assert!(!silent.injected && silent.text.is_empty());
+    for provider in ["alpha", "beta", "alpha"] {
+        routes(&home, &[(provider, 90.0)]).await;
+        let result = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+            .await
+            .expect("provider-only context");
+        assert!(!result.injected && result.text.is_empty(), "{provider}");
+    }
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_active_only_change_resends_the_active_block_without_priorities`.
@@ -506,12 +469,13 @@ async fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
         external_turn_id: None,
     };
     routes(&home, &[("alpha", 90.0)]).await;
+    active_agent(&home, &reference);
     budget(&home, 0);
     let empty = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("zero-budget context");
     assert_eq!((empty.text, empty.injected), (String::new(), false));
-    assert!(empty.orchestrator_session_id.is_none());
+    // The active agent's binding created the session; a zero budget records nothing.
     let store = home.store();
     assert_eq!(
         store
@@ -526,10 +490,12 @@ async fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
         .await
         .expect("restored context");
     assert!(restored.injected);
-    assert!(restored.text.contains("Provider capacity order"));
+    assert!(restored.text.starts_with("Active agents (1)"));
+    assert!(!restored.text.contains("Provider capacity order"));
 }
 
-/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_tight_budget_clips_priority_and_growth_delivers_the_full_summary`.
+/// A tight budget clips the active block to its slot; growth re-delivers the
+/// full summary because the slot is part of the receipt key.
 #[tokio::test]
 async fn python_context_tight_budget_hides_then_reveals_priority_lines() {
     let home = common::Home::new();
@@ -541,20 +507,20 @@ async fn python_context_tight_budget_hides_then_reveals_priority_lines() {
         external_turn_id: None,
     };
     routes(&home, &[("alpha", 90.0), ("beta", 50.0), ("gamma", 10.0)]).await;
-    budget(&home, 940);
+    active_agent(&home, &reference);
+    budget(&home, 60);
     let clipped = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("clipped context");
     assert!(clipped.injected);
-    assert!(clipped.text.contains("More routes omitted"));
-    assert!(clipped.text.contains("alpha"));
-    assert!(!clipped.text.contains("gamma"));
+    assert!(clipped.text.chars().count() <= 60, "{}", clipped.text);
+    assert!(!clipped.text.contains("do not start replacements"));
     budget(&home, 2500);
     let grown = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("grown context");
-    assert!(grown.injected && grown.text.contains("gamma"));
-    assert!(!grown.text.contains("More routes omitted"));
+    assert!(grown.injected && grown.text.contains("do not start replacements"));
+    assert!(!grown.text.contains("gamma"), "{}", grown.text);
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_legacy_digest_receipt_is_replaced_in_place_and_components_preserved`.
@@ -596,10 +562,9 @@ async fn python_context_legacy_receipt_migrates_in_place_and_preserves_component
         .expect("migrated key");
     let value: serde_json::Value = serde_json::from_str(&key).expect("versioned receipt");
     assert_eq!(value["v"], 2);
-    assert_eq!(
-        value["components"].as_object().expect("components").len(),
-        2
-    );
+    let components = value["components"].as_object().expect("components");
+    assert_eq!(components.len(), 1);
+    assert!(components.contains_key("active"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_sessions_and_transports_keep_independent_receipts`.
@@ -622,6 +587,9 @@ async fn python_context_receipts_are_independent_per_transport_and_session() {
         ..first.clone()
     };
     routes(&home, &[("alpha", 90.0)]).await;
+    for reference in [&first, &transport, &second] {
+        active_agent(&home, reference);
+    }
     let a = context::build(&home.path, &first, Some(agent_run_core::domain::now()))
         .await
         .unwrap();
@@ -664,6 +632,7 @@ async fn python_context_concurrent_identical_receipt_changes_have_one_winner() {
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
+    active_agent(&home, &reference);
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .unwrap();
@@ -712,6 +681,7 @@ async fn python_context_hook_cli_delivers_once_then_on_change() {
         external_turn_id: None,
     };
     routes(&home, &[("alpha", 90.0)]).await;
+    active_agent(&home, &reference);
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .unwrap();
@@ -719,11 +689,17 @@ async fn python_context_hook_cli_delivers_once_then_on_change() {
         .await
         .unwrap();
     assert!(first.injected && !second.injected && second.text.is_empty());
+    // A provider edit is not a change; another active agent is.
     routes(&home, &[("beta", 50.0)]).await;
+    let unchanged = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
+    assert!(!unchanged.injected);
+    active_agent(&home, &reference);
     let third = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .unwrap();
-    assert!(third.injected && third.text.contains("beta"));
+    assert!(third.injected && third.text.starts_with("Active agents (2)"));
 }
 
 /// Returns the fixed host session identity used by the hook parity tests.
@@ -1103,7 +1079,8 @@ async fn start_pool_receipt_binds_the_whole_pool_atomically() {
     .is_err());
 }
 
-/// A slow or missing Quota response stays unknown and cannot consume the active block.
+/// The hook never contacts Quota, even when a Quota socket is configured, and
+/// a zero budget performs no read; the active block is the whole context.
 #[tokio::test]
 async fn quota_hook_timeout_preserves_active_and_zero_budget_makes_no_request() {
     let home = common::Home::new();
@@ -1119,147 +1096,61 @@ async fn quota_hook_timeout_preserves_active_and_zero_budget_makes_no_request() 
         .await
         .unwrap();
     assert!(!disabled.injected);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), listener.accept())
-            .await
-            .is_err()
-    );
     budget(&home, 2500);
-    let (release, released) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        stream.read_to_end(&mut request).await.unwrap();
-        released.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err()
-        );
-        request
-    });
-    let started = std::time::Instant::now();
     let result = context::build_for_hook(&home.path, &reference, None)
         .await
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(result.text.contains("Active agents (1)"));
     assert!(
-        result.text.contains("\"fixture\":unknown"),
+        result.text.starts_with("Active agents (1)"),
         "{}",
         result.text
     );
+    for removed in [
+        "Provider capacity order",
+        "\"fixture\":",
+        "quota",
+        "acct-codex",
+    ] {
+        assert!(!result.text.contains(removed), "{removed}: {}", result.text);
+    }
     assert!(
-        result
-            .text
-            .contains("quota cannot be determined from available data")
-    );
-    assert!(!result.text.contains("acct-codex"));
-    assert!(!result.text.contains("private-codex"));
-    release.send(()).unwrap();
-    let request = tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&request).unwrap()["method"],
-        "snapshot"
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "the hook context must not read Quota"
     );
 }
 
-/// The actual socket snapshot supplies standings and respects explicit and live clocks.
-#[tokio::test]
-async fn quota_hook_uses_validated_snapshot_and_clock_after_fetch() {
-    let home = common::Home::new();
-    routes(&home, &[("codex", 1.0)]).await;
-    let writer = common::writer::Harness::start(&home.path);
-    let _socket = writer.serve_unix(&home.path);
-    let (dir, listener) = quota_listener();
-    quota_endpoint(&home, &dir.path().join("quota.sock"));
-    let server = tokio::spawn(async move {
-        for live in [false, false, true] {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).await.unwrap();
-            let mut frame: Value = serde_json::from_str(
-                &include_str!("fixtures/quota-client-v1/snapshot-v2.json")
-                    .replace("acct-test", "acct-codex")
-                    .replace("model-a", "fixture"),
-            )
-            .unwrap();
-            if live {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                shift_quota_times(&mut frame, now() - 10000.0);
-            }
-            let mut bytes = serde_json::to_vec(&frame).unwrap();
-            bytes.push(b'\n');
-            stream.write_all(&bytes).await.unwrap();
-        }
-    });
-    let reference = reference();
-    let before = context::build(&home.path, &reference, Some(9999.0))
-        .await
-        .unwrap();
-    assert!(
-        before.text.contains("\"fixture\":unknown"),
-        "{}",
-        before.text
-    );
-    let current = context::build(&home.path, &reference, Some(10002.0))
-        .await
-        .unwrap();
-    assert!(
-        current.text.contains("\"fixture\":available"),
-        "{}",
-        current.text
-    );
-    assert!(!current.text.contains("acct-codex"));
-    let live_reference = OrchestratorRef {
-        external_session_id: "live-clock".into(),
-        ..reference
-    };
-    let live = context::build(&home.path, &live_reference, None)
-        .await
-        .unwrap();
-    assert!(live.text.contains("\"fixture\":available"), "{}", live.text);
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-/// A failed independent SQL component cannot discard the available component;
-/// strict operator context still reports the storage failure rather than success.
+/// An unreadable active-agent component is reported as unavailable in
+/// advisory context, while strict operator context still reports the
+/// storage failure rather than success.
 #[tokio::test]
 async fn advisory_context_preserves_independently_available_components() {
-    for broken_table in ["binding_cooldowns", "messages"] {
-        let home = common::Home::new();
-        let reference = OrchestratorRef {
-            transport: "claude_uds".into(),
-            external_session_id: "partial-context".into(),
-            external_turn_id: None,
-        };
-        routes(&home, &[("alpha", 1.0)]).await;
-        active_agent(&home, &reference);
-        home.store()
-            .conn
-            .execute_batch(&format!("DROP TABLE {broken_table}"))
-            .unwrap();
-        let writer = common::writer::Harness::start(&home.path);
-        let _socket = writer.serve_unix(&home.path);
-        let result = context::build_for_hook(&home.path, &reference, None)
-            .await
-            .unwrap();
-        assert!(result.injected);
-        if broken_table == "binding_cooldowns" {
-            assert!(result.text.contains("Active agents (1)"));
-            assert!(!result.text.contains("Provider capacity order"));
-        } else {
-            assert!(result.text.contains("Provider capacity order"));
-            assert!(!result.text.contains("Active agents"));
-        }
-        assert!(context::build(&home.path, &reference, None).await.is_err());
-    }
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "claude_uds".into(),
+        external_session_id: "partial-context".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 1.0)]).await;
+    active_agent(&home, &reference);
+    home.store()
+        .conn
+        .execute_batch("DROP TABLE messages")
+        .unwrap();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
+    let result = context::build_for_hook(&home.path, &reference, None)
+        .await
+        .unwrap();
+    assert!(result.injected);
+    assert!(
+        result.text.contains("Active-agent state unavailable"),
+        "{}",
+        result.text
+    );
+    assert!(!result.text.contains("Provider capacity order"));
+    assert!(context::build(&home.path, &reference, None).await.is_err());
 }
 
 /// A deliberately expensive read is interrupted by SQLite itself, preserving

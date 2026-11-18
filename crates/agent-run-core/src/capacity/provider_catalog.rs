@@ -1,14 +1,15 @@
-//! Read-only public provider catalog and provider capacity order (schema 2).
+//! Read-only provider catalog behind the delegation guide (schema 2).
 //!
 //! Projection combines one validated immutable config revision with one
-//! committed local read and caller-supplied Quota standings. It never collects
-//! quota, probes a harness, reserves capacity, writes samples or starts agents.
-//! The orchestrator alone chooses provider, model, effort and profile; these
-//! views report configured facts, declared recommendation prose, canonical
-//! role grants, and cached quota standing — no automatic choice or score of
-//! model ability. No account id, label, or credential reference is emitted.
+//! committed local read. It never reads or presents quota, probes a harness,
+//! reserves capacity, writes samples or starts agents; Agent Quota owns
+//! capacity presentation. The orchestrator alone chooses provider, model,
+//! effort and profile; this view reports configured facts, declared
+//! recommendation prose and canonical role grants — no automatic choice or
+//! score of model ability. No account id, label, or credential reference is
+//! emitted.
 
-use crate::{Result, capacity::provider_ranking, error::invalid};
+use crate::{Result, error::invalid};
 use agent_run_config::{policy, profiles, provider_config::ProviderConfig, role_plan};
 use agent_run_domain::{
     ModelsQuery, ProviderStartRequest,
@@ -110,21 +111,23 @@ pub(super) fn check_model(catalog: &ProviderCatalog, model: Option<&str>) -> Res
     Ok(())
 }
 
-/// Projects the existing catalog shape with one caller-supplied provider order.
-pub(super) fn models_from_store(
+/// Projects the account-free provider catalog for the delegation guide from
+/// one committed local read: providers and models in configured order, each
+/// model's params, restrictions, recommendations and admissible canonical
+/// roles. Carries no quota standing, ranking or account identity; Agent Quota
+/// owns capacity presentation. Exact filters are validated as before.
+pub fn catalog_at(
     store: &Store,
     home: &Path,
     config: &ProviderConfig,
     revision: &str,
     query: &ModelsQuery,
-    at: f64,
-    order: impl FnOnce(
-        &Store,
-        &ProviderCatalog,
-        &dyn Fn(&ProviderDefinition, &ProviderModel) -> bool,
-        f64,
-    ) -> Result<provider_ranking::ProviderCapacityOrder>,
 ) -> Result<Value> {
+    let _read = if store.conn.is_autocommit() {
+        Some(store.conn.unchecked_transaction()?)
+    } else {
+        None
+    };
     let catalog = resolve(config, store)?;
     if let Some(provider) = &query.provider
         && catalog.provider(&provider.parse()?).is_none()
@@ -151,61 +154,42 @@ pub(super) fn models_from_store(
     };
     let any = any.unwrap_or_default();
     let mut roles = Vec::new();
-    let mut profiles_out = Vec::new();
     for name in names {
         match load_role(config, home, any.0, any.1, &name) {
-            Ok(profile) => {
-                profiles_out.push(json!({
-                    "name": profile.name,
-                    "revision": profile.revision,
-                    "write": profile.write,
-                    "network": profile.network,
-                    "allow_external_read_roots": profile.allow_external_read_roots,
-                    "read_roots": profile.read_roots,
-                    "required_constraints": profile.required_constraints,
-                    "skills": profile.skills,
-                    "mcp": profile.mcp,
-                }));
-                roles.push(profile);
-            }
+            Ok(profile) => roles.push(profile),
             Err(_) if query.profile.is_some() => {
                 return Err(invalid("profile filter names no canonical role"));
             }
-            Err(_) => profiles_out.push(json!({"name": name, "canonical": false})),
+            Err(_) => {}
         }
     }
-    let keep = |definition: &ProviderDefinition, offering: &ProviderModel| {
-        query
+    let mut providers = Vec::new();
+    for definition in catalog.providers() {
+        if query
             .provider
             .as_deref()
-            .is_none_or(|wanted| wanted == definition.id.as_str())
-            && query
+            .is_some_and(|wanted| wanted != definition.id.as_str())
+        {
+            continue;
+        }
+        let mut models = Vec::new();
+        for offering in &definition.models {
+            if query
                 .model
                 .as_deref()
-                .is_none_or(|wanted| wanted == offering.id)
-            && (query.profile.is_none()
-                || roles
-                    .iter()
-                    .all(|role| admissible(config, definition, offering, role)))
-    };
-    let order = order(store, &catalog, &keep, at)?;
-    let mut providers = Vec::new();
-    for entry in &order.providers {
-        let definition = catalog
-            .provider(&entry.provider)
-            .ok_or_else(|| invalid("provider order names an unknown provider"))?;
-        let mut models = Vec::new();
-        for standing in &entry.models {
-            let offering = definition
-                .models
-                .iter()
-                .find(|offering| offering.id == standing.model)
-                .ok_or_else(|| invalid("provider order names an unknown model"))?;
+                .is_some_and(|wanted| wanted != offering.id)
+            {
+                continue;
+            }
             let admissible: Vec<&str> = roles
                 .iter()
                 .filter(|role| admissible(config, definition, offering, role))
                 .map(|role| role.name.as_str())
                 .collect();
+            // A profile filter keeps only offerings every named role admits.
+            if query.profile.is_some() && admissible.len() != roles.len() {
+                continue;
+            }
             models.push(json!({
                 "model": offering.id,
                 "native_model": offering.native_model,
@@ -214,17 +198,16 @@ pub(super) fn models_from_store(
                 "restrictions": offering.restrictions,
                 "recommendations": offering.recommendations,
                 "profiles": admissible,
-                "quota": quota(standing),
             }));
+        }
+        if models.is_empty() {
+            continue;
         }
         providers.push(json!({
             "provider": definition.id,
             "harness": definition.harness,
             "connection": connection(&definition.connection),
             "auth_family": definition.auth_family,
-            "limits_source": definition.limits_source,
-            "priority_multiplier": entry.priority_multiplier,
-            "score": entry.score,
             "recommendations": definition.recommendations,
             "models": models,
         }));
@@ -232,52 +215,18 @@ pub(super) fn models_from_store(
     Ok(json!({
         "schema_version": 2,
         "config_revision": revision,
-        "capacity_revision": order.capacity_revision,
-        "ranked_at": order.observed_at,
-        "roles_sha256": agent_run_domain::canonical::sha256_hex(&json!(profiles_out), true),
-        "profiles": profiles_out,
         "providers": providers,
     }))
 }
 
-/// Renders one offering's cached standing without any account identity.
-fn quota(standing: &provider_ranking::ProviderModelOrder) -> Value {
-    json!({
-        "status": standing.status,
-        "best_priority": standing.best_priority,
-        "evidence": standing.evidence,
-        "newest_observed_at": standing.newest_observed_at,
-        "exhausted_until": standing.exhausted_until,
-    })
-}
-
-/// Serializes existing provider ranking without changing its compatibility
-/// shape, numerical priorities or account-free provider/model identities.
-pub(super) fn order_value(
-    order: &provider_ranking::ProviderCapacityOrder,
+/// Renders the compact account-free delegation guide from [`catalog_at`].
+pub fn delegation_guide_at(
+    store: &Store,
+    home: &Path,
+    config: &ProviderConfig,
     revision: &str,
-) -> Value {
-    let providers: Vec<Value> = order
-        .providers
-        .iter()
-        .map(|entry| {
-            json!({
-                "provider": entry.provider,
-                "priority_multiplier": entry.priority_multiplier,
-                "score": entry.score,
-                "models": entry.models.iter().map(|standing| json!({
-                    "model": standing.model,
-                    "native_model": standing.native_model,
-                    "quota": quota(standing),
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    json!({
-        "schema_version": 2,
-        "config_revision": revision,
-        "capacity_revision": order.capacity_revision,
-        "ranked_at": order.observed_at,
-        "providers": providers,
-    })
+    query: &ModelsQuery,
+) -> Result<Value> {
+    let catalog = catalog_at(store, home, config, revision, query)?;
+    Ok(Value::String(crate::delegation_guide::render(&catalog)?))
 }

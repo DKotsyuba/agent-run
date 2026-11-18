@@ -507,7 +507,7 @@ pub struct AgentPage {
     pub observed_at: f64,
 }
 
-/// Optional exact filters of the public `models` provider catalog.
+/// Optional exact filters of the public `delegation_guide` provider catalog.
 ///
 /// Every filter is an exact configured identifier, never a fuzzy or
 /// semantic match: `provider` selects one configured provider, `model` keeps
@@ -534,14 +534,4 @@ impl ModelsQuery {
     pub fn is_empty(&self) -> bool {
         self.provider.is_none() && self.profile.is_none() && self.model.is_none()
     }
-}
-
-/// Optional exact model filter of the public provider `capacity_order`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapacityOrderQuery {
-    /// Exact provider-visible model id; keeps only providers offering it and
-    /// ranks each by that model's own availability.
-    #[serde(default)]
-    pub model: Option<String>,
 }

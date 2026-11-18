@@ -67,6 +67,18 @@ enum Current {
         expected_incarnation: Incarnation,
     },
 }
+/// Pool-authenticated release of one pin minted by its managed enrollment.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedPinRelease {
+    version: u32,
+    expected_store_id: StoreId,
+    /// Pool component store of the enrollment; must match the authenticated route.
+    pool_store_id: String,
+    /// Pool's own enrollment request key (not Run's derived internal key).
+    request_id: String,
+    pin_id: agent_run_domain::batch::PinId,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CurrentLookup {
@@ -285,6 +297,7 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
             ("capacity_exhausted", "operator")
         }
         Error::Capacity => ("capacity_exhausted", "operator"),
+        Error::PinNotFound(_) => ("pin_not_found", "none"),
         Error::Conflict => ("intent_conflict", "none"),
         Error::Validation(_) => ("binding_unavailable", "operator"),
         _ => ("recovery_required", "operator"),
@@ -349,6 +362,7 @@ pub(crate) async fn dispatch(
                     "attempt_admission_v1",
                     "attempt_namespace_retirement_v1",
                     "managed_enrollment_v1",
+                    "managed_pin_release_v1",
                 ]
             } else {
                 Vec::new()
@@ -510,6 +524,22 @@ pub(crate) async fn dispatch(
             };
             Ok(
                 json!({"version":1,"store_id":key.expected_store_id,"request_id":key.request_id,"fingerprint":key.fingerprint,"state":state,"receipt":receipt,"jobs_state":jobs_state}),
+            )
+        }
+        "_managed_pin_release_v1" => {
+            let req: ManagedPinRelease = parse(params)?;
+            version(req.version)?;
+            let release = service
+                .managed_pin_release(
+                    grant,
+                    req.expected_store_id.clone(),
+                    &req.pool_store_id,
+                    &req.request_id,
+                    req.pin_id,
+                )
+                .await?;
+            Ok(
+                json!({"version":1,"store_id":req.expected_store_id,"pin_id":release.pin_id,"status":release.status,"already_released":release.already_released}),
             )
         }
         "_managed_enrollment_current_v1" => {

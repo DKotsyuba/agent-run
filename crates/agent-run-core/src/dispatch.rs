@@ -6,7 +6,9 @@ use crate::{
     error::invalid,
     service::{Query, Service},
 };
-pub use agent_run_domain::tools::{is_tool, tool, tools_json};
+pub use agent_run_domain::tools::{
+    is_orchestrator_tool, is_tool, socket_tools_json, tool, tools_json,
+};
 use agent_run_domain::{
     storage::WriteAuthority,
     worker::{WorkerCatalogProof, known_worker_catalog},
@@ -29,7 +31,8 @@ pub const CLI_TRANSCRIPT_MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Socket-only retry code for a transcript page changed between fragments.
 pub const CLI_TRANSCRIPT_PAGE_CHANGED_CODE: &str = "TranscriptPageChanged";
 
-/// Returns the one domain-owned, Python-compatible public discovery table.
+/// Returns the one domain-owned, Python-compatible orchestrator MCP discovery
+/// table; socket-only service methods are listed by [`socket_tools_json`].
 pub fn tools() -> Vec<Value> {
     tools_json()
 }
@@ -550,7 +553,8 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 })
                 .await
         }
-        "history_pins" => service.history_pins(args(raw)?).await,
+        "history_pins_list" => service.history_pins_list(args(raw)?).await,
+        "history_pins_release" => service.history_pins_release(args(raw)?).await,
         "_lineage_hold_acquire"
         | "_lineage_hold_lookup"
         | "_lineage_hold_list"
@@ -731,19 +735,16 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             let topic = a.topic.as_deref().unwrap_or("index");
             Ok(json!({"topic":topic,"text":doc(topic)?}))
         }
-        "models" => service.models(args(raw)?).await,
-        "limits" => {
-            let _: Empty = args(raw)?;
-            service.limits().await
-        }
-        "capacity_order" => service.capacity_order(args(raw)?).await,
         "delegation_guide" => service.delegation_guide_filtered(args(raw)?).await,
         // Socket-only control/discovery methods; absent from public tool discovery.
         "tools" => {
             let _: Empty = args(raw)?;
             // The private socket discovery method predates MCP and returns the
-            // table itself, not an MCP-shaped wrapper.
-            Ok(Value::Array(tools()))
+            // table itself, not an MCP-shaped wrapper. It lists every socket
+            // method, including socket-only service methods marked
+            // `"surface":"socket"`, so feature detection such as Hub's
+            // `answer_chunk`/`capabilities`/`initial_task` probes keeps working.
+            Ok(Value::Array(socket_tools_json()))
         }
         "ping" => {
             let options: Ping = args(raw)?;

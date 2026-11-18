@@ -1,7 +1,10 @@
-//! Bounded changed-only routing context for UserPromptSubmit hooks.
+//! Bounded changed-only active-agent context for UserPromptSubmit hooks.
+//!
+//! Run injects only its own execution state. Provider capacity and quota
+//! context belong to Agent Quota's own hook.
 
 use crate::{
-    Error, Result, capacity,
+    Error, Result,
     config::Config,
     domain::{OrchestratorRef, now},
     error::invalid,
@@ -19,10 +22,8 @@ pub const CONTEXT_HARD_LIMIT_CHARS: usize = 2500;
 pub const ACTIVE_BLOCK_MAX_CHARS: usize = 600;
 /// End-to-end cooperative budget for optional context, including SQL and persistence.
 const HOOK_BUDGET: Duration = Duration::from_millis(750);
-/// The Quota fetch and SQL work share this allowance before persistence.
+/// Local SQL allowance before persistence.
 const READ_BUDGET: Duration = Duration::from_millis(250);
-/// Preserve part of the read allowance for local agent and provider state.
-const LOCAL_READ_RESERVE: Duration = Duration::from_millis(100);
 /// Existing maximum wait for the writer acknowledgement.
 const WRITE_BUDGET: Duration = Duration::from_millis(500);
 const MAX_LISTED_AGENTS: usize = 5;
@@ -57,10 +58,9 @@ pub async fn build(
 }
 
 /// Builds optional host context without losing a prepared snapshot when its
-/// deduplication write fails or becomes unknown. The Quota fetch and local SQL
-/// share a 250 ms read deadline; persistence uses the remainder of the 750 ms
-/// call budget, never more than 500 ms. No SQL transaction spans an await;
-/// bounded Quota metadata and parsing jobs can finish after a fetch timeout.
+/// deduplication write fails or becomes unknown. Local SQL has a 250 ms read
+/// deadline; persistence uses the remainder of the 750 ms call budget, never
+/// more than 500 ms. No SQL transaction spans an await.
 ///
 /// Available components survive an independent component read failure. Failures
 /// before any context can be prepared propagate for the CLI's nonblocking hook
@@ -96,8 +96,7 @@ pub fn log_failure(error: &Error, stored_schema: Option<i64>) {
 
 /// Shared strict/advisory implementation. Only the advisory caller may retain
 /// read components after errors and bypass a failed deduplication write.
-/// Quota is fetched before opening the local snapshot, and store handles are
-/// dropped before awaiting the authenticated writer operation.
+/// Store handles are dropped before awaiting the authenticated writer operation.
 async fn build_inner(
     home: &Path,
     reference: &OrchestratorRef,
@@ -136,28 +135,6 @@ async fn build_inner(
         });
     }
     let read_deadline = started + READ_BUDGET;
-    let quota = if budget > 0 {
-        if let Some((config, _)) = &providers {
-            let allowance = read_deadline
-                .saturating_duration_since(Instant::now())
-                .saturating_sub(LOCAL_READ_RESERVE);
-            if allowance.is_zero() {
-                None
-            } else {
-                tokio::time::timeout(
-                    allowance,
-                    capacity::quota_adapter::fetch(config.capacity.quota.as_ref()),
-                )
-                .await
-                .unwrap_or(None)
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // A service evaluation can occur during the fetch, so sample the clock after it.
     let now = at.unwrap_or_else(now);
     let store = if advisory {
         let remaining = read_deadline.saturating_duration_since(Instant::now());
@@ -190,39 +167,14 @@ async fn build_inner(
         }
         Err(error) => return Err(error),
     };
-    let capacity = if advisory && Instant::now() >= read_deadline {
-        Err(Error::Runtime("context read budget exhausted".into()))
-    } else {
-        if advisory {
-            store
-                .conn
-                .busy_timeout(read_deadline.saturating_duration_since(Instant::now()))?;
-        }
-        match &providers {
-            Some((config, revision)) => {
-                provider_block(&store, config, revision, quota.as_ref(), now)
-            }
-            None => Ok("Capacity order unavailable for schema_version 1; migrate configuration to schema_version 2.".into()),
-        }
-    };
-    let capacity_text = match capacity {
-        Ok(text) => text,
-        Err(error) if advisory => {
-            log_failure(&error, None);
-            "Capacity order unavailable; do not infer current provider availability.".into()
-        }
-        Err(error) => return Err(error),
-    };
     let (active_text, active_key) = if active_unavailable {
         ("Active-agent state unavailable; do not start replacements for existing agents. Retry their stored ids when state is readable.".into(), "unavailable".into())
     } else {
         active_block(&agents, now)
     };
-    let (priority_text, active_text, active_slot) = assemble(&capacity_text, &active_text, budget);
+    let active_slot = ACTIVE_BLOCK_MAX_CHARS.min(budget);
+    let active_text = truncate(&active_text, active_slot);
     let mut components = BTreeMap::new();
-    if !priority_text.is_empty() {
-        components.insert("priority".into(), digest(&priority_text));
-    }
     if !active_text.is_empty() {
         components.insert(
             "active".into(),
@@ -231,10 +183,7 @@ async fn build_inner(
     }
     drop(snapshot);
     drop(store);
-    let context_key = combine_key(
-        components.get("priority").map_or("", String::as_str),
-        components.get("active").map_or("", String::as_str),
-    );
+    let context_key = combine_key("", components.get("active").map_or("", String::as_str));
     if components.is_empty() {
         return Ok(ContextResult {
             orchestrator_session_id: prior_session,
@@ -274,96 +223,17 @@ async fn build_inner(
         }
         Err(error) => return Err(error),
     };
-    let text = [
-        changed
-            .iter()
-            .any(|name| name == "priority")
-            .then_some(priority_text),
-        changed
-            .iter()
-            .any(|name| name == "active")
-            .then_some(active_text),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n");
+    let text = if changed.iter().any(|name| name == "active") {
+        active_text
+    } else {
+        String::new()
+    };
     Ok(ContextResult {
         orchestrator_session_id: session_id,
         context_key,
         injected: !text.is_empty(),
         text,
     })
-}
-
-/// Renders the schema-2 provider-only capacity order: one line per provider
-/// with each offered model's Quota status, never an account or credential.
-/// It is read-only standing, not a choice; the caller picks provider/model.
-fn provider_block(
-    store: &Store,
-    config: &agent_run_config::provider_config::ProviderConfig,
-    revision: &str,
-    quota: Option<&crate::quota_client::Snapshot>,
-    at: f64,
-) -> Result<String> {
-    let order = capacity::quota_projection::order_at(
-        store,
-        config,
-        revision,
-        &Default::default(),
-        quota,
-        at,
-    )?;
-    let providers = order["providers"]
-        .as_array()
-        .ok_or_else(|| invalid("provider order has invalid providers"))?;
-    let mut lines = vec!["Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; use models for roles, recommendations and evidence. unknown = quota cannot be determined from available data, not a health claim.".to_owned()];
-    if providers.is_empty() {
-        lines.push("No configured providers.".into());
-    }
-    for (index, entry) in providers.iter().enumerate() {
-        let models = entry["models"]
-            .as_array()
-            .ok_or_else(|| invalid("provider order has invalid models"))?
-            .iter()
-            .map(|model| {
-                format!(
-                    "{}:{}",
-                    json_ascii(model["model"].as_str().unwrap_or_default()),
-                    model["quota"]["status"].as_str().unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        lines.push(format!(
-            "{}. provider={}; models=[{}]",
-            index + 1,
-            json_ascii(entry["provider"].as_str().unwrap_or_default()),
-            models
-        ));
-    }
-    Ok(lines.join("\n"))
-}
-
-/// Encodes a JSON string with Python-compatible ASCII-only escaping.
-fn json_ascii(value: &str) -> String {
-    let encoded = serde_json::to_string(value).expect("strings serialize");
-    let mut output = String::with_capacity(encoded.len());
-    for character in encoded.chars() {
-        if character.is_ascii() {
-            output.push(character);
-        } else if (character as u32) <= 0xffff {
-            output.push_str(&format!("\\u{:04x}", character as u32));
-        } else {
-            let code = character as u32 - 0x1_0000;
-            output.push_str(&format!(
-                "\\u{:04x}\\u{:04x}",
-                0xd800 + (code >> 10),
-                0xdc00 + (code & 0x3ff)
-            ));
-        }
-    }
-    output
 }
 
 /// Creates the bounded active-agent summary and its semantic receipt key.
@@ -406,7 +276,8 @@ fn active_block(agents: &[Value], at: f64) -> (String, String) {
     } else {
         String::new()
     };
-    let guidance = " Use agent-run status/transcript; do not start replacements for existing ids.";
+    let guidance =
+        " Use agent-run list_agents/transcript; do not start replacements for existing ids.";
     let body = format!("Active agents ({total}): {}{suffix}.", entries.join("; "));
     (
         format!(
@@ -471,38 +342,6 @@ fn truncate(value: &str, limit: usize) -> String {
     format!("{}…", prefix.trim_end())
 }
 
-/// Keeps complete priority lines and the prescribed omission instruction within a slot.
-fn truncate_priority(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.into();
-    }
-    let lines = value.lines().collect::<Vec<_>>();
-    let hint = "More routes omitted; use capacity_order if needed";
-    if lines.is_empty() || lines[0].chars().count() + 1 + hint.chars().count() > limit {
-        return String::new();
-    }
-    let mut kept = vec![lines[0]];
-    for line in &lines[1..] {
-        let candidate = [kept.join("\n"), (*line).into(), hint.into()].join("\n");
-        if candidate.chars().count() > limit {
-            break;
-        }
-        kept.push(line);
-    }
-    [kept.join("\n"), hint.into()].join("\n")
-}
-
-/// Reserves a fixed active slot so active changes never resize priority text.
-fn assemble(priority: &str, active: &str, budget: usize) -> (String, String, usize) {
-    let active_slot = ACTIVE_BLOCK_MAX_CHARS.min(budget);
-    let priority_slot = budget.saturating_sub(active_slot + 1);
-    (
-        truncate_priority(priority, priority_slot),
-        truncate(active, active_slot),
-        active_slot,
-    )
-}
-
 /// Hashes a visible component into the receipt representation.
 fn digest(value: &str) -> String {
     agent_run_platform::fs::sha256(value.as_bytes())
@@ -511,19 +350,4 @@ fn digest(value: &str) -> String {
 /// Combines component hashes into the Python-compatible 32-character context key.
 fn combine_key(priority: &str, active: &str) -> String {
     digest(&format!("{priority}::{active}"))[..32].into()
-}
-
-#[cfg(test)]
-mod tests {
-    /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_unicode_separators_cannot_split_a_route_line`.
-    #[test]
-    fn unicode_separators_are_escaped_inside_one_route_line() {
-        let text = format!(
-            "Runtime priorities.\n1. runtime={}",
-            super::json_ascii("name\u{2028}line")
-        );
-        assert!(!text.contains('\u{2028}'));
-        assert!(text.contains("\\u2028"));
-        assert_eq!(text.lines().count(), 2);
-    }
 }

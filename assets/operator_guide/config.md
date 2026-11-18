@@ -95,7 +95,8 @@ The broker checks configuration every 60 seconds and at request boundaries.
 Invalid revisions retain the last valid configuration. Existing runs keep their
 frozen settings; new runs receive the validated revision. Agent Quota owns quota
 collection; see its operator documentation to configure collection. Use
-`agent-run limits` to inspect available quota and its completeness marker.
+Agent Quota (for example `agent-quota limits`) to inspect available quota and
+its completeness marker; Run no longer presents quota.
 The old `agent-run capacity collect` and `capacity launchd` commands are no
 longer available. Existing scheduled jobs are not changed automatically;
 moving a macOS launchd job requires a separate migration.

@@ -540,82 +540,31 @@ async fn python_partial_frame_hits_idle_deadline() {
     drop(home);
 }
 
-/// A held Quota read must not block a durable cancel on the separate lane.
-/// The legacy schema-1 order explicitly advises migration before this test
-/// switches only its own synthetic config to schema 2.
+/// Quota presentation moved to Agent Quota: the removed quota reads and the
+/// combined `history_pins` method are unknown socket methods, while the
+/// socket-only service methods stay served.
 #[tokio::test]
 async fn python_capacity_order_and_durable_cancel_use_independent_paths() {
     let (home, path, task) = broker().await;
-    let id = admitted(&home);
-    let legacy = request(
+    for (id, method) in [
+        (0, "capacity_order"),
+        (1, "limits"),
+        (2, "models"),
+        (3, "history_pins"),
+    ] {
+        let response = request(
+            &path,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32601, "{method}: {response}");
+    }
+    let capabilities = request(
         &path,
-        json!({"jsonrpc":"2.0","id":0,"method":"capacity_order","params":{}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"capabilities","params":{}}),
     )
     .await;
-    assert_eq!(legacy["error"]["data"]["code"], "Unsupported");
-    assert!(
-        legacy["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("schema_version 2")
-    );
-
-    let quota_path = home.path().join("quota.sock");
-    let listener = tokio::net::UnixListener::bind(&quota_path).unwrap();
-    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let quota_task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes).await.unwrap();
-        let request: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(request["method"], "snapshot");
-        assert_eq!(request["accounts"], json!([]));
-        let _ = seen_tx.send(());
-        let _ = release_rx.await;
-        // EOF models an unavailable Quota source after the proven held read.
-    });
-    std::fs::write(
-        home.path().join("config.toml"),
-        format!(
-            "schema_version=2\n[capacity.quota]\nsocket={}\n",
-            toml::Value::String(quota_path.to_string_lossy().into_owned()),
-        ),
-    )
-    .unwrap();
-    let order = tokio::spawn({
-        let path = path.clone();
-        async move {
-            request(
-                &path,
-                json!({"jsonrpc":"2.0","id":1,"method":"capacity_order","params":{}}),
-            )
-            .await
-        }
-    });
-    tokio::time::timeout(Duration::from_secs(3), seen_rx)
-        .await
-        .unwrap()
-        .unwrap();
-    let started = tokio::time::Instant::now();
-    let response = request(
-        &path,
-        json!({
-            "jsonrpc":"2.0", "id":2, "method":"cancel", "params":{"agent_id":id}
-        }),
-    )
-    .await;
-    assert!(response.get("result").is_some(), "response={response}");
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(
-        !order.is_finished(),
-        "order must still be waiting for Quota"
-    );
-    release_tx.send(()).unwrap();
-    let order = order.await.unwrap();
-    assert_eq!(order["result"]["quota_coverage"]["state"], "unknown");
-    assert_eq!(order["result"]["quota_coverage"]["incomplete"], true);
-    quota_task.await.unwrap();
+    assert_eq!(capabilities["result"]["product"], "agent-run");
     stop(task).await;
     drop(home);
 }
@@ -668,7 +617,7 @@ async fn python_successful_tool_round_trip() {
     assert!(
         request(
             &path,
-            json!({"jsonrpc":"2.0","id":2,"method":"models","params":{}})
+            json!({"jsonrpc":"2.0","id":2,"method":"doc","params":{}})
         )
         .await
         .get("result")
@@ -679,11 +628,11 @@ async fn python_successful_tool_round_trip() {
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_surface_is_dispatch_tools_plus_control_methods`.
-/// The current shared surface additionally exposes the compact delegation guide
-/// and the five cooperative-pool operator tools plus the native integration read.
+/// The socket `tools` listing is the whole registry: orchestrator tools plus the
+/// socket-only service methods (marked `"surface":"socket"`) Hub detects.
 #[test]
 fn python_socket_surface_is_shared_tools_plus_controls() {
-    let names = agent_run::dispatch::tools()
+    let names = agent_run::dispatch::socket_tools_json()
         .into_iter()
         .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
         .collect::<std::collections::BTreeSet<_>>();
@@ -705,9 +654,12 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 24);
-    assert!(!names.contains("models"));
-    assert!(!names.contains("capacity_order"));
+    for removed in ["models", "capacity_order", "limits", "history_pins"] {
+        assert!(!names.contains(removed), "{removed}");
+    }
+    for socket_only in ["initial_task", "history_pins_list", "history_pins_release"] {
+        assert!(names.contains(socket_only), "{socket_only}");
+    }
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_wait_timeout_validation`.
@@ -999,7 +951,8 @@ bridge_reader_credential_sha256="{token_hash}"
             "attempt_consensus_v1",
             "attempt_admission_v1",
             "attempt_namespace_retirement_v1",
-            "managed_enrollment_v1"
+            "managed_enrollment_v1",
+            "managed_pin_release_v1"
         ])
     );
     let id = agent_run::domain::AgentId::new();

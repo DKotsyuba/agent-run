@@ -228,19 +228,40 @@ Separate CLI/MCP processes do not remember earlier outcomes for the caller.
 An active history pin retains the database execution and attempt rows, including
 cleanup proofs, for its entire lineage and future resumes, against both age and
 count retention. It does not prevent resume or promise to retain process files.
-The operator group calls `history_pins {"action":"release","pin_id":"..."}`
-to release it; both `already_released:false` and `true` confirm release.
-The permanent released tombstone prevents an old batch replay from reviving it.
-`PinNotFound`, timeout or an absent reply does not confirm release and does not
-restore a missing tombstone. Retry the same pin ID to reconcile an uncertain
-release. A pin ID itself grants no authority.
+Only the pin's owner releases it, through the operator socket (never MCP):
+`history_pins_release {"pin_id":"...","request_id":"..."}`, where `request_id`
+is the `start_batch` request ID that admitted the pin. The release transaction
+reads the permanent batch receipt and refuses with `RequestConflict` when that
+receipt did not mint the pin (any other key, including after release, so a
+tombstone does not reveal ownership), when the pin was minted by an Agent Pool
+managed enrollment, or while an active lineage hold protects it. Reserved
+internal keys (`p3_`, `p3c_`) are a `ValidationError`. Agent Pool releases
+pins of its managed enrollments over its authenticated attempt channel with
+`_managed_pin_release_v1 {"version":1,"expected_store_id","pool_store_id",
+"request_id","pin_id"}` (its own enrollment key; Run derives the internal batch
+key from the authenticated Pool route), advertised by
+`_attempt_capabilities_v1` as `managed_pin_release_v1`. Both
+`already_released:false` and `true` confirm release. The permanent released
+tombstone prevents an old batch replay from reviving it. `PinNotFound`,
+timeout or an absent reply does not confirm release and does not restore a
+missing tombstone. Retry the same pin ID and key to reconcile an uncertain
+release. A pin ID alone grants no authority.
 
-`history_pins {"action":"list"}` lists active and released pins, with optional
+There is no operator override. An operator who lost the batch request ID cannot
+release the pin through Run: the key is the only ownership proof Run holds, and
+an override would let any operator-group caller (including an orchestrator
+shell) bypass Pool's after-close rule. Such a pin keeps its lineage history
+until an owner releases it; this is the deliberate fail-closed outcome. The
+owner can recover the key from its own records (for Pool, its member binding).
+
+`history_pins_list` lists active and released pins, with optional
 `status` (`active`, `released` or `all`), `limit` (default 100, maximum 1000),
 and exclusive `after_pin_id`. Continue with `next_after_pin_id`; null marks the
 last page. The ordering is by pin ID; concurrent new pins can require a fresh
-scan. CLI equivalents are `agent-run history-pins list` and
-`agent-run history-pins release --pin-id PIN_ID`.
+scan. The listing never discloses the admitting batch request ID. CLI
+equivalents are `agent-run history-pins list` and
+`agent-run history-pins release --pin-id PIN_ID --request-id BATCH_REQUEST_ID`.
+The removed combined `history_pins` method returns method-not-found.
 Both list and release also accept optional `expected_store_id`; their database
 scope check shares the list snapshot or release transaction respectively.
 CLI supplies it with `--expected-store-id` and obtains an ID with
@@ -349,14 +370,33 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-Shared MCP/socket discovery advertises 20 tools: `start`, `start_batch`, `resume`, `cancel`,
-`steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
-`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, `history_pins`, and
-`agent_integration`, `capabilities`, and `answer_chunk`.
-`models` and `capacity_order` remain call-only compatibility methods in the
-same registry/dispatcher; their original structured CLI/socket responses and
-direct MCP calls by known name remain available. Schema-1 `capacity_order`
-and `limits` return `Unsupported` with guidance to migrate to schema 2.
+### Transport surfaces
+
+One registry (`assets/tools.json`) and one dispatcher serve CLI, MCP and the
+operator socket, but the orchestrator MCP surface is narrower:
+
+- **Orchestrator MCP** discovery and dispatch: `start`, `start_batch`,
+  `resume`, `cancel`, `steer`, `list_agents`, `answer`, `transcript`,
+  `delegation_guide` and `doc` (plus the legacy cooperative-pool tools
+  `start_pool`, `pool_post`, `pool_replace`, `pool` and `list_pools` until
+  their removal).
+- **Operator socket and CLI only** (registry entries marked
+  `"surface":"socket"`): `status`, `batch_receipt`, `capabilities`,
+  `transcript_exact`, `initial_task`, `answer_chunk`, `agent_integration`,
+  `history_pins_list` and `history_pins_release`. MCP `tools/list` omits them
+  and MCP `tools/call` rejects them as unknown tools.
+
+The socket `tools` method lists every socket method, including the
+socket-only ones with `"surface":"socket"`, so a socket client keeps detecting
+features from one `tools` call (Hub checks `answer_chunk`, `capabilities` and
+`initial_task` this way). `capabilities` remains the versioned detector for
+transport limits, lineage holds and `initial_task` support.
+`schemas/tools.json` is the orchestrator MCP discovery export.
+
+Quota presentation left Run in 0.32.0: `limits`, `models` and
+`capacity_order` (MCP, CLI and socket) are removed and return unknown-method
+errors. Agent Quota presents quota windows and capacity. Run keeps only the
+Quota read its admission needs.
 
 ### Operator lineage holds (v1)
 
@@ -680,22 +720,6 @@ New rows also expose immutable `policy` evidence with the runtime/platform and
 one entry for every known constraint: actual enforcement, support, whether the
 caller required it, exact scope, and reason. Historical rows return `null`.
 
-With schema 2, `capacity_order` accepts an optional exact `model` filter and
-returns provider-only advice: `schema_version`, `config_revision`,
-`capacity_revision`, `ranked_at`, account-free `quota_coverage`, and ordered `providers`. Each provider has its
-id, `priority_multiplier`, nullable `score`, and models with `native_model`
-and Quota-provided `quota` standing. It does not expose accounts or legacy physical-route
-aliases. An unknown model is a `ValidationError`. The view uses one newly fetched
-Quota response and one separate local read without collecting quota, reserving
-capacity or starting work. `quota_coverage.evaluated_at` is the Quota score's
-source clock, while `ranked_at` is the local projection time; local revision
-equality does not establish score freshness or cross-service atomicity.
-
-The CLI equivalent is `agent-run capacity order [--model MODEL]`. Select a
-compatible model and canonical role using `delegation_guide`; `models` is a
-structured compatibility read for existing clients.
-Schema 1 returns `Unsupported` and suggests migration to schema 2.
-
 Three methods exist only on this socket transport: `tools` and `ping` above,
 plus:
 
@@ -744,25 +768,14 @@ Notes for the loop:
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
-- Use `limits` for available Quota windows, percentages, reset times and
-  freshness. Schema 2 adds `ranking` and `coverage` (`state`, `incomplete`,
-  nullable `evaluated_at`); unreported quota is unknown when coverage is
-  incomplete. Quota unavailability produces unknown coverage, not a confirmed
-  empty history. `observed_at` equals the local `ranking.ranked_at`; score
-  evaluation uses Quota's separate clock. At most 1000 rows are returned and
-  truncation marks coverage incomplete. MCP omits account/pool identities and
-  refuses a page over its whole-response budget. Schema 1 returns `Unsupported`
-  with migration guidance. Historical storage and low-level latch code do not
-  supply these schema-2 reads; the
-  supervisor no longer writes native failures to that latch.
-- `models` and `capacity_order` retain their structured compatibility responses
-  for existing CLI/socket clients, without joining the advertised MCP catalog.
+- Quota windows, reset times and capacity standing come from Agent Quota, not
+  Run. Admission still reads one fresh Quota snapshot per decision and refuses
+  an exhausted choice with `QuotaExhausted`.
 - `delegation_guide` (optional exact `provider`, `model`, `profile` filters;
   schema 2 only) returns one compact plain-text
-  routing guide — providers in capacity order with each exact model id, cached
-  quota standing, admissible profiles, params, restrictions, and configured
-  guidance prose — instead of reading the full `models` JSON just to pick a
-  route. Its result is a JSON string here and real MCP text content on the MCP
+  routing guide — providers in configured order with each exact model id,
+  admissible profiles, params, restrictions, and configured guidance prose. It
+  carries no quota standing. Its result is a JSON string here and real MCP text content on the MCP
   transport; the CLI equivalent is `agent-run delegation-guide` with optional
   `--provider`, `--model`, and `--profile` filters.
   Unknown filters are `ValidationError`; omitted filters keep default guidance.

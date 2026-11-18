@@ -127,8 +127,8 @@ fn fresh_init_is_an_empty_v2_catalog() {
         fs::read_to_string(home.join("config.toml")).unwrap(),
         "schema_version = 2\n"
     );
-    let (ok, models) = run(&home, &["models"]);
-    assert!(ok, "{models}");
+    let (ok, guide) = run(&home, &["delegation-guide"]);
+    assert!(ok, "{guide}");
     // Doctor sees a coherent home: an empty catalog is information, not an
     // invalid config.
     // The detached canary belongs to the real CLI entrypoint. The integration

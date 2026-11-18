@@ -136,6 +136,11 @@ impl FakeQuota {
     fn assert_requested(&self, minimum: usize) {
         assert!(self.requests.load(std::sync::atomic::Ordering::Relaxed) >= minimum);
     }
+
+    /// Returns how many snapshot requests this fixture has served.
+    fn requested(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Drop for FakeQuota {
@@ -1363,15 +1368,7 @@ async fn admission_codes_survive_every_public_transport() {
     let quota = FakeQuota::start(true);
     let broker = Broker::start();
     quota.configure(&broker);
-    let view = BrokerClient::new(broker.home.join("api.sock"))
-        .call("models", Some(json!({})))
-        .await
-        .unwrap();
-    assert_eq!(
-        view["providers"][0]["models"][0]["quota"]["status"],
-        "exhausted"
-    );
-    assert_eq!(view["quota_coverage"]["incomplete"], false);
+    // Run presents no quota; the authoritative exhaustion still refuses admission.
     broker.assert_refused("quota_exhausted").await;
 
     assert!(
@@ -1380,7 +1377,8 @@ async fn admission_codes_survive_every_public_transport() {
             .success()
     );
     broker.assert_refused("no_eligible_account").await;
-    quota.assert_requested(4);
+    // One fresh Quota read per refused admission (CLI, MCP and socket).
+    quota.assert_requested(3);
 }
 
 /// A static credential/connection mismatch returns a typed refusal through
@@ -1467,8 +1465,10 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
 }
 
 /// One isolated broker and real raw MCP exchanges prove the advertised
-/// tools, filtered guidance, typed errors, diagnostic privacy/numbers, and
-/// unchanged structured CLI/socket compatibility aliases without provider turns.
+/// orchestrator tools, filtered guidance and typed errors, that the removed
+/// quota reads are unknown on MCP, socket and CLI, that socket-only service
+/// methods stay off MCP discovery but on the socket `tools` listing, and that
+/// no routing read contacts Quota or launches provider turns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     let quota = FakeQuota::start(false);
@@ -1476,10 +1476,6 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     quota.configure(&broker);
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let store = agent_run_store::fixture::open(&broker.home).unwrap();
-    let initial = client.call("limits", Some(json!({}))).await.unwrap();
-    assert_eq!(initial["items"][0]["remaining_percent"], 60.0);
-    assert_eq!(initial["coverage"]["incomplete"], false);
-    assert!(initial["coverage"]["evaluated_at"].is_number());
     let discovery = mcp_request(&broker.home, "2026-07-28", "tools/list", json!({})).await;
     let legacy_discovery = mcp_request(&broker.home, "2025-06-18", "tools/list", json!({})).await;
     assert_eq!(
@@ -1487,12 +1483,38 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         discovery["result"]["tools"]
     );
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 24, "{discovery}");
-    for name in ["models", "capacity_order"] {
-        assert!(!tools.iter().any(|tool| tool["name"] == name));
+    assert_eq!(
+        tools.len(),
+        agent_run_domain::tools_json().len(),
+        "{discovery}"
+    );
+    let socket_only = [
+        "status",
+        "batch_receipt",
+        "capabilities",
+        "transcript_exact",
+        "initial_task",
+        "answer_chunk",
+        "agent_integration",
+        "history_pins_list",
+        "history_pins_release",
+    ];
+    for name in ["models", "capacity_order", "limits", "history_pins"]
+        .iter()
+        .chain(&socket_only)
+    {
+        assert!(!tools.iter().any(|tool| tool["name"] == *name), "{name}");
     }
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
-    assert_eq!(socket_tools.as_array().unwrap().len(), 24);
+    let socket_tools = socket_tools.as_array().unwrap();
+    assert_eq!(socket_tools.len(), tools.len() + socket_only.len());
+    for name in socket_only {
+        let entry = socket_tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from socket tools"));
+        assert_eq!(entry["surface"], "socket", "{name}");
+    }
     let filtered_cli = cli(
         &broker.home,
         &[
@@ -1529,6 +1551,14 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         assert_eq!(guide["result"]["isError"], false, "{protocol}: {guide}");
         let text = guide["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("fixture") && text.contains("review"));
+        for private in [
+            "acct-work",
+            "synthetic-token",
+            "gateway.example",
+            "FAKE_TOKEN",
+        ] {
+            assert!(!text.contains(private), "{private}: {text}");
+        }
         for key in ["provider", "model", "profile"] {
             let bad = call("delegation_guide", json!({key:"missing"})).await;
             assert_eq!(bad["result"]["isError"], true, "{protocol}: {bad}");
@@ -1539,49 +1569,36 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
                     .contains("ValidationError")
             );
         }
-        let limits = call("limits", json!({})).await;
-        assert_eq!(limits["result"]["isError"], false, "{protocol}: {limits}");
-        let text = limits["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("60.0% remaining") && text.contains("resets in"));
-        assert!(text.contains("score") && text.contains("multiplier") && text.contains("priority"));
-        for private in [
-            "acct-work",
-            "synthetic-token",
-            "gateway.example",
-            "FAKE_TOKEN",
+        for method in [
+            "models",
+            "capacity_order",
+            "limits",
+            "status",
+            "capabilities",
         ] {
-            assert!(!text.contains(private), "{private}: {text}");
-        }
-        for method in ["models", "capacity_order"] {
-            let alias = call(method, json!({})).await;
-            assert_eq!(alias["result"]["isError"], false, "{protocol}: {alias}");
+            let refused = call(method, json!({})).await;
+            assert!(refused.get("result").is_none(), "{protocol}: {refused}");
+            assert_eq!(refused["error"]["code"], -32602, "{protocol}: {refused}");
         }
     }
     for (method, command) in [
         ("models", &["models"][..]),
         ("capacity_order", &["capacity", "order"][..]),
+        ("limits", &["limits"][..]),
     ] {
-        let legacy = client.call(method, Some(json!({}))).await.unwrap();
-        assert_eq!(legacy["schema_version"], 2);
-        assert!(legacy.get("ranking").is_none());
-        let output = cli(&broker.home, command);
-        assert!(output.status.success(), "{output:?}");
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            value["providers"][0]["provider"],
-            legacy["providers"][0]["provider"]
+        let removed = client.call(method, Some(json!({}))).await.unwrap_err();
+        assert!(
+            removed.to_string().contains("method not found"),
+            "{removed}"
         );
-        assert_eq!(
-            value.as_object().unwrap().keys().collect::<Vec<_>>(),
-            legacy.as_object().unwrap().keys().collect::<Vec<_>>()
-        );
+        assert!(!cli(&broker.home, command).status.success(), "{command:?}");
     }
     let agents: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
         .unwrap();
     assert_eq!(agents, 0, "read-only smoke must not launch provider turns");
-    quota.assert_requested(3);
+    assert_eq!(quota.requested(), 0, "routing reads never contact Quota");
 }
 
 /// The delegation guide is one plain-text result on every public transport:
@@ -1603,7 +1620,8 @@ async fn delegation_guide_is_plain_text_on_every_public_transport() {
         text.contains("provider glm-user (harness claude-code)"),
         "{text}"
     );
-    assert!(text.contains("- fixture:"), "{text}");
+    assert!(text.contains("  - fixture\n"), "{text}");
+    assert!(!text.contains("quota unknown"), "{text}");
     assert!(
         text.contains("provider glm-user (harness claude-code) — all models admit: review"),
         "{text}"

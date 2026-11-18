@@ -78,18 +78,6 @@ const TEMPLATES: &[(&str, &str)] = &[
         "answer",
         include_str!("../../../../assets/mcp/answer.txt.j2"),
     ),
-    (
-        "models",
-        include_str!("../../../../assets/mcp/models.txt.j2"),
-    ),
-    (
-        "capacity_order",
-        include_str!("../../../../assets/mcp/capacity_order.txt.j2"),
-    ),
-    (
-        "limits",
-        include_str!("../../../../assets/mcp/limits.txt.j2"),
-    ),
     ("doc", include_str!("../../../../assets/mcp/doc.txt.j2")),
 ];
 
@@ -808,7 +796,7 @@ fn budget(tool: &str) -> Budget {
             rows: 8,
             content: 0,
         },
-        "list_agents" | "limits" | "agent_integration" => Budget {
+        "list_agents" | "agent_integration" => Budget {
             bytes: 8192,
             rows: 20,
             content: 0,
@@ -822,11 +810,6 @@ fn budget(tool: &str) -> Budget {
             bytes: 16384,
             rows: 0,
             content: 14336,
-        },
-        "models" | "capacity_order" => Budget {
-            bytes: 16384,
-            rows: 100,
-            content: 0,
         },
         _ => Budget {
             bytes: 2048,
@@ -1042,14 +1025,7 @@ pub fn success_result_with_request(
         return status_result(value)
             .unwrap_or_else(|_| error_result("RuntimeError", "invalid status response"));
     }
-    if tool == "history_pins" {
-        return history_pins_result(value).unwrap_or_else(|_| {
-            error_result(
-                "RuntimeError",
-                "history pin result is invalid; reconcile release by pin_id",
-            )
-        });
-    }
+
     if tool == "start_batch" {
         return batch_result(value, request_id).unwrap_or_else(|_| {
             ExecutionReceipt::capture(tool, &Value::Null, request_id).fallback(tool)
@@ -1212,30 +1188,6 @@ fn status_result(value: &Value) -> Result<CallToolResult> {
         "agent-run status: complete proof in structuredContent.",
     )]);
     result.structured_content = Some(serde_json::to_value(output)?);
-    let mut wire = BoundedWriter {
-        bytes: Vec::new(),
-        limit: MAX_RESULT_WIRE_BYTES,
-    };
-    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
-    Ok(result)
-}
-
-/// Publishes the bounded structured pin page or exact release acknowledgement.
-fn history_pins_result(value: &Value) -> Result<CallToolResult> {
-    if value.get("pins").is_some() {
-        let _: agent_run_domain::batch::HistoryPinsPage =
-            serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
-    } else {
-        let release: agent_run_domain::batch::HistoryPinRelease =
-            serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
-        if release.status != agent_run_domain::batch::HistoryPinState::Released {
-            return Err(shape_error());
-        }
-    }
-    let mut result = CallToolResult::success(vec![ContentBlock::text(
-        "agent-run history_pins: result in structuredContent.",
-    )]);
-    result.structured_content = Some(value.clone());
     let mut wire = BoundedWriter {
         bytes: Vec::new(),
         limit: MAX_RESULT_WIRE_BYTES,
@@ -1467,194 +1419,6 @@ pub fn error_result(kind: &str, message: &str) -> CallToolResult {
     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.is_error = Some(true);
     result
-}
-
-/// One canonical role, retaining explicit false grants and exact constraints.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RoleTextView {
-    /// Actionable role name.
-    name: String,
-    /// Explicit boolean spelling; not a default grant.
-    write: String,
-    /// Explicit network grant spelling.
-    network: String,
-    /// Exact comma-separated constraint identifiers.
-    constraints: Option<String>,
-}
-
-/// One public model offering, without backend/account or credential metadata.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ModelTextView {
-    /// Exact offered model name.
-    id: String,
-    /// Optional native model spelling.
-    native_model: Option<String>,
-    /// Validated quota status, including unknown.
-    status: String,
-    /// Explicit observation evidence classification.
-    evidence: String,
-    /// Existing best model priority, including zero; unknown stays absent.
-    priority: Option<f64>,
-    /// Exact admissible profile list, optionally hoisted to the provider.
-    profiles: Option<String>,
-    /// Faithful configured parameter choices.
-    params: Option<String>,
-    /// Exact hard constraints.
-    restrictions: Option<String>,
-    /// Display-safe bounded guidance labels.
-    #[serde(default)]
-    guidance: Vec<String>,
-}
-
-/// One provider catalog/order row; optional numbers distinguish zero from absent.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProviderTextView {
-    /// Actionable public provider name.
-    id: String,
-    /// Optional configured harness.
-    harness: Option<String>,
-    /// Exact common profiles.
-    profiles: Option<String>,
-    /// Public score, including zero.
-    score: Option<f64>,
-    /// Explicit priority multiplier, including zero.
-    multiplier: Option<f64>,
-    /// Display-safe bounded configured guidance.
-    #[serde(default)]
-    guidance: Vec<String>,
-    /// Every validated model in source order.
-    models: Vec<ModelTextView>,
-}
-
-/// Legacy runtime roster retains explicit availability and exact model references.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RuntimeTextView {
-    /// Actionable runtime name.
-    name: String,
-    /// Explicit upstream availability.
-    available: bool,
-    /// Optional display-safe reason.
-    reason: Option<String>,
-    /// Exact offered model names.
-    models: Vec<String>,
-}
-
-/// Legacy route standing, independent of model ability.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RouteTextView {
-    /// Exact route runtime.
-    runtime: String,
-    /// Recorded priority; zero is meaningful.
-    priority: f64,
-    /// Exact configured aliases, without truncation.
-    aliases: Option<String>,
-}
-
-/// Explicit catalog family, preserving the schema-1/2 compatibility distinction.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CatalogTextView {
-    /// Validated product result schema, independent of MCP protocol.
-    schema: u64,
-    /// Optional exact capacity revision.
-    capacity_revision: Option<u64>,
-    /// Schema-2 canonical role grants.
-    profiles: Option<Vec<RoleTextView>>,
-    /// Schema-2 ordered providers.
-    providers: Option<Vec<ProviderTextView>>,
-    /// Schema-1 runtime roster.
-    runtimes: Option<Vec<RuntimeTextView>>,
-    /// Schema-1 ordered routes.
-    routes: Option<Vec<RouteTextView>>,
-    /// Exact unavailable route names.
-    unavailable: Option<String>,
-}
-
-/// One capacity diagnostic row; private account/pool fields never reach templates.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct LimitTextView {
-    /// Exact public runtime.
-    runtime: String,
-    /// Public quota lane.
-    lane: String,
-    /// Quota window name.
-    window: String,
-    /// Explicit observation validity.
-    known: bool,
-    /// Optional percent, preserving zero.
-    remaining_percent: Option<f64>,
-    /// Optional observed reset horizon, including 0s.
-    resets_in: Option<String>,
-}
-
-/// Whole capacity diagnostic page, refusing oversized data without dropping rows.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct LimitsTextView {
-    /// Every source diagnostic in order.
-    items: Vec<LimitTextView>,
-    /// Optional account-free schema-2 standing from the same diagnostic snapshot.
-    ranking: Option<CatalogTextView>,
-    /// Account-free source coverage and its evaluation clock, when available.
-    coverage_note: Option<String>,
-    /// An incomplete empty page is not evidence that no samples exist.
-    coverage_incomplete: bool,
-}
-
-/// Converts the existing dynamic catalog projection to its allowlisted typed view.
-fn render_catalog(name: &str, value: Value, limit: usize) -> Result<String> {
-    render_view(name, &projected::<CatalogTextView>(value)?, limit)
-}
-
-/// Adds source-clock and incompleteness information without exposing account IDs.
-fn render_catalog_coverage(
-    name: &str,
-    context: Value,
-    source: &Value,
-    limit: usize,
-) -> Result<String> {
-    let mut text = render_catalog(name, context, limit)?;
-    if let Some(note) = coverage_note(source.get("quota_coverage")) {
-        text.push('\n');
-        text.push_str(&note);
-        text.push('\n');
-    }
-    if text.len() > limit {
-        return Err(Error::Runtime("presentation_budget_exceeded".into()));
-    }
-    Ok(text)
-}
-
-/// Extracts only bounded, nonsecret coverage facts for human-readable pages.
-fn coverage_note(coverage: Option<&Value>) -> Option<String> {
-    let coverage = coverage?;
-    let mut note = if coverage["incomplete"] == true {
-        "Quota coverage incomplete; unreported capacity is unknown.".to_owned()
-    } else {
-        "Quota coverage complete.".to_owned()
-    };
-    if let Some(at) = coverage["evaluated_at"].as_f64() {
-        note.push_str(&format!(" Quota evaluated at Unix seconds {at}."));
-    }
-    Some(note)
-}
-
-/// Rejects contradictory or malformed source coverage when it is present.
-fn validate_coverage(coverage: Option<&Value>) -> Result<()> {
-    let Some(coverage) = coverage else {
-        return Ok(());
-    };
-    let state = coverage["state"].as_str().ok_or_else(shape_error)?;
-    let evaluated_at = coverage.get("evaluated_at").ok_or_else(shape_error)?;
-    let valid_clock = evaluated_at
-        .as_f64()
-        .is_some_and(|at| at.is_finite() && at >= 0.0);
-    if !matches!(state, "complete" | "partial" | "unknown")
-        || (state != "complete" && coverage["incomplete"] != true)
-        || !coverage["incomplete"].is_boolean()
-        || !(valid_clock || (state == "unknown" && evaluated_at.is_null()))
-    {
-        return Err(shape_error());
-    }
-    Ok(())
 }
 
 /// Fixed safe error for shape, enum or critical-fidelity rejection.
@@ -1945,124 +1709,6 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
                 return Err(Error::Runtime("presentation_budget_exceeded".into()));
             }
         }
-        "models" | "capacity_order" if value.get("providers").is_some() => {
-            validate_coverage(value.get("quota_coverage"))?;
-            if value.get("schema_version").is_some_and(|s| s != 2) {
-                return Err(shape_error());
-            }
-            if !value["capacity_revision"].is_u64() {
-                return Err(shape_error());
-            }
-            let mut count = 0usize;
-            for provider in required_rows(value, "providers", policy.rows)? {
-                required_reference(provider, "provider")?;
-                for model in required_rows(provider, "models", policy.rows)? {
-                    count += 1;
-                    required_reference(model, "model")?;
-                    if tool == "models" {
-                        for key in ["profiles", "restrictions"] {
-                            for entry in required_rows(model, key, policy.rows)? {
-                                if !entry.is_string() {
-                                    return Err(shape_error());
-                                }
-                            }
-                        }
-                        for key in ["params", "allowed_params"] {
-                            let entries = model[key].as_object().ok_or_else(shape_error)?;
-                            if entries.len() > 20 {
-                                return Err(shape_error());
-                            }
-                            for (name, parameter) in
-                                entries.iter().filter(|(name, _)| name.as_str() == "effort")
-                            {
-                                if !reference(name) {
-                                    return Err(shape_error());
-                                }
-                                let choices = if key == "allowed_params" {
-                                    parameter.as_array().ok_or_else(shape_error)?.as_slice()
-                                } else {
-                                    std::slice::from_ref(parameter)
-                                };
-                                if choices.len() > 20
-                                    || choices.iter().any(|v| {
-                                        !matches!(
-                                            v,
-                                            Value::String(_) | Value::Bool(_) | Value::Number(_)
-                                        )
-                                    })
-                                {
-                                    return Err(shape_error());
-                                }
-                            }
-                        }
-                    }
-                    if !matches!(
-                        model["quota"]["status"].as_str(),
-                        Some(
-                            "available"
-                                | "unknown"
-                                | "priority_overflow"
-                                | "exhausted"
-                                | "no_eligible_account"
-                        )
-                    ) || !matches!(
-                        model["quota"]["evidence"].as_str(),
-                        Some("fresh" | "stale" | "missing")
-                    ) {
-                        return Err(shape_error());
-                    }
-                }
-            }
-            if count > policy.rows {
-                return Err(Error::Runtime("presentation_budget_exceeded".into()));
-            }
-            if tool == "models" {
-                for role in required_rows(value, "profiles", policy.rows)? {
-                    required_reference(role, "name")?;
-                    required_bool(role, "write")?;
-                    required_bool(role, "network")?;
-                }
-            }
-        }
-        "models" => {
-            if value.get("schema_version").is_some() || !value.is_object() {
-                return Err(shape_error());
-            }
-            for (name, runtime) in value.as_object().ok_or_else(shape_error)? {
-                if !reference(name) {
-                    return Err(shape_error());
-                }
-                required_bool(runtime, "available")?;
-                for model in required_rows(runtime, "models", policy.rows)? {
-                    required_reference(model, "id")?;
-                }
-            }
-        }
-        "capacity_order" => {
-            if value.get("schema_version").is_some_and(|s| s != 1) {
-                return Err(shape_error());
-            }
-            required_rows(value, "routes", policy.rows)?;
-            required_rows(value, "unavailable_runtimes", policy.rows)?;
-        }
-        "limits" => {
-            validate_coverage(value.get("coverage"))?;
-            if let Some(ranking) = value.get("ranking") {
-                if ranking["schema_version"] != 2 || ranking["ranked_at"] != value["observed_at"] {
-                    return Err(shape_error());
-                }
-                validate_result("capacity_order", ranking)?;
-            }
-            for item in required_rows(value, "items", policy.rows)? {
-                let known = required_bool(item, "known")?;
-                for key in ["runtime", "lane", "window"] {
-                    required_reference(&item["key"], key)?;
-                }
-                if known && !item["remaining_percent"].is_number() {
-                    return Err(shape_error());
-                }
-            }
-        }
         _ => return Err(shape_error()),
     }
     Ok(())
@@ -2295,11 +1941,6 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
             &projected::<AdmissionTextView>(start_context(value))?,
             limit,
         ),
-        "limits" => render_view(
-            name,
-            &projected::<LimitsTextView>(limits_context(value))?,
-            limit,
-        ),
         "cancel" => render_view(
             name,
             &projected::<CancelTextView>(json!({"agent": agent_fields(value)}))?,
@@ -2375,8 +2016,6 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
             let page = pool_page(value.clone()).map_err(|_| shape_error())?;
             render_view(name, &projected::<PoolPageTextView>(page)?, limit)
         }
-        "models" => render_catalog_coverage(name, models_context(value), value, limit),
-        "capacity_order" => render_catalog_coverage(name, order_context(value), value, limit),
         _ => Err(shape_error()),
     }
 }
@@ -2545,238 +2184,6 @@ fn answer_context(value: &Value) -> Value {
         "size_bytes": value["size_bytes"].as_u64(),
         "kind": value["kind"].as_str(), "media_type": value["media_type"].as_str(),
     })
-}
-
-/// Models context: schema-2 provider catalog or the legacy runtime roster.
-fn models_context(value: &Value) -> Value {
-    if value["providers"].as_array().is_some() {
-        json!({
-            "schema": 2,
-            "capacity_revision": value["capacity_revision"],
-            "profiles": value["profiles"].as_array().into_iter().flatten()
-                .map(|role| json!({
-                    "name": role["name"].as_str().map(exact_display),
-                    "write": role["write"].as_bool().unwrap_or(false).to_string(),
-                    "network": role["network"].as_bool().unwrap_or(false).to_string(),
-                    "constraints": nonempty(&role["required_constraints"].as_array()
-                        .into_iter().flatten().filter_map(Value::as_str)
-                        .collect::<Vec<_>>().join(", ")),
-                })).collect::<Vec<_>>(),
-            "providers": providers_context(value),
-        })
-    } else {
-        json!({
-            "schema": 1,
-            "runtimes": value.as_object().into_iter().flatten().map(|(name, runtime)| {
-                json!({
-                    "name": exact_display(name), "available": runtime["available"],
-                    "reason": runtime["reason"].as_str().map(label),
-                    "models": runtime["models"].as_array().into_iter().flatten()
-                        .map(|model| model["id"].as_str().map(exact_display)).collect::<Vec<_>>(),
-                })
-            }).collect::<Vec<_>>(),
-        })
-    }
-}
-
-/// Provider/model projection shared by the `models` and guide layouts.
-fn providers_context(value: &Value) -> Vec<Value> {
-    value["providers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|provider| {
-            let models: Vec<Value> = provider["models"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|model| {
-                    let profiles = model["profiles"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str).map(exact_display)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    json!({
-                        "id": model["model"].as_str().map(exact_display),
-                        "native_model": model["native_model"].as_str().map(exact_display),
-                        "status": model["quota"]["status"],
-                        "evidence": model["quota"]["evidence"],
-                        "guidance": model["recommendations"]
-                            .as_array().into_iter().flatten()
-                            .filter_map(Value::as_str).map(prose).collect::<Vec<_>>(),
-                        "profiles": if profiles.is_empty() { "none".to_owned() } else { profiles },
-                        "params": param_line(&model["params"], &model["allowed_params"]),
-                        "restrictions": nonempty(&model["restrictions"]
-                            .as_array().into_iter().flatten()
-                            .filter_map(Value::as_str).map(exact_display).collect::<Vec<_>>().join(", ")),
-                    })
-                })
-                .collect();
-            // When every model admits the same nonempty profile set, state it
-            // once at the provider instead of repeating the list per model.
-            let common = models
-                .iter()
-                .map(|model| model["profiles"].as_str().unwrap_or("none"))
-                .reduce(|left, right| if left == right { left } else { "" })
-                .filter(|common| !common.is_empty() && *common != "none")
-                .map(str::to_owned);
-            let mut provider = json!({
-                "id": provider["provider"].as_str().map(exact_display), "harness": provider["harness"].as_str().map(exact_display),
-                "guidance": provider["recommendations"]
-                    .as_array().into_iter().flatten()
-                    .filter_map(Value::as_str).map(prose).collect::<Vec<_>>(),
-                "models": models,
-            });
-            // Null (not removal) so strict-undefined templates still see a
-            // defined, falsy key after hoisting.
-            provider["profiles"] = common
-                .as_deref()
-                .map_or(Value::Null, |common| json!(common));
-            if common.is_some() {
-                for model in provider["models"].as_array_mut().into_iter().flatten() {
-                    model["profiles"] = Value::Null;
-                }
-            }
-            provider
-        })
-        .collect()
-}
-
-/// Capacity-order context: schema-2 provider order or the legacy routes.
-fn order_context(value: &Value) -> Value {
-    if value["providers"].as_array().is_some() {
-        json!({
-            "schema": 2,
-            "capacity_revision": value["capacity_revision"],
-            "providers": value["providers"].as_array().into_iter().flatten().map(|provider| {
-                json!({
-                    "id": provider["provider"].as_str().map(exact_display),
-                    "score": provider["score"].as_f64(),
-                    "multiplier": provider["priority_multiplier"].as_f64(),
-                    "models": provider["models"].as_array().into_iter().flatten().map(|model| {
-                        json!({
-                            "id": model["model"].as_str().map(exact_display), "status": model["quota"]["status"],
-                            "evidence": model["quota"]["evidence"],
-                            "priority": model["quota"]["best_priority"].as_f64(),
-                        })
-                    }).collect::<Vec<_>>(),
-                })
-            }).collect::<Vec<_>>(),
-        })
-    } else {
-        json!({
-            "schema": 1,
-            "routes": value["routes"].as_array().into_iter().flatten().map(|route| {
-                json!({
-                    "runtime": route["runtime"].as_str().map(exact_display), "priority": route["priority"],
-                    "aliases": nonempty(&route["aliases"].as_array().into_iter().flatten()
-                        .filter_map(Value::as_str).map(exact_display).collect::<Vec<_>>().join(", ")),
-                })
-            }).collect::<Vec<_>>(),
-            "unavailable": nonempty(&value["unavailable_runtimes"].as_array()
-                .into_iter().flatten().filter_map(Value::as_str)
-                .collect::<Vec<_>>().join(", ")),
-        })
-    }
-}
-
-/// Limits context: the diagnostic rows this API already exposes publicly.
-///
-/// Reset horizons are derived against the read's own `observed_at` clock as
-/// readable spans, so no raw fractional epoch reaches the text.
-fn limits_context(value: &Value) -> Value {
-    let observed_at = value["observed_at"].as_f64();
-    json!({
-        "ranking": value.get("ranking").map(order_context),
-        "coverage_note": coverage_note(value.get("coverage")),
-        "coverage_incomplete": value["coverage"]["incomplete"] == true,
-        "items": value["items"].as_array().into_iter().flatten().map(|item| {
-            let key = &item["key"];
-            json!({
-                "runtime": key["runtime"].as_str().map(exact_display), "lane": key["lane"].as_str().map(exact_display), "window": key["window"].as_str().map(exact_display),
-                "known": item["known"],
-                "remaining_percent": item["remaining_percent"].as_f64(),
-                "resets_in": observed_at
-                    .zip(item["reset_at"].as_f64())
-                    .map(|(observed_at, reset_at)| span(reset_at - observed_at)),
-            })
-        }).collect::<Vec<_>>(),
-    })
-}
-
-/// Renders one finite non-negative duration in compact human units.
-///
-/// Sub-second spans round up to `1s`; anything from seconds upward keeps
-/// its largest whole unit (`45s`, `2m`, `2h`, `3d`), and longer spans stay
-/// in days. A non-finite or negative input renders as `0s` rather than a
-/// misleading clock reading.
-fn span(seconds: f64) -> String {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return "0s".to_owned();
-    }
-    let whole = [(86_400.0, "d"), (3_600.0, "h"), (60.0, "m"), (1.0, "s")];
-    for (unit, suffix) in whole {
-        if seconds >= unit {
-            return format!("{}{suffix}", (seconds / unit).ceil());
-        }
-    }
-    "1s".to_owned()
-}
-
-/// Renders the public loader's sole admitted parameter, effort, faithfully.
-/// Other metadata keys are discarded before templates, including credentials;
-/// defaults and allowed values remain exact scalar data rather than labels.
-fn param_line(defaults: &Value, allowed: &Value) -> Option<String> {
-    let mut parts = Vec::new();
-    for (name, value) in defaults
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(name, _)| name.as_str() == "effort")
-    {
-        // Render the scalar itself, not its JSON encoding.
-        let scalar = match value {
-            Value::String(text) => exact_display(text),
-            other => other.to_string(),
-        };
-        parts.push(format!("{}={scalar}", exact_display(name)));
-    }
-    for (name, values) in allowed
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(name, _)| name.as_str() == "effort")
-    {
-        let choices = values
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|value| match value {
-                Value::String(text) => exact_display(text),
-                Value::Bool(_) | Value::Number(_) => value.to_string(),
-                _ => String::new(),
-            })
-            .collect::<Vec<_>>()
-            .join("|");
-        parts.push(if choices.is_empty() {
-            format!("allowed {name}")
-        } else {
-            format!("allowed {name}: {choices}")
-        });
-    }
-    nonempty(&parts.join("; "))
-}
-
-/// Returns `None` for an empty string so templates can omit empty lines.
-fn nonempty(text: &str) -> Option<String> {
-    (!text.is_empty()).then(|| text.to_owned())
-}
-
-/// Formats only friendly guidance labels with quoting and visible shortening.
-fn prose(text: &str) -> String {
-    label(text)
 }
 
 /// Displays an actionable path/value without shortening or invisible formatting.
@@ -2965,7 +2372,11 @@ mod tests {
         let wire = serde_json::to_value(&result).unwrap();
         let text = wire["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Execution sequence: 1") && text.contains(&digest));
-        assert!(text.contains("answer_chunk") && !text.contains(&"я".repeat(100)));
+        assert!(
+            text.contains(&format!(
+                "agent-run answer-chunk {id} --sequence 1 --expected-sha256 {digest} --offset-bytes 0"
+            )) && !text.contains(&"я".repeat(100))
+        );
         assert_eq!(wire["structuredContent"]["sha256"], digest);
         assert_eq!(wire["structuredContent"]["size_bytes"], 16_000);
         assert_eq!(wire["content"][1]["type"], "resource_link");
@@ -3584,176 +2995,28 @@ mod tests {
         assert!(full.contains("the whole answer"), "{full}");
     }
 
-    /// One representative schema-2 catalog renders compactly with the
-    /// configured facts, hoisted profiles, and no account or endpoint.
-    #[test]
-    fn models_renders_compact_guidance_and_grants() {
-        // The bulky per-role asset arrays a real catalog carries; the text
-        // page omits them, which is where its compactness comes from.
-        let bulky = |prefix: &str, count: usize| {
-            (0..count)
-                .map(|index| json!({"id": format!("{prefix}-{index}")}))
-                .collect::<Vec<_>>()
-        };
-        let model = json!({
-            "model": "gpt-main", "native_model": "gpt-native",
-            "params": {"effort": "medium"}, "allowed_params": {"effort": ["medium", "high"]},
-            "restrictions": ["web_tools_disabled"],
-            "recommendations": ["broad coding"],
-            "profiles": ["code", "review"],
-            "quota": {"status": "available", "evidence": "fresh"},
-        });
-        let mut other = model.clone();
-        other["model"] = json!("gpt-review");
-        let catalog = json!({
-            "schema_version": 2, "config_revision": "abc123",
-            "capacity_revision": 7,
-            "profiles": [
-                {"name": "code", "write": true, "network": false,
-                 "read_roots": ["/tmp"], "required_constraints": [],
-                 "skills": bulky("skill", 12), "mcp": bulky("server", 6),
-                 "revision": "r1", "allow_external_read_roots": false},
-                {"name": "review", "write": false, "network": false,
-                 "read_roots": [], "required_constraints": ["filesystem_write_isolation"],
-                 "skills": bulky("skill", 12), "mcp": bulky("server", 6),
-                 "revision": "r2", "allow_external_read_roots": false},
-            ],
-            "providers": [{
-                "provider": "codex", "harness": "codex",
-                "recommendations": ["native subscription"],
-                "models": [model, other],
-            }],
-        });
-        let page = text("models", &catalog);
-        assert!(
-            page.contains("- code: write=true, network=false\n"),
-            "{page}"
-        );
-        assert!(
-            page.contains(
-                "- review: write=false, network=false, constraints: filesystem_write_isolation"
-            ),
-            "{page}"
-        );
-        assert!(
-            page.contains("provider codex (harness codex) — all models admit: code, review"),
-            "{page}"
-        );
-        assert!(
-            page.contains("provider guidance: \"native subscription\""),
-            "{page}"
-        );
-        assert!(
-            page.contains("- gpt-main (gpt-native): available, evidence fresh"),
-            "{page}"
-        );
-        assert!(
-            page.contains("params: effort=medium; allowed effort: medium|high"),
-            "{page}"
-        );
-        assert!(page.contains("restrictions: web_tools_disabled"), "{page}");
-        assert!(page.contains("model guidance: \"broad coding\""), "{page}");
-        assert!(!page.contains("acct-"), "{page}");
-        assert!(!page.contains("https://"), "{page}");
-        assert!(
-            page.len() < catalog.to_string().len(),
-            "compact: {} vs {}",
-            page.len(),
-            catalog.to_string().len()
-        );
-    }
-
-    /// Legacy rosters, both capacity-order schemas, limits, and doc render.
+    /// The doc page renders verbatim; the removed quota reads have no renderer.
     #[test]
     fn legacy_and_remaining_tools_render_their_essentials() {
-        let legacy = text(
-            "models",
-            &json!({"codex": {"available": true, "reason": null,
-                              "models": [{"id": "gpt-5"}]}}),
-        );
-        assert!(legacy.contains("schema 1 runtime rosters"), "{legacy}");
-        assert!(legacy.contains("- codex: available"), "{legacy}");
-        assert!(legacy.contains("model: gpt-5"), "{legacy}");
-        let order = text(
-            "capacity_order",
-            &json!({"schema_version": 2, "capacity_revision": 4, "providers": [
-                {"provider": "glm", "score": 60.0, "priority_multiplier": 1.5,
-                 "models": [{"model": "glm-5.3",
-                             "quota": {"status": "available", "evidence": "fresh"}}]},
-            ]}),
-        );
-        assert!(
-            order.contains("1. glm (score 60.0, multiplier 1.5)"),
-            "{order}"
-        );
-        assert!(
-            order.contains("- glm-5.3: available, evidence fresh"),
-            "{order}"
-        );
-        assert!(order.contains("not model ability"), "{order}");
-        let legacy_order = text(
-            "capacity_order",
-            &json!({"routes": [{"runtime": "codex", "priority": 9.5,
-                                "aliases": ["codex/main"]}],
-                    "unavailable_runtimes": ["claude"]}),
-        );
-        assert!(
-            legacy_order.contains("1. codex (priority 9.5) aliases: codex/main"),
-            "{legacy_order}"
-        );
-        assert!(
-            legacy_order.contains("unavailable runtimes: claude"),
-            "{legacy_order}"
-        );
-        let limits = text(
-            "limits",
-            &json!({"observed_at": 1000.0, "items": [
-                {"key": {"runtime": "glm", "lane": "glm-5.3", "window": "5h"},
-                 "account": "work", "pool": "work::glm-5.3", "known": true,
-                 "remaining_percent": 60.0, "reset_at": 4600.0},
-                {"key": {"runtime": "codex", "lane": "codex", "window": "5h"},
-                 "known": false},
-            ]}),
-        );
-        assert!(
-            limits.contains("- glm/glm-5.3/5h: 60.0% remaining, resets in 1h"),
-            "{limits}"
-        );
-        assert!(
-            limits.contains("- codex/codex/5h: no current sample (stale or expired)"),
-            "{limits}"
-        );
         let doc = text("doc", &json!({"topic": "config", "text": "guide prose\n"}));
         assert_eq!(doc, "guide prose\n");
+        for removed in ["models", "capacity_order", "limits"] {
+            assert_eq!(
+                success_result(removed, &json!({"items": [], "providers": []})).is_error,
+                Some(true),
+                "{removed}"
+            );
+        }
     }
 
     /// Empty catalog states, legacy empties, and errors are explicit.
     #[test]
     fn empty_states_and_errors_are_explicit() {
-        let empty_models = text(
-            "models",
-            &json!({"providers": [], "profiles": [],
-                    "config_revision": "empty", "capacity_revision": 3}),
-        );
-        assert!(
-            empty_models.contains("no providers are currently configured"),
-            "{empty_models}"
-        );
-        let empty_legacy = text("models", &json!({}));
-        assert!(
-            empty_legacy.contains("no enabled runtimes"),
-            "{empty_legacy}"
-        );
         let empty_agents = text(
             "list_agents",
             &json!({"items": [], "total": 0, "offset": 0, "complete": true}),
         );
         assert!(empty_agents.contains("0 of 0 matching"), "{empty_agents}");
-        let empty_limits = text("limits", &json!({"items": []}));
-        assert!(
-            empty_limits.contains("no stored capacity samples"),
-            "{empty_limits}"
-        );
         let error = error_result("ValidationError", "unknown arguments: ['x']\nsecond line");
         assert_eq!(error.is_error, Some(true));
         assert_eq!(error.structured_content, None);
@@ -3827,17 +3090,6 @@ mod tests {
         assert!(answer.contains(content));
         assert!(answer.contains(&"a".repeat(64)));
         assert!(answer.contains("answers/a b.md"));
-        for n in [0, 1] {
-            let page = text(
-                "capacity_order",
-                &json!({"schema_version":2,"capacity_revision":0,"providers":[
-                {"provider":"p","score":n,"priority_multiplier":0,"models":[
-                    {"model":"m","quota":{"status":"unknown","evidence":"missing"}}]}]}),
-            );
-            assert!(page.contains(&format!("score {n}.0")));
-            assert!(page.contains("multiplier 0.0"));
-            assert!(page.contains("unknown, evidence missing"));
-        }
     }
 
     /// Rendering owns a bounded private buffer, with exact byte boundaries,
@@ -3976,27 +3228,16 @@ mod tests {
         );
     }
 
-    /// Actionable model names/parameters are reversible rather than shortened,
-    /// while unknown credential-bearing parameter metadata never reaches the view.
+    /// Actionable values are reversible rather than shortened, and an empty
+    /// verified answer is stated explicitly.
     #[test]
     fn model_and_answer_empty_fidelity_drops_private_param_metadata() {
         let model = "custom\n\u{202e}{{ data }}";
-        let catalog = json!({"schema_version":2,"capacity_revision":0,"profiles":[],
-            "providers":[{"provider":"p","harness":"codex","models":[{
-                "model":model,"native_model":model,"profiles":[],"restrictions":[],
-                "params":{"effort":"medium","credential":{"value":"SECRET_CANARY"}},
-                "allowed_params":{"effort":["medium","high"],"account_token":["PRIVATE_CANARY"]},
-                "quota":{"status":"available","evidence":"fresh"}}]}]});
-        let page = text("models", &catalog);
-        assert!(page.contains(&super::exact_display(model)));
         assert_eq!(
             serde_json::from_str::<String>(&super::exact_display(model)).unwrap(),
             model
         );
-        assert!(!page.contains("SECRET_CANARY"));
-        assert!(!page.contains("PRIVATE_CANARY"));
-        assert!(!page.contains('\u{202e}'));
-        assert!(page.contains("effort=medium"));
+        assert!(!super::exact_display(model).contains('\u{202e}'));
         let empty = text(
             "answer",
             &json!({"agent_id":"ag-1","status":"succeeded",
@@ -4182,72 +3423,6 @@ mod tests {
         }
     }
 
-    /// Diagnostic text preserves zero scores and explicit multipliers while
-    /// private physical identities, invalid standing/clock and oversized rows fail closed.
-    #[test]
-    fn limits_ranking_preserves_numbers_privacy_and_existing_bounds() {
-        let value = json!({
-            "observed_at":100.0,
-            "items":[{"key":{"runtime":"glm","lane":"m","window":"5h"},
-                "known":true,"remaining_percent":100.0,"reset_at":200.0,
-                "account":"PRIVATE_ACCOUNT","pool":"PRIVATE_POOL"}],
-            "ranking":{"schema_version":2,"capacity_revision":5,"ranked_at":100.0,
-                "config_revision":"PRIVATE_REVISION",
-                "providers":[{"provider":"glm","score":0.0,"priority_multiplier":2.5,
-                    "models":[{"model":"m","quota":{"status":"exhausted","evidence":"fresh","best_priority":0.0}}]}]}
-        });
-        let rendered = text("limits", &value);
-        assert!(rendered.contains("100.0% remaining"), "{rendered}");
-        assert!(rendered.contains("score 0"), "{rendered}");
-        assert!(rendered.contains("multiplier 2.5"), "{rendered}");
-        assert!(rendered.contains("exhausted") && rendered.contains("priority 0"));
-        for private in ["PRIVATE_ACCOUNT", "PRIVATE_POOL", "PRIVATE_REVISION"] {
-            assert!(!rendered.contains(private));
-        }
-        let mut wrong = value.clone();
-        wrong["ranking"]["ranked_at"] = json!(99.0);
-        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
-        wrong = value.clone();
-        wrong["ranking"]["providers"][0]["models"][0]["quota"]["status"] = json!("made_up");
-        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
-        wrong = value.clone();
-        wrong["items"] = json!(vec![value["items"][0].clone(); 21]);
-        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
-        wrong = value.clone();
-        wrong["ranking"]["providers"] = json!(vec![value["ranking"]["providers"][0].clone(); 101]);
-        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
-    }
-
-    /// Partial and unavailable quota never masquerade as an authoritative empty page.
-    #[test]
-    fn limits_reports_incomplete_coverage_without_private_ids() {
-        let mut value = json!({
-            "observed_at":100.0,
-            "items":[{"key":{"runtime":"glm","lane":"m","window":"5h"},
-                "known":true,"remaining_percent":80.0,"reset_at":200.0,
-                "account":"PRIVATE_ACCOUNT","pool":"PRIVATE_POOL"}],
-            "coverage":{"state":"partial","incomplete":true,"evaluated_at":90.0}
-        });
-        let partial = text("limits", &value);
-        assert!(partial.contains("80.0% remaining"));
-        assert!(partial.contains("Quota coverage incomplete"));
-        assert!(partial.contains("Quota evaluated at Unix seconds 90"));
-        assert!(!partial.contains("PRIVATE_ACCOUNT") && !partial.contains("PRIVATE_POOL"));
-        value["items"] = json!([]);
-        value["coverage"] = json!({"state":"unknown","incomplete":true,"evaluated_at":null});
-        let outage = text("limits", &value);
-        assert!(outage.contains("Quota coverage incomplete"));
-        assert!(!outage.contains("no stored capacity samples"));
-        value["coverage"]["incomplete"] = json!(false);
-        assert_eq!(success_result("limits", &value).is_error, Some(true));
-        value["coverage"] = json!({"state":"complete","incomplete":false,"evaluated_at":null});
-        assert_eq!(success_result("limits", &value).is_error, Some(true));
-        value["coverage"]
-            .as_object_mut()
-            .unwrap()
-            .remove("evaluated_at");
-        assert_eq!(success_result("limits", &value).is_error, Some(true));
-    }
     /// Maximum escaped fragments remain intact in the MCP frame and schema result.
     #[test]
     fn transcript_exact_mcp_preserves_bounded_structured_fragment() {

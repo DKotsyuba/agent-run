@@ -227,10 +227,10 @@ impl BrokerClient {
                             crate::error::invalid("invalid batch receipt"),
                         ));
                     }
-                    if method == "history_pins"
-                        && params
-                            .as_ref()
-                            .is_none_or(|params| !valid_history_pin_response(&value, params))
+                    if HISTORY_PIN_METHODS.contains(&method)
+                        && params.as_ref().is_none_or(|params| {
+                            !valid_history_pin_response(method, &value, params)
+                        })
                     {
                         *connection = None;
                         return Err(Error::Runtime(
@@ -484,7 +484,7 @@ const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_METHODS: &[&str] = &[
     "start",
     "start_batch",
-    "history_pins",
+    "history_pins_release",
     "_lineage_hold_acquire",
     "_lineage_hold_release",
     "resume",
@@ -914,6 +914,9 @@ const SERVICE_RESTART_METHODS: &[&str] = &[
     "_service_restart_claim",
 ];
 
+/// Split operator pin methods whose responses are correlated before success.
+const HISTORY_PIN_METHODS: &[&str] = &["history_pins_list", "history_pins_release"];
+
 /// Generic hold controls are operator-socket methods, never MCP model tools.
 const LINEAGE_HOLD_METHODS: &[&str] = &[
     "_lineage_hold_acquire",
@@ -1039,7 +1042,12 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
         };
     }
     // Do not create an unacknowledged hold or release through a notification.
-    if notification && matches!(method, "_lineage_hold_acquire" | "_lineage_hold_release") {
+    if notification
+        && matches!(
+            method,
+            "_lineage_hold_acquire" | "_lineage_hold_release" | "history_pins_release"
+        )
+    {
         return None;
     }
     let known = dispatch::is_tool(method)
@@ -2959,26 +2967,34 @@ pub(crate) fn valid_batch_receipt_response(value: &Value, params: &Value) -> boo
     output.validate_for(&request).is_ok()
 }
 
-/// Verifies a pin response against the operator request before reporting success.
-pub(crate) fn valid_history_pin_response(value: &Value, params: &Value) -> bool {
+/// Verifies a pin response against the operator request before reporting
+/// success. `method` selects `history_pins_list` or `history_pins_release`;
+/// any other method (including the removed `history_pins`) is never valid.
+pub(crate) fn valid_history_pin_response(method: &str, value: &Value, params: &Value) -> bool {
     use agent_run_domain::batch::{
-        HistoryPinFilter, HistoryPinRelease, HistoryPinState, HistoryPinsPage, HistoryPinsRequest,
+        HistoryPinFilter, HistoryPinRelease, HistoryPinReleaseRequest, HistoryPinState,
+        HistoryPinsListRequest, HistoryPinsPage,
     };
-    let Ok(request) = serde_json::from_value::<HistoryPinsRequest>(params.clone()) else {
-        return false;
-    };
-    match request {
-        HistoryPinsRequest::Release { pin_id, .. } => {
+    match method {
+        "history_pins_release" => {
+            let Ok(request) = serde_json::from_value::<HistoryPinReleaseRequest>(params.clone())
+            else {
+                return false;
+            };
             serde_json::from_value::<HistoryPinRelease>(value.clone()).is_ok_and(|response| {
-                response.pin_id == pin_id && response.status == HistoryPinState::Released
+                response.pin_id == request.pin_id && response.status == HistoryPinState::Released
             })
         }
-        HistoryPinsRequest::List {
-            status,
-            limit,
-            after_pin_id,
-            ..
-        } => {
+        "history_pins_list" => {
+            let Ok(HistoryPinsListRequest {
+                status,
+                limit,
+                after_pin_id,
+                ..
+            }) = serde_json::from_value::<HistoryPinsListRequest>(params.clone())
+            else {
+                return false;
+            };
             let Ok(page) = serde_json::from_value::<HistoryPinsPage>(value.clone()) else {
                 return false;
             };
@@ -3000,6 +3016,7 @@ pub(crate) fn valid_history_pin_response(value: &Value, params: &Value) -> bool 
                 page.pins.len() == limit && page.pins.last().is_some_and(|pin| &pin.pin_id == next)
             })
         }
+        _ => false,
     }
 }
 
@@ -3147,7 +3164,9 @@ async fn client_with_wait_deadlines(
                 crate::error::invalid("invalid batch receipt"),
             ));
         }
-        if method == "history_pins" && !valid_history_pin_response(&result, &params) {
+        if HISTORY_PIN_METHODS.contains(&method)
+            && !valid_history_pin_response(method, &result, &params)
+        {
             return Err(Error::Runtime(
                 "history pin result is invalid; reconcile release by pin_id".into(),
             ));
@@ -3163,23 +3182,39 @@ mod tests {
     fn history_pin_responses_are_correlated_and_bounded() {
         let first = "pin_550e8400e29b41d4a716446655440000";
         let next = "pin_550e8400e29b41d4a716446655440001";
-        let request = json!({"action":"release","pin_id":first});
+        let release = "history_pins_release";
+        let request = json!({"pin_id":first,"request_id":"batch-1"});
         let mut result = json!({"pin_id":first,"status":"released","already_released":false});
-        assert!(valid_history_pin_response(&result, &request));
+        assert!(valid_history_pin_response(release, &result, &request));
+        // The removed combined method and the old action shape never validate.
+        assert!(!valid_history_pin_response(
+            "history_pins",
+            &result,
+            &request
+        ));
+        let old = json!({"action":"release","pin_id":first});
+        assert!(!valid_history_pin_response(release, &result, &old));
+        // A release without the ownership proof is not a valid request.
+        assert!(!valid_history_pin_response(
+            release,
+            &result,
+            &json!({"pin_id":first})
+        ));
         result["status"] = json!("active");
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(release, &result, &request));
         result["status"] = json!("released");
         result["pin_id"] = json!(next);
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(release, &result, &request));
 
-        let request = json!({"action":"list","status":"active","limit":1});
+        let list = "history_pins_list";
+        let request = json!({"status":"active","limit":1});
         let mut result = json!({"pins":[{"pin_id":first,"agent_id":"ag-20260826-120000-0123456789","status":"active"}],"next_after_pin_id":first});
-        assert!(valid_history_pin_response(&result, &request));
+        assert!(valid_history_pin_response(list, &result, &request));
         result["next_after_pin_id"] = json!(next);
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(list, &result, &request));
         result["next_after_pin_id"] = json!(null);
         result["pins"][0]["status"] = json!("released");
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(list, &result, &request));
     }
 
     /// A batch receipt must provide exactly the requested set of pin IDs.

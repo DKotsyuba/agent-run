@@ -40,8 +40,7 @@ impl Store<'_> {
     /// Duplicate ids or canonical auth-family/reference identities fail
     /// without changing previous rows. A successful registration advances
     /// the quota capacity revision in the same transaction, so advice
-    /// computed before it (`models`, `capacity_order`, candidate sets) is
-    /// visibly stale.
+    /// computed before it (admission candidate sets) is visibly stale.
     pub fn register_account(&mut self, record: &AccountRecord) -> Result<()> {
         if !CredentialRef::from_secret(&record.secret_ref)?.matches_family(&record.auth_family) {
             return Err(invalid("native credential family does not match account"));

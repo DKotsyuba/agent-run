@@ -135,41 +135,35 @@ async fn list_pools_service_and_dispatch_share_strict_read_projection() {
     }
 }
 
-/// Legacy models remain callable; quota reads demand schema 2 and never
-/// fabricate a complete empty result when Quota is unavailable.
+/// Quota presentation moved to Agent Quota: the former `models`, `limits` and
+/// `capacity_order` methods are unknown on every configuration schema.
 #[tokio::test]
-async fn restored_operator_tools_dispatch() {
+async fn removed_quota_tools_are_unknown_on_every_schema() {
     let home = common::Home::new();
     let service = Service::new(home.path.clone());
-    let legacy = dispatch::call(&service, "models", json!({})).await.unwrap();
-    assert!(legacy.get("mock").is_some());
-    for method in ["limits", "capacity_order"] {
-        let error = dispatch::call(&service, method, json!({}))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, agent_run_domain::Error::Unsupported(_)),
-            "{method}: {error}"
-        );
-        assert!(error.to_string().contains("schema_version 2"));
+    for schema in ["schema_version=1\n", "schema_version=2\n"] {
+        std::fs::write(home.path.join("config.toml"), schema).unwrap();
+        for method in ["models", "limits", "capacity_order"] {
+            let error = dispatch::call(&service, method, json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.machine_code().as_str(), "ValidationError", "{method}");
+            assert!(
+                error.to_string().contains("unknown tool"),
+                "{method}: {error}"
+            );
+        }
     }
-
-    std::fs::write(home.path.join("config.toml"), "schema_version=2\n").unwrap();
-    let models = dispatch::call(&service, "models", json!({})).await.unwrap();
-    assert_eq!(models["schema_version"], 2);
-    assert_eq!(models["providers"], json!([]));
-    assert_eq!(models["quota_coverage"]["state"], "unknown");
-    assert_eq!(models["quota_coverage"]["incomplete"], true);
-    let limits = dispatch::call(&service, "limits", json!({})).await.unwrap();
-    assert_eq!(limits["items"], json!([]));
-    assert_eq!(limits["coverage"]["state"], "unknown");
-    assert_eq!(limits["coverage"]["incomplete"], true);
-    let order = dispatch::call(&service, "capacity_order", json!({}))
+    // The delegation guide remains, configuration-only.
+    let guide = dispatch::call(&service, "delegation_guide", json!({}))
         .await
         .unwrap();
-    assert_eq!(order["providers"], json!([]));
-    assert_eq!(order["quota_coverage"]["state"], "unknown");
-    assert_eq!(order["quota_coverage"]["incomplete"], true);
+    assert!(
+        guide
+            .as_str()
+            .unwrap()
+            .contains("No providers are currently configured.")
+    );
 }
 
 /// Mirrors `tests/test_dispatch.py::test_cancel_returns_the_current_agent_view`.

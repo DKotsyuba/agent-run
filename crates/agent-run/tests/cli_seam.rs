@@ -83,15 +83,6 @@ impl CliService for FakeService {
             .map(|(_, page)| page.clone())
             .ok_or_else(|| invalid("missing transcript fixture"))
     }
-    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(async { Ok(json!([])) })
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
-    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
     /// Returns empty text for this fixture's guide query without catalog I/O.
     fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
         Box::pin(async { Ok(Value::String(String::new())) })
@@ -218,7 +209,7 @@ async fn batch_cli_rejects_missing_or_malformed_execution_ref_as_unknown() {
     }
 }
 
-/// One CLI command uses the shared pin wire for release and list actions.
+/// The CLI uses the split pin methods; release always carries the owner proof.
 #[tokio::test]
 async fn history_pins_cli_uses_exact_release_key_and_list_page() {
     let pin = "pin_550e8400e29b41d4a716446655440000";
@@ -232,8 +223,22 @@ async fn history_pins_cli_uses_exact_release_key_and_list_page() {
     ]));
     let output = Arc::new(Mutex::new(Vec::new()));
     for args in [
-        vec!["history-pins", "release", "--pin-id", pin],
-        vec!["history-pins", "release", "--pin-id", pin],
+        vec![
+            "history-pins",
+            "release",
+            "--pin-id",
+            pin,
+            "--request-id",
+            "batch-1",
+        ],
+        vec![
+            "history-pins",
+            "release",
+            "--pin-id",
+            pin,
+            "--request-id",
+            "batch-1",
+        ],
         vec!["history-pins", "list", "--status", "released"],
     ] {
         agent_run::cli::run_with(
@@ -249,12 +254,13 @@ async fn history_pins_cli_uses_exact_release_key_and_list_page() {
     }
     assert_eq!(output.lock().unwrap().as_slice(), &[first, second, page]);
     let calls = broker.calls.lock().unwrap();
-    assert!(calls.iter().all(|(method, _)| method == "history_pins"));
-    assert_eq!(calls[0].1, json!({"action":"release","pin_id":pin}));
-    assert_eq!(calls[1].1, calls[0].1);
+    assert_eq!(calls[0].0, "history_pins_release");
+    assert_eq!(calls[0].1, json!({"pin_id":pin,"request_id":"batch-1"}));
+    assert_eq!(calls[1], calls[0]);
+    assert_eq!(calls[2].0, "history_pins_list");
     assert_eq!(
         calls[2].1,
-        json!({"action":"list","status":"released","limit":100,"after_pin_id":null})
+        json!({"status":"released","limit":100,"after_pin_id":null})
     );
 }
 
@@ -1754,15 +1760,6 @@ impl CliService for PausingService {
             )
         }
     }
-    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(async { Ok(json!([])) })
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
-    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
     /// Returns empty text for this fixture's guide query without catalog I/O.
     fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
         Box::pin(async { Ok(Value::String(String::new())) })
@@ -2027,15 +2024,6 @@ impl CliService for FollowService {
     }
     fn transcript(&self, _id: &AgentId, _cursor: i64, _limit: usize) -> agent_run::Result<Value> {
         Ok(json!({"messages":[]}))
-    }
-    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(async { Ok(json!([])) })
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
-    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
     }
     /// Returns empty text for this fixture's guide query without catalog I/O.
     fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {

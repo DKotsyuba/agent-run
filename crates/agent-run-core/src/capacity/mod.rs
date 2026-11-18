@@ -1,15 +1,12 @@
-//! Local provider selection and compatibility views over independent Quota results.
+//! Local provider selection over independent Quota results.
+//!
+//! Run keeps only the minimal Quota read admission needs (fetch, candidate
+//! scoring and the `QuotaExhausted` refusal); Agent Quota owns quota and
+//! capacity presentation.
 
 pub mod provider_catalog;
 pub mod provider_ranking;
 /// Adapts independent Quota snapshots to local candidate selection.
 pub mod quota_adapter;
-/// Read projections over independent Quota results and local eligibility.
-pub mod quota_projection;
-/// Bounded native metadata probes for legacy model rosters.
+/// Bounded native metadata probes (legacy schema-1 helpers).
 pub mod sources;
-
-/// Reads the legacy schema-1 native model roster without collecting quota.
-pub async fn models(home: &std::path::Path) -> crate::Result<serde_json::Value> {
-    sources::models(home).await
-}

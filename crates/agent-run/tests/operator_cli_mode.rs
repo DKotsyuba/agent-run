@@ -407,39 +407,10 @@ fn operator_controls_send_exact_selectors_and_preserve_public_results() {
 #[test]
 fn operator_catalog_reads_keep_filters_and_output_formats() {
     let fixture = Fixture::new();
-    let models =
-        json!({"schema_version":2,"providers":[{"provider":"p","models":[{"model":"m"}]}]});
-    let limits = json!({"schema_version":2,"revision":4,"limits":[]});
-    let order = json!({"schema_version":2,"providers":[{"provider":"p"}]});
     let server = serve(
         &fixture.socket,
-        vec![
-            models.clone(),
-            models.clone(),
-            limits.clone(),
-            json!("filtered guide\n"),
-            json!("default guide"),
-            order.clone(),
-            order.clone(),
-        ],
+        vec![json!("filtered guide\n"), json!("default guide")],
     );
-    assert_eq!(output_json(fixture.operator(None), &["models"]), models);
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &[
-                "models",
-                "--provider",
-                "p",
-                "--profile",
-                "review",
-                "--model",
-                "m"
-            ]
-        ),
-        models
-    );
-    assert_eq!(output_json(fixture.operator(None), &["limits"]), limits);
     for (args, expected) in [
         (
             vec![
@@ -468,44 +439,28 @@ fn operator_catalog_reads_keep_filters_and_output_formats() {
         );
         assert_eq!(output.stdout, expected.as_bytes());
     }
-    assert_eq!(
-        output_json(fixture.operator(None), &["capacity", "order"]),
-        order
-    );
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &["capacity", "order", "--model", "m"]
-        ),
-        order
-    );
+    // Quota presentation moved to Agent Quota; these commands no longer parse.
+    for removed in [&["models"][..], &["limits"], &["capacity", "order"]] {
+        let output = fixture
+            .operator(None)
+            .args(removed)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{removed:?}");
+    }
     let calls = server.join().unwrap();
-    assert_eq!(calls[0]["method"], "models");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["method"], "delegation_guide");
     assert_eq!(
         calls[0]["params"],
-        json!({"provider":null,"profile":null,"model":null})
+        json!({"provider":"p","profile":"review","model":"m"})
     );
-    assert_eq!(calls[1]["method"], "models");
+    assert_eq!(calls[1]["method"], "delegation_guide");
     assert_eq!(
         calls[1]["params"],
-        json!({"provider":"p","profile":"review","model":"m"})
-    );
-    assert_eq!(calls[2]["method"], "limits");
-    assert_eq!(calls[2]["params"], json!({}));
-    assert_eq!(calls[3]["method"], "delegation_guide");
-    assert_eq!(
-        calls[3]["params"],
-        json!({"provider":"p","profile":"review","model":"m"})
-    );
-    assert_eq!(calls[4]["method"], "delegation_guide");
-    assert_eq!(
-        calls[4]["params"],
         json!({"provider":null,"profile":null,"model":null})
     );
-    assert_eq!(calls[5]["method"], "capacity_order");
-    assert_eq!(calls[5]["params"], json!({"model":null}));
-    assert_eq!(calls[6]["method"], "capacity_order");
-    assert_eq!(calls[6]["params"], json!({"model":"m"}));
     fixture.assert_homes_absent();
 }
 
@@ -554,12 +509,12 @@ fn operator_controls_and_catalog_preserve_broker_error_classes() {
             "invalid agent transition",
         ),
         (
-            vec!["models", "--provider", "unknown"],
+            vec!["delegation-guide", "--provider", "unknown"],
             "ValidationError",
             "unknown provider",
         ),
         (
-            vec!["capacity", "order", "--model", "m"],
+            vec!["delegation-guide", "--model", "m"],
             "Unsupported",
             "catalog unavailable",
         ),

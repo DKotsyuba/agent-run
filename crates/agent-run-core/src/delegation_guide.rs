@@ -3,11 +3,11 @@
 //! The layout lives in the repo-owned MiniJinja asset
 //! `assets/delegation_guide.txt.j2`, embedded at build time (never loaded
 //! from the filesystem or hot-reloaded). This module only prepares a small
-//! normalized projection of the exact JSON the public `models` read already
-//! produced — one committed provider/quota snapshot in capacity order — and
-//! renders it. It adds no facts, no collection, no ranking of model ability,
-//! and no account, credential, endpoint, or hash detail; configured
-//! recommendation prose is whitespace-normalized and never invented.
+//! normalized projection of one committed provider catalog snapshot in
+//! configured order and renders it. It adds no facts, no quota standing (Agent
+//! Quota owns capacity presentation), no ranking of model ability, and no
+//! account, credential, endpoint, or hash detail; configured recommendation
+//! prose is whitespace-normalized and never invented.
 
 use crate::{Error, Result};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
@@ -42,20 +42,16 @@ fn environment() -> &'static Environment<'static> {
     })
 }
 
-/// Renders the guide text for one `models`-shaped catalog snapshot.
+/// Renders the guide text for one provider catalog snapshot.
 ///
-/// `catalog` must be the value [`crate::capacity::quota_projection::models_at`]
-/// returned for the caller's exact filters (or default query): providers stand in
-/// capacity order with each model's cached quota standing, admissible
-/// profiles, configured params, restrictions, and recommendation prose. The
-/// template owns prose and conditional omission over the compact projection
-/// built here; unknown, stale, or missing standings keep their own words —
-/// never rendered as healthy — a model no canonical profile may use says
-/// `profiles: none`, and an explicitly empty catalog says so. Sample ages
-/// and reset horizons are derived from the snapshot's own `ranked_at`
-/// advice clock, never printed as raw epochs.
+/// `catalog` must be the value
+/// [`crate::capacity::provider_catalog::catalog_at`] returned for the
+/// caller's exact filters (or default query): providers in configured order
+/// with each model's admissible profiles, configured params, restrictions,
+/// and recommendation prose. The template owns prose and conditional omission
+/// over the compact projection built here; a model no canonical profile may
+/// use says `profiles: none`, and an explicitly empty catalog says so.
 pub fn render(catalog: &Value) -> Result<String> {
-    let ranked_at = catalog["ranked_at"].as_f64();
     let providers: Vec<Value> = catalog["providers"]
         .as_array()
         .into_iter()
@@ -69,14 +65,6 @@ pub fn render(catalog: &Value) -> Result<String> {
                     let profiles = strings(&model["profiles"]).join(", ");
                     json!({
                         "id": model["model"].as_str().unwrap_or("unknown"),
-                        "status": model["quota"]["status"].as_str().unwrap_or("unknown"),
-                        "evidence": model["quota"]["evidence"].as_str().unwrap_or("missing"),
-                        "resets": ranked_at
-                            .zip(model["quota"]["exhausted_until"].as_f64())
-                            .map(|(ranked_at, until)| span(until - ranked_at)),
-                        "age": ranked_at
-                            .zip(model["quota"]["newest_observed_at"].as_f64())
-                            .map(|(ranked_at, at)| span(ranked_at - at)),
                         "profiles": if profiles.is_empty() { "none".to_owned() } else { profiles },
                         "params": params(&model["params"], &model["allowed_params"]),
                         "restrictions": nonempty(&strings(&model["restrictions"]).join(", ")),
@@ -198,86 +186,57 @@ fn prose(text: &str) -> String {
         .join(" ")
 }
 
-/// Renders one finite non-negative duration in compact human units.
-///
-/// Sub-second spans round up to `1s`; anything from seconds upward keeps
-/// its largest whole unit (`45s`, `2m`, `2h`, `3d`), and longer spans stay
-/// in days. A non-finite or negative input renders as `0s` rather than a
-/// misleading clock reading.
-fn span(seconds: f64) -> String {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return "0s".to_owned();
-    }
-    let whole = [(86_400.0, "d"), (3_600.0, "h"), (60.0, "m"), (1.0, "s")];
-    for (unit, suffix) in whole {
-        if seconds >= unit {
-            return format!("{}{suffix}", (seconds / unit).ceil());
-        }
-    }
-    "1s".to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::render;
     use serde_json::json;
 
-    /// Empty/control-laden catalogs stay honest, and the single optional
-    /// diagnostics direction names limits without requiring compatibility reads.
+    /// Empty/control-laden catalogs stay honest and the guide carries no
+    /// quota standing or pointer to a removed quota tool.
     #[test]
     fn render_states_an_empty_catalog_and_normalizes_prose() {
         let empty = render(&json!({"providers": []})).unwrap();
         assert!(empty.contains("No providers are currently configured."));
-        assert_eq!(empty.matches("For optional quota percentages, reset times and numeric priority details, use limits.").count(), 1);
+        assert!(!empty.contains("use limits"), "{empty}");
+        assert!(!empty.contains("reflects capacity"), "{empty}");
+        assert!(empty.contains("Agent Quota"), "{empty}");
         let messy = render(&json!({
-            "ranked_at": 1000.0,
             "providers": [{
                 "provider": "p", "harness": "codex", "models": [{
-                    "model": "m\u{00e9}", "quota": {"status": "unknown", "evidence": "missing"},
+                    "model": "m\u{00e9}",
                     "recommendations": ["line one\nline\u{0007}two  spaced"],
                 }],
                 "recommendations": ["ok"],
             }]
         }))
         .unwrap();
-        assert!(messy.contains("- mé: quota unknown, evidence missing"));
+        assert!(messy.contains("- mé\n"), "{messy}");
+        assert!(!messy.contains(": quota "), "{messy}");
         assert!(messy.contains("provider guidance: ok"));
         assert!(messy.contains("model guidance: line one line two spaced"));
         assert!(messy.contains("profiles: none"), "{messy}");
     }
 
-    /// Sample ages and reset horizons derive from `ranked_at` as readable
-    /// spans; no raw fractional epoch timestamp is printed, and unconfigured
-    /// params, restrictions, and guidance lines are omitted, not fabricated.
+    /// Unconfigured params, restrictions, and guidance lines are omitted, not
+    /// fabricated, and per-model profiles stay distinct when they differ.
     #[test]
-    fn render_derives_ages_and_horizons_from_the_advice_clock() {
+    fn render_omits_unconfigured_lines() {
         let text = render(&json!({
-            "ranked_at": 10000.0,
             "providers": [{
                 "provider": "p", "harness": "codex", "models": [
-                    {"model": "seen", "profiles": ["code"],
-                     "quota": {"status": "available", "evidence": "fresh",
-                               "newest_observed_at": 9955.0}},
-                    {"model": "spent", "profiles": [],
-                     "quota": {"status": "exhausted", "evidence": "fresh",
-                               "newest_observed_at": 9990.0,
-                               "exhausted_until": 17200.0}},
+                    {"model": "seen", "profiles": ["code"]},
+                    {"model": "spent", "profiles": []},
                 ],
             }]
         }))
         .unwrap();
-        assert!(
-            text.contains("- seen: quota available, evidence fresh, sample age 45s"),
-            "{text}"
-        );
-        assert!(text.contains("resets in 2h"), "{text}");
-        assert!(text.contains("sample age 10s"), "{text}");
-        assert!(!text.contains("9955"), "{text}");
-        assert!(!text.contains("17200"), "{text}");
+        assert!(text.contains("- seen\n"), "{text}");
         assert!(text.contains("profiles: code"), "{text}");
         assert!(text.contains("profiles: none"), "{text}");
         assert!(!text.contains("params:"), "{text}");
         assert!(!text.contains("restrictions:"), "{text}");
+        assert!(!text.contains(": quota "), "{text}");
+        assert!(!text.contains("evidence"), "{text}");
         assert!(text.ends_with('\n'), "{text}");
     }
 }

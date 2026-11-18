@@ -147,33 +147,53 @@ pub enum HistoryPinFilter {
     Released,
 }
 
-/// One shared operator operation for release and bounded observation.
+/// Operator-socket `history_pins_list`: pins after an exclusive canonical
+/// key, up to 1000 at a time. Read-only; never discloses the release proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HistoryPinsRequest {
-    /// Idempotently release one exact durable pin.
-    Release {
-        /// Exact pin key.
-        pin_id: PinId,
-        /// Optional database scope checked in the release transaction.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_store_id: Option<StoreId>,
-    },
-    /// List pins after an exclusive canonical key, up to 1000 at a time.
-    List {
-        /// Filter both states by default.
-        #[serde(default)]
-        status: HistoryPinFilter,
-        /// Page size, default 100 and maximum 1000.
-        #[serde(default = "default_pin_limit")]
-        limit: usize,
-        /// Exclusive prior pin ID, independent of row retention.
-        #[serde(default)]
-        after_pin_id: Option<PinId>,
-        /// Optional database scope checked in the same read snapshot.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_store_id: Option<StoreId>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct HistoryPinsListRequest {
+    /// Filter both states by default.
+    #[serde(default)]
+    pub status: HistoryPinFilter,
+    /// Page size, default 100 and maximum 1000.
+    #[serde(default = "default_pin_limit")]
+    pub limit: usize,
+    /// Exclusive prior pin ID, independent of row retention.
+    #[serde(default)]
+    pub after_pin_id: Option<PinId>,
+    /// Optional database scope checked in the same read snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_store_id: Option<StoreId>,
+}
+
+/// Operator-socket `history_pins_release`: idempotently release one exact
+/// durable pin as its owner.
+///
+/// Ownership proof is the `request_id` of the `start_batch` whose permanent
+/// receipt minted the pin. Pins minted by an Agent Pool managed enrollment
+/// (reserved internal batch keys) are never releasable here; Pool releases
+/// them through its authenticated attempt channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryPinReleaseRequest {
+    /// Exact pin key.
+    pub pin_id: PinId,
+    /// The admitting batch's caller-chosen idempotency key.
+    pub request_id: String,
+    /// Optional database scope checked in the release transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_store_id: Option<StoreId>,
+}
+
+impl HistoryPinReleaseRequest {
+    /// Validates the public ownership proof; reserved internal keys are refused.
+    pub fn validate(&self) -> Result<()> {
+        external_id("request_id", &self.request_id)?;
+        if is_reserved_internal_key(&self.request_id) {
+            return Err(invalid("request_id uses a reserved internal prefix"));
+        }
+        Ok(())
+    }
 }
 
 fn default_pin_limit() -> usize {

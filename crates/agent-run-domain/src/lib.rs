@@ -61,8 +61,7 @@ pub use types::{
     PositiveFinite, ProcessBirthProof, RelativeOwnedPath, RuntimeName, Sha256Digest, StoreId,
 };
 pub use views::{
-    AgentPage, AgentView, AnswerView, CapacityOrderQuery, CleanupView, CommandView, DeliveryView,
-    ListPoolsView, MessageView, ModelsQuery, PoolListMemberView, PoolListView, StartResult,
-    TranscriptPage,
+    AgentPage, AgentView, AnswerView, CleanupView, CommandView, DeliveryView, ListPoolsView,
+    MessageView, ModelsQuery, PoolListMemberView, PoolListView, StartResult, TranscriptPage,
 };
 pub use worker::{NotifyReceipt, NotifyRequest, WorkerCall, WorkerMessageKind, WorkerNotice};

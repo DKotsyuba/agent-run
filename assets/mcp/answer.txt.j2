@@ -13,9 +13,9 @@ agent-run answer for {{ agent_id }}
 {% if available %}
 - Answer: available (verified){% if inline_complete %}, complete inline text below{% else %}; inline text absent or partial — full artifact: {{ kind }}{% if media_type %} ({{ media_type }}){% endif %}{% if path %} at {{ path }}{% endif %}{% if size_bytes %}, {{ size_bytes }} bytes{% endif %}{{ "" }}
 {% if sequence is not none and sha256 is not none %}
-- Retrieve via answer_chunk using this agent ID, sequence and SHA-256; start at offset_bytes=0.
+- Read the artifact file, or retrieve it with the operator CLI: agent-run answer-chunk {{ agent_id }} --sequence {{ sequence }} --expected-sha256 {{ sha256 }} --offset-bytes 0
 {% elif sequence is none %}
-- Execution sequence is temporarily unavailable; retry answer to retrieve it for answer_chunk.
+- Execution sequence is temporarily unavailable; retry answer to retrieve it for agent-run answer-chunk.
 {% endif %}
 {% endif %}
 {% if content is not none %}

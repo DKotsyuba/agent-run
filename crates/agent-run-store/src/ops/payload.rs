@@ -230,6 +230,9 @@ pub struct ReleaseHistoryPin {
     pub pin_id: agent_run_domain::batch::PinId,
     /// Optional database identity checked in the same release transaction.
     pub expected_store_id: Option<agent_run_domain::StoreId>,
+    /// Ownership proof: the request_id of the batch whose receipt minted the
+    /// pin (an internal managed key only after Pool route authentication).
+    pub owner_request_id: String,
 }
 
 /// Atomically hold the exact successful lineage tails under broker authority.
