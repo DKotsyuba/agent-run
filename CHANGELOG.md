@@ -73,6 +73,24 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   Leaders are Claude Code only; Codex matcher rewriting is unchanged. See
   "Agent Pool leader profiles" in `docs/provider-config-v2.md`.
 
+### Data
+
+- No schema change and no DROP migration: legacy pool tables and the
+  `pool_membership_ever` fence stay readable and replayable, so rollback is a
+  binary swap at the same schema. No code path inserts or updates the legacy
+  pool tables; ordinary retention may still release a whole expired pool.
+- Writer operations 4-7, 47-51 and 95 are removed and their wire ids are
+  reserved (`ops::RESERVED_WIRE_IDS`); a frame naming one is refused as an
+  unknown kind.
+- Historical rows decode tolerantly: pending pool notices end `failed` with
+  `legacy_pool_retired` at claim, queued `pool` commands complete without a
+  push, historical pool-loop steers are refused as stale, and stored health
+  snapshots with old pool evidence still decode. Pool membership no longer
+  suppresses individual completion notices.
+- Archival access is read-only SQL documented in `agent-run doc completion`.
+
+## 0.31.8
+
 ### Fixed
 
 - A per-agent supervisor no longer spends about a fifth of a CPU watching its
@@ -106,22 +124,6 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   refusing the signal and orphan the scratch directory and its `sleep`.
   Host-load-sensitive tests were made robust against scheduling delays without
   weakening their lifecycle assertions.
-
-### Data
-
-- No schema change and no DROP migration: legacy pool tables and the
-  `pool_membership_ever` fence stay readable and replayable, so rollback is a
-  binary swap at the same schema. No code path inserts or updates the legacy
-  pool tables; ordinary retention may still release a whole expired pool.
-- Writer operations 4-7, 47-51 and 95 are removed and their wire ids are
-  reserved (`ops::RESERVED_WIRE_IDS`); a frame naming one is refused as an
-  unknown kind.
-- Historical rows decode tolerantly: pending pool notices end `failed` with
-  `legacy_pool_retired` at claim, queued `pool` commands complete without a
-  push, historical pool-loop steers are refused as stale, and stored health
-  snapshots with old pool evidence still decode. Pool membership no longer
-  suppresses individual completion notices.
-- Archival access is read-only SQL documented in `agent-run doc completion`.
 
 ## 0.31.7
 
