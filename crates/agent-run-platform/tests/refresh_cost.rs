@@ -36,14 +36,23 @@ fn io_counter(name: &str) -> u64 {
         .unwrap()
 }
 
-/// Returns this process's consumed user plus system CPU time.
-fn cpu_time() -> Duration {
+/// Returns this process's consumed user and system CPU time.
+fn cpu_split() -> (Duration, Duration) {
     // SAFETY: rusage is plain old data and getrusage only writes it.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: RUSAGE_SELF with a valid out-pointer has no other preconditions.
     assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
     let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
-    Duration::from_micros(micros(usage.ru_utime) + micros(usage.ru_stime))
+    (
+        Duration::from_micros(micros(usage.ru_utime)),
+        Duration::from_micros(micros(usage.ru_stime)),
+    )
+}
+
+/// Returns this process's consumed user plus system CPU time.
+fn cpu_time() -> Duration {
+    let (user, system) = cpu_split();
+    user + system
 }
 
 #[test]
@@ -67,21 +76,24 @@ fn refresh_cost_probe() {
     let host = process::processes().unwrap().len();
 
     let rounds = 200u32;
-    let (reads, bytes, cpu, wall) = (
+    let (reads, bytes, (user, system), wall) = (
         io_counter("syscr"),
         io_counter("rchar"),
-        cpu_time(),
+        cpu_split(),
         Instant::now(),
     );
     for _ in 0..rounds {
         owner.refresh();
     }
     let wall = wall.elapsed();
+    let (user_end, system_end) = cpu_split();
+    let per = |d: Duration| d.as_secs_f64() * 1e3 / f64::from(rounds);
     println!(
-        "refresh x{rounds} over {host} processes: {:.3} ms wall, {:.3} ms cpu, \
+        "refresh x{rounds} over {host} processes: {:.3} ms wall, {:.3} ms user + {:.3} ms system cpu, \
          {} read syscalls, {} bytes read per refresh",
-        wall.as_secs_f64() * 1e3 / f64::from(rounds),
-        (cpu_time() - cpu).as_secs_f64() * 1e3 / f64::from(rounds),
+        per(wall),
+        per(user_end - user),
+        per(system_end - system),
         (io_counter("syscr") - reads) / u64::from(rounds),
         (io_counter("rchar") - bytes) / u64::from(rounds),
     );
