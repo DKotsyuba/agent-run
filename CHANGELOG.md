@@ -4,6 +4,20 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- A harness may now declare more hooks than the managed Pool Bridge hook, so
+  an ordinary Agent Pool leader profile can carry its own `PreToolUse` hook
+  (matcher `mcp__agent-pool-leader__.*`) beside the managed one on the
+  `claude-code` harness. Managed role selection picks the single `PreToolUse`
+  hook whose matcher is `mcp__<pool_server>__.*` and refuses the role when it
+  is missing, duplicated or on another event; a managed home materializes
+  exactly that hook, while ordinary launches receive every configured hook.
+  A frozen managed role compares only its Pool-matcher hooks with the current
+  configuration, so adding a leader hook does not refuse its next launch.
+  Leaders are Claude Code only; Codex matcher rewriting is unchanged. See
+  "Agent Pool leader profiles" in `docs/provider-config-v2.md`.
+
 ## 0.31.7
 
 ### Fixed

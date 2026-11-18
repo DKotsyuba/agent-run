@@ -683,6 +683,16 @@ fn materialize_with_provider(
         restricted.plugins.clear();
         restricted.hooks.clear();
     }
+    if let Some(selection) = managed_selection {
+        // A managed home carries exactly the selected Pool Bridge hook; every
+        // other harness hook (for example a pool-leader's) is ordinary-only.
+        restricted
+            .hooks
+            .retain(|hook| super::managed_role::is_bridge_hook(hook, &selection.bridge_hook));
+        if restricted.hooks.len() != 1 {
+            return Err(invalid("managed Bridge hook is unqualified"));
+        }
+    }
     let runtime = &restricted;
     let kind = runtime.kind()?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;

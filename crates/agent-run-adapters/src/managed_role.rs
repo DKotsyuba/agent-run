@@ -10,6 +10,9 @@ pub struct Selection {
     pub host_id: String,
     pub role_digest: String,
     pub inventory: BTreeMap<String, BTreeSet<String>>,
+    /// The single Pool Bridge hook declaration (see [`bridge_hook`]); the
+    /// managed home receives exactly this hook and no other harness hook.
+    pub bridge_hook: agent_run_config::config::Hook,
     /// Codex-only native facts; `None` for every other harness.
     pub codex: Option<CodexSelection>,
 }
@@ -116,13 +119,19 @@ pub fn launch_build_pins(
         return Err(changed());
     };
     let value = |value: Option<Value>| value.unwrap_or(Value::Null);
+    // Only the declarations a managed launch can receive are semantic: the
+    // hooks carrying the Pool matcher. Other harness hooks (for example an
+    // ordinary pool-leader profile's) never reach a managed home.
+    let matcher = bridge_hook_matcher(&original.pool_server);
     let hooks = |config: &agent_run_config::provider_config::ProviderConfig| {
-        value(
-            config
-                .harnesses
-                .get(&harness)
-                .and_then(|runtime| serde_json::to_value(&runtime.hooks).ok()),
-        )
+        value(config.harnesses.get(&harness).and_then(|runtime| {
+            let selected: Vec<_> = runtime
+                .hooks
+                .iter()
+                .filter(|hook| hook.matcher.as_deref() == Some(matcher.as_str()))
+                .collect();
+            serde_json::to_value(selected).ok()
+        }))
     };
     let server = |config: &agent_run_config::provider_config::ProviderConfig| {
         value(
@@ -158,9 +167,49 @@ pub fn launch_build_pins(
     Ok(launch)
 }
 
+/// The PreToolUse matcher, as configured, of the Bridge hook that gates every
+/// call to the managed Pool server `pool_server`.
+pub fn bridge_hook_matcher(pool_server: &str) -> String {
+    format!("mcp__{pool_server}__.*")
+}
+
+/// The one harness hook a managed launch receives: the declaration whose
+/// matcher is exactly [`bridge_hook_matcher`]. Hooks with any other matcher
+/// are ordinary-launch hooks and are ignored here; none, or more than one,
+/// Pool-matcher declaration is refused, as is one that is not a PreToolUse
+/// command hook.
+pub fn bridge_hook<'a>(
+    hooks: &'a [agent_run_config::config::Hook],
+    pool_server: &str,
+) -> Result<&'a agent_run_config::config::Hook> {
+    let matcher = bridge_hook_matcher(pool_server);
+    let mut selected = hooks
+        .iter()
+        .filter(|hook| hook.matcher.as_deref() == Some(matcher.as_str()));
+    let (Some(hook), None) = (selected.next(), selected.next()) else {
+        return Err(invalid("managed Bridge hook is unqualified"));
+    };
+    if hook.event != "PreToolUse" || hook.command.is_empty() {
+        return Err(invalid("managed Bridge hook is unqualified"));
+    }
+    Ok(hook)
+}
+
+/// Whether `hook` is the selected managed Bridge hook declaration.
+pub fn is_bridge_hook(
+    hook: &agent_run_config::config::Hook,
+    selected: &agent_run_config::config::Hook,
+) -> bool {
+    hook.event == selected.event
+        && hook.command == selected.command
+        && hook.matcher == selected.matcher
+}
+
 /// Select only the explicitly named restricted role. Every enabled selection
-/// rejects plugins, skills, broad tools, extra MCPs and unpinned executables.
-/// An absent/disabled switch or a different role always stays ordinary.
+/// rejects plugins, skills, broad tools, extra MCPs and unpinned executables,
+/// and delivers exactly the one Pool Bridge hook ([`bridge_hook`]); other
+/// harness hooks stay with ordinary launches. An absent/disabled switch or a
+/// different role always stays ordinary.
 pub fn select(
     config: &agent_run_config::provider_config::ProviderConfig,
     harness: agent_run_domain::catalog::HarnessId,
@@ -192,19 +241,10 @@ pub fn select(
         .harnesses
         .get(&harness)
         .ok_or_else(|| invalid("managed harness unavailable"))?;
-    if !runtime.plugins.is_empty()
-        || !runtime.plugin_snapshot_assets.is_empty()
-        || runtime.hooks.len() != 1
-    {
+    if !runtime.plugins.is_empty() || !runtime.plugin_snapshot_assets.is_empty() {
         return Err(invalid("managed role assets are unqualified"));
     }
-    let hook = &runtime.hooks[0];
-    if hook.event != "PreToolUse"
-        || hook.command.is_empty()
-        || hook.matcher.as_deref() != Some(format!("mcp__{}__.*", settings.pool_server).as_str())
-    {
-        return Err(invalid("managed Bridge hook is unqualified"));
-    }
+    let hook = bridge_hook(&runtime.hooks, &settings.pool_server)?;
     trusted_binary(
         std::path::Path::new(&hook.command[0]),
         &settings.bridge_hook_sha256,
@@ -320,6 +360,7 @@ pub fn select(
             (server.id.clone(), pool),
             (agent_run_domain::worker::SERVER_NAME.into(), names),
         ]),
+        bridge_hook: hook.clone(),
         codex,
     }))
 }
