@@ -1239,7 +1239,8 @@ impl OwnedProcess {
         }
         Ok(signalled)
     }
-    /// Observe a captured descendant by its exact PID, native token and birth time.
+    /// Observe a captured descendant by its exact PID and native token (birth
+    /// time only for legacy evidence without a native token).
     /// Missing evidence stays unknown; a matching zombie is dead, not signallable.
     fn descendant_state(process: &Identity) -> ProcessState {
         if process.pid <= 1 || process.token.is_empty() || !process.birth.is_finite() {
@@ -1247,12 +1248,11 @@ impl OwnedProcess {
         }
         match inspect(process.pid) {
             Ok(actual) if actual.pid != process.pid => ProcessState::Unknown,
-            Ok(actual) if actual.token != process.token || actual.birth != process.birth => {
-                ProcessState::Reused
-            }
-            Ok(actual) if actual.zombie => ProcessState::Dead,
-            Ok(_) => ProcessState::Alive,
-            Err(error) => verdict(Err(error), Some(&process.token), Some(process.birth)),
+            // A native token is the exact identity; `birth` decides only for
+            // legacy evidence without one. Linux birth depends on the wall-clock
+            // boot time, which another process can compute differently after a
+            // clock step, and must not turn a live exact match into reuse.
+            observed => verdict(observed, Some(&process.token), Some(process.birth)),
         }
     }
     /// Signal each still-live captured descendant after a fresh exact identity check.
@@ -1510,6 +1510,61 @@ mod tests {
         assert!(kernel_incarnation(&leader).is_err());
     }
 
+    /// After a wall-clock step another process computes a different Linux
+    /// birth for the same PID generation; the exact native token still proves
+    /// the descendant alive, so cleanup is never confirmed while it runs.
+    /// Legacy evidence without a native token keeps the exact birth comparison.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_native_token_outranks_a_stepped_birth() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let leader = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let helper = Reap(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let mut stepped = inspect(helper.0.id() as i32).unwrap();
+        let exact_birth = stepped.birth;
+        stepped.birth += 3600.0;
+        assert_eq!(
+            OwnedProcess::descendant_state(&stepped),
+            ProcessState::Alive
+        );
+        let mut owned = OwnedProcess::capture(leader.0.id() as i32);
+        assert!(owned.descendants_observed);
+        owned
+            .known
+            .insert((stepped.pid, stepped.token.clone()), stepped.clone());
+        assert_eq!(
+            owned.descendants_gone(),
+            Some(false),
+            "a live descendant is not gone"
+        );
+
+        let mut legacy = stepped;
+        legacy.token = "legacy-psutil".into();
+        legacy.birth = exact_birth;
+        assert_eq!(OwnedProcess::descendant_state(&legacy), ProcessState::Alive);
+        legacy.birth += 3600.0;
+        assert_eq!(
+            OwnedProcess::descendant_state(&legacy),
+            ProcessState::Reused
+        );
+    }
+
     /// Boot facts are read once, match a fresh procfs read and keep the token format.
     #[cfg(target_os = "linux")]
     #[test]
@@ -1532,7 +1587,13 @@ mod tests {
             .unwrap();
         assert_eq!(me.token, format!("linux:{}:{ticks}", fresh.boot_id));
         assert_eq!(me.birth, fresh.btime + ticks as f64 / fresh.hz);
-        assert_eq!(read_proc_stat(me.pid).unwrap(), stat);
+        // Counters in the line change between reads; compare identity fields only.
+        let again = read_proc_stat(me.pid).unwrap();
+        let identity = |line: &[u8]| {
+            let fields = stat_fields(line).unwrap();
+            [1, 2, 19].map(|i| fields[i].to_vec())
+        };
+        assert_eq!(identity(&again), identity(&stat));
     }
 
     /// A memoized parent verdict is keyed by the exact generation: a recycled
@@ -1874,7 +1935,9 @@ mod tests {
         assert!(!owned.signal_descendants(libc::SIGTERM));
         assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
 
+        // Legacy evidence without a native token is matched by birth time.
         identity = captured;
+        identity.token = "legacy-psutil".into();
         identity.birth += 1.0;
         assert_eq!(
             OwnedProcess::descendant_state(&identity),
