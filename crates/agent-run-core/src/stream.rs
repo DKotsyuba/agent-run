@@ -2346,6 +2346,11 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             host_id: "host".into(),
             role_digest: "a".repeat(64),
             inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+            bridge_hook: agent_run_config::config::Hook {
+                event: "PreToolUse".into(),
+                command: vec!["/fixture/bridge-hook".into()],
+                matcher: Some("mcp__pool__.*".into()),
+            },
             codex: None,
         };
         let mut args =
@@ -2435,6 +2440,11 @@ if line:
                 host_id: "host".into(),
                 role_digest: "b".repeat(64),
                 inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+                bridge_hook: agent_run_config::config::Hook {
+                    event: "PreToolUse".into(),
+                    command: vec!["/fixture/bridge-hook".into()],
+                    matcher: Some("mcp__pool__.*".into()),
+                },
                 codex: None,
             };
             // As discovered from a real Pool: the deny complement is not empty.

@@ -19,15 +19,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   snapshot per decision, account ranking with Run's configured multipliers
   and the `QuotaExhausted` refusal.
 - The orchestrator MCP surface is now `start`, `start_batch`, `resume`,
-  `cancel`, `steer`, `list_agents`, `answer`, `transcript`,
-  `delegation_guide` and `doc`. The service integration methods `status`, `batch_receipt`,
+  `cancel`, `steer`, `list_agents`, `answer`, `transcript`, `delegation_guide`
+  and `doc`. The service integration methods `status`, `batch_receipt`,
   `capabilities`, `transcript_exact`, `initial_task`, `answer_chunk`,
   `agent_integration` and the history-pin methods are served only by the
-  operator socket and CLI: MCP discovery omits them and MCP calls reject them
-  as unknown tools. The socket `tools` method still lists them, marked
+  operator socket and CLI: MCP discovery omits them and MCP calls reject them as
+  unknown tools. The socket `tools` method still lists them, marked
   `"surface":"socket"`, so Hub feature detection keeps working.
-  `schemas/tools.json` now exports the orchestrator MCP discovery only. The
-  MCP `answer` text points large-answer retrieval to the file or
+  `schemas/tools.json` now exports the orchestrator MCP discovery only. The MCP
+  `answer` text points large-answer retrieval to the file or
   `agent-run answer-chunk`.
 - `history_pins` is split into `history_pins_list` (read-only) and
   `history_pins_release`; the old method returns method-not-found. Release
@@ -48,8 +48,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   and `bind --pool`; whole-pool hook binding; pool settlement, push commands,
   read guards, health wait evidence and the `agent-run.pool-completion` /
   `agent-run.pool-attention` notices. The socket answers removed methods as
-  unknown (`-32601`). Nothing is migrated
-  into Agent Pool.
+  unknown (`-32601`). Nothing is migrated into Agent Pool.
 - The `agent-run-tui` crate and binary are removed. Native releases seal the
   fixed `assets/tui-compat.sh` shim as `bin/agent-run-tui`, so an installed
   launcher reports the move to Agent Hub instead of failing silently.
@@ -59,6 +58,20 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   managed catalog bytes are identical, and catalogs registered by earlier
   binaries (including the historical v2/v3 pool-capable digests) are no
   longer recognized.
+
+### Changed
+
+- A harness may now declare more hooks than the managed Pool Bridge hook, so
+  an ordinary Agent Pool leader profile can carry its own `PreToolUse` hook
+  (matcher `mcp__agent-pool-leader__.*`) beside the managed one on the
+  `claude-code` harness. Managed role selection picks the single `PreToolUse`
+  hook whose matcher is `mcp__<pool_server>__.*` and refuses the role when it
+  is missing, duplicated or on another event; a managed home materializes
+  exactly that hook, while ordinary launches receive every configured hook.
+  A frozen managed role compares only its Pool-matcher hooks with the current
+  configuration, so adding a leader hook does not refuse its next launch.
+  Leaders are Claude Code only; Codex matcher rewriting is unchanged. See
+  "Agent Pool leader profiles" in `docs/provider-config-v2.md`.
 
 ### Data
 

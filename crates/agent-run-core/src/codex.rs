@@ -2925,6 +2925,11 @@ mod tests {
             host_id: "host".into(),
             role_digest: "a".repeat(64),
             inventory: BTreeMap::new(),
+            bridge_hook: agent_run_config::config::Hook {
+                event: "PreToolUse".into(),
+                command: vec!["/fixture/bridge-hook".into()],
+                matcher: Some("mcp__agent-pool__.*".into()),
+            },
             codex: Some(agent_run_adapters::managed_role::CodexSelection {
                 pool_server: "agent-pool".into(),
                 pool_namespace: "agent_pool".into(),

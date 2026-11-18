@@ -2448,3 +2448,206 @@ fn third_party_mcp_private_environment_is_refused() {
         assert!(result.is_err(), "{provider}");
     }
 }
+
+/// A harness may declare a pool-leader Bridge hook beside the managed Pool
+/// hook: a managed launch selects and materializes exactly the Pool hook,
+/// an ordinary launch receives every configured hook, and a missing or
+/// duplicated Pool hook still refuses the managed role.
+#[test]
+fn managed_launch_receives_only_the_pool_hook_beside_a_leader_hook() {
+    use agent_run_adapters::managed_role::{launch_build_pins, select};
+    use agent_run_config::{config::Hook, provider_config::ManagedAttemptBinding};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    fs::create_dir_all(root.join("accounts/codex/work")).unwrap();
+    fs::write(root.join("accounts/codex/work/auth.json"), "{}\n").unwrap();
+    let pool = root.join("pool-frontend");
+    let hook = root.join("bridge-hook");
+    fs::copy("/usr/bin/true", &pool).unwrap();
+    fs::copy("/usr/bin/false", &hook).unwrap();
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":pool,"args":["mcp","--config",root.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    let bridge = |matcher: &str, channel: &str| Hook {
+        event: "PreToolUse".into(),
+        command: vec![
+            hook.to_string_lossy().into_owned(),
+            channel.into(),
+            "claude-code".into(),
+        ],
+        matcher: Some(matcher.into()),
+    };
+    let pool_hook = bridge("mcp__pool__.*", "managed");
+    let leader_hook = bridge("mcp__pool-leader__.*", "leader");
+    let set_hooks = |config: &mut ProviderConfig, hooks: &[&Hook]| {
+        for harness in config.harnesses.values_mut() {
+            harness.hooks = hooks.iter().map(|hook| (*hook).clone()).collect();
+        }
+    };
+    set_hooks(&mut config, &[&leader_hook, &pool_hook]);
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "managed".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: agent_run_platform::fs::sha256(&fs::read(&pool).unwrap()),
+        bridge_hook_sha256: agent_run_platform::fs::sha256(&fs::read(&hook).unwrap()),
+        host_id: "host".into(),
+        pool_resident_executable: None,
+        pool_resident_sha256: None,
+        transport: None,
+        codex_code_mode_host_sha256: None,
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    let profile = Profile {
+        name: "managed".into(),
+        body: "fixture".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec!["pool".into()],
+        mcp_tools: BTreeMap::new(),
+        required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+    };
+    let managed = resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+    for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+        let selected = select(&config, harness, &managed, true).unwrap().unwrap();
+        assert_eq!(
+            selected.bridge_hook.matcher.as_deref(),
+            Some("mcp__pool__.*")
+        );
+        assert_eq!(selected.bridge_hook.command, pool_hook.command);
+    }
+
+    // Managed homes: exactly the Pool hook, in the native form of each harness.
+    let catalog = catalog(&config);
+    let pre_tool_use = |home: &Path, codex: bool| -> Vec<serde_json::Value> {
+        let hooks = if codex {
+            let native: toml::Value =
+                toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+            serde_json::to_value(&native["hooks"]).unwrap()
+        } else {
+            let settings: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(home.join("settings.json")).unwrap())
+                    .unwrap();
+            settings["hooks"].clone()
+        };
+        hooks["PreToolUse"].as_array().cloned().unwrap_or_default()
+    };
+    let claude_hook = |matcher: &str, channel: &str| {
+        serde_json::json!({
+            "matcher": matcher,
+            "hooks": [{
+                "type": "command",
+                "command": format!("{} {channel} claude-code", hook.display()),
+                "timeout": 600,
+            }],
+        })
+    };
+    for (provider, model, account, codex) in [
+        ("codex-plus", "gpt", "acct-native", true),
+        ("claude-main", "sonnet", "acct-claude", false),
+    ] {
+        let home = root.join(format!("managed-{provider}"));
+        materialize_selected(
+            &config,
+            &catalog,
+            &provider.parse().unwrap(),
+            model,
+            &account.parse().unwrap(),
+            &managed,
+            &root,
+            &home,
+            &root,
+        )
+        .unwrap();
+        let groups = pre_tool_use(&home, codex);
+        if codex {
+            assert_eq!(groups.len(), 1, "{groups:?}");
+            // Codex's native Pool name; the rewrite itself is unchanged.
+            assert_eq!(groups[0]["matcher"], "mcp__pool__.*");
+            let native = fs::read_to_string(home.join("config.toml")).unwrap();
+            assert!(!native.contains("pool-leader") && !native.contains(" leader "));
+        } else {
+            assert_eq!(groups, vec![claude_hook("mcp__pool__.*", "managed")]);
+            let settings: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                settings["hooks"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .collect::<Vec<_>>(),
+                vec!["PreToolUse"]
+            );
+        }
+    }
+
+    // An ordinary launch on the same harness receives every configured hook.
+    let ordinary = role(&root, false);
+    let home = root.join("ordinary-claude-main");
+    materialize_selected(
+        &config,
+        &catalog,
+        &"claude-main".parse().unwrap(),
+        "sonnet",
+        &"acct-claude".parse().unwrap(),
+        &ordinary,
+        &root,
+        &home,
+        &root,
+    )
+    .unwrap();
+    assert_eq!(
+        pre_tool_use(&home, false),
+        vec![
+            claude_hook("mcp__pool-leader__.*", "leader"),
+            claude_hook("mcp__pool__.*", "managed"),
+        ]
+    );
+
+    // A missing, duplicated or non-PreToolUse Pool hook refuses the managed
+    // role; the leader hook never stands in for it.
+    let mut post = pool_hook.clone();
+    post.event = "PostToolUse".into();
+    for hooks in [
+        vec![&leader_hook],
+        vec![],
+        vec![&pool_hook, &leader_hook, &pool_hook],
+        vec![&leader_hook, &post],
+        vec![&pool_hook, &post],
+    ] {
+        let mut refused = config.clone();
+        set_hooks(&mut refused, &hooks);
+        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            assert!(
+                select(&refused, harness, &managed, true).is_err(),
+                "{harness:?} {hooks:?}"
+            );
+        }
+    }
+
+    // Adding or changing the leader hook after admission leaves a frozen
+    // managed role launchable; changing its Pool hook is still refused.
+    let mut frozen = config.clone();
+    set_hooks(&mut frozen, &[&pool_hook]);
+    let mut current = config.clone();
+    set_hooks(
+        &mut current,
+        &[&pool_hook, &bridge("mcp__pool-leader__.*", "other")],
+    );
+    let launch = launch_build_pins(&frozen, &current, HarnessId::ClaudeCode).unwrap();
+    assert_eq!(launch.harnesses[&HarnessId::ClaudeCode].hooks.len(), 1);
+    let mut changed = current.clone();
+    set_hooks(&mut changed, &[&bridge("mcp__pool__.*", "changed")]);
+    assert!(launch_build_pins(&frozen, &changed, HarnessId::ClaudeCode).is_err());
+    let mut removed = current.clone();
+    set_hooks(&mut removed, &[&leader_hook]);
+    assert!(launch_build_pins(&frozen, &removed, HarnessId::ClaudeCode).is_err());
+}
