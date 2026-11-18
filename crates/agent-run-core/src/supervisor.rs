@@ -230,6 +230,65 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
         .map_err(launch_error)
 }
 
+/// End an engine whose launch failed after its program started.
+///
+/// The exact registered root is recorded as the attempt's process first, so
+/// the attempt can never be certified as never spawned, and the captured tree
+/// is persisted for recovery. The standard bounded cleanup then runs; only a
+/// confirmed proof with the engine's status collected releases ownership.
+/// Otherwise ownership is retained and the distinct `cleanup unconfirmed`
+/// outcome is reported for recovery to finish.
+async fn abandon_started_launch(
+    store: &mut Persist,
+    id: &AgentId,
+    attempt: &str,
+    started: adapters::engine_launch::StartedLaunch,
+) -> Error {
+    let recorded = match started.owner.leader.clone() {
+        Some(leader) => store
+            .provider_process(id, attempt, &leader, None, None)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if recorded && let Some(snapshot) = started.owner.snapshot() {
+        let _ = persist::ownership_future(
+            store.producer(),
+            attempt.to_owned(),
+            snapshot,
+            persist::CRITICAL_BUDGET,
+        )
+        .await;
+    }
+    let outcome = started.cleanup(Duration::from_secs(2)).await;
+    if recorded && let Some(snapshot) = outcome.snapshot.clone() {
+        let _ = persist::ownership_future(
+            store.producer(),
+            attempt.to_owned(),
+            snapshot,
+            persist::CRITICAL_BUDGET,
+        )
+        .await;
+    }
+    let released = recorded
+        && outcome.confirmed
+        && match &outcome.proof {
+            Ok(proof) => store.provider_cleanup(id, attempt, proof).await.is_ok(),
+            Err(_) => false,
+        };
+    let verdict = if released { "confirmed" } else { "unconfirmed" };
+    let _ = store
+        .event_durable(
+            id,
+            "provider_launch_failed_after_start_v1",
+            &json!({"cleanup": verdict}),
+        )
+        .await;
+    Error::Runtime(format!(
+        "engine launch failed after the program started; cleanup {verdict}"
+    ))
+}
+
 /// Cleans up a spawned but unauthenticated supervisor off the async runtime.
 async fn abandon(
     started: launch::StartedLaunch,
@@ -299,6 +358,15 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -
     // child of this process must be spawned through `process::spawn_registered`
     // (engine transports do): an unregistered child would look like an orphan.
     let _ = process::become_subreaper();
+    // Test-only: `<home>/fixture-descendant-refresh-ms` pins the durable
+    // mid-run refresh so cadence-sensitive fixtures stay deterministic.
+    #[cfg(feature = "test-fixtures")]
+    if let Some(ms) = std::fs::read_to_string(home.join("fixture-descendant-refresh-ms"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        process::pin_durable_refresh_interval(Duration::from_millis(ms));
+    }
     if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none() {
         crate::logging::configure(home, "supervisor");
     }
@@ -2125,22 +2193,42 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .await;
             }
         }
-        // Process::spawn yields Io only when the OS refused Command::spawn,
-        // before a child exists; other failures retain ownership for recovery.
-        let spawned = if managed_selection.is_some() {
-            Process::spawn_managed(&planned.launch, managed_owner_v2)
+        // Only `NotStarted` proves no engine program runs: an Io error there is
+        // the OS refusing the launch, which may reset the attempt as never
+        // spawned. A launch that failed after the program started is owned:
+        // its root is recorded and its tree cleaned before the error returns.
+        use adapters::engine_launch::{LaunchKind, SpawnError};
+        let kind = if managed_selection.is_some() {
+            LaunchKind::Managed(managed_owner_v2.map(Box::new))
         } else if identity.authority.harness == HarnessId::OpenCode {
-            Process::spawn_lease(&planned.launch)
+            LaunchKind::Lease
         } else {
-            Process::spawn(&planned.launch)
+            LaunchKind::Rpc
         };
-        let mut process = match spawned {
+        // Test-only seams: fail the harness wrapping after the engine started
+        // (once its `wrap-release` marker exists), optionally with an
+        // unidentifiable root.
+        #[cfg(feature = "test-fixtures")]
+        {
+            if home.join("fixture-wrap-failure").exists() {
+                adapters::engine_launch::fixture::fail_next_wrap(
+                    planned.launch.cwd.join("wrap-release"),
+                );
+            }
+            adapters::engine_launch::fixture::hide_next_owner(
+                home.join("fixture-hide-started-owner").exists(),
+            );
+        }
+        let mut process = match Process::launch(&planned.launch, kind) {
             Ok(process) => process,
-            Err(error @ Error::Io(_)) => {
+            Err(SpawnError::NotStarted(error @ Error::Io(_))) => {
                 store.provider_spawn_failed(id, &attempt_id).await?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(SpawnError::NotStarted(error)) => return Err(error),
+            Err(SpawnError::Started(started)) => {
+                return Err(abandon_started_launch(store, id, &attempt_id, *started).await);
+            }
         };
         let switched = continuing.is_some();
         let execution = async {

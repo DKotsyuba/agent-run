@@ -80,9 +80,7 @@ impl Drop for Spawned {
 /// Launch and register `command` once, like the engine transport does.
 fn spawn(command: &mut Command) -> Spawned {
     let command = std::mem::replace(command, Command::new("/bin/false"));
-    let (child, claim) =
-        process::spawn_registered(command, |mut command| command.spawn(), |c| Some(c.id()))
-            .unwrap();
+    let (child, claim) = process::spawn_registered(command).unwrap();
     Spawned {
         child,
         claim: Some(claim),

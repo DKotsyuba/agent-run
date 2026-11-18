@@ -41,6 +41,10 @@ fn writer(home: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
 async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
     let (_temp, home) = home();
     let _cleanup = ServiceProcesses(home.clone());
+    // The fixture child lives about one second while the WAL writer is held;
+    // pin the supervisors' mid-run refresh to 200 ms so it is captured (and its
+    // ownership checkpoint contends) inside that window.
+    fs::write(home.join("fixture-descendant-refresh-ms"), b"200").unwrap();
     let service = fixture_service(home.clone()).await;
     let mut runs = Vec::new();
     fs::write(home.join("fixture-pause-terminal-1"), b"pause").unwrap();

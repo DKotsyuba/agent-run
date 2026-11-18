@@ -416,6 +416,38 @@ fn main() {
         std::thread::sleep(Duration::from_millis(600));
         return;
     }
+    // Fork-before-wrap mode (test only): before reading any input the engine
+    // starts one child in its own group and one double-forked, setsid daemon,
+    // records all three PIDs, then releases the supervisor's injected launch
+    // wrapping failure and keeps running until it is killed.
+    if std::path::Path::new("fixture-fork-before-wrap").exists() {
+        let exe = std::env::current_exe().expect("fixture exe path");
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(&exe)
+            .arg("--child-sleep")
+            .arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("fixture child spawn");
+        let daemon = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("( setsid \"$0\" --child-sleep 600 </dev/null >/dev/null 2>&1 & echo $! > fork-daemon.pid )")
+            .arg(&exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("fixture daemon spawn");
+        assert!(daemon.success());
+        std::fs::write("fork-leader.pid", std::process::id().to_string()).unwrap();
+        std::fs::write("fork-child.pid", child.id().to_string()).unwrap();
+        std::fs::write("wrap-release", b"forked").unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     let resume = argument(&args, "--resume");
     let is_resumed = resume.is_some();
     let resume_path = resume.as_deref().and_then(|value| {
@@ -609,17 +641,15 @@ fn main() {
     }
     // The disposable database driver holds the WAL writer before releasing
     // this finite synthetic engine; one child changes its ownership revision.
-    // The child outlives one durable mid-run refresh (2 s for an exclusive
-    // Linux subreaper owner, 200 ms otherwise), so it is captured while it
-    // runs; a waited child that ends sooner is never observed mid-run.
     if task == "fixture:sqlite-stream" || task == "fixture:sqlite-stream-fail" {
         std::fs::write("sqlite-ready", b"ready").unwrap();
         wait_marker("sqlite-release");
         let mut descendant = std::process::Command::new("/bin/sleep")
-            .arg("3")
+            .arg("1")
             .env_clear()
             .spawn()
             .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
         descendant.wait().unwrap();
     }
     emit(

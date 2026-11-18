@@ -1892,6 +1892,128 @@ async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
     assert!(deliveries <= 1, "at most one terminal delivery record");
 }
 
+/// PIDs the fork-before-wrap fixture engine recorded in `home`.
+fn fork_before_wrap_pids(home: &Path) -> Vec<i32> {
+    ["fork-leader.pid", "fork-child.pid", "fork-daemon.pid"]
+        .iter()
+        .map(|name| {
+            fs::read_to_string(home.join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Whether `pid` is gone or only an unreaped zombie.
+fn ended(pid: i32) -> bool {
+    agent_run_platform::process::inspect(pid).map_or(true, |now| now.zombie)
+}
+
+/// Run one provider attempt whose engine forks a child and a daemon and then
+/// has its launch wrapping fail; returns the execution and its attempt row.
+async fn wrap_failure_run(home: &Path) -> (AgentId, i64, Option<String>, Option<String>) {
+    fs::write(home.join("fixture-wrap-failure"), "").unwrap();
+    fs::write(home.join("fixture-fork-before-wrap"), "").unwrap();
+    let service = fixture_service(home.to_path_buf()).await;
+    let admitted = service
+        .admit_provider_trusted(request(home), candidates(committed(home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(home, &id).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let (active, proof, process): (i64, Option<String>, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json,process_identity FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    (id, active, proof, process)
+}
+
+/// The cleanup verdict recorded for a launch that failed after its start.
+fn launch_failure_verdict(home: &Path, id: &AgentId) -> String {
+    let store = agent_run_store::fixture::open(home).unwrap();
+    let data: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE agent_id=? AND kind='provider_launch_failed_after_start_v1'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(&data).unwrap()["cleanup"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A launch whose wrapping fails after the engine forked is never certified
+/// never-spawned: the root is recorded, the whole tree (child and daemon) is
+/// killed by the ordinary cleanup and only a confirmed proof is recorded.
+#[tokio::test]
+async fn a_launch_failing_after_start_cleans_its_tree_and_is_not_never_spawned() {
+    let (_temp, home) = home();
+    let (id, active, proof, process) = wrap_failure_run(&home).await;
+    assert_eq!(launch_failure_verdict(&home, &id), "confirmed");
+    assert!(process.is_some(), "the started root was recorded");
+    // The confirmed proof is recorded; recovery honours it to release.
+    assert_eq!(active, 1);
+    let phase: String = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT phase FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "cleanup_complete");
+    let proof: serde_json::Value = serde_json::from_str(&proof.unwrap()).unwrap();
+    assert_eq!(proof["confirmed"], true, "{proof}");
+    assert!(proof.get("never_spawned").is_none(), "{proof}");
+    for pid in fork_before_wrap_pids(&home) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ended(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine tree member {pid} survived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// When the started root cannot be identified nothing can be proven: the
+/// outcome is `cleanup unconfirmed`, ownership stays active for recovery and
+/// the attempt is not certified never-spawned.
+#[tokio::test]
+async fn an_unprovable_started_launch_keeps_ownership() {
+    let (_temp, home) = home();
+    fs::write(home.join("fixture-hide-started-owner"), "").unwrap();
+    let (id, active, proof, _) = wrap_failure_run(&home).await;
+    let pids = fork_before_wrap_pids(&home);
+    let alive = pids.iter().all(|pid| !ended(*pid));
+    for pid in &pids {
+        // SAFETY: exact fixture PIDs recorded by this test's engine.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    assert_eq!(launch_failure_verdict(&home, &id), "unconfirmed");
+    assert_eq!(active, 1, "ownership retained");
+    assert_eq!(proof, None, "no cleanup or never-spawned proof");
+    assert!(alive, "an unverified tree was signalled");
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert!(!store.get(&id).unwrap().status.terminal());
+}
+
 /// A second enabled account on `glm-user` and an alias provider binding the
 /// first account again under another label.
 const TWO_ACCOUNTS: &str = r#"
