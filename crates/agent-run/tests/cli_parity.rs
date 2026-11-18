@@ -195,7 +195,7 @@ fn python_cli_spec_command_surface_is_present() {
                     "--native-history",
                 ],
             ),
-            "bind" => (&[], &["--run-id", "--pool"]),
+            "bind" => (&[], &["--run-id"]),
             "cancel" | "steer" | "answer" | "delivery status" => (&[], &["--run-id"]),
             "agents" => (&[], &["--follow"]),
             _ => (&[], &[]),
@@ -224,11 +224,6 @@ fn python_cli_spec_command_surface_is_present() {
             let Some(argument) = argument_for(&command, action) else {
                 continue;
             };
-            // `bind` takes the agent id unless `--pool` names a whole pool, so
-            // its id is required only conditionally.
-            if path == "bind" && action["dest"] == "agent_id" {
-                continue;
-            }
             assert_eq!(
                 argument.is_required_set(),
                 action["required"].as_bool().expect("required marker"),

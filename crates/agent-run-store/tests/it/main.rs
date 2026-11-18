@@ -39,10 +39,6 @@ mod outbox;
 mod owner_v2;
 #[path = "../ownership.rs"]
 mod ownership;
-#[path = "../pool_chat.rs"]
-mod pool_chat;
-#[path = "../pool_schema.rs"]
-mod pool_schema;
 #[path = "../process_ownership.rs"]
 mod process_ownership;
 #[path = "../projection_proof.rs"]

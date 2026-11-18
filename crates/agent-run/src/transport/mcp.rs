@@ -28,7 +28,7 @@ const BROKER_UNAVAILABLE: &str =
 /// Return a blocked-start receipt that the existing post-tool hook can bind.
 /// No agent was admitted; the host supplies the caller's session separately.
 fn restart_refusal(tool: &str, error: &Error) -> Option<CallToolResult> {
-    if !matches!(tool, "start" | "start_pool")
+    if tool != "start"
         || error.machine_code() != agent_run_domain::MachineCode::StateTransitionError
     {
         return None;
@@ -106,11 +106,6 @@ fn validate_frame_id(frame: &mut Vec<u8>) -> std::io::Result<()> {
             .is_ok(),
             Some("status") => {
                 serde_json::from_slice::<Frame<agent_run_domain::status::StatusRequest>>(frame)
-                    .map(|frame| frame.params.arguments)
-                    .is_ok()
-            }
-            Some("start_pool") => {
-                serde_json::from_slice::<Frame<agent_run_domain::pool::PoolStartRequest>>(frame)
                     .map(|frame| frame.params.arguments)
                     .is_ok()
             }
@@ -386,7 +381,7 @@ impl ServerHandler for Proxy {
                 .into());
             }
         }
-        if matches!(request.name.as_ref(), "start" | "start_pool" | "resume")
+        if matches!(request.name.as_ref(), "start" | "resume")
             && !arguments.contains_key("orchestrator")
             && let Some(o) = &self.orchestrator
         {

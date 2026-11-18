@@ -13,7 +13,7 @@ binary/home, hooks, plugin assets, workspace policy, and unowned native
 settings. Account weights and prose recommendations live only in TOML.
 
 `[harnesses.codex].fast_mode = true` forces Fast for every provider/model/account
-using Codex, including pool members. Omission or `false` preserves explicit
+using Codex, including batch jobs. Omission or `false` preserves explicit
 per-request `fast` behavior. Starts capture the effective value once; retries
 keep it. Each resume captures the current flag while preserving the parent
 role, native session and sealed assets. Turning off the flag stops forcing

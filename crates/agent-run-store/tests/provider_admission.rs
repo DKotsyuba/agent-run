@@ -851,7 +851,6 @@ mod p3 {
                     .unwrap(),
                 1
             );
-            assert!(store.existing_pool_member(&job.lineage_root_id).is_err());
         }
         assert!(
             store
@@ -883,10 +882,17 @@ mod p3 {
                 .unwrap()
                 .is_some()
         );
-        assert!(
+        // The external-independence fence survives pin release.
+        assert_eq!(
             store
-                .existing_pool_member(&accepted.receipt.jobs[0].lineage_root_id)
-                .is_err()
+                .conn
+                .query_row(
+                    "SELECT pool_membership_ever FROM agents WHERE id=?",
+                    [accepted.receipt.jobs[0].lineage_root_id.as_str()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
         );
         assert_eq!(
             store

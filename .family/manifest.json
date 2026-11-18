@@ -14,7 +14,7 @@
       "path": "docs/family-standard.md",
       "role": "boundary-summary",
       "origin": "product",
-      "sha256": "ce4c31476714ce2fdb35d5695b8772b0b26ae46d3b35c42bf39ab594b622582f"
+      "sha256": "1d10bb589f95c0e621e6be19b48e2443fc4ea602151ecdd651babfa73cddbe4c"
     },
     {
       "path": ".family/baseline/scaffold-family.toml",

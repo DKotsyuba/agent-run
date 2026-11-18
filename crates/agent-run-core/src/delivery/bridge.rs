@@ -14,8 +14,6 @@ pub(super) fn intent(claim: &Claim, config: &BridgeDelivery) -> Result<BridgeInt
     let (kind, message) = match &claim.payload {
         NoticePayload::Completion(n) => ("agent-run.completion", n.render()?),
         NoticePayload::Worker(n) => ("agent-run.worker-report", n.render()?),
-        NoticePayload::Pool(n) => ("agent-run.pool-completion", n.render()?),
-        NoticePayload::PoolAttention(n) => ("agent-run.pool-attention", n.render_attention()?),
         NoticePayload::Restart(text) => ("agent-run.maintenance", text.clone()),
     };
     let (owner, address) = if let Some(before) = &claim.restart_before {
@@ -353,7 +351,6 @@ mod tests {
     use super::*;
     use agent_run_domain::{
         domain::Status,
-        pool::PoolNotice,
         worker::{WorkerMessageKind, WorkerNotice},
     };
     use std::os::unix::fs::PermissionsExt;
@@ -361,14 +358,9 @@ mod tests {
     /// All external notice categories retain their distinct rendering, stable IDs
     /// and explicitly configured lossless native namespaces without socket I/O.
     #[test]
-    fn four_notice_kinds_keep_bound_destination_and_content() {
+    fn notice_kinds_keep_bound_destination_and_content() {
         let agent: agent_run_domain::domain::AgentId =
             "ag-20260825-120000-0123456789".parse().unwrap();
-        let pool = PoolNotice {
-            notification_id: "ntf_pool".into(),
-            pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
-            message: "reviewed".into(),
-        };
         let home = tempfile::tempdir().unwrap();
         let directory = home.path().canonicalize().unwrap();
         agent_run_platform::fs::private_dir(&directory).unwrap();
@@ -406,16 +398,6 @@ mod tests {
                 }),
                 "agent-run.worker-report",
                 "agent-run/worker-message",
-            ),
-            (
-                NoticePayload::Pool(pool.clone()),
-                "agent-run.pool-completion",
-                "agent-run/pool-completion",
-            ),
-            (
-                NoticePayload::PoolAttention(pool),
-                "agent-run.pool-attention",
-                "agent-run/pool-attention",
             ),
         ] {
             let mut claim = Claim {

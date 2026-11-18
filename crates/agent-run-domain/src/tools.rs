@@ -251,11 +251,6 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
-            "list_pools" => &[
-                MachineCode::ValidationError,
-                MachineCode::IOError,
-                MachineCode::StorageError,
-            ],
             "agent_integration" => &[
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,
@@ -272,33 +267,6 @@ impl ToolDefinition {
             ],
             "capacity_order" | "models" | "limits" | "delegation_guide" => &[
                 MachineCode::ValidationError,
-                MachineCode::Unsupported,
-                MachineCode::RuntimeError,
-                MachineCode::IOError,
-                MachineCode::StorageError,
-            ],
-            "start_pool" => &[
-                MachineCode::ValidationError,
-                MachineCode::PathEscapeError,
-                MachineCode::RequestConflict,
-                MachineCode::SelectionBusy,
-                MachineCode::NoEligibleAccount,
-                MachineCode::QuotaExhausted,
-                MachineCode::CapacityExhausted,
-                MachineCode::Unsupported,
-                MachineCode::RuntimeError,
-                MachineCode::IOError,
-                MachineCode::StorageError,
-            ],
-            "pool_post" | "pool_replace" | "pool" => &[
-                MachineCode::ValidationError,
-                MachineCode::AgentNotFound,
-                MachineCode::StateTransitionError,
-                MachineCode::RequestConflict,
-                MachineCode::CapacityExhausted,
-                MachineCode::SelectionBusy,
-                MachineCode::NoEligibleAccount,
-                MachineCode::QuotaExhausted,
                 MachineCode::Unsupported,
                 MachineCode::RuntimeError,
                 MachineCode::IOError,
@@ -381,14 +349,9 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         | ("doc", "topic")
         | ("models" | "delegation_guide", "provider" | "profile" | "model")
         | ("capacity_order", "model") => Some(ArgumentDefault::Null),
-        ("start_pool", "acceptance" | "orchestrator")
-        | ("pool_replace", "start")
-        | ("pool", "after_seq" | "before_seq" | "limit") => Some(ArgumentDefault::Null),
         ("resume" | "cancel" | "steer" | "answer" | "transcript", "run_id") => {
             Some(ArgumentDefault::Null)
         }
-        ("list_pools", "state") => Some(ArgumentDefault::Null),
-        ("list_pools", "limit") => Some(ArgumentDefault::Integer(50)),
         ("history_pins", "limit") => Some(ArgumentDefault::Integer(100)),
         ("history_pins", "after_pin_id") => Some(ArgumentDefault::Null),
         ("history_pins" | "start_batch" | "status", "expected_store_id") => {
@@ -402,9 +365,7 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         }
         ("answer_chunk" | "initial_task", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
         ("initial_task", "offset") => Some(ArgumentDefault::Integer(0)),
-        ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
-            Some(ArgumentDefault::Integer(0))
-        }
+        ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
         ("list_agents", "after_message_revision") => Some(ArgumentDefault::Null),
         ("transcript", "view") => Some(ArgumentDefault::Null),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),

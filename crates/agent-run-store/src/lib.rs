@@ -36,13 +36,6 @@ pub mod migrations;
 pub mod ops;
 /// Durable one-effect owner-v2 reservation and recovery journal.
 pub mod owner_v2;
-pub mod pool_admission;
-/// Exact-attempt enrollment of active independent workers into one pool.
-pub mod pool_enrollment;
-/// Authenticated pool writes, the durable shared log, and derived status.
-pub mod pool_log;
-pub mod pool_replace;
-pub mod pool_settle;
 pub mod process_ownership;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
@@ -1244,7 +1237,7 @@ impl Store<'_> {
         run_stats::backfill(self)
     }
     pub fn enqueue(&mut self, id: &AgentId, kind: &str, payload: &Value) -> Result<Value> {
-        if !["cancel", "steer", "pool"].contains(&kind) {
+        if !["cancel", "steer"].contains(&kind) {
             return Err(invalid("unknown command kind"));
         }
         let tx = crate::writer::WriteTx::begin(&self.conn)?;

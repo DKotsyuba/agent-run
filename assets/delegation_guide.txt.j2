@@ -33,4 +33,4 @@ provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profil
 No providers are currently configured.
 {% endif %}
 
-Cooperative pools: use start_pool when two to five agents should pursue ONE common goal with their own tasks; they coordinate through private tools, complete only by unanimous ready votes, successful ends and verified cleanup (a formal check, not proof the result is right), and you receive one common notice. Guide with pool_post, inspect with pool, replace a terminal member with pool_replace.
+Cooperative pools: Agent Run has no pool tools (start_pool was removed). For several agents with one goal, use start_batch and coordinate their results yourself, or use Agent Pool where its MCP server is available.

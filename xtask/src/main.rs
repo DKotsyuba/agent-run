@@ -196,8 +196,9 @@ fn archive_command(arguments: &[String]) {
 /// in the invoking toolchain, dependency resolution cannot compose a different
 /// dependency graph, and a missing target fails before an incomplete release
 /// directory is created. One build produces each executable sealed from the
-/// single workspace version: the `agent-run` runtime, the `agent-run-tui`
-/// observer, and the `xtask` deployment helper.
+/// single workspace version: the `agent-run` runtime and the `xtask`
+/// deployment helper. The removed terminal observer is sealed as its fixed
+/// `assets/tui-compat.sh` shim, so an installed launcher keeps a clear message.
 fn native_binaries(target: Option<&str>) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
     for name in [
@@ -215,8 +216,6 @@ fn native_binaries(target: Option<&str>) -> Result<PathBuf, String> {
         "--release",
         "-p",
         "agent-run",
-        "-p",
-        "agent-run-tui",
         "-p",
         "xtask",
     ]);
@@ -282,7 +281,7 @@ fn release_command(arguments: &[String]) {
                     &text("--version").ok_or("--version is required")?,
                     &directory.join("agent-run"),
                     &directory.join("xtask"),
-                    Some(&directory.join("agent-run-tui")),
+                    Some(&root.join("assets/tui-compat.sh")),
                 )
             })
             .map(|path| println!("{}", path.display())),

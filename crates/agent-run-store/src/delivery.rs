@@ -17,10 +17,7 @@ pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 
 /// Inserts a durable completion notice for a terminal event when one is needed.
 ///
-/// Successful runs in a current pool seat omit individual notices;
-/// the pool's common completion notice represents that success. Failures and
-/// other terminal outcomes still create individual notices. A run with an
-/// orchestrator session starts `pending`; without one, no delivery row can be
+/// A run with an orchestrator session starts `pending`; without one, no delivery row can be
 /// activated. The caller owns the transaction, keeping any row atomic with its
 /// terminal event. Repeated calls for the same terminal event reuse its notice,
 /// including failed or expired rows. Returns the notification id when present, otherwise
@@ -32,14 +29,6 @@ pub(crate) fn insert_terminal_notice(
     terminal_event_seq: i64,
     at: f64,
 ) -> Result<Option<String>> {
-    let suppress_member_success: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents a JOIN pool_members m ON m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) JOIN pools p ON p.id=m.pool_id WHERE a.id=? AND a.status='succeeded' AND m.replaced_by IS NULL)",
-        [id.as_str()],
-        |row| row.get(0),
-    )?;
-    if suppress_member_success {
-        return Ok(None);
-    }
     let Some(session) = session else {
         return Ok(None);
     };
@@ -62,8 +51,8 @@ pub(crate) fn insert_terminal_notice(
 }
 
 /// Repairs a completion omitted before binding, atomically with the binding transaction.
-/// Only a durable terminal status event can create a notice. Existing notices are reused
-/// and successful current pool members remain suppressed; no historical row is resurrected.
+/// Only a durable terminal status event can create a notice. Existing notices are reused;
+/// no historical row is resurrected.
 pub(crate) fn ensure_bound_terminal_notice(
     tx: &rusqlite::Connection,
     id: &AgentId,
@@ -377,41 +366,6 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> 
         return Ok(json!({"kind":"restart","notice":message,"before_intent":before}));
     }
     let agent_id = agent_id.ok_or_else(|| invalid("delivery has no agent or restart notice"))?;
-    let attention: Option<(String, String)> = tx
-        .query_row(
-            "SELECT json_extract(e.data_json,'$.pool_id'),json_extract(e.data_json,'$.notice') FROM deliveries d \
-             JOIN events e ON e.seq=d.terminal_event_seq WHERE d.id=? AND e.kind='pool_join_needs_action'",
-            [delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let pool: Option<(String, String)> = tx
-        .query_row(
-            "SELECT p.id,json_extract(e.data_json,'$.notice') FROM pools p JOIN deliveries d ON d.id=p.completion_delivery_id \
-             JOIN events e ON e.seq=d.terminal_event_seq WHERE p.completion_delivery_id=?",
-            [delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((kind, (pool_id, message))) = attention
-        .map(|found| ("pool_attention", found))
-        .or_else(|| pool.map(|found| ("pool", found)))
-    {
-        let notice = agent_run_domain::pool::PoolNotice {
-            notification_id: delivery_id.to_owned(),
-            pool_id: pool_id.parse()?,
-            message,
-        };
-        notice.validate()?;
-        return Ok(json!({
-            "kind": kind,
-            "notice": {
-                "notification_id": notice.notification_id,
-                "pool_id": notice.pool_id.as_str(),
-                "message": notice.message,
-            }
-        }));
-    }
     let root: String = tx.query_row(
         "SELECT CASE WHEN root_agent_id='' THEN id ELSE root_agent_id END FROM agents WHERE id=?",
         [agent_id],
@@ -432,16 +386,6 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> 
             "blocker" => agent_run_domain::worker::WorkerMessageKind::Blocker,
             _ => return Err(invalid("invalid stored worker kind")),
         };
-        let entry = tx
-            .query_row(
-                "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
-                 severity,proposal_seq,roster_revision,decision,body FROM pool_entries WHERE delivery_id=?",
-                [delivery_id],
-                crate::pool_log::entry_view,
-            )
-            .optional()?
-            .map(|entry| agent_run_domain::pool::render_entry(&entry))
-            .transpose()?;
         let notice = agent_run_domain::worker::WorkerNotice {
             notification_id: delivery_id.to_owned(),
             agent_id: root.parse()?,
@@ -450,7 +394,7 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> 
             message,
         };
         notice.validate()?;
-        return Ok(json!({"kind": "worker", "notice": notice, "pool_entry": entry}));
+        return Ok(json!({"kind": "worker", "notice": notice}));
     }
     let (runtime, model, request_json, status, failure_kind): (
         String,
@@ -504,6 +448,7 @@ impl Store<'_> {
     /// Lease the oldest due Bridge publication for `op.owner`, expiring unbound terminal notices.
     /// Every unattempted row selects Bridge before I/O, even without deployment configuration.
     /// Attempted historical native rows end held with `legacy_delivery_held` and retained evidence;
+    /// legacy Run pool notices end failed with `legacy_pool_retired`;
     /// malformed payloads quarantine only their own row. A paired restart result
     /// waits for the warning's frozen route; retry policy remains unchanged.
     /// Returns owned facts or no lease.
@@ -565,6 +510,24 @@ impl Store<'_> {
             tx.execute(
                 "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,last_error='legacy_delivery_held',ambiguous_result=1 WHERE id=?",
                 [&delivery_id],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+        // Legacy Run pool notices (common completion and enrollment attention)
+        // are retired with the pool surface: they end failed, never rendered or
+        // replayed. A row already in Bridge custody stays marked ambiguous.
+        let legacy_pool: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pools WHERE completion_delivery_id=?1) \
+             OR EXISTS(SELECT 1 FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq \
+             WHERE d.id=?1 AND e.kind='pool_join_needs_action')",
+            [&delivery_id],
+            |row| row.get(0),
+        )?;
+        if legacy_pool {
+            tx.execute(
+                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,last_error='legacy_pool_retired',ambiguous_result=? WHERE id=?",
+                params![existing_bridge, &delivery_id],
             )?;
             tx.commit()?;
             return Ok(None);

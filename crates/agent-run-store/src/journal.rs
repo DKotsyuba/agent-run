@@ -282,7 +282,7 @@ impl Store<'_> {
     }
 
     /// Claims the oldest pending command, preferring cancellation over
-    /// steering over pool delivery, exactly once.
+    /// steering over historical command kinds, exactly once.
     pub fn claim_command(&mut self, id: &AgentId) -> Result<Option<(i64, String, Value)>> {
         self.claim_command_for_turn(id, true)
     }

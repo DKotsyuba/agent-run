@@ -64,52 +64,35 @@ Previously attempted native rows are never sent through Bridge. Historical
 accepted facts remain readable; unresolved attempts are held with
 `legacy_delivery_held`, retaining immutable evidence for explicit review.
 
-## Cooperative pools
+## Legacy Run pools (removed)
 
-`start_pool` admits two to five seats sharing one goal and acceptance criteria.
-Each member supplies exactly one `start` or `existing_agent_id`, plus a descriptive
-`role`. Only new members launch and get every stable peer ID in their first prompt.
-An attached independent RUNNING worker retains its task, native session, grants,
-account and reservation. It must have no prior pool membership
-and authenticated proof of the current worker catalog; unknown historical proof
-is refused. The batch commits atomically, including compatible binding inference.
+Agent Run 0.32.0 removed its own cooperative pools: `start_pool`, `pool`,
+`pool_post`, `pool_replace`, `list_pools`, the worker `pool_*` tools, the
+matching CLI commands, `bind --pool` and `agent-run-tui`. Use Agent Pool for
+groups with shared membership, messages and consensus; Run still starts,
+resumes and reports each member. Nothing was migrated into Agent Pool.
 
-Existing seats are `pending` until the pinned worker uses `pool_read`, then posts
-its current-work summary with the exact broker-issued ACK `request_id`. Queueing,
-Claude writes and Codex transport acceptance do not prove awareness. Pending seats
-cannot vote or complete the pool. Ended or unconfirmed joins show `needs_action`;
-recover an active worker using existing context/steer and the same challenge. Executions have no lifetime limit. A distinct broker attention uses the existing outbox;
-All external notice kinds use the same Bridge Message/KeepAll route. No join action
-restarts or cancels the original work. Members talk through private
-pool tools they receive automatically; you can `pool_post` guidance (stamped as
-from you, never changing goal or grants), read `pool`, and `pool_replace` a
-terminal, fully cleaned member. The pool is complete only when every member voted
-ready on the same current proposal, every member ended successfully and cleanup
-is verified; that is a formal check, so judge the result yourself. One common
-`agent-run/pool-completion` notice arrives for the whole pool, bound through the
-post-tool hook on a direct `start_pool` call (or `orchestrator`, or `agent-run
-bind --pool <id>`); until bound it waits. A completed pool's record stays frozen
-even if a member is resumed later. Pool history is kept until every member has
-expired.
+Old pool rows stay in `state.db` unchanged (no schema change, no DROP) and are
+never written again; ordinary retention may still release a whole old pool once
+every member lineage expired. Pending old pool notices end `failed` with
+`legacy_pool_retired`; queued old pool commands are never pushed.
+The `pool_membership_ever` independence fence stays durable.
 
-Pool reads also carry a read-time `activity` beside the unchanged status:
-`running`, `stopping` (all ended, cleanup not yet proven), `cancelled` (all
-current members cancelled and cleaned; the stored state stays `open`, so the
-pool is restorable by resuming or replacing members, and nothing is completed or
-notified), `settling` (agreed success awaiting its completion record),
-`needs_action` (failure, mixed cancellation, or missing or blocked votes) and
-`completed`. It is a projection only; it never records or implies success.
+Archival reads are read-only SQL, run as the service owner against a backup
+or a read-only connection (`file:<home>/state.db?mode=ro`, `uri=True` in
+Python's `sqlite3`), never against a writable handle:
 
-Pool reads expose live notice delivery: binding, outbox state, attempts,
-ambiguity and safe classifier/evidence. It starts as `not_created`; unbound
-completed pools stay `waiting_binding`. Delivery can advance beside the frozen
-completion proof; notification and orchestrator-session IDs stay private.
+```sql
+SELECT id,state,roster_revision,created_at,completed_at,goal FROM pools ORDER BY created_at DESC;
+SELECT pool_id,slot,name,role,agent_id,replaced_by FROM pool_members WHERE pool_id=?;
+SELECT seq,author_kind,author_name,kind,decision,proposal_seq,body,created_at
+  FROM pool_entries WHERE pool_id=? ORDER BY seq;
+```
 
 ## Delivery repair
 
 Binding a run that finished before the host hook creates its missing completion
-notice from the durable terminal event exactly once. Successful pool members
-still omit individual notices. Cancelled notices omit failure metadata while
+notice from the durable terminal event exactly once. Cancelled notices omit failure metadata while
 retaining internal evidence; malformed stored payloads end only their own
 delivery row with `invalid_payload`, allowing later notices to proceed.
 

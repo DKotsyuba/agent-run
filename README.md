@@ -208,9 +208,8 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It advertises 24 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
-`answer`, `transcript`, `transcript_exact`, `initial_task`, `doc`, `delegation_guide`, `limits`, `start_pool`,
-`pool_post`, `pool_replace`, `pool`, `list_pools`, `agent_integration`,
+It advertises 19 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
+`answer`, `transcript`, `transcript_exact`, `initial_task`, `doc`, `delegation_guide`, `limits`, `agent_integration`,
 `capabilities`, and `answer_chunk`. Use `delegation_guide`
 with optional exact `provider`, `model`, and `profile` filters for routing;
 use `limits` for quota windows plus numerical provider/model standing.
@@ -230,10 +229,15 @@ its returned pin is released with `agent-run history-pins release --pin-id PIN_I
 Active pins also retain process-ownership evidence and recovery details for the
 lineage. They do not grant additional authority.
 
-New schema-2 workers receive a separate built-in MCP with five fixed tools:
-`notify_orchestrator` plus four pool tools authorized by live membership.
-`start_pool` can mix new members with supported independent RUNNING workers;
-attached workers keep their work and must acknowledge enrollment before voting. Ordinary work MCPs remain profile-controlled.
+New schema-2 workers receive a separate built-in MCP: `notify_orchestrator`,
+plus `health_reply` and `finish` in explicit-completion mode (research roles
+add `save_report`). Ordinary work MCPs remain profile-controlled.
+
+Agent Run 0.32.0 removed its legacy cooperative pools (`start_pool`, `pool`,
+`pool_post`, `pool_replace`, `list_pools`, the worker `pool_*` tools and the
+matching CLI commands). Agent Pool owns groups, membership, messages and
+consensus; old pool rows stay readable through read-only SQL
+(`agent-run doc completion`).
 See [worker reports](docs/worker-mcp.md) for bounds, replies and upgrade behavior.
 
 ## Use the socket API
@@ -242,22 +246,12 @@ The broker binds `<home>/api.sock` with mode `0600`. It accepts newline-framed
 JSON-RPC 2.0 and provides the tool methods plus `ping`, `tools`, and `wait`.
 See [docs/api.md](docs/api.md).
 
-## Observe with the terminal UI
+## Observe sessions
 
-The release installer installs both `agent-run` and the separate `agent-run-tui`
-binary at the same version. Start the observer with `agent-run-tui`.
-
-After updating, quit and reopen existing observer windows: a running process
-keeps its previous binary. Check `agent-run --version` and
-`agent-run-tui --version` to confirm that both commands select the new release.
-The redesigned observer includes Sessions and Pools tabs; press `1` or `2`
-to switch between them. A binary launched directly from a development worktree
-is independent of the installed release.
-
-`agent-run-tui` is a read-only terminal observer for the resident broker: it
-lists sessions live and shows any selected session's transcript, keyed with
-the mouse and the same JSON-RPC surface as the CLI. See
-[docs/tui.md](docs/tui.md).
+The `agent-run-tui` terminal observer was removed in 0.32.0; use Agent Hub, or
+`agent-run agents` and `agent-run transcript`. Releases still seal
+`bin/agent-run-tui` as a fixed compatibility shim that reports the move and
+exits non-zero, so an existing launcher keeps a clear message.
 
 ## Reliability contract
 

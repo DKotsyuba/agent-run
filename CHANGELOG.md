@@ -4,6 +4,44 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Removed (breaking)
+
+- Legacy Run cooperative pools are removed (owner decision; Agent Pool owns
+  groups, membership, messages and consensus). Gone: the orchestrator tools
+  `start_pool`, `pool`, `pool_post`, `pool_replace` and `list_pools`; the worker
+  tools `pool_post`, `pool_read`, `pool_propose` and `pool_vote`; the CLI
+  commands `start-pool`, `pool-post`, `pool-replace`, `pool`, `pools`/`list-pools`
+  and `bind --pool`; whole-pool hook binding; pool settlement, push commands,
+  read guards, health wait evidence and the `agent-run.pool-completion` /
+  `agent-run.pool-attention` notices. MCP discovery now lists 19 tools; the
+  socket answers removed methods as unknown (`-32601`). Nothing is migrated
+  into Agent Pool.
+- The `agent-run-tui` crate and binary are removed. Native releases seal the
+  fixed `assets/tui-compat.sh` shim as `bin/agent-run-tui`, so an installed
+  launcher reports the move to Agent Hub instead of failing silently.
+- Worker catalogs no longer contain pool tools. Ordinary workers serve only
+  `notify_orchestrator`; explicit-completion workers add `health_reply` and
+  `finish` (research adds `save_report`). Catalog versions are unchanged, the
+  managed catalog bytes are identical, and catalogs registered by earlier
+  binaries (including the historical v2/v3 pool-capable digests) are no
+  longer recognized.
+
+### Data
+
+- No schema change and no DROP migration: legacy pool tables and the
+  `pool_membership_ever` fence stay readable and replayable, so rollback is a
+  binary swap at the same schema. No code path inserts or updates the legacy
+  pool tables; ordinary retention may still release a whole expired pool.
+- Writer operations 4-7, 47-51 and 95 are removed and their wire ids are
+  reserved (`ops::RESERVED_WIRE_IDS`); a frame naming one is refused as an
+  unknown kind.
+- Historical rows decode tolerantly: pending pool notices end `failed` with
+  `legacy_pool_retired` at claim, queued `pool` commands complete without a
+  push, historical pool-loop steers are refused as stale, and stored health
+  snapshots with old pool evidence still decode. Pool membership no longer
+  suppresses individual completion notices.
+- Archival access is read-only SQL documented in `agent-run doc completion`.
+
 ## 0.31.7
 
 ### Fixed

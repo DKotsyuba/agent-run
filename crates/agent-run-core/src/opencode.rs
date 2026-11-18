@@ -1002,8 +1002,6 @@ async fn run_native(
             }
             let text = if kind == "steer" {
                 commands::steer_text(&payload).map(str::to_owned)
-            } else if kind == "pool" {
-                commands::pool_push_text(store, &record.id, &payload).ok()
             } else {
                 None
             };

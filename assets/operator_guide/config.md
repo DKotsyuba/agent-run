@@ -71,8 +71,8 @@ for native harness limits. Harnesses
 own native settings, hooks, plugins and workspace roots. Provider models carry
 explicit native aliases, effort settings, recommendations and restrictions.
 
-`harnesses.codex.fast_mode = true` forces Fast for every Codex provider/model
-and pool member, without a per-call flag. Default false keeps explicit `fast`.
+`harnesses.codex.fast_mode = true` forces Fast for every Codex provider/model,
+without a per-call flag. Default false keeps explicit `fast`.
 Resume reads the current flag; retries keep the admitted effective mode. Running
 processes do not change. Other harnesses reject true; reasoning effort is separate.
 Fast uses subscription limits/credits at higher rates.

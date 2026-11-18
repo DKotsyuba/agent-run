@@ -73,10 +73,6 @@ mod persist_batches;
 mod persist_diagnostics;
 #[path = "../persist_recovery.rs"]
 mod persist_recovery;
-#[path = "../pool_enrollment.rs"]
-mod pool_enrollment;
-#[path = "../pool_push_stream.rs"]
-mod pool_push_stream;
 #[path = "../provider_catalog.rs"]
 mod provider_catalog;
 #[path = "../provider_ranking.rs"]

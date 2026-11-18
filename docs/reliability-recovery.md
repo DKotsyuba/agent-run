@@ -1,6 +1,6 @@
 # Reliability recovery and observation
 
-## Native completion and pool waiting
+## Native completion waiting
 
 A Codex command with a native `processId` returned a pending process handle.
 Its owned terminal item queues one durable completion even if it arrives before
@@ -8,30 +8,11 @@ its originating inference turn ends. The queue delivers it only after idle.
 Synchronous commands without a process handle do not manufacture a new turn;
 replayed/foreign item identities never duplicate a wake or journal result.
 
-The new private worker catalog v4 declares pool_read guard side effects. Frozen
-v1/v2/v3 catalogs keep their original bytes and read contract; they are not
-silently enrolled in this protection. New starts register the actual v4 proof.
-
-Explicit pool prompts require reporting newly completed work before waiting and
-finishing after the member's verified ready vote, without waiting for whole-pool
-completion. Reads are immediate after an event. Three empty forward reads of the
-same actual log revision trigger one durable risk report per attempt and one
-corrective steer. Notice and control intent commit together; failed writes remain
-retryable and a crash cannot strand the notice without its command. Unbound risk notices are retained as `waiting_binding`; they do
-not consume the worker-authored report quota. The steer is refused if its exact attempt is no longer running,
-the model is already idle, or a new pool entry advanced the revision. Continued
-empty reads get bounded 25-second backpressure rather than a fast error loop.
-This is a bounded corrective guard, not a guarantee that a model will obey text;
-it never forcibly terminates an inference turn or logical session. New entries
-rearm normal reading; reverse pagination remains immediate.
-
-The cached health view includes current pool members, observed phases, pending
-message counts, last log revision/time and a concrete pool-event wait source.
-When all current members are idle without queued messages, one representative
-reports `pool_progress_stalled` for that log revision. Observations do not prove
-that peers consumed messages, completed criteria or can produce a future event.
-TUI session rows and the transcript header distinguish waiting, missing wake
-sources and pool stalls. Old attempts are not silently enrolled in health checks.
+The legacy Run pool read guard, pool wait evidence and `pool_progress_stalled`
+reason were removed with the pool tools in 0.32.0. A historical pool-loop
+corrective steer still queued is refused as stale; stored health snapshots that
+carry old pool wait evidence still decode. Old attempts are not silently
+enrolled in health checks.
 
 ## Legacy Claude transcript display
 

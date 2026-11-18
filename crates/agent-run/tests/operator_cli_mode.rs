@@ -139,9 +139,6 @@ fn output_json(mut command: Command, args: &[&str]) -> Value {
 #[test]
 fn operator_cli_routes_broker_commands_without_local_state() {
     let fixture = Fixture::new();
-    let spec = fixture.dir.path().join("spec.json");
-    let request_spec = json!({"request_id":"p-1", "goal":"fixture", "members":[]});
-    fs::write(&spec, serde_json::to_vec(&request_spec).unwrap()).unwrap();
     let ok = json!({"fixture":true});
     let server = serve(
         &fixture.socket,
@@ -150,11 +147,6 @@ fn operator_cli_routes_broker_commands_without_local_state() {
             json!({"agent_id":AGENT_ID,"sequence":7,"created":true}),
             json!({"status":"succeeded","answer":"done"}),
             json!({"agent_id":AGENT_ID,"sequence":8,"created":false}),
-            ok.clone(),
-            ok.clone(),
-            ok.clone(),
-            ok.clone(),
-            ok.clone(),
             ok.clone(),
         ],
     );
@@ -195,75 +187,6 @@ fn operator_cli_routes_broker_commands_without_local_state() {
         ),
         json!({"agent_id":AGENT_ID,"created":false})
     );
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &["start-pool", "--spec", spec.to_str().unwrap()]
-        ),
-        ok
-    );
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &[
-                "pool-post",
-                "--pool-id",
-                "pool-1",
-                "--request-id",
-                "post-1",
-                "--text",
-                "hello"
-            ]
-        ),
-        ok
-    );
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &[
-                "pool-replace",
-                "--pool-id",
-                "pool-1",
-                "--agent-id",
-                AGENT_ID,
-                "--request-id",
-                "replace-1",
-                "--spec",
-                spec.to_str().unwrap()
-            ]
-        ),
-        ok
-    );
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &[
-                "pool",
-                "--pool-id",
-                "pool-1",
-                "--after-seq",
-                "2",
-                "--limit",
-                "5"
-            ]
-        ),
-        ok
-    );
-    assert_eq!(
-        output_json(
-            fixture.operator(None),
-            &[
-                "list-pools",
-                "--state",
-                "open",
-                "--offset",
-                "2",
-                "--limit",
-                "3"
-            ]
-        ),
-        ok
-    );
     let hash = "a".repeat(64);
     assert_eq!(
         output_json(
@@ -289,18 +212,7 @@ fn operator_cli_routes_broker_commands_without_local_state() {
             .iter()
             .map(|call| call["method"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        [
-            "capabilities",
-            "start",
-            "wait",
-            "resume",
-            "start_pool",
-            "pool_post",
-            "pool_replace",
-            "pool",
-            "list_pools",
-            "answer_chunk"
-        ]
+        ["capabilities", "start", "wait", "resume", "answer_chunk"]
     );
     assert_eq!(calls[0]["params"], json!({}));
     assert_eq!(calls[1]["params"]["provider"], "codex");
@@ -314,25 +226,8 @@ fn operator_cli_routes_broker_commands_without_local_state() {
         calls[3]["params"],
         json!({"agent_id":AGENT_ID,"task":"continue","request_id":"resume-1","orchestrator":null})
     );
-    assert_eq!(calls[4]["params"], request_spec);
     assert_eq!(
-        calls[5]["params"],
-        json!({"pool_id":"pool-1","request_id":"post-1","message":"hello"})
-    );
-    assert_eq!(
-        calls[6]["params"],
-        json!({"pool_id":"pool-1","agent_id":AGENT_ID,"request_id":"replace-1","start":request_spec})
-    );
-    assert_eq!(
-        calls[7]["params"],
-        json!({"pool_id":"pool-1","after_seq":2,"before_seq":null,"limit":5})
-    );
-    assert_eq!(
-        calls[8]["params"],
-        json!({"state":"open","offset":2,"limit":3})
-    );
-    assert_eq!(
-        calls[9]["params"],
+        calls[4]["params"],
         json!({"agent_id":AGENT_ID,"sequence":7,"expected_sha256":hash,"offset_bytes":12,"max_bytes":20})
     );
     fixture.assert_homes_absent();

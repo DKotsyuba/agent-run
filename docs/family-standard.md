@@ -23,9 +23,9 @@ to that template.
 | External programs | `tools` | Codex, Claude Code, and GLM engine CLIs are configured, version-reported external executables |
 | Host adapter | yes | Embedded Desktop frontend (`assets/desktop-transport.cjs`) executed by host-supplied Node, plus host hook binding |
 
-The release payload is one main binary plus the `agent-run-tui` observer and
-the `agent-run-deploy` installation helper, all sealed from the same
-workspace version. The Desktop bridge is embedded in the binary; it is not
+The release payload is one main binary plus the `agent-run-deploy`
+installation helper, sealed from the same workspace version, and the fixed
+`agent-run-tui` compatibility shim for the removed observer. The Desktop bridge is embedded in the binary; it is not
 `scripts/services/codegraph-probe.cjs`, the separately shipped CodeGraph
 integration probe. Node is used for these declared product integrations, not
 general repository automation. CI invokes their fixture checks through

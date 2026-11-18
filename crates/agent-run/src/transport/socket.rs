@@ -490,9 +490,6 @@ const CONTROL_METHODS: &[&str] = &[
     "resume",
     "cancel",
     "steer",
-    "start_pool",
-    "pool_post",
-    "pool_replace",
     "_hook_bind",
 ];
 /// Steady database maintenance interval: expiry found no work and compaction
@@ -1339,11 +1336,6 @@ fn valid_start_frame(raw: &[u8], method: &str) -> bool {
         }
         "batch_receipt" => {
             serde_json::from_slice::<Frame<agent_run_domain::batch::StartBatchRequest>>(raw)
-                .map(|frame| frame.params)
-                .is_ok()
-        }
-        "start_pool" => {
-            serde_json::from_slice::<Frame<agent_run_domain::pool::PoolStartRequest>>(raw)
                 .map(|frame| frame.params)
                 .is_ok()
         }
@@ -3683,16 +3675,20 @@ mod tests {
             .unwrap();
     }
 
-    /// Pool discovery consumes only the read lane and no control reservation.
+    /// Discovery consumes only the read lane and no control reservation; the
+    /// removed legacy pool methods are no longer control methods.
     #[test]
-    fn list_pools_uses_the_read_lane() {
+    fn discovery_uses_the_read_lane() {
         let lanes = Lanes::new(0);
-        let read = lanes.try_acquire("list_pools").unwrap();
-        assert!(lanes.try_acquire("list_agents").is_none());
-        assert!(lanes.try_acquire("start_pool").is_some());
+        let read = lanes.try_acquire("list_agents").unwrap();
+        assert!(lanes.try_acquire("transcript").is_none());
+        assert!(lanes.try_acquire("start").is_some());
         assert!(lanes.try_acquire("start_batch").is_some());
         drop(read);
-        assert!(lanes.try_acquire("list_pools").is_some());
+        assert!(lanes.try_acquire("list_agents").is_some());
+        for removed in ["start_pool", "pool_post", "pool_replace"] {
+            assert!(!CONTROL_METHODS.contains(&removed));
+        }
     }
 
     /// A cancelled batch wait cannot release control capacity while work is running.

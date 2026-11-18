@@ -216,11 +216,6 @@ fn extend_start_description(value: &mut Value) {
 fn additive_wires() -> Vec<Value> {
     [
         "delegation_guide",
-        "start_pool",
-        "pool_post",
-        "pool_replace",
-        "pool",
-        "list_pools",
         "start_batch",
         "batch_receipt",
         "history_pins",
@@ -519,29 +514,6 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
     }
 }
 
-/// The real MCP proxy calls list_pools over the broker socket and renders its page.
-#[test]
-fn list_pools_live_mcp_round_trip() {
-    let mut harness = Harness::new();
-    harness.start_broker();
-    let mut mcp = harness.mcp();
-    mcp.send(initialize("2025-11-25")).unwrap();
-    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}));
-    let reply = mcp
-        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"list_pools","arguments":{"state":"open","limit":1}}}))
-        .unwrap();
-    assert_eq!(reply["result"]["isError"], false);
-    assert!(
-        reply["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("agent-run pools: 0 of 0")
-    );
-    assert!(reply["result"].get("structuredContent").is_none());
-    mcp.finish();
-}
-
 /// Pins the explicit call-only/additive discovery delta over the frozen
 /// schema table, after the SDK's null omission; historical calls remain covered.
 #[test]
@@ -678,16 +650,7 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        names,
-        [
-            "notify_orchestrator",
-            "pool_post",
-            "pool_read",
-            "pool_propose",
-            "pool_vote"
-        ]
-    );
+    assert_eq!(names, ["notify_orchestrator"]);
     let unknown = mcp.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start","arguments":{}}})).unwrap();
     assert_eq!(unknown["error"]["code"], -32602);
     assert!(unknown.get("result").is_none());
@@ -745,11 +708,11 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
             let result = if expected == agent_run_domain::worker::CATALOG_METHOD {
                 assert_eq!(
                     call["params"]["version"],
-                    agent_run_domain::worker::POOL_CATALOG_VERSION
+                    agent_run_domain::worker::WORKER_CATALOG_VERSION
                 );
                 assert_eq!(
                     call["params"]["digest"],
-                    agent_run_domain::worker::pool_catalog_digest()
+                    agent_run_domain::worker::worker_catalog_digest()
                 );
                 json!({"registered":true})
             } else {

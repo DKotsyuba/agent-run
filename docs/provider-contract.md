@@ -163,7 +163,7 @@ resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
 `ValidationError`; there is no runtime alias. A repeated `request_id` returns
 the original admission (`created=false`). `[harnesses.codex].fast_mode = true`
-forces the effective Fast option for all Codex starts/pool members. Resume reads
+forces the effective Fast option for all Codex starts and batch jobs. Resume reads
 the current override; each admitted execution and its retries retain that value.
 Raw requests, replay digests and parent native configuration remain unchanged.
 `fast` is carried to the codex
@@ -281,8 +281,8 @@ published length limit is applied.
 Before creating a durable agent/attempt or reserving account capacity, provider
 admission resolves the frozen canonical role and checks the executable, shared
 role policy, credential-reference connection shape and Codex grant compiler
-used by real launch. Single starts, new
-pool members and replacements share prepare_provider; historical start uses
+used by real launch. Single starts, batch jobs and managed Pool enrollments
+share prepare_provider; historical start uses
 the same native grant compiler. Replays still return their original admission
 before consulting mutable state. Unsupported writable Codex external read roots
 are typed errors in the start call, with no partial admission.
@@ -312,11 +312,11 @@ runtime_protocol_failed categories; actual cleanup ownership is unchanged.
 
 Claude's persistent input stream can produce several native results, including
 one result for a coalesced input batch. The shared runner assigns a fresh UUID
-to each initial task, steering input and pool message, and requests
+to each initial task, steering input and injected native-owner note, and requests
 `--replay-user-messages`. A result's `user_message_uuid` must match a known
 input and, when acknowledgements are present, the last input in that replay
 batch. A batch completes the current task only if it includes the latest
-initial/steering input. Pool-only successful results do not finish the task.
+initial/steering input. Note-only successful results do not finish the task.
 These UUIDs are native framing, not public agent identifiers, and are omitted
 from diagnostic metadata.
 
@@ -327,7 +327,7 @@ produce `ambiguous_result`. A single legacy result remains compatible only
 when no additional task or context inputs were written; even one uncorrelated
 result after multiple inputs is ambiguous.
 A genuine empty task result stays `empty_result` even when assistant progress
-or a later pool-only answer is nonblank. A possibly partial control write
+or a later note-only answer is nonblank. A possibly partial control write
 cannot certify success. EOF, exit zero, durable answer and verified process
 cleanup remain required; transcript text is never an answer fallback.
 
