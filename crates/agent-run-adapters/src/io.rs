@@ -187,6 +187,15 @@ pub struct Process {
     exit_kill_deadline: Option<tokio::time::Instant>,
     /// Last descendant snapshot, shared by startup RPC and streaming reads.
     observed_at: tokio::time::Instant,
+    /// Mid-run descendant refresh period, fixed at spawn.
+    ///
+    /// With a Linux child subreaper, orphans stay reachable by parentage and
+    /// are captured at every termination point (primary exit, signals,
+    /// cleanup), so this only bounds how stale the durable crash-recovery
+    /// capture and adopted-zombie reaping may get (10 s by default). Without
+    /// one, descendants that orphan before a refresh would escape, so the
+    /// original 200 ms polling remains.
+    refresh_every: Duration,
     /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
     ownership_sink: Option<OwnershipSink>,
     /// Last successfully persisted append-only capture revision.
@@ -340,6 +349,7 @@ impl Process {
             primary_exited: false,
             exit_kill_deadline: None,
             observed_at: tokio::time::Instant::now(),
+            refresh_every: agent_run_platform::process::descendant_refresh_interval(),
             ownership_sink: None,
             ownership_revision: None,
             ownership_pending: None,
@@ -484,11 +494,11 @@ impl Process {
     }
 
     /// One observation step: primary exit with escalation, then a descendant
-    /// refresh when 200 ms have passed since the last one.
+    /// refresh when the refresh period has passed since the last one.
     fn observe_tick(&mut self) -> Result<()> {
         self.observe_primary_exit()?;
         let now = tokio::time::Instant::now();
-        if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+        if now.duration_since(self.observed_at) >= self.refresh_every {
             self.owner.refresh();
             self.observed_at = now;
         }
@@ -674,7 +684,7 @@ impl Process {
     async fn receive(&mut self) -> Event {
         loop {
             let now = tokio::time::Instant::now();
-            if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+            if now.duration_since(self.observed_at) >= self.refresh_every {
                 self.owner.refresh();
                 self.observed_at = now;
             }
@@ -711,7 +721,7 @@ impl Process {
                     // The next iteration records exit and sends the first TERM sweep.
                 }
                 event = self.events.recv() => return event.unwrap_or(Event::Eof),
-                _ = tokio::time::sleep_until(self.observed_at + Duration::from_millis(200)) => {},
+                _ = tokio::time::sleep_until(self.observed_at + self.refresh_every) => {},
             }
         }
     }

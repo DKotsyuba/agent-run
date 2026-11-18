@@ -49,3 +49,5 @@ mod provider_launch;
 mod redaction;
 #[path = "../snapshots.rs"]
 mod snapshots;
+#[path = "../subreaper_cadence.rs"]
+mod subreaper_cadence;

@@ -23,3 +23,5 @@ mod refresh_cost;
 mod release;
 #[path = "../safe_fs.rs"]
 mod safe_fs;
+#[path = "../subreaper.rs"]
+mod subreaper;

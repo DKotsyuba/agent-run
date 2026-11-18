@@ -292,6 +292,11 @@ fn launch_error(error: launch::LaunchError) -> Error {
 /// class without persisting task text or credentials, including errors whose
 /// owned process prevents finish.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -> Result<()> {
+    // Before any child exists: orphaned engine descendants (double fork,
+    // setsid, nohup) reparent here instead of init, so termination-point
+    // captures reach them and mid-run polling can slow to the durable-evidence
+    // cadence. Refusal (or macOS) keeps the original 200 ms polling.
+    let _ = process::become_subreaper();
     if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none() {
         crate::logging::configure(home, "supervisor");
     }
