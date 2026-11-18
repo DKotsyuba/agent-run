@@ -85,13 +85,31 @@ child whose owner went away first (a dropped engine transport, an unconfirmed
 started launch) is handed to one process-wide reaper thread, which never kills
 it and releases the registration only after collecting its status.
 
-The admission lock is never held across the spawn itself: an admission mark
-taken under the lock (with the clean-boundary check) keeps other spawns and
-adoption waiting until the registrar registers the child, and the registrar's
-wait for the child's PID report is bounded. A child stopped before it reports
-can still hold its own launching thread inside `Command::spawn` (the standard
-library offers no bound there), but no longer the lock, other spawns or
-adoption. Process groups and PID listings never decide
+The admission lock is held from the clean-boundary check through the single
+spawn to the registration, so no observer sees the new child unregistered and
+no spawns interleave. The registrar's wait for the child's PID report is
+bounded (10 s): a child that never reports is refused, never execs, and the
+spawn returns. Known limitation: a child *stopped* before exec (SIGSTOP, a
+tracer) keeps the standard library's exec-status pipe open, so the spawn, and
+with it the admission lock, waits until that child continues or dies; the
+supervisor never stops its children.
+
+The process-wide reaper drops a queued child only once its exit is
+established: its status was collected, or (when another waiter took it) its
+registered identity is provably gone. If the reaper thread cannot be created,
+a task on the current async runtime polls instead and keeps retrying.
+
+Recovery after a supervisor failure acts only on SQLite ownership rows: the
+attempt's recorded root (`process_identity`), its persisted member snapshots
+and a recorded cleanup proof. The private recovery receipt is investigation
+evidence, never a recovery input. Consequently a confirmed proof is released;
+with the root recorded but no member rows, recovery can re-adopt and clean a
+still-live root's group but cannot verify escaped descendants after the root
+is gone (`leader_gone_descendants_unverifiable`); with no recorded identity it
+reports `no_process_evidence`. In every unverifiable case the attempt stays
+owned with a typed blocker.
+
+Process groups and PID listings never decide
 ownership. An orphan cannot name its tree, so it is attributed to an engine only
 when that engine was spawned at a clean boundary: under the same lock and
 before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT | __WALL)` reported that the
