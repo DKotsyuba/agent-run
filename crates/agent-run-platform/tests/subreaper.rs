@@ -1,7 +1,9 @@
 //! Linux child-subreaper ownership: orphaned (double-forked, `setsid`, or
 //! regrouped) descendants are reached by parentage at termination points and
 //! killed by cleanup; registered spawns are never adopted, signalled through
-//! adoption or reaped; orphans are attributed only to an exclusive spawn.
+//! adoption or reaped; orphans are attributed only to a spawn admitted while
+//! this process had no other child. Fixtures orphan immediately: registration
+//! and the exclusivity decision happen before the engine program runs.
 //!
 //! The subreaper flag and spawn registry are process-wide, so each case
 //! re-runs itself in a fresh process of this test binary.
@@ -70,7 +72,8 @@ impl Drop for Spawned {
 
 /// Spawn and register `command`, like the engine transport does.
 fn spawn(command: &mut Command) -> Spawned {
-    let (child, claim) = process::spawn_child(|| command.spawn(), |c| Some(c.id())).unwrap();
+    let gate = process::SpawnGate::install(command).unwrap();
+    let (child, claim) = gate.spawn(|| command.spawn(), |c| Some(c.id())).unwrap();
     Spawned {
         child,
         claim: Some(claim),
@@ -78,12 +81,9 @@ fn spawn(command: &mut Command) -> Spawned {
     }
 }
 
-/// Spawn a registered group leader whose subshell double-forks `daemon`.
-///
-/// The short delay keeps the fork out of the spawn-time exclusivity
-/// snapshots; an orphan already present there (correctly) refuses exclusivity.
+/// Spawn a registered group leader whose subshell double-forks `daemon` at once.
 fn spawn_with_daemon(daemon: &str) -> Spawned {
-    let script = format!("sleep 0.3; ( {daemon} </dev/null >/dev/null 2>&1 & ) ; exec sleep 600");
+    let script = format!("( {daemon} </dev/null >/dev/null 2>&1 & ) ; exec sleep 600");
     spawn(
         Command::new("/bin/sh")
             .args(["-c", &script])
@@ -200,7 +200,7 @@ fn a_descendant_joining_the_supervisor_group_is_still_killed() {
         "a_descendant_joining_the_supervisor_group_is_still_killed",
         || {
             let exe = std::env::current_exe().unwrap();
-            let script = "sleep 0.3; ( \"$JOINER\" --exact subreaper::pgid_joiner_fixture --nocapture \
+            let script = "( \"$JOINER\" --exact subreaper::pgid_joiner_fixture --nocapture \
                       </dev/null >/dev/null 2>&1 & ) ; exec sleep 600";
             let mut fixture = spawn(
                 Command::new("/bin/sh")
@@ -231,38 +231,36 @@ fn adopted_zombies_are_reaped_but_spawned_children_are_not() {
     isolated(
         "adopted_zombies_are_reaped_but_spawned_children_are_not",
         || {
-            // A registered helper in its own group, already exited: its status
-            // belongs to its spawner even though it is a zombie direct child.
-            let mut helper = spawn(
+            // The registered leader orphans a short-lived daemon, then exits 7
+            // and stays an unreaped zombie whose status belongs to its spawner.
+            let mut fixture = spawn(
                 Command::new("/bin/sh")
-                    .args(["-c", "exit 7"])
+                    .args([
+                        "-c",
+                        "( setsid true </dev/null >/dev/null 2>&1 & ) ; exit 7",
+                    ])
                     .process_group(0),
             );
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !process::inspect(helper.child.id() as i32).unwrap().zombie {
-                assert!(Instant::now() < deadline, "helper never exited");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let mut fixture = spawn_with_daemon("setsid true");
             let leader = fixture.child.id() as i32;
             let mut owner = OwnedProcess::capture(leader);
-            let orphan = adopted_child(leader, |p| p.zombie && p.pid != helper.child.id() as i32);
+            let orphan = adopted_child(leader, |p| p.zombie);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !process::inspect(leader).unwrap().zombie {
+                assert!(Instant::now() < deadline, "leader never exited");
+                std::thread::sleep(Duration::from_millis(20));
+            }
 
             owner.refresh();
             assert!(captured(&owner, &orphan));
             assert!(
                 process::inspect(orphan.pid).is_err_and(|e| e.raw_os_error() == Some(libc::ENOENT)),
-                "the adopted zombie was not reaped"
+                "the captured adopted zombie was not reaped"
             );
-            let helper_now = process::inspect(helper.child.id() as i32).unwrap();
-            assert!(helper_now.zombie, "the registered helper was reaped");
-            assert!(!captured(&owner, &helper_now));
-            assert_eq!(helper.wait().code(), Some(7), "helper status kept");
             assert!(
-                fixture.child.try_wait().unwrap().is_none(),
-                "leader untouched"
+                process::inspect(leader).unwrap().zombie,
+                "the registered leader was reaped"
             );
-            assert!(!process::inspect(leader).unwrap().zombie);
+            assert_eq!(fixture.wait().code(), Some(7), "leader status kept");
         },
     );
 }

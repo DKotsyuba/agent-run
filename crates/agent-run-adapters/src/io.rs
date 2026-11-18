@@ -271,8 +271,9 @@ impl Process {
             .kill_on_drop(false);
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
-        // Registered under the admission lock before any observer can see it.
-        let (mut child, spawned) = process::spawn_child(|| command.spawn(), Child::id)?;
+        // Registered by exact identity before the engine program runs.
+        let gate = process::SpawnGate::install(command.as_std_mut())?;
+        let (mut child, spawned) = gate.spawn(|| command.spawn(), Child::id)?;
         let pid = child
             .id()
             .ok_or_else(|| Error::Runtime("child PID unavailable".into()))?

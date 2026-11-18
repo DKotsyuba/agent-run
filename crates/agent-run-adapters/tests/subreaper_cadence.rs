@@ -167,7 +167,7 @@ fn primary_exit_captures_and_kills_a_daemonized_descendant() {
                 .unwrap();
             runtime.block_on(async {
                 let mut fixture = spawn(
-                    "sleep 0.3; ( setsid sleep 600 </dev/null >/dev/null 2>&1 & ) ; \
+                    "( setsid sleep 600 </dev/null >/dev/null 2>&1 & ) ; \
                      printf '{\"ready\":1}\\n'; read request; exit 3",
                 );
                 let leader = fixture.0.owner.pid;

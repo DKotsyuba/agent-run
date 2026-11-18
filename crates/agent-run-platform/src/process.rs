@@ -795,34 +795,9 @@ fn with_program(mut identity: Identity) -> Identity {
 
 mod adoption;
 pub use adoption::{
-    DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnedChild, become_subreaper,
-    durable_refresh_interval, spawn_child, subreaper_active,
+    DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnGate, SpawnedChild, become_subreaper,
+    durable_refresh_interval, subreaper_active,
 };
-
-/// Reap zombie direct children of this subreaper process that it did not spawn.
-///
-/// Runs under the admission lock. Each candidate is re-inspected right before
-/// `waitpid(pid, WNOHANG)` on that exact PID: still a zombie, still this
-/// process's child, the same start token, and not a registered spawn. Nobody
-/// else may wait for such an orphan (its original parent is gone and every
-/// spawn of this process is registered), and an unreaped child's PID cannot be
-/// reused, so the call can collect neither a spawner's status nor another
-/// process. `waitpid(-1)` is never used. A reaped captured member later
-/// observes as dead.
-#[cfg(target_os = "linux")]
-fn reap_orphans(state: &adoption::State, all: &[Identity]) {
-    let me = std::process::id() as i32;
-    for p in all.iter().filter(|p| p.ppid == me && p.zombie) {
-        let Ok(now) = inspect(p.pid) else {
-            continue;
-        };
-        if now.zombie && now.ppid == me && now.token == p.token && !state.registered(&now) {
-            let mut status = 0;
-            // SAFETY: exact positive PID of an unreaped, unregistered zombie child; WNOHANG never blocks.
-            unsafe { libc::waitpid(p.pid, &mut status, libc::WNOHANG) };
-        }
-    }
-}
 
 /// Per-refresh memo of [`observe`] verdicts for captured parents.
 ///
@@ -888,7 +863,7 @@ impl OwnedProcess {
             exclusive: leader
                 .as_ref()
                 .filter(|_| subreaper_active())
-                .and_then(|leader| adoption::lock().exclusive(leader)),
+                .and_then(adoption::exclusive_generation),
             leader,
             pid,
             captured: known.keys().cloned().collect(),
@@ -1088,7 +1063,38 @@ impl OwnedProcess {
         }
         #[cfg(target_os = "linux")]
         if let Some(state) = &admission {
-            reap_orphans(state, all);
+            self.reap_captured(state, all);
+        }
+    }
+    /// Reap this owner's captured zombies that are adopted children of this process.
+    ///
+    /// Runs under the admission lock. Only an exact captured `(pid, token)` is
+    /// reaped, after re-inspection shows it is still a zombie child of this
+    /// process and not a registered spawn, with `waitpid(pid, WNOHANG)` on that
+    /// exact PID. Its original parent is gone and a registered spawn's status
+    /// belongs to its spawner, so no other waiter exists; an unreaped child's
+    /// PID cannot be reused. `waitpid(-1)` is never used, and orphans this
+    /// owner never captured are left alone. A reaped member observes as dead.
+    #[cfg(target_os = "linux")]
+    fn reap_captured(&self, state: &adoption::State, all: &[Identity]) {
+        let me = std::process::id() as i32;
+        for p in all.iter().filter(|p| p.ppid == me && p.zombie) {
+            if !self.knows(p)
+                || self
+                    .leader
+                    .as_ref()
+                    .is_some_and(|leader| leader.pid == p.pid && leader.token == p.token)
+            {
+                continue;
+            }
+            let Ok(now) = inspect(p.pid) else {
+                continue;
+            };
+            if now.zombie && now.ppid == me && now.token == p.token && !state.registered(&now) {
+                let mut status = 0;
+                // SAFETY: exact positive PID of an unreaped, captured, unregistered zombie child; WNOHANG never blocks.
+                unsafe { libc::waitpid(p.pid, &mut status, libc::WNOHANG) };
+            }
         }
     }
     /// Period until the next mid-run refresh of this owner.
