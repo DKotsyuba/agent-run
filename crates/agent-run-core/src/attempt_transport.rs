@@ -259,8 +259,47 @@ fn has_launch_marker(pid: u32) -> Result<bool> {
         .any(|entry| entry.starts_with(b"AGENT_RUN_LAUNCH_ID=")))
 }
 
+/// Return whether one ancestry link is a recorded Run process.
+///
+/// Same-UID links (`exact`) match a bound attempt launch or a captured attempt
+/// member by exact incarnation. Every link above PID 1 is also matched against
+/// recorded supervisor identities by PID and exact start token: a Linux
+/// supervisor is the child subreaper of its engine tree, so a daemonized,
+/// environment-cleared descendant that escaped every ownership capture still
+/// has that supervisor as an ancestor. The token embeds this boot and the
+/// link's start ticks, so a recycled PID never matches an old record.
+#[cfg(target_os = "linux")]
+fn run_owned_link(
+    conn: &rusqlite::Connection,
+    boot_id: &str,
+    link: &RoleLink,
+    exact: Option<&agent_run_platform::process::KernelIncarnation>,
+) -> Result<bool> {
+    let reject = || invalid("Pool resident process context unavailable");
+    if let Some(exact) = exact {
+        let namespace = i64::try_from(exact.pid_namespace_inode).map_err(|_| reject())?;
+        let ticks = i64::try_from(exact.start_ticks).map_err(|_| reject())?;
+        let token = format!("linux:{}:{}", exact.boot_id, exact.start_ticks);
+        let owned:bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE state='bound' AND boot_id=?1 AND pid_namespace_inode=?2 AND uid=?3 AND pid=?4 AND start_ticks=?5 UNION ALL SELECT 1 FROM process_members WHERE owner_kind='attempt' AND pid=?4 AND token=?6)",rusqlite::params![exact.boot_id,namespace,exact.uid,exact.pid,ticks,token],|row|row.get(0)).map_err(|_| reject())?;
+        if owned {
+            return Ok(true);
+        }
+    }
+    if link.pid <= 1 {
+        return Ok(false);
+    }
+    let token = format!("linux:{boot_id}:{}", link.ticks);
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE supervisor_pid=?1 AND supervisor_identity=?2)",
+        rusqlite::params![link.pid, token],
+        |row| row.get(0),
+    )
+    .map_err(|_| reject())
+}
+
 /// Verify that a Pool peer is not a Run harness or a descendant of one. The
-/// complete ancestry, inherited negative marker and recorded ownership are all
+/// complete ancestry, inherited negative marker and recorded ownership
+/// (including recorded supervisor identities, see [`run_owned_link`]) are all
 /// checked, then the whole chain is reread to reject reparent/PID reuse races.
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_pool_resident(stream: &UnixStream, home: &Path) -> Result<()> {
@@ -318,15 +357,8 @@ pub(crate) fn verify_pool_resident(stream: &UnixStream, home: &Path) -> Result<(
     }
     let store = agent_run_store::Store::open(home).map_err(|_| reject())?;
     let snapshot = store.conn.unchecked_transaction().map_err(|_| reject())?;
-    for (_, exact) in &chain {
-        let Some(exact) = exact else {
-            continue;
-        };
-        let namespace = i64::try_from(exact.pid_namespace_inode).map_err(|_| reject())?;
-        let ticks = i64::try_from(exact.start_ticks).map_err(|_| reject())?;
-        let token = format!("linux:{}:{}", exact.boot_id, exact.start_ticks);
-        let owned:bool = snapshot.query_row("SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE state='bound' AND boot_id=?1 AND pid_namespace_inode=?2 AND uid=?3 AND pid=?4 AND start_ticks=?5 UNION ALL SELECT 1 FROM process_members WHERE owner_kind='attempt' AND pid=?4 AND token=?6)",rusqlite::params![exact.boot_id,namespace,exact.uid,exact.pid,ticks,token],|row|row.get(0)).map_err(|_| reject())?;
-        if owned {
+    for (link, exact) in &chain {
+        if run_owned_link(&snapshot, &incarnation.boot_id, link, exact.as_ref())? {
             return Err(reject());
         }
     }
@@ -1020,6 +1052,141 @@ mod tests {
         assert!(bridge_result(valid.clone(), "id", "lookup", None).is_ok());
         assert!(bridge_result(valid.clone(), "wrong", "lookup", None).is_err());
         assert!(bridge_result(valid, "id", "retire", None).is_err());
+    }
+
+    /// Records `pid`/`token` as the supervisor of a fixture agent row.
+    #[cfg(target_os = "linux")]
+    fn record_supervisor(store: &agent_run_store::Store, id: &str, pid: u32, token: &str) {
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,supervisor_pid,supervisor_identity) VALUES (?1,'fixture','fixture','review','fixture','fixture','/tmp','{}','running',1,'fixture',?2,?3)", rusqlite::params![id, pid, token]).unwrap();
+    }
+
+    /// The complete parent chain of `pid`, read like `verify_pool_resident`.
+    #[cfg(target_os = "linux")]
+    fn ancestry(mut pid: u32) -> Vec<RoleLink> {
+        let mut chain = Vec::new();
+        while pid != 0 {
+            let link = role_link(pid).unwrap();
+            pid = link.parent;
+            chain.push(link);
+        }
+        chain
+    }
+
+    /// Whether any link of `chain` is a recorded Run process in `store`.
+    #[cfg(target_os = "linux")]
+    fn run_owned(store: &agent_run_store::Store, chain: &[RoleLink]) -> bool {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        chain
+            .iter()
+            .any(|link| run_owned_link(&store.conn, boot.trim(), link, None).unwrap())
+    }
+
+    /// A supervisor is the subreaper of its engine tree: a double-forked
+    /// descendant whose environment was replaced without the launch marker
+    /// (an empty environment is already refused) is rejected through the
+    /// recorded supervisor identity alone, with no ownership capture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_adopted_by_a_recorded_supervisor_is_not_a_pool_resident() {
+        const CASE: &str = "AGENT_RUN_POOL_RESIDENT_SUBREAPER_CASE";
+        if std::env::var_os(CASE).is_none() {
+            // The subreaper flag is process-wide: run the case in a fresh process.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "attempt_transport::tests::a_daemon_adopted_by_a_recorded_supervisor_is_not_a_pool_resident",
+                    "--nocapture",
+                ])
+                .env(CASE, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated case failed: {status}");
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        agent_run_platform::process::become_subreaper().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(dir.path()).unwrap();
+        let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+        let harness = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "( env -i PATH=/usr/bin:/bin /usr/bin/setsid /bin/sleep 600 </dev/null >/dev/null 2>&1 & ) ; exec /bin/sleep 600",
+            ])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let leader = harness.id() as i32;
+        // SAFETY: getpgrp has no preconditions.
+        let own_group = unsafe { libc::getpgrp() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let daemon = loop {
+            if let Some(found) = agent_run_platform::process::processes()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.ppid == me.pid && p.pid != leader && p.group != own_group && !p.zombie)
+            {
+                break found;
+            }
+            assert!(std::time::Instant::now() < deadline, "no adopted daemon");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        /// Kills the fixture daemon and harness group even if an assertion unwinds.
+        struct Fixture(i32, std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // SAFETY: exact fixture PIDs owned by this test process.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::kill(-(self.1.id() as i32), libc::SIGKILL);
+                }
+                let _ = self.1.wait();
+            }
+        }
+        let _fixture = Fixture(daemon.pid, harness);
+        let chain = ancestry(daemon.pid as u32);
+        assert_eq!(chain[1].pid, me.pid as u32, "the supervisor adopted it");
+        assert!(
+            !has_launch_marker(daemon.pid as u32).unwrap(),
+            "marker-free environment"
+        );
+        assert!(!run_owned(&store, &chain), "nothing recorded yet");
+        record_supervisor(&store, "agent", me.pid as u32, &me.token);
+        assert!(run_owned(&store, &chain), "recorded supervisor ancestor");
+    }
+
+    /// A resident outside every recorded supervisor (for example started by
+    /// systemd) still passes, including when a stale record names an
+    /// ancestor's PID with another start token.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resident_outside_recorded_supervisors_is_not_run_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(dir.path()).unwrap();
+        let mut unrelated = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut resident = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other = agent_run_platform::process::inspect(unrelated.id() as i32).unwrap();
+        record_supervisor(&store, "live", other.pid as u32, &other.token);
+        let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+        let stale = format!("{}:1", me.token.rsplit_once(':').unwrap().0);
+        record_supervisor(&store, "stale", me.pid as u32, &stale);
+        let chain = ancestry(resident.id());
+        let owned = run_owned(&store, &chain);
+        let _ = unrelated.kill();
+        let _ = resident.kill();
+        let _ = unrelated.wait();
+        let _ = resident.wait();
+        assert_eq!(chain.last().unwrap().pid, 1, "the chain reaches init");
+        assert!(
+            !owned,
+            "a PID-reused or unrelated supervisor record rejected a resident"
+        );
     }
 
     #[test]
