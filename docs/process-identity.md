@@ -69,11 +69,16 @@ The supervisor tells its own spawns from adopted orphans only by an explicit
 registry. Every child is forked through a spawn gate: before `exec` the child
 reports its PID and waits until the supervisor has registered its exact PID and
 start token under an admission lock. A child that cannot be registered never
-runs its program; the spawn fails and is reaped. If the launch fails after the
-program started (tokio can fail while wrapping a live child and drops it
-unwaited), the registered child is pinned by pidfd, killed and reaped before
-the failure is reported. A registration stays until the spawner collected the
-exit status. Process groups and PID listings never decide
+runs its program; the spawn fails and is reaped. The OS launch is a single
+standard-library spawn of a command consumed by the gate; wrapping the child
+for the async runtime is a separate step. If wrapping fails after the program
+started, the engine and its process tree stay owned: the supervisor records
+the exact root as the attempt's process (so the attempt is never certified as
+never spawned), runs the ordinary bounded cleanup and records a confirmed
+cleanup proof only when the tree is proven gone and the engine's status was
+collected. Otherwise ownership is retained and the run reports
+`cleanup unconfirmed` for recovery. A registration stays until the spawner
+collected the exit status. Process groups and PID listings never decide
 ownership. An orphan cannot name its tree, so it is attributed to an engine only
 when that engine was spawned at a clean boundary: under the same lock and
 before the fork, `waitid(P_ALL, WNOHANG | WNOWAIT | __WALL)` reported that the
