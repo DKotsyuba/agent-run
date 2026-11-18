@@ -31,6 +31,10 @@ test-group = "follow"
 # Timing-sensitive tests (sub-second windows, short deadlines, latency
 # percentiles) run alone so load from other test processes cannot starve them.
 # Thresholds stay unchanged; only concurrency with other tests is removed.
+# The writer_load waves start up to 64 producer processes with 10-20 s barriers
+# and the lock test has a 250 ms commit allowance, so they join this group too.
+# Load from outside nextest cannot be removed; `fifteen_agent_cohorts` also
+# widens its latency budgets by the host stall it measures (StallProbe).
 [[profile.default.overrides]]
 filter = """
 test(=process::tests::cleanup_signals_captured_descendant_after_group_exit)
@@ -40,5 +44,8 @@ test(=process::tests::cleanup_signals_captured_descendant_after_group_exit)
 | test(=sqlite_busy::idle_command_poll_does_not_acquire_the_wal_writer)
 | test(=socket_api_planned::python_capacity_order_and_durable_cancel_use_independent_paths)
 | test(=codex_session::python_test_codex_app_server_closed_error_does_not_wait_unboundedly)
+| test(=writer_load::lock_release_and_long_refusal_preserve_neighbour_progress)
+| test(=writer_load::increasing_real_process_load_is_exact_and_replay_safe)
+| test(=writer_load::bounded_real_process_growth_is_exact_and_readers_progress)
 """
 threads-required = "num-test-threads"
