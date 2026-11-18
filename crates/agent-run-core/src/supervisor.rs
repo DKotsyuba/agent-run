@@ -295,7 +295,9 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -
     // Before any child exists: orphaned engine descendants (double fork,
     // setsid, nohup) reparent here instead of init, so termination-point
     // captures reach them and mid-run polling can slow to the durable-evidence
-    // cadence. Refusal (or macOS) keeps the original 200 ms polling.
+    // cadence. Refusal (or macOS) keeps the original 200 ms polling. Every
+    // child of this process must be spawned through `process::spawn_child`
+    // (engine transports do): an unregistered child would look like an orphan.
     let _ = process::become_subreaper();
     if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none() {
         crate::logging::configure(home, "supervisor");

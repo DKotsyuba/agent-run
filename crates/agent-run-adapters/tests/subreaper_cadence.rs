@@ -19,8 +19,14 @@ use std::{
 /// Names the case a re-executed child process must run, and whether it becomes a subreaper.
 const CASE: &str = "AGENT_RUN_SUBREAPER_CADENCE_CASE";
 
-/// Run `body` in a fresh process of this binary, as exactly `name`.
+/// Run `body` in a fresh process of this binary, as exactly `name`, with an
+/// optional durable refresh override in milliseconds.
 fn isolated(name: &str, subreaper: bool, body: fn()) {
+    isolated_with(name, subreaper, None, body);
+}
+
+/// [`isolated`] with an explicit [`process::REFRESH_ENV`] value.
+fn isolated_with(name: &str, subreaper: bool, refresh_ms: Option<&str>, body: fn()) {
     if std::env::var(CASE).as_deref() == Ok(name) {
         if subreaper {
             process::become_subreaper().expect("become subreaper");
@@ -38,6 +44,7 @@ fn isolated(name: &str, subreaper: bool, body: fn()) {
         ])
         .env(CASE, name)
         .env_remove(process::REFRESH_ENV)
+        .envs(refresh_ms.map(|ms| (process::REFRESH_ENV, ms)))
         .status()
         .unwrap();
     assert!(status.success(), "isolated case {name} failed: {status}");
@@ -103,14 +110,33 @@ fn quiet_window_reads() -> (u64, u64) {
 
 #[test]
 fn a_subreaper_engine_does_not_poll_proc_while_running() {
-    isolated(
+    isolated_with(
         "a_subreaper_engine_does_not_poll_proc_while_running",
+        true,
+        Some("600000"),
+        || {
+            let (reads, host) = quiet_window_reads();
+            println!(
+                "subreaper, no durable refresh due: {reads} read syscalls in 3 s over {host} processes"
+            );
+            // One refresh alone reads every /proc/<pid>/stat at least once.
+            assert!(reads < host, "a /proc scan ran mid-run: {reads} reads");
+        },
+    );
+}
+
+#[test]
+fn a_subreaper_engine_refreshes_only_at_the_durable_cadence() {
+    isolated(
+        "a_subreaper_engine_refreshes_only_at_the_durable_cadence",
         true,
         || {
             let (reads, host) = quiet_window_reads();
-            println!("subreaper: {reads} read syscalls in 3 s over {host} processes");
-            // One refresh alone reads every /proc/<pid>/stat at least once.
-            assert!(reads < host, "a /proc scan ran mid-run: {reads} reads");
+            println!(
+                "subreaper, 2 s durable refresh: {reads} read syscalls in 3 s over {host} processes"
+            );
+            // At 2 s, three seconds hold one or two scans of about two reads per process.
+            assert!(reads < 5 * host, "polling cadence mid-run: {reads} reads");
         },
     );
 }
@@ -123,8 +149,8 @@ fn without_a_subreaper_the_engine_keeps_polling() {
         || {
             let (reads, host) = quiet_window_reads();
             println!("polling: {reads} read syscalls in 3 s over {host} processes");
-            // At 200 ms, three seconds hold well over five full scans.
-            assert!(reads >= 5 * host, "polling refresh stopped: {reads} reads");
+            // At 200 ms, three seconds hold about fifteen scans.
+            assert!(reads >= 10 * host, "polling refresh stopped: {reads} reads");
         },
     );
 }
@@ -141,7 +167,7 @@ fn primary_exit_captures_and_kills_a_daemonized_descendant() {
                 .unwrap();
             runtime.block_on(async {
                 let mut fixture = spawn(
-                    "( setsid sleep 600 </dev/null >/dev/null 2>&1 & ) ; \
+                    "sleep 0.3; ( setsid sleep 600 </dev/null >/dev/null 2>&1 & ) ; \
                      printf '{\"ready\":1}\\n'; read request; exit 3",
                 );
                 let leader = fixture.0.owner.pid;

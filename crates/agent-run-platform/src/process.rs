@@ -793,128 +793,34 @@ fn with_program(mut identity: Identity) -> Identity {
     identity
 }
 
-/// Whether this process successfully became a Linux child subreaper.
-static SUBREAPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+mod adoption;
+pub use adoption::{
+    DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnedChild, become_subreaper,
+    durable_refresh_interval, spawn_child, subreaper_active,
+};
 
-/// Leaders this process spawned and still owns through a live [`OwnedProcess`]
-/// created by [`OwnedProcess::capture`], keyed by exact `(pid, token)`.
+/// Reap zombie direct children of this subreaper process that it did not spawn.
 ///
-/// They are direct children whose exit status belongs to their spawner (for
-/// example a tokio `Child`), so adoption never captures and never reaps them.
-static SPAWNED: std::sync::Mutex<Vec<(i32, String)>> = std::sync::Mutex::new(Vec::new());
-
-/// Default descendant refresh period once orphans are adopted by this process.
-pub const SUBREAPER_REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Descendant refresh period without a subreaper (macOS, or `prctl` refused).
-pub const POLLING_REFRESH: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// Environment override, in milliseconds, of [`SUBREAPER_REFRESH`].
-pub const REFRESH_ENV: &str = "AGENT_RUN_DESCENDANT_REFRESH_MS";
-
-/// Make this process the Linux child subreaper for all its descendants.
-///
-/// Call once, before spawning any child, in a process that owns one agent tree
-/// (the per-agent supervisor). Orphaned descendants (double fork, `setsid`,
-/// `nohup`) then reparent to this process instead of init, so a snapshot taken
-/// at a termination point still reaches them by parentage, and
-/// [`OwnedProcess::refresh`] reaps exactly captured adopted zombies. Other
-/// platforms return `Unsupported` and keep the polling refresh.
-pub fn become_subreaper() -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: PR_SET_CHILD_SUBREAPER takes one integer flag and no pointers.
-        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        SUBREAPER.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "child subreaper is Linux-only",
-    ))
-}
-
-/// Return whether [`become_subreaper`] succeeded in this process.
-pub fn subreaper_active() -> bool {
-    SUBREAPER.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Period between mid-run descendant refreshes of a live owned tree.
-///
-/// With a subreaper the full descendant set stays reachable at termination
-/// points, so the mid-run refresh only keeps crash-recovery evidence fresh:
-/// [`SUBREAPER_REFRESH`] by default, or [`REFRESH_ENV`] milliseconds within
-/// 200..=600000. Without one, the original [`POLLING_REFRESH`] remains.
-pub fn descendant_refresh_interval() -> std::time::Duration {
-    if !subreaper_active() {
-        return POLLING_REFRESH;
-    }
-    static CONFIGURED: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| refresh_override(std::env::var(REFRESH_ENV).ok().as_deref()))
-}
-
-/// Parse a refresh override; absent or out-of-range values keep the default.
-fn refresh_override(value: Option<&str>) -> std::time::Duration {
-    value
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .filter(|ms| (200..=600_000).contains(ms))
-        .map_or(SUBREAPER_REFRESH, std::time::Duration::from_millis)
-}
-
-/// Registration of one spawned leader in [`SPAWNED`], removed on drop.
-struct Spawned((i32, String));
-impl Spawned {
-    /// Register `leader` as a spawned direct child of this process.
-    fn register(leader: &Identity) -> Self {
-        let key = (leader.pid, leader.token.clone());
-        if let Ok(mut spawned) = SPAWNED.lock() {
-            spawned.push(key.clone());
-        }
-        Self(key)
-    }
-}
-impl Drop for Spawned {
-    fn drop(&mut self) {
-        if let Ok(mut spawned) = SPAWNED.lock()
-            && let Some(at) = spawned.iter().position(|key| *key == self.0)
-        {
-            spawned.swap_remove(at);
-        }
-    }
-}
-
-/// Return whether `process` is an exact registered spawned leader.
+/// Runs under the admission lock. Each candidate is re-inspected right before
+/// `waitpid(pid, WNOHANG)` on that exact PID: still a zombie, still this
+/// process's child, the same start token, and not a registered spawn. Nobody
+/// else may wait for such an orphan (its original parent is gone and every
+/// spawn of this process is registered), and an unreaped child's PID cannot be
+/// reused, so the call can collect neither a spawner's status nor another
+/// process. `waitpid(-1)` is never used. A reaped captured member later
+/// observes as dead.
 #[cfg(target_os = "linux")]
-fn spawned_leader(process: &Identity) -> bool {
-    // A poisoned registry fails closed: everything counts as spawned.
-    SPAWNED.lock().map_or(true, |spawned| {
-        spawned
-            .iter()
-            .any(|(pid, token)| *pid == process.pid && *token == process.token)
-    })
-}
-
-/// This process's identity facts used to recognise adopted orphans.
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
-struct Adopter {
-    /// This process's PID: adopted orphans have it as their parent.
-    pid: i32,
-    /// This process's group: same-group children are its own helpers, not orphans.
-    group: i32,
-}
-#[cfg(target_os = "linux")]
-impl Adopter {
-    /// Return whether `process` is a child this process adopted rather than spawned.
-    ///
-    /// Spawned leaders (registered) and helpers in this process's own group
-    /// (their spawner waits for them) are excluded; such a process is never
-    /// captured or reaped through adoption.
-    fn adopted(self, process: &Identity) -> bool {
-        process.ppid == self.pid && process.group != self.group && !spawned_leader(process)
+fn reap_orphans(state: &adoption::State, all: &[Identity]) {
+    let me = std::process::id() as i32;
+    for p in all.iter().filter(|p| p.ppid == me && p.zombie) {
+        let Ok(now) = inspect(p.pid) else {
+            continue;
+        };
+        if now.zombie && now.ppid == me && now.token == p.token && !state.registered(&now) {
+            let mut status = 0;
+            // SAFETY: exact positive PID of an unreaped, unregistered zombie child; WNOHANG never blocks.
+            unsafe { libc::waitpid(p.pid, &mut status, libc::WNOHANG) };
+        }
     }
 }
 
@@ -956,9 +862,10 @@ pub struct OwnedProcess {
     /// False means no descendant set was ever verified, so cleanup reports the
     /// descendant scope as unknown rather than clean.
     descendants_observed: bool,
-    /// Registration of a leader this process spawned, kept while this owner lives.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    spawned: Option<Spawned>,
+    /// Admission generation in which this owner's leader was spawned as the
+    /// only live tree of a subreaper process; orphans are adopted only while
+    /// it is still the current generation.
+    exclusive: Option<u64>,
 }
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
@@ -978,7 +885,10 @@ impl OwnedProcess {
             .collect();
         let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
         Self {
-            spawned: leader.as_ref().map(Spawned::register),
+            exclusive: leader
+                .as_ref()
+                .filter(|_| subreaper_active())
+                .and_then(|leader| adoption::lock().exclusive(leader)),
             leader,
             pid,
             captured: known.keys().cloned().collect(),
@@ -999,7 +909,7 @@ impl OwnedProcess {
             leader: Some(leader),
             pid,
             descendants_observed: false,
-            spawned: None,
+            exclusive: None,
         }
     }
     /// Exports captured identities without probing or changing the tree; absent root evidence returns None.
@@ -1084,7 +994,7 @@ impl OwnedProcess {
             captured: known.keys().cloned().collect(),
             known,
             descendants_observed: snapshot.descendants_observed,
-            spawned: None,
+            exclusive: None,
         })
     }
     /// Record descendants visible from a complete native process snapshot.
@@ -1135,8 +1045,15 @@ impl OwnedProcess {
             // The leader's own observation is the same probe with the same evidence.
             parents.record(leader.pid, &leader.token, state == ProcessState::Alive);
         }
+        // Adoption, expansion and reaping hold the admission lock, so no spawn
+        // is admitted (and mistaken for an orphan) while they decide.
         #[cfg(target_os = "linux")]
-        let adopter = self.adopter();
+        let admission = subreaper_active().then(adoption::lock);
+        #[cfg(target_os = "linux")]
+        let adopting = admission.as_ref().is_some_and(|state| {
+            self.exclusive
+                .is_some_and(|generation| generation == state.generation())
+        });
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {
             let mut changed = false;
@@ -1145,9 +1062,13 @@ impl OwnedProcess {
                     continue;
                 }
                 let in_group = leader_owned && p.group == self.pid;
-                // A subreaper's adopted orphan is reachable by parentage from this process.
+                // An exclusive owner's adopted orphan is reachable by parentage from
+                // this process; registered spawns are never orphans.
                 #[cfg(target_os = "linux")]
-                let in_group = in_group || adopter.is_some_and(|adopter| adopter.adopted(p));
+                let in_group = in_group
+                    || (adopting
+                        && p.ppid == std::process::id() as i32
+                        && admission.as_ref().is_some_and(|state| !state.registered(p)));
                 let child = in_group
                     || self
                         .known
@@ -1166,52 +1087,23 @@ impl OwnedProcess {
             }
         }
         #[cfg(target_os = "linux")]
-        self.reap_adopted(all);
-    }
-    /// Return this process as the adoption root for this owner, if any.
-    ///
-    /// Requires an active subreaper and that this owner is the only live
-    /// registered spawn in this process, so an orphan cannot be attributed to
-    /// the wrong tree. With several live owners nothing is adopted and each
-    /// keeps the parentage and group rules alone.
-    #[cfg(target_os = "linux")]
-    fn adopter(&self) -> Option<Adopter> {
-        let own = &self.spawned.as_ref()?.0;
-        if !subreaper_active() || SPAWNED.lock().ok()?.as_slice() != std::slice::from_ref(own) {
-            return None;
+        if let Some(state) = &admission {
+            reap_orphans(state, all);
         }
-        Some(Adopter {
-            pid: std::process::id() as i32,
-            // SAFETY: getpgrp has no preconditions.
-            group: unsafe { libc::getpgrp() },
-        })
     }
-    /// Reap exactly captured adopted zombies from snapshot `all`.
+    /// Period until the next mid-run refresh of this owner.
     ///
-    /// Each reaped PID was observed as a zombie child of this process with the
-    /// captured `(pid, token)`; until this process reaps it the PID cannot be
-    /// reused. Spawned leaders and same-group helpers are never reaped, and
-    /// only `waitpid(pid, WNOHANG)` on that exact PID is used. A reaped member
-    /// stays captured and later observes as dead.
-    ///
-    /// Reaping, like adoption, needs this owner to be the process's only live
-    /// spawned owner, so no two owners can race to reap one PID and then
-    /// touch its successor. While several owners live, adopted zombies wait.
-    #[cfg(target_os = "linux")]
-    fn reap_adopted(&self, all: &[Identity]) {
-        let Some(adopter) = self.adopter() else {
-            return;
-        };
-        for p in all {
-            let leader = self
-                .leader
-                .as_ref()
-                .is_some_and(|leader| leader.pid == p.pid && leader.token == p.token);
-            if p.zombie && !leader && self.knows(p) && adopter.adopted(p) {
-                let mut status = 0;
-                // SAFETY: exact positive PID of an unreaped zombie child; WNOHANG never blocks.
-                unsafe { libc::waitpid(p.pid, &mut status, libc::WNOHANG) };
-            }
+    /// An exclusive owner of a subreaper process reaches every orphan of its
+    /// tree at termination points, so its mid-run refresh only keeps durable
+    /// crash-recovery evidence and zombie reaping current
+    /// ([`durable_refresh_interval`]). Every other owner keeps
+    /// [`POLLING_REFRESH`], because a descendant which orphans before a refresh
+    /// cannot be attributed to it later.
+    pub fn refresh_interval(&self) -> std::time::Duration {
+        if subreaper_active() && self.exclusive.is_some_and(|g| g == adoption::generation()) {
+            durable_refresh_interval()
+        } else {
+            POLLING_REFRESH
         }
     }
     /// Return whether this exact PID generation is already captured, without allocating a key.

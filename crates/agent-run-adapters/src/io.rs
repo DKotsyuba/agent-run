@@ -7,7 +7,7 @@ use crate::{
 use agent_run_domain::{Error, OwnershipStage, Result};
 use agent_run_platform::{
     frame,
-    process::{OwnedProcess, OwnershipSnapshot},
+    process::{self, OwnedProcess, OwnershipSnapshot},
 };
 use serde_json::{Value, json};
 use std::{
@@ -187,15 +187,9 @@ pub struct Process {
     exit_kill_deadline: Option<tokio::time::Instant>,
     /// Last descendant snapshot, shared by startup RPC and streaming reads.
     observed_at: tokio::time::Instant,
-    /// Mid-run descendant refresh period, fixed at spawn.
-    ///
-    /// With a Linux child subreaper, orphans stay reachable by parentage and
-    /// are captured at every termination point (primary exit, signals,
-    /// cleanup), so this only bounds how stale the durable crash-recovery
-    /// capture and adopted-zombie reaping may get (10 s by default). Without
-    /// one, descendants that orphan before a refresh would escape, so the
-    /// original 200 ms polling remains.
-    refresh_every: Duration,
+    /// Claim on the engine's exit status in the subreaper spawn registry,
+    /// released only after tokio collected that status.
+    spawned: Option<process::SpawnedChild>,
     /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
     ownership_sink: Option<OwnershipSink>,
     /// Last successfully persisted append-only capture revision.
@@ -277,7 +271,8 @@ impl Process {
             .kill_on_drop(false);
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
-        let mut child = command.spawn()?;
+        // Registered under the admission lock before any observer can see it.
+        let (mut child, spawned) = process::spawn_child(|| command.spawn(), Child::id)?;
         let pid = child
             .id()
             .ok_or_else(|| Error::Runtime("child PID unavailable".into()))?
@@ -349,7 +344,7 @@ impl Process {
             primary_exited: false,
             exit_kill_deadline: None,
             observed_at: tokio::time::Instant::now(),
-            refresh_every: agent_run_platform::process::descendant_refresh_interval(),
+            spawned: Some(spawned),
             ownership_sink: None,
             ownership_revision: None,
             ownership_pending: None,
@@ -498,7 +493,7 @@ impl Process {
     fn observe_tick(&mut self) -> Result<()> {
         self.observe_primary_exit()?;
         let now = tokio::time::Instant::now();
-        if now.duration_since(self.observed_at) >= self.refresh_every {
+        if now.duration_since(self.observed_at) >= self.owner.refresh_interval() {
             self.owner.refresh();
             self.observed_at = now;
         }
@@ -662,6 +657,10 @@ impl Process {
     fn observe_primary_exit(&mut self) -> Result<()> {
         if !self.primary_exited && self.child.try_wait()?.is_some() {
             self.primary_exited = true;
+            // tokio collected the status; the PID may now be reused.
+            if let Some(spawned) = self.spawned.take() {
+                spawned.reaped();
+            }
             self.owner.signal_descendants(libc::SIGTERM);
             self.input.take();
             self.exit_kill_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
@@ -684,7 +683,7 @@ impl Process {
     async fn receive(&mut self) -> Event {
         loop {
             let now = tokio::time::Instant::now();
-            if now.duration_since(self.observed_at) >= self.refresh_every {
+            if now.duration_since(self.observed_at) >= self.owner.refresh_interval() {
                 self.owner.refresh();
                 self.observed_at = now;
             }
@@ -721,7 +720,7 @@ impl Process {
                     // The next iteration records exit and sends the first TERM sweep.
                 }
                 event = self.events.recv() => return event.unwrap_or(Event::Eof),
-                _ = tokio::time::sleep_until(self.observed_at + self.refresh_every) => {},
+                _ = tokio::time::sleep_until(self.observed_at + self.owner.refresh_interval()) => {},
             }
         }
     }
@@ -951,7 +950,12 @@ impl Process {
     /// Waits briefly for child exit and bounded reader cleanup before releasing pipes.
     pub async fn reap(&mut self) -> Option<i32> {
         let code = match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
-            Ok(Ok(s)) => s.code(),
+            Ok(Ok(s)) => {
+                if let Some(spawned) = self.spawned.take() {
+                    spawned.reaped();
+                }
+                s.code()
+            }
             _ => None,
         };
         for mut task in self.tasks.drain(..) {
