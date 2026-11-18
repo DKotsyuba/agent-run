@@ -1373,12 +1373,12 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         discovery["result"]["tools"]
     );
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 24, "{discovery}");
+    assert_eq!(tools.len(), 19, "{discovery}");
     for name in ["models", "capacity_order"] {
         assert!(!tools.iter().any(|tool| tool["name"] == name));
     }
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
-    assert_eq!(socket_tools.as_array().unwrap().len(), 24);
+    assert_eq!(socket_tools.as_array().unwrap().len(), 19);
     let filtered_cli = cli(
         &broker.home,
         &[

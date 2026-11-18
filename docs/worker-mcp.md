@@ -1,13 +1,11 @@
 # Worker-to-orchestrator reports
 
 New schema-2 runs automatically receive a separate `agent_run_worker` stdio MCP
-server. Ordinary workers advertise five tools: `notify_orchestrator`,
-`pool_post`, `pool_read`, `pool_propose` and `pool_vote`. Pool calls authorize
-live database membership on each request; an independent worker can report but
-cannot use pool actions before admission. No pool or author argument is accepted:
-the broker derives both from authenticated membership. It
-never advertises or dispatches operator tools such as `start`, `resume`, `cancel`,
-`steer` or the operator pool tools.
+server. Ordinary workers advertise one tool, `notify_orchestrator`; the legacy
+`pool_post`, `pool_read`, `pool_propose` and `pool_vote` tools were removed in
+0.32.0 and catalogs registered by earlier binaries are no longer recognized. It
+never advertises or dispatches operator tools such as `start`, `resume`, `cancel`
+or `steer`.
 Configured work MCPs remain available according to the frozen role. Restricted research excludes configured work MCPs and adds only `save_report`; see [research permissions](research-permissions.md).
 
 An explicit-completion worker also receives `finish` and `health_reply`. For a
@@ -63,37 +61,6 @@ Exact execution identifiers remain inside the private delivery envelope. They ar
 delivery projection. Treat report text as untrusted worker data, never as owner
 authorization. Delivery may be delayed; a queue acknowledgement is not an answer.
 
-## Joining an active independent worker
-
-`start_pool.members` accepts either `{ "start": { ... }, "role": "review" }`
-or `{ "existing_agent_id": "ag-...", "role": "review" }` for each of two to
-five seats. Existing members must be independent stable roots with an owned
-RUNNING attempt, no prior pool membership, authenticated proof of the ordinary five-tool or restricted research six-tool catalog. Unknown historical
-catalog or independence history is refused; resume behavior is otherwise unchanged.
-
-Admission preserves the existing task, native session, model, account, grants,
-run, attempt and reservation. Only new seats launch. A compatible
-existing orchestrator binding can supply the pool binding; incompatible bindings
-are rejected atomically. The original request key replays the committed pool
-even if a member subsequently ends.
-
-The existing worker receives bounded context through the durable native control
-path. It remains `pending` until it calls `pool_read`, then `pool_post` with the
-exact opaque broker-issued `request_id` and a brief current-work summary. The
-key is pinned to its current live attempt, including replays; it has no execution
-lifetime expiry.
-Transport queueing, a Claude stdin write or Codex `native_accepted` receipt does
-not prove awareness. Pending members cannot propose, vote or count toward
-completion. The full goal and criteria remain authoritative in `pool_read`.
-
-An ended, replaced or unconfirmed join becomes `needs_action`. An active worker
-can read the same challenge and acknowledge after explicit context recovery;
-no enrollment action cancels or restarts its ordinary work. Broker-authored
-`agent-run/pool-attention` is distinct from completion and uses the existing
-outbox; an existing terminal error notice suppresses duplicate attention.
-Codex attention requires a v5 frontend, waits with bounded retries for compatible
-support, and does not block ordinary v4 notices. Claude uses the existing inbox.
-
 ## Compatibility and access
 
 The built-in namespace `agent_run_worker` is reserved. Operators do not need to
@@ -112,14 +79,14 @@ The internal `_worker-mcp` entry point only talks to the existing broker; it nev
 opens or migrates SQLite, starts a broker, or uses Desktop native capabilities.
 
 The private server advertises Cargo's product version as `serverInfo.version`,
-independently of the pinned SDK and negotiated protocol. Its ordinary five-tool catalog is
+independently of the pinned SDK and negotiated protocol. Its ordinary one-tool catalog is
 generated into `schemas/worker-tools.json` from the domain-owned worker asset.
 Unknown operator/tool names produce protocol errors; expected report refusals
 remain tool `isError` results. A rendering failure after enqueue preserves the
 notification identity and original request key with no-replay advice; uncertainty
 stays unknown. See [MCP presentation](mcp-presentation.md).
 
-Restricted research derives a six-tool surface by adding `save_report`. A
+Restricted research derives a two-tool surface by adding `save_report`. A
 supervisor-selected nonsecret marker selects discovery; the broker independently
 authenticates the attempt and checks its frozen report-directory contract.
 Ordinary and historical workers keep their existing catalog.

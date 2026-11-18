@@ -72,7 +72,7 @@ cargo xtask archive --revision HEAD \
 ```
 
 `build-native` seals the current host binaries. The sealed directory contains the
-runtime, the separate `bin/agent-run-tui` observer, `bin/agent-run-deploy` (the native xtask deployment entry point),
+runtime, the fixed `bin/agent-run-tui` compatibility shim (`assets/tui-compat.sh`; the observer was removed in 0.32.0), `bin/agent-run-deploy` (the native xtask deployment entry point),
 systemd examples, metadata, `SHA256SUMS`, and the `COMPLETE` marker. Quota collector assets belong to Agent Quota.
 It contains no
 interpreter, virtual environment, or package installation. `release verify` and the
@@ -170,11 +170,12 @@ requires an identical store schema, and checks active work before cutover.
 Explicit config/schema migrations remain separate operations. No services are
 stopped automatically; an occupied installation fails without killing processes.
 It copies into the permanent releases directory before calling the journalled
-deployer, then creates managed `agent-run` and `agent-run-tui` launchers with
-the selected default home. Both executable names use the same release version.
-All bundled launcher paths are checked before switching the current release;
-a foreign TUI command is never overwritten. Legacy releases without the TUI
-remain installable.
+deployer, then creates the managed `agent-run` launcher with the selected
+default home. A release whose `bin/agent-run-tui` is the exact compatibility
+shim leaves any existing TUI launcher untouched; releases that sealed the real
+observer still get a managed `agent-run-tui` launcher. All bundled launcher
+paths are checked before switching the current release; a foreign TUI command is
+never overwritten. Legacy releases without the TUI remain installable.
 An explicit `AGENT_RUN_HOME` or CLI `--home` still overrides that default.
 Foreign launchers, conflicting bytes at an existing version and pending
 deployment recovery are refused. An identical selected release is a no-op.

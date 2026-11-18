@@ -15,8 +15,7 @@ New provider starts accept `idle_ping`:
 | `off` | No health probes. Use for an explicitly held execution. |
 
 The CLI accepts `--idle-ping observe|recover|off`; MCP and socket start requests
-use the same `idle_ping` property. Pool member start requests use that same
-contract. Recovery requires explicit-finish mode. Policy is frozen in admission
+use the same `idle_ping` property, as do batch jobs. Recovery requires explicit-finish mode. Policy is frozen in admission
 and inherited by continuation. The free default is omitted from serialized
 requests, preserving old replay fingerprints. Existing attempts without a health
 initialization marker remain unmonitored; explicit `off` is retained.
@@ -110,7 +109,7 @@ operator/cancel races, clock causality, actual stream input and verified child
 group cleanup. Real model calls and installed-runtime qualification are separate;
 this source change neither publishes nor installs a release.
 
-See [reliability recovery](reliability-recovery.md) for native completion races, pool waiting, legacy transcript reconstruction and writer observations.
+See [reliability recovery](reliability-recovery.md) for native completion races, legacy transcript reconstruction and writer observations.
 
 
 ## Native command completion is distinct from a pending return

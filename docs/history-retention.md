@@ -13,9 +13,10 @@ rule, which still applies to them on its own schedule. A recent resume
 therefore counts once and lifts its whole lineage into the protected set,
 matching the intuition that resumed work is still current history.
 
-Pool logs and rosters remain protected whenever a member has a workflow
-reference, an active managed-service lease, or a prepared runtime layout,
-matching the underlying agent protection.
+Legacy Run pool logs and rosters (read-only since 0.32.0) remain protected
+whenever a member has a workflow reference, an active managed-service lease, or
+a prepared runtime layout, matching the underlying agent protection; a whole old
+pool is released only after every member lineage expired.
 
 Database expiry runs on startup and then hourly; a backlog of ordinary history,
 operation receipts or producer watermarks drains in small transactions with a
@@ -49,7 +50,7 @@ As with other cooperative budgets, operating-system I/O is not preempted.
 
 Actual receipt/watermark removals keep the one-second drain cadence even when
 ordinary history is empty. Reconciliation and managed-service ticks use read-only
-preflights before submitting pool-settlement or service-lease operations;
+preflights before submitting service-lease operations;
 unchanged state creates no per-tick receipt. Writer-side completion, cleanup,
 lease and process-ownership predicates remain authoritative after every hint.
 

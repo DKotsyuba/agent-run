@@ -6,10 +6,16 @@ three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
-Workers use a [separate fixed five-tool MCP surface](worker-mcp.md):
-`notify_orchestrator`, `pool_post`, `pool_read`, `pool_propose` and `pool_vote`.
-Pool actions require live authenticated membership. Private worker broker routes are not in operator
-discovery and requires the current run/attempt capability on every call.
+Workers use a [separate fixed MCP surface](worker-mcp.md): `notify_orchestrator`,
+plus `health_reply` and `finish` in explicit-completion mode. Private worker
+broker routes are not in operator discovery and require the current
+run/attempt capability on every call.
+
+The legacy cooperative pool methods (`start_pool`, `pool_post`, `pool_replace`,
+`pool`, `list_pools`) and the worker `pool_*` tools were removed in 0.32.0;
+the socket answers them as unknown methods (`-32601`). Agent Pool owns groups.
+Old pool rows remain readable only through read-only SQL; see
+`agent-run doc completion`.
 
 Audience: an integrating agent or developer who has never seen this repo.
 Everything needed to connect is on this page.
@@ -304,28 +310,6 @@ the logical outcome.
 The store's row/byte/time checks are cooperative and do not impose a hard
 deadline on an individual SQLite query.
 
-Cooperative pools use five strict methods from the same table: `start_pool`
-(two to five members sharing one goal and acceptance criteria, admitted
-atomically; each member supplies exactly one `start` or `existing_agent_id` plus
-`role`; returns the stable `pool_id` and each member's `agent_id`,
-name, role and status), `pool_post` (an operator message stamped as the
-orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
-`request_id` returns the same new member) and `pool` (status plus a cursor-paged
-log), and `list_pools` (read-only discovery). The first three ride the control
-lane; `pool` and `list_pools` use the read lane. Refusals use the shared error codes
-with the pool code leading the message (`member_busy`, `pool_completed`,
-`pool_not_found`, ...). A pool completes only by formal verification (every
-member voted ready on one proposal, ended successfully, cleanup verified) and
-delivers exactly one common notice; that is not proof the result is correct.
-
-An attached existing member keeps its current owned RUNNING execution, task,
-account, grants, native session and reservation. Its admission
-member row adds `existing: true` and an `enrollment` view (`state`, optional failure reason); ordinary new-only member shapes stay unchanged.
-The worker-only `pool_read` adds its own attempt-pinned ACK challenge. Only an
-exact `pool_post` summary using that challenge changes `pending` to `joined`;
-unjoined members cannot vote or settle. `needs_action` reports failed awareness
-without restarting or cancelling old work. See [worker enrollment](worker-mcp.md).
-
 Over MCP, existing tool results render as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
 additionally keep `structuredContent` `{"agent_id": ..., "sequence": ...}` so
@@ -349,10 +333,11 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-Shared MCP/socket discovery advertises 20 tools: `start`, `start_batch`, `resume`, `cancel`,
-`steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
-`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, `history_pins`, and
-`agent_integration`, `capabilities`, and `answer_chunk`.
+Shared MCP/socket discovery advertises 19 tools: `start`, `start_batch`,
+`batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`,
+`list_agents`, `answer`, `transcript`, `transcript_exact`, `initial_task`,
+`doc`, `delegation_guide`, `limits`, `agent_integration`, `capabilities`, and
+`answer_chunk`.
 `models` and `capacity_order` remain call-only compatibility methods in the
 same registry/dispatcher; their original structured CLI/socket responses and
 direct MCP calls by known name remain available. Schema-1 `capacity_order`
@@ -487,38 +472,6 @@ that frame cap falls back to metadata with `content:null` and
 `inline_complete:false`, retaining proof and availability. The metadata form is
 checked again; other oversized replies keep the existing error. No text is
 silently truncated and no wire limit is increased.
-
-`list_pools` accepts a strict object with optional `state` (`"open"` or
-`"completed"`; omitted/null means all), `limit` (integer 1..200, default 50)
-and `offset` (nonnegative integer, default 0). It returns one consistent read
-snapshot, an exact filtered `total`, and `items` ordered by `created_at`
-descending with `pool_id` descending as the tie-breaker. `next_offset` is null
-at the end; `complete` also holds for an offset beyond the total. Offset pages
-may shift if pools are admitted or purged between calls.
-
-Each item has `pool_id`, `state`, a `goal` excerpt capped at 512 UTF-8 bytes
-on a character boundary, `goal_truncated`, `created_at` (UTC epoch seconds),
-`last_seq` (greatest retained log sequence, zero for an empty log), nullable
-`completed_at`, `roster_revision`, `members_count`, `ready`, nullable
-`current_proposal_seq`, and `members` in ascending slot order. Member rows
-contain only `slot`, `name`, `role`, stable `agent_id` and `tip_status`.
-`ready` counts only members whose derived `pool` status has `counts: true`;
-raw ready decisions invalidated by a changed roster, tip or failed execution
-do not count. Completed summaries reuse the frozen completion evidence even
-if a member resumes later. Full criteria, proposal snapshots and log bodies
-are available through `pool`, and are absent from discovery.
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"list_pools","params":{"state":"open","limit":1,"offset":0}}
-{"jsonrpc":"2.0","id":2,"result":{"items":[{"pool_id":"pool-20261004-120000-0123456789","state":"open","goal":"Ship the observer","goal_truncated":false,"created_at":1791115200.0,"last_seq":7,"completed_at":null,"roster_revision":1,"members_count":2,"ready":1,"current_proposal_seq":4,"members":[{"slot":1,"name":"Reviewer","role":"review","agent_id":"ag-20261004-120000-0123456789","tip_status":"running"},{"slot":2,"name":"Builder","role":"implement","agent_id":"ag-20261004-120000-abcdef0123","tip_status":"running"}]}],"total":2,"offset":0,"limit":1,"next_offset":1,"complete":false}}
-```
-
-The CLI equivalent is `agent-run pools [--state open|completed] [--offset N]
-[--limit N]`, alias `list-pools`; default output is JSON and `--text` prints
-the compact MCP page. No worker capability is accepted. Discovery has no
-long-poll: operator pool posts do not advance the existing event revision,
-so it would miss changes to `last_seq`. Members provide the join with
-`list_agents`; `AgentView` remains unchanged.
 
 See [continuations](continuations.md) for native-context `resume`, inherited
 authority, idempotency and history availability.
@@ -736,9 +689,6 @@ Notes for the loop:
   string of at most 512 UTF-8 bytes, and delivery attempt evidence accepts only
   its declared fields. The `wait`
   example above is for an unbound API caller, not a bound-chat polling loop.
-  Successful members of an open pool are represented by its single common pool
-  completion notice; failed or otherwise non-successful members still receive
-  individual completion notices.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.

@@ -56,8 +56,7 @@ pub fn finish(
 /// legacy cleanup releases ownership in this scope; unconfirmed attempts
 /// remain owned for recovery. A provider attempt that provably never spawned
 /// gets its never-spawned cleanup proof in the same scope, before the proof
-/// prerequisite is checked. Successful current pool members omit the
-/// individual notice because pool settlement owns the common success notice.
+/// prerequisite is checked.
 /// A pending cancel observed while success or an explicit-mode outcome is
 /// being committed wins in this same scope and receives its terminal command
 /// result. Explicit success also requires an observed done finish; any

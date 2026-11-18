@@ -222,7 +222,7 @@ struct ResultInputs {
     sent: std::collections::BTreeSet<String>,
     /// Native notification UUIDs observed on the owned session; never task authority.
     native_context: std::collections::BTreeSet<String>,
-    /// Most recent initial task or written steering input; pool notes do not replace it.
+    /// Most recent initial task or written steering input; injected native notes do not replace it.
     task: Option<String>,
     /// Native replay acknowledgements since the preceding terminal frame, in order.
     replayed: Vec<String>,
@@ -609,7 +609,7 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// The function journals recognized events, services bounded control commands, and
 /// returns malformed stream data or persistence failures as domain errors.
 /// Native input UUIDs and replay batches correlate results to the latest task or
-/// steering input; pool-only results cannot complete it. Every result is observed
+/// steering input; note-only results cannot complete it. Every result is observed
 /// and validated, errors stay fatal, and uncorrelated multiple results fail closed.
 /// A single legacy result remains compatible. Success requires a nonblank native
 /// answer, EOF, exit zero, and no uncertain input write.
@@ -1950,7 +1950,7 @@ fn runtime_result_usage(result: &Value) -> Value {
 }
 
 /// Writes one user text message with the caller's fresh correlation `id` before
-/// `deadline`; shared by operator steering and pool delivery. The ID is native
+/// `deadline`; shared by operator steering and native owner input. The ID is native
 /// framing only, not a public agent identity or a delivery/consumption proof.
 /// `false` after a possible partial write is not proof that nothing was sent.
 async fn send_user_text(

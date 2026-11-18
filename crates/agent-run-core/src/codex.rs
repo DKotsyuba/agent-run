@@ -2892,7 +2892,7 @@ async fn turn_input(
 }
 
 /// Sends one text input to the active turn through the bounded native steer
-/// exchange; shared by operator steering and pool delivery so both keep the
+/// exchange; shared by operator steering and native owner input so both keep the
 /// same one-second-class 30 s bound and disposition semantics.
 async fn turn_steer(
     process: &mut agent_run_adapters::io::Process,

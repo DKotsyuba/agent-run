@@ -37,7 +37,7 @@ External schema references cannot read files or fetch network resources.
 ## Idle and wakes
 
 Idle remains active for process/account capacity and keeps its worker capability.
-Pool messages and steering use the existing durable command queue. Claude-family
+Steering uses the existing durable command queue. Claude-family
 native notifications must pass the owned-session replay contract. Codex native
 command/MCP completions must match the exact started item, thread, originating
 turn, kind and tool name. Completion receipts are deduplicated per attempt;
@@ -90,8 +90,8 @@ On macOS, isolated default-mode runs on Codex, Sonnet and GLM each launched one
 120-second native command, ended the inference turn and received its actual
 completion in the same native session. Each used two runtime turns with about
 118–121 seconds idle, no polling, an exact callback/answer hash match and confirmed
-owned-process cleanup. A peer-message scenario also demonstrated idle/wake,
-ordered messages, current-proposal ready votes and formal pool completion.
+owned-process cleanup. A peer-message scenario (legacy Run pools, removed in
+0.32.0) also demonstrated idle/wake and ordered messages.
 
 Explicit continuations preserve earlier answers and native session identity.
 The runtime supplies a new execution boundary so an earlier finish cannot be

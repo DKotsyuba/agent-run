@@ -21,9 +21,6 @@ idempotency: use the same nonempty request_id and unchanged arguments for an
 identical retry. Steer is additive but repeated calls can enqueue additional
 commands. Cancel is destructive and is not declared unconditionally idempotent.
 Worker reports require a request key scoped to their immutable run context.
-Pool admission, messages, replacements, proposals and votes likewise require
-their documented request keys. Replacements and superseding proposals/votes
-carry conservative destructive hints; read pages remain read-only.
 Hints are descriptive, never authorization.
 
 `schemas/mcp-registration.json` is host-neutral metadata: actual commands,
@@ -81,10 +78,6 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 | Tools | Hard UTF-8 text cap | Whole-row cap | Exact content cap |
 |---|---:|---:|---:|
 | start, resume | 4096 | 8 displayed MCP selections, plus explicit omitted count | none |
-| start_pool, pool_replace | 8192 | 5 members | none |
-| pool_post, pool_propose, pool_vote | 8192 | none | none |
-| pool, pool_read | 614400 | 50 entries, every entry displayed or the page refused | 563200 |
-| list_pools | 524288 | 200 | 524288 |
 | cancel, steer, notify_orchestrator, routine errors | 2048 | 8 | none |
 | list_agents | 8192 | 20 | none |
 | limits | 8192 | 20 windows; ranking retains 100 providers and 100 models total | none |
@@ -94,8 +87,7 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 
 Admission replies reserve the original request key, whose existing contract
 allows 512 characters; reversible quoting can expand it beyond 2 KiB. These
-are text byte limits, not token counts. Pool pages retain a larger justified
-profile for exact shared messages and proposal snapshots. The presenter also
+are text byte limits, not token counts. The presenter also
 serializes privately through a bounded writer to check the encoded MCP result,
 reserving 4096 bytes within the one-MiB frame for protocol framing. JSON escaping
 can exceed the wire budget even when text fits: a read fails safely when no
@@ -115,10 +107,7 @@ Semantic execution receipts are captured before presentation. Degradation after
 accepted admission, steering or enqueue keeps the confirmed identity, original
 request key and no-replay advice with isError=false. A valid admission counter
 keeps the tiny agent_id/sequence structured mirror for PostToolUse binding.
-Pool admission keeps the tiny pool_id binding mirror. Pool mutation degradation
-also preserves request identity, log position and a replacement agent identity
-when known. Shared entries use the domain's stamped untrusted-body formatter;
-reverse/block transcript pages preserve omission, error and continuation data.
+Reverse/block transcript pages preserve omission, error and continuation data.
 Invalid counters never bind, even when acceptance is known. Unknown writes stay
 unknown with isError=true and reconciliation advice; expected business failures
 stay errors. Fallback never emits raw JSON, Debug values, context or error chains.
