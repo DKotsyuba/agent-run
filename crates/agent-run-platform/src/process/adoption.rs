@@ -429,9 +429,15 @@ fn report(report_read: std::os::fd::OwnedFd) -> Option<(i32, String)> {
         if tests::FAIL_REGISTRATION.load(Ordering::SeqCst) {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(
-            tests::REGISTRAR_DELAY_MS.load(Ordering::SeqCst),
-        ));
+        // Test-only: report entry and wait for the test to let it proceed.
+        let gate = tests::REGISTRAR_GATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((entered, proceed)) = gate {
+            let _ = entered.send(());
+            let _ = proceed.recv();
+        }
     }
     let identity = super::inspect(pid).ok()?;
     if identity.ppid != std::process::id() as i32 || identity.zombie {
@@ -466,7 +472,19 @@ fn clean_boundary() -> bool {
 }
 
 /// Children waiting for their exit status, with their registrations.
-static LATER: Mutex<Vec<(std::process::Child, Option<SpawnedChild>)>> = Mutex::new(Vec::new());
+static LATER: Mutex<Later> = Mutex::new(Later {
+    queue: Vec::new(),
+    fallback: false,
+});
+
+/// Queued children and the fallback flag, under one lock so that a fallback
+/// deciding to stop and an enqueue deciding to start one never interleave.
+struct Later {
+    /// Children waiting for their exit status, with their registrations.
+    queue: Vec<(std::process::Child, Option<SpawnedChild>)>,
+    /// A runtime task polls in place of the reaper thread.
+    fallback: bool,
+}
 
 /// Signalled when [`LATER`] gains an entry.
 static LATER_READY: Condvar = Condvar::new();
@@ -487,6 +505,7 @@ pub fn reap_later(child: std::process::Child, claim: Option<SpawnedChild>) {
     LATER
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+        .queue
         .push((child, claim));
     LATER_READY.notify_one();
     poll_later();
@@ -495,36 +514,77 @@ pub fn reap_later(child: std::process::Child, claim: Option<SpawnedChild>) {
 
 /// Start the reaper thread, or a runtime fallback when it cannot be created.
 fn ensure_reaper() {
-    if REAPER.swap(true, Ordering::SeqCst) {
+    if start_reaper_thread() {
         return;
     }
-    if std::thread::Builder::new()
-        .name("agent-run-reaper".into())
-        .spawn(reaper)
-        .is_ok()
-    {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let mut later = LATER.lock().unwrap_or_else(PoisonError::into_inner);
+    if later.fallback || later.queue.is_empty() {
         return;
     }
-    REAPER.store(false, Ordering::SeqCst);
-    if let Ok(runtime) = tokio::runtime::Handle::try_current()
-        && !FALLBACK.swap(true, Ordering::SeqCst)
-    {
-        runtime.spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let empty = poll_later();
-                if REAPER.load(Ordering::SeqCst) || empty {
-                    break;
-                }
-                ensure_reaper();
+    later.fallback = true;
+    drop(later);
+    // Built before the spawn: a task cancelled or never polled (runtime
+    // shutdown) still clears the flag, so later enqueues can start another.
+    let guard = FallbackGuard;
+    runtime.spawn(async move {
+        let _guard = guard;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            poll_later();
+            if start_reaper_thread() {
+                return;
             }
-            FALLBACK.store(false, Ordering::SeqCst);
-        });
+            // Stop only when the queue is empty, decided under the same lock
+            // an enqueue uses to decide whether to start a fallback.
+            if LATER
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .queue
+                .is_empty()
+            {
+                return;
+            }
+        }
+    });
+}
+
+/// Clears the fallback flag when its task ends, however it ends. The flag is
+/// cleared under the queue lock; if children are still queued (the task was
+/// cancelled), the next enqueue or reaper start picks them up.
+struct FallbackGuard;
+
+impl Drop for FallbackGuard {
+    fn drop(&mut self) {
+        LATER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fallback = false;
     }
 }
 
-/// Whether a runtime task is polling in place of the reaper thread.
-static FALLBACK: AtomicBool = AtomicBool::new(false);
+/// Start the reaper thread once; returns whether it is running.
+fn start_reaper_thread() -> bool {
+    if REAPER.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    let refused = tests::FAIL_REAPER_THREAD.load(Ordering::SeqCst);
+    #[cfg(not(all(test, target_os = "linux")))]
+    let refused = false;
+    if !refused
+        && std::thread::Builder::new()
+            .name("agent-run-reaper".into())
+            .spawn(reaper)
+            .is_ok()
+    {
+        return true;
+    }
+    REAPER.store(false, Ordering::SeqCst);
+    false
+}
 
 /// Whether a queued child's exit is established and its entry may go.
 ///
@@ -554,7 +614,8 @@ fn exit_established(child: &mut std::process::Child, claim: Option<&SpawnedChild
 fn poll_later() -> bool {
     let mut done = Vec::new();
     let empty = {
-        let mut queue = LATER.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut later = LATER.lock().unwrap_or_else(PoisonError::into_inner);
+        let queue = &mut later.queue;
         let mut index = 0;
         while index < queue.len() {
             let (child, claim) = &mut queue[index];
@@ -576,10 +637,10 @@ fn poll_later() -> bool {
 fn reaper() {
     loop {
         if poll_later() {
-            let queue = LATER.lock().unwrap_or_else(PoisonError::into_inner);
+            let later = LATER.lock().unwrap_or_else(PoisonError::into_inner);
             drop(
                 LATER_READY
-                    .wait_while(queue, |queue| queue.is_empty())
+                    .wait_while(later, |later| later.queue.is_empty())
                     .unwrap_or_else(PoisonError::into_inner),
             );
         } else {
@@ -600,9 +661,13 @@ pub(super) mod tests {
     /// Overrides the PID-report bound, in milliseconds (0 keeps the default).
     pub(in crate::process) static REPORT_BOUND_MS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
-    /// Delays the registrar after reading the child's PID, in milliseconds.
-    pub(in crate::process) static REGISTRAR_DELAY_MS: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    /// The registrar, once it read a PID, signals entry and waits to proceed.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::process) static REGISTRAR_GATE: Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = Mutex::new(None);
+    /// Refuses to start the reaper thread, forcing the runtime fallback.
+    pub(in crate::process) static FAIL_REAPER_THREAD: AtomicBool = AtomicBool::new(false);
 
     /// Names the case a re-executed unit-test process must run.
     const CASE: &str = "AGENT_RUN_ADOPTION_UNIT_CASE";
@@ -697,26 +762,107 @@ pub(super) mod tests {
         );
     }
 
-    /// The admission lock is held through the registration: an observer that
-    /// asks for it while a forked child waits to be registered only gets it
-    /// once that child is registered, so it never sees the child unregistered.
+    /// The admission lock is held through the registration: while the
+    /// registrar handles a forked child the lock cannot be taken, and an
+    /// observer waiting for it only gets it once that child is registered.
     #[test]
     fn an_observer_never_sees_a_forked_child_unregistered() {
         isolated("an_observer_never_sees_a_forked_child_unregistered", || {
-            REGISTRAR_DELAY_MS.store(300, Ordering::SeqCst);
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (proceed, proceed_rx) = std::sync::mpsc::channel();
+            *REGISTRAR_GATE.lock().unwrap() = Some((entered_tx, proceed_rx));
             let launch = std::thread::spawn(|| gated(command("/bin/sleep", &["30"])));
-            std::thread::sleep(Duration::from_millis(100));
-            let state = lock();
-            let registered = state.spawned.len();
-            drop(state);
+            entered.recv().unwrap();
+            assert!(
+                STATE.try_lock().is_err(),
+                "the lock is free mid-registration"
+            );
+            let observer = std::thread::spawn(|| lock().spawned.len());
+            proceed.send(()).unwrap();
             let (mut child, claim) = launch.join().unwrap().unwrap();
-            REGISTRAR_DELAY_MS.store(0, Ordering::SeqCst);
-            assert_eq!(registered, 1, "the observer ran before the registration");
+            assert_eq!(
+                observer.join().unwrap(),
+                1,
+                "observed an unregistered child"
+            );
             let identity = super::super::inspect(child.id() as i32).unwrap();
             assert!(lock().registered(&identity));
             child.kill().unwrap();
             child.wait().unwrap();
             claim.reaped();
+        });
+    }
+
+    /// With the reaper thread refused, the runtime fallback reaps every child
+    /// even when enqueues race its stop decision, and a fallback cancelled by
+    /// runtime shutdown does not suppress later fallbacks.
+    #[test]
+    fn the_fallback_reaper_strands_no_child() {
+        isolated("the_fallback_reaper_strands_no_child", || {
+            FAIL_REAPER_THREAD.store(true, Ordering::SeqCst);
+            let spawn = |seconds: &str| {
+                let child = command("/bin/sleep", &[seconds]).spawn().unwrap();
+                let pid = child.id() as i32;
+                (child, pid)
+            };
+            let wait_gone = |pids: &[i32]| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while pids.iter().any(|pid| super::super::inspect(*pid).is_ok()) {
+                    assert!(std::time::Instant::now() < deadline, "a child was stranded");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            // Many enqueues from several threads while fallbacks start and stop.
+            let pids = runtime.block_on(async {
+                let mut pids = Vec::new();
+                for round in 0..20 {
+                    let (child, pid) = spawn(if round % 2 == 0 { "0.05" } else { "0.15" });
+                    pids.push(pid);
+                    let handle = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        let _entered = handle.enter();
+                        reap_later(child, None);
+                    })
+                    .join()
+                    .unwrap();
+                    tokio::time::sleep(Duration::from_millis(30 * (round % 5))).await;
+                }
+                pids
+            });
+            wait_gone(&pids);
+            // A fallback cancelled by runtime shutdown leaves its child queued
+            // but clears the flag, so the next enqueue starts a new fallback.
+            let (first, first_pid) = spawn("0.3");
+            runtime.block_on(async { reap_later(first, None) });
+            assert!(LATER.lock().unwrap().fallback);
+            drop(runtime);
+            assert!(
+                !LATER.lock().unwrap().fallback,
+                "cancelled fallback kept its flag"
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (second, second_pid) = spawn("0.1");
+            runtime.block_on(async {
+                reap_later(second, None);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while [first_pid, second_pid]
+                    .iter()
+                    .any(|pid| super::super::inspect(*pid).is_ok())
+                {
+                    assert!(std::time::Instant::now() < deadline, "a child was stranded");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+            assert!(LATER.lock().unwrap().queue.is_empty());
+            FAIL_REAPER_THREAD.store(false, Ordering::SeqCst);
         });
     }
 
