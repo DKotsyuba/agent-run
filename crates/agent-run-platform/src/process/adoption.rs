@@ -716,6 +716,19 @@ pub(super) mod tests {
         (entered, proceed)
     }
 
+    /// A child that stays alive until the returned stdin is dropped (it blocks
+    /// in `read` on a pipe), so it cannot exit before the asserted state.
+    fn held() -> (std::process::Child, i32, std::process::ChildStdin) {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let release = child.stdin.take().unwrap();
+        let pid = child.id() as i32;
+        (child, pid, release)
+    }
+
     /// The current reaper state.
     fn state() -> Reaper {
         LATER.lock().unwrap().reaper
@@ -901,7 +914,7 @@ pub(super) mod tests {
             wait_gone(&pids);
             // A fallback cancelled by runtime shutdown leaves its child queued
             // but returns the state to `Idle`, so the next enqueue starts a new one.
-            let (first, first_pid) = spawn("0.3");
+            let (first, first_pid, first_release) = held();
             runtime.block_on(async { reap_later(first, None) });
             assert_eq!(state(), Reaper::Fallback);
             drop(runtime);
@@ -910,9 +923,11 @@ pub(super) mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let (second, second_pid) = spawn("0.1");
+            drop(first_release);
+            let (second, second_pid, second_release) = held();
             runtime.block_on(async {
                 reap_later(second, None);
+                drop(second_release);
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 while [first_pid, second_pid]
                     .iter()
@@ -940,20 +955,21 @@ pub(super) mod tests {
                 .build()
                 .unwrap();
             let (stopped, proceed) = arm(&STOP_GATE);
-            let first = command("/bin/sleep", &["0.05"]).spawn().unwrap();
-            let first_pid = first.id() as i32;
+            let (first, first_pid, first_release) = held();
             runtime.block_on(async { reap_later(first, None) });
+            assert_eq!(state(), Reaper::Fallback);
+            drop(first_release);
             // The first fallback reaped its child and decided to stop.
             stopped.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(super::super::inspect(first_pid).is_err());
             assert_eq!(state(), Reaper::Idle, "state outlived the stop decision");
-            let second = command("/bin/sleep", &["0.05"]).spawn().unwrap();
-            let second_pid = second.id() as i32;
+            let (second, second_pid, second_release) = held();
             {
                 let _entered = runtime.enter();
                 reap_later(second, None);
             }
             assert_eq!(state(), Reaper::Fallback, "no fallback for the new child");
+            drop(second_release);
             proceed.send(()).unwrap();
             wait_reaped(&[second_pid]);
             FAIL_REAPER_THREAD.store(false, Ordering::SeqCst);
@@ -975,8 +991,7 @@ pub(super) mod tests {
                 for start_fails in [true, false] {
                     FAIL_REAPER_THREAD.store(true, Ordering::SeqCst);
                     let (starting, proceed) = arm(&STARTING_GATE);
-                    let first = command("/bin/sleep", &["0.05"]).spawn().unwrap();
-                    let first_pid = first.id() as i32;
+                    let (first, first_pid, first_release) = held();
                     let handle = runtime.handle().clone();
                     let starter = std::thread::spawn(move || {
                         let _entered = handle.enter();
@@ -984,8 +999,7 @@ pub(super) mod tests {
                     });
                     starting.recv_timeout(Duration::from_secs(10)).unwrap();
                     assert_eq!(state(), Reaper::Starting);
-                    let second = command("/bin/sleep", &["0.05"]).spawn().unwrap();
-                    let second_pid = second.id() as i32;
+                    let (second, second_pid, second_release) = held();
                     {
                         let _entered = runtime.enter();
                         reap_later(second, None);
@@ -1002,6 +1016,8 @@ pub(super) mod tests {
                             Reaper::Running
                         }
                     );
+                    drop(first_release);
+                    drop(second_release);
                     wait_reaped(&[first_pid, second_pid]);
                     if start_fails {
                         let deadline = std::time::Instant::now() + Duration::from_secs(10);
