@@ -32,6 +32,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   clock step can no longer make a live descendant look reused and gone.
 - A Pool peer whose ancestry includes a recorded supervisor (PID and exact
   start token) is refused as a Run descendant.
+- `install.sh` waits (bounded) for its watchdog child to exec before capturing
+  the child's identity, so a slow fork can no longer leave the identity check
+  refusing the signal and orphan the scratch directory and its `sleep`.
+  Host-load-sensitive tests were made robust against scheduling delays without
+  weakening their lifecycle assertions.
 
 ## 0.31.7
 
