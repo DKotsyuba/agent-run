@@ -609,15 +609,17 @@ fn main() {
     }
     // The disposable database driver holds the WAL writer before releasing
     // this finite synthetic engine; one child changes its ownership revision.
+    // The child outlives one durable mid-run refresh (2 s for an exclusive
+    // Linux subreaper owner, 200 ms otherwise), so it is captured while it
+    // runs; a waited child that ends sooner is never observed mid-run.
     if task == "fixture:sqlite-stream" || task == "fixture:sqlite-stream-fail" {
         std::fs::write("sqlite-ready", b"ready").unwrap();
         wait_marker("sqlite-release");
         let mut descendant = std::process::Command::new("/bin/sleep")
-            .arg("1")
+            .arg("3")
             .env_clear()
             .spawn()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(300));
         descendant.wait().unwrap();
     }
     emit(

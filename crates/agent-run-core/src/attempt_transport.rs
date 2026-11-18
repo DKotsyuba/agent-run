@@ -1091,16 +1091,23 @@ mod tests {
         const CASE: &str = "AGENT_RUN_POOL_RESIDENT_SUBREAPER_CASE";
         if std::env::var_os(CASE).is_none() {
             // The subreaper flag is process-wide: run the case in a fresh process.
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "attempt_transport::tests::a_daemon_adopted_by_a_recorded_supervisor_is_not_a_pool_resident",
                     "--nocapture",
                 ])
                 .env(CASE, "1")
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success(), "isolated case failed: {status}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed"),
+                "isolated case failed: {}\n{stdout}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{stdout}");
             return;
         }
         use std::os::unix::process::CommandExt;

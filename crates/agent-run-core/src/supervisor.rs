@@ -296,7 +296,7 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -
     // setsid, nohup) reparent here instead of init, so termination-point
     // captures reach them and mid-run polling can slow to the durable-evidence
     // cadence. Refusal (or macOS) keeps the original 200 ms polling. Every
-    // child of this process must be spawned through a `process::SpawnGate`
+    // child of this process must be spawned through `process::spawn_registered`
     // (engine transports do): an unregistered child would look like an orphan.
     let _ = process::become_subreaper();
     if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none() {

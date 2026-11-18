@@ -34,7 +34,7 @@ fn isolated_with(name: &str, subreaper: bool, refresh_ms: Option<&str>, body: fn
         body();
         return;
     }
-    let status = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             &format!("subreaper_cadence::{name}"),
@@ -45,9 +45,16 @@ fn isolated_with(name: &str, subreaper: bool, refresh_ms: Option<&str>, body: fn
         .env(CASE, name)
         .env_remove(process::REFRESH_ENV)
         .envs(refresh_ms.map(|ms| (process::REFRESH_ENV, ms)))
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "isolated case {name} failed: {status}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "isolated case {name} failed: {}\n{stdout}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    print!("{stdout}");
 }
 
 /// Cleans verified members even if an assertion unwinds.

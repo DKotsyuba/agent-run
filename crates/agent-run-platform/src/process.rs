@@ -795,8 +795,8 @@ fn with_program(mut identity: Identity) -> Identity {
 
 mod adoption;
 pub use adoption::{
-    DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnGate, SpawnedChild, become_subreaper,
-    durable_refresh_interval, subreaper_active,
+    DURABLE_REFRESH, POLLING_REFRESH, REFRESH_ENV, SpawnedChild, become_subreaper,
+    durable_refresh_interval, spawn_registered, subreaper_active,
 };
 
 /// Per-refresh memo of [`observe`] verdicts for captured parents.
@@ -1079,22 +1079,55 @@ impl OwnedProcess {
     fn reap_captured(&self, state: &adoption::State, all: &[Identity]) {
         let me = std::process::id() as i32;
         for p in all.iter().filter(|p| p.ppid == me && p.zombie) {
-            if !self.knows(p)
-                || self
-                    .leader
-                    .as_ref()
-                    .is_some_and(|leader| leader.pid == p.pid && leader.token == p.token)
-            {
-                continue;
+            if self.knows(p) {
+                self.reap_if_adopted_zombie(state, p);
             }
-            let Ok(now) = inspect(p.pid) else {
-                continue;
-            };
-            if now.zombie && now.ppid == me && now.token == p.token && !state.registered(&now) {
-                let mut status = 0;
-                // SAFETY: exact positive PID of an unreaped, captured, unregistered zombie child; WNOHANG never blocks.
-                unsafe { libc::waitpid(p.pid, &mut status, libc::WNOHANG) };
-            }
+        }
+    }
+    /// Reap every captured member that is now an adopted zombie of this process.
+    ///
+    /// The final step before this owner is released; cleanup ends with it and
+    /// an owner dropped without cleanup should call it first:
+    /// a member can exit after the last settling snapshot, observe as dead in
+    /// the cleanup proof and would otherwise stay an unreaped zombie child,
+    /// which blocks the next spawn's clean boundary. Same exact checks as
+    /// [`Self::reap_captured`], driven by the captured identities instead of a
+    /// process snapshot.
+    /// Without an active subreaper (and on macOS) this does nothing.
+    pub fn reap_captured_zombies(&self) {
+        #[cfg(target_os = "linux")]
+        if subreaper_active() {
+            self.reap_captured_zombies_linux();
+        }
+    }
+    /// Linux body of [`Self::reap_captured_zombies`].
+    #[cfg(target_os = "linux")]
+    fn reap_captured_zombies_linux(&self) {
+        let state = adoption::lock();
+        for member in self.known.values() {
+            self.reap_if_adopted_zombie(&state, member);
+        }
+    }
+    /// Reap `member` iff it is exactly a captured, unregistered zombie child of
+    /// this process and not this owner's leader. Runs under the admission lock.
+    #[cfg(target_os = "linux")]
+    fn reap_if_adopted_zombie(&self, state: &adoption::State, member: &Identity) {
+        let me = std::process::id() as i32;
+        if member.pid <= 1
+            || self
+                .leader
+                .as_ref()
+                .is_some_and(|leader| leader.pid == member.pid && leader.token == member.token)
+        {
+            return;
+        }
+        let Ok(now) = inspect(member.pid) else {
+            return;
+        };
+        if now.zombie && now.ppid == me && now.token == member.token && !state.registered(&now) {
+            let mut status = 0;
+            // SAFETY: exact positive PID of an unreaped, captured, unregistered zombie child; WNOHANG never blocks.
+            unsafe { libc::waitpid(member.pid, &mut status, libc::WNOHANG) };
         }
     }
     /// Period until the next mid-run refresh of this owner.
@@ -1315,6 +1348,7 @@ impl OwnedProcess {
                 .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
                 || std::time::Instant::now() >= settle_deadline
             {
+                self.reap_captured_zombies();
                 return result;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1357,6 +1391,7 @@ impl OwnedProcess {
                 .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
                 || tokio::time::Instant::now() >= settle_deadline
             {
+                self.reap_captured_zombies();
                 return result;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

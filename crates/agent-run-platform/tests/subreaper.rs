@@ -28,13 +28,20 @@ fn isolated(name: &str, body: fn()) {
         body();
         return;
     }
-    let status = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &format!("subreaper::{name}"), "--nocapture"])
         .env(CASE, name)
         .env_remove(process::REFRESH_ENV)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "isolated case {name} failed: {status}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "isolated case {name} failed: {}\n{stdout}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    print!("{stdout}");
 }
 
 /// A registered spawn: kills its group and any listed daemon, then reports it reaped.
@@ -70,10 +77,12 @@ impl Drop for Spawned {
     }
 }
 
-/// Spawn and register `command`, like the engine transport does.
+/// Launch and register `command` once, like the engine transport does.
 fn spawn(command: &mut Command) -> Spawned {
-    let gate = process::SpawnGate::install(command).unwrap();
-    let (child, claim) = gate.spawn(|| command.spawn(), |c| Some(c.id())).unwrap();
+    let command = std::mem::replace(command, Command::new("/bin/false"));
+    let (child, claim) =
+        process::spawn_registered(command, |mut command| command.spawn(), |c| Some(c.id()))
+            .unwrap();
     Spawned {
         child,
         claim: Some(claim),
@@ -164,6 +173,10 @@ fn a_daemonized_grandchild_is_captured_and_killed_at_finish() {
             );
             assert!(cleanup.confirmed, "{cleanup:?}");
             assert!(ended(&daemon), "the daemon survived cleanup");
+            assert!(
+                process::inspect(daemon.pid).is_err(),
+                "cleanup left the captured daemon an unreaped zombie"
+            );
             // The registered leader's exit status still belongs to its spawner.
             assert!(!fixture.wait().success());
         },
@@ -261,6 +274,51 @@ fn adopted_zombies_are_reaped_but_spawned_children_are_not() {
                 "the registered leader was reaped"
             );
             assert_eq!(fixture.wait().code(), Some(7), "leader status kept");
+        },
+    );
+}
+
+/// A captured orphan that exits after the last observation still observes as
+/// dead, so cleanup proofs pass; releasing the owner must reap it, or the
+/// zombie would deny the next spawn its clean boundary.
+#[test]
+fn a_late_captured_zombie_is_reaped_before_the_owner_is_released() {
+    isolated(
+        "a_late_captured_zombie_is_reaped_before_the_owner_is_released",
+        || {
+            let mut fixture = spawn_with_daemon("setsid sleep 600");
+            let leader = fixture.child.id() as i32;
+            let mut owner = OwnedProcess::capture(leader);
+            let daemon = adopted_child(leader, |p| !p.zombie);
+            fixture.daemons.push(daemon.pid);
+            owner.refresh();
+            assert!(captured(&owner, &daemon));
+            // The daemon exits after that last observation.
+            // SAFETY: exact captured fixture PID, an unreaped child of this process.
+            unsafe { libc::kill(daemon.pid, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !process::inspect(daemon.pid).unwrap().zombie {
+                assert!(Instant::now() < deadline, "daemon never exited");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // SAFETY: exact live registered leader PID.
+            unsafe { libc::kill(leader, libc::SIGKILL) };
+            fixture.wait();
+            assert!(process::inspect(daemon.pid).unwrap().zombie);
+
+            owner.reap_captured_zombies();
+            assert!(
+                process::inspect(daemon.pid).is_err_and(|e| e.raw_os_error() == Some(libc::ENOENT)),
+                "the late captured zombie was not reaped"
+            );
+            drop(owner);
+            let next = spawn(Command::new("/bin/sleep").arg("600").process_group(0));
+            let next_owner = OwnedProcess::capture(next.child.id() as i32);
+            assert_eq!(
+                next_owner.refresh_interval(),
+                process::DURABLE_REFRESH,
+                "the next spawn regained a clean boundary"
+            );
         },
     );
 }

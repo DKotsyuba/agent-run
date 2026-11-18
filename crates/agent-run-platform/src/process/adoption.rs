@@ -4,7 +4,7 @@
 //! process. Two facts make adoption exact by construction:
 //!
 //! - **Registration before the program runs.** Every child is spawned through
-//!   a [`SpawnGate`]: the forked child reports its PID and then waits, before
+//!   [`spawn_registered`]: the forked child reports its PID and then waits, before
 //!   `exec`, until the parent registered its exact `(pid, token)` under the
 //!   admission lock. A child whose registration fails never execs; its spawn
 //!   fails and the standard library reaps it. A registration stays until the
@@ -129,7 +129,7 @@ pub(super) fn generation() -> u64 {
 /// Make this process the Linux child subreaper for all its descendants.
 ///
 /// Call once, before this process spawns any child, and spawn every child
-/// through a [`SpawnGate`] afterwards: an unregistered direct child would be
+/// through [`spawn_registered`] afterwards: an unregistered direct child would be
 /// indistinguishable from an adopted orphan. Orphaned descendants (double
 /// fork, `setsid`, `nohup`, regrouping) then reparent here instead of init, so
 /// termination points reach them by parentage. Other platforms return
@@ -190,129 +190,134 @@ impl SpawnedChild {
     }
 }
 
-/// Registers one spawn before its program runs.
+/// Launch exactly one child of `command`, registered before its program runs.
 ///
-/// [`Self::install`] adds a `pre_exec` handshake to the command; [`Self::spawn`]
-/// then runs the spawn under the admission lock. Without an active subreaper
-/// both are pass-through and nothing is registered.
-pub struct SpawnGate(#[cfg(target_os = "linux")] Option<Handshake>);
-
-/// Both pipe pairs of one handshake; every descriptor is close-on-exec.
-#[cfg(target_os = "linux")]
-struct Handshake {
-    /// Parent reads the child's PID here.
-    report_read: std::os::fd::OwnedFd,
-    /// Child writes its PID here (the parent's copy closes after the spawn).
-    report_write: std::os::fd::OwnedFd,
-    /// Child waits here for the release byte (the parent's copy closes after the spawn).
-    release_read: std::os::fd::OwnedFd,
-    /// Parent writes the release byte here only after registration.
-    release_write: std::os::fd::OwnedFd,
+/// The command is taken by value: a `pre_exec` handshake is installed on it
+/// and the command is handed to `launch` for this single launch, so no hook
+/// with consumed descriptors can survive on a reusable command. `launch` must
+/// spawn the command (for example through tokio) and `pid` reads the child's
+/// PID from the result. Without an active subreaper this is a plain launch.
+///
+/// With one, the forked child reports its PID and waits before `exec` until
+/// its exact `(pid, token)` is registered under the admission lock; the
+/// clean-boundary check runs first under the same lock. If registration fails
+/// the child never execs and the launch fails. If `launch` fails *after* the
+/// program started (tokio can fail while wrapping a live child, dropping it
+/// without waiting), the registered child is pinned by pidfd, killed and
+/// reaped before the error is returned; a child the standard library already
+/// reaped (failed exec) is only released.
+pub fn spawn_registered<T>(
+    command: std::process::Command,
+    launch: impl FnOnce(std::process::Command) -> std::io::Result<T>,
+    pid: impl FnOnce(&T) -> Option<u32>,
+) -> std::io::Result<(T, SpawnedChild)> {
+    #[cfg(target_os = "linux")]
+    if subreaper_active() {
+        return spawn_registered_linux(command, launch, pid);
+    }
+    launch(command).map(|child| (child, SpawnedChild(None)))
 }
 
-impl SpawnGate {
-    /// Prepare `command` so its child waits, before `exec`, for registration.
-    pub fn install(command: &mut std::process::Command) -> std::io::Result<Self> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = command;
-            Ok(Self())
-        }
-        #[cfg(target_os = "linux")]
-        Self::install_linux(command)
+/// Linux body of [`spawn_registered`] with an active subreaper.
+#[cfg(target_os = "linux")]
+fn spawn_registered_linux<T>(
+    mut command: std::process::Command,
+    launch: impl FnOnce(std::process::Command) -> std::io::Result<T>,
+    pid: impl FnOnce(&T) -> Option<u32>,
+) -> std::io::Result<(T, SpawnedChild)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let (report_read, report_write) = pipe()?;
+    let (release_read, release_write) = pipe()?;
+    let fds = [
+        report_read.as_raw_fd(),
+        report_write.as_raw_fd(),
+        release_read.as_raw_fd(),
+        release_write.as_raw_fd(),
+    ];
+    // SAFETY: the hook runs in the forked child before exec and calls only
+    // async-signal-safe functions (close, getpid, write, read) on descriptors
+    // inherited from this handshake; it allocates nothing. The command is
+    // consumed by this one launch, so the hook never outlives its descriptors.
+    unsafe {
+        command.pre_exec(move || child_handshake(fds));
     }
-
-    /// Linux body of [`Self::install`].
-    #[cfg(target_os = "linux")]
-    fn install_linux(command: &mut std::process::Command) -> std::io::Result<Self> {
-        if !subreaper_active() {
-            return Ok(Self(None));
+    let mut state = lock();
+    let clean = clean_boundary();
+    let (launched, registered) = std::thread::scope(|scope| {
+        let state = &mut *state;
+        let registrar = scope.spawn(move || register(report_read, release_write, state, clean));
+        let launched = launch(command);
+        // Without the parent's copies the registrar sees EOF if no child reports.
+        drop(report_write);
+        drop(release_read);
+        (launched, registrar.join().ok().flatten())
+    });
+    match (launched, registered) {
+        (Ok(child), Some(key)) if pid(&child) == u32::try_from(key.0).ok() => {
+            Ok((child, SpawnedChild(Some(key))))
         }
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-        let (report_read, report_write) = pipe()?;
-        let (release_read, release_write) = pipe()?;
-        let fds = [
-            report_read.as_raw_fd(),
-            report_write.as_raw_fd(),
-            release_read.as_raw_fd(),
-            release_write.as_raw_fd(),
-        ];
-        // SAFETY: the hook runs in the forked child before exec and calls only
-        // async-signal-safe functions (close, getpid, write, read) on
-        // descriptors inherited from this handshake; it allocates nothing.
-        unsafe {
-            command.pre_exec(move || child_handshake(fds));
+        (Ok(_), None) => Err(std::io::Error::other(
+            "spawned child could not be registered",
+        )),
+        (result, Some(key)) => {
+            // The program may be running although the launch failed or
+            // returned another child: end it before reporting the failure.
+            terminate_registered(&key);
+            state.release(&key);
+            Err(result.err().unwrap_or_else(|| {
+                std::io::Error::other("launched child does not match its registration")
+            }))
         }
-        Ok(Self(Some(Handshake {
-            report_read,
-            report_write,
-            release_read,
-            release_write,
-        })))
+        (Err(error), None) => Err(error),
     }
+}
 
-    /// Spawn under the admission lock, registering the child before it execs.
-    ///
-    /// The clean-boundary check runs first, under the same lock, so nothing
-    /// this process spawns can appear between the check and the fork. If the
-    /// child cannot be registered it never execs and `spawn` fails; if the
-    /// program then fails to exec, its registration is removed (the standard
-    /// library already reaped it).
-    pub fn spawn<T>(
-        self,
-        spawn: impl FnOnce() -> std::io::Result<T>,
-        pid: impl FnOnce(&T) -> Option<u32>,
-    ) -> std::io::Result<(T, SpawnedChild)> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = pid;
-            spawn().map(|child| (child, SpawnedChild(None)))
-        }
-        #[cfg(target_os = "linux")]
-        self.spawn_linux(spawn, pid)
+/// Kill and reap one registered child whose launch failed, if it still exists.
+///
+/// The PID is pinned with a pidfd and the exact start token is verified
+/// through it before any signal, so a PID that was already reaped and reused
+/// is never touched. `waitid(P_PIDFD)` then collects the status; `ECHILD`
+/// means another waiter (for example tokio's orphan queue) collected it first.
+#[cfg(target_os = "linux")]
+fn terminate_registered(key: &(i32, String)) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    /// `P_PIDFD` from linux/wait.h (Linux 5.4).
+    const P_PIDFD: libc::idtype_t = 3;
+    // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, key.0, 0) };
+    if raw < 0 {
+        return; // Already reaped (the standard library waits for a failed exec).
     }
-
-    /// Linux body of [`Self::spawn`].
-    #[cfg(target_os = "linux")]
-    fn spawn_linux<T>(
-        self,
-        spawn: impl FnOnce() -> std::io::Result<T>,
-        pid: impl FnOnce(&T) -> Option<u32>,
-    ) -> std::io::Result<(T, SpawnedChild)> {
-        let Some(handshake) = self.0 else {
-            return spawn().map(|child| (child, SpawnedChild(None)));
+    // SAFETY: pidfd_open returned a new descriptor owned by nobody else.
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+    if super::inspect(key.0).map_or(true, |now| now.token != key.1) {
+        return; // The PID now names another process.
+    }
+    // SAFETY: the pidfd refers to the verified registered child.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
+    // SAFETY: siginfo_t is plain old data; waitid only writes it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: waits only for the pinned child; blocks until SIGKILL lands.
+        let code = unsafe {
+            libc::waitid(
+                P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED,
+            )
         };
-        let Handshake {
-            report_read,
-            report_write,
-            release_read,
-            release_write,
-        } = handshake;
-        let mut state = lock();
-        let clean = clean_boundary();
-        let (spawned, registered) = std::thread::scope(|scope| {
-            let state = &mut *state;
-            let registrar = scope.spawn(move || register(report_read, release_write, state, clean));
-            let spawned = spawn();
-            // Without the parent's copies the registrar sees EOF if no child reports.
-            drop(report_write);
-            drop(release_read);
-            (spawned, registrar.join().ok().flatten())
-        });
-        match (spawned, registered) {
-            (Ok(child), Some(key)) if pid(&child) == u32::try_from(key.0).ok() => {
-                Ok((child, SpawnedChild(Some(key))))
-            }
-            (Ok(_), _) => Err(std::io::Error::other(
-                "spawned child could not be registered",
-            )),
-            (Err(error), key) => {
-                if let Some(key) = key {
-                    state.release(&key);
-                }
-                Err(error)
-            }
+        if code == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break;
         }
     }
 }
@@ -410,9 +415,11 @@ fn register(
 
 /// Whether this process has no child at all, live or zombie, right now.
 ///
-/// `waitid(P_ALL, WNOHANG | WNOWAIT)` covers children of every thread, never
-/// reaps, and fails with `ECHILD` only when no child exists; the kernel
-/// answers atomically, so this is not a PID census.
+/// `waitid(P_ALL, WNOHANG | WNOWAIT | __WALL)` covers children of every
+/// thread and of every exit signal (not only `SIGCHLD` children; adopted
+/// orphans always signal `SIGCHLD`), never reaps, and fails with `ECHILD` only
+/// when no child exists; the kernel answers atomically, so this is not a PID
+/// census.
 #[cfg(target_os = "linux")]
 fn clean_boundary() -> bool {
     {
@@ -424,7 +431,7 @@ fn clean_boundary() -> bool {
                 libc::P_ALL,
                 0,
                 &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
             )
         };
         code == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
@@ -449,22 +456,39 @@ pub(super) mod tests {
             body();
             return;
         }
-        let status = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 &format!("process::adoption::tests::{name}"),
                 "--nocapture",
             ])
             .env(CASE, name)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "isolated case {name} failed: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "isolated case {name} failed: {}\n{stdout}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{stdout}");
     }
 
-    /// Spawn `command` through a gate.
-    fn gated(command: &mut Command) -> std::io::Result<(std::process::Child, SpawnedChild)> {
-        let gate = SpawnGate::install(command)?;
-        gate.spawn(|| command.spawn(), |child| Some(child.id()))
+    /// Launch `command` once through the registration handshake.
+    fn gated(command: Command) -> std::io::Result<(std::process::Child, SpawnedChild)> {
+        spawn_registered(
+            command,
+            |mut command| command.spawn(),
+            |child| Some(child.id()),
+        )
+    }
+
+    /// An owned command for `program` with `args`.
+    fn command(program: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
     }
 
     /// Absent, malformed or out-of-range overrides keep the 2 s durable default.
@@ -484,9 +508,10 @@ pub(super) mod tests {
         isolated("a_failed_registration_refuses_the_spawn", || {
             let marker = std::env::temp_dir().join(format!("gate-{}", std::process::id()));
             FAIL_REGISTRATION.store(true, Ordering::SeqCst);
-            let error = gated(
-                Command::new("/bin/sh").args(["-c", &format!("touch '{}'", marker.display())]),
-            )
+            let error = gated(command(
+                "/bin/sh",
+                &["-c", &format!("touch '{}'", marker.display())],
+            ))
             .err()
             .expect("unregistered spawn refused");
             FAIL_REGISTRATION.store(false, Ordering::SeqCst);
@@ -505,15 +530,52 @@ pub(super) mod tests {
         isolated(
             "registration_precedes_exec_and_exec_failure_is_released",
             || {
-                let (mut child, claim) = gated(Command::new("/bin/sleep").arg("30")).unwrap();
+                let (mut child, claim) = gated(command("/bin/sleep", &["30"])).unwrap();
                 let identity = super::super::inspect(child.id() as i32).unwrap();
                 assert!(lock().registered(&identity), "exact token registered");
-                assert!(gated(&mut Command::new("/nonexistent/engine")).is_err());
+                assert!(gated(command("/nonexistent/engine", &[])).is_err());
                 assert_eq!(lock().spawned.len(), 1, "failed exec released");
                 child.kill().unwrap();
                 child.wait().unwrap();
                 claim.reaped();
                 assert!(lock().spawned.is_empty());
+            },
+        );
+    }
+
+    /// A launch that fails after the program started (as tokio can while
+    /// wrapping a live child, dropping it unwaited) still ends that exact
+    /// registered child before the failure is reported.
+    #[test]
+    fn a_post_exec_launch_failure_kills_and_reaps_the_child() {
+        isolated(
+            "a_post_exec_launch_failure_kills_and_reaps_the_child",
+            || {
+                let started = std::sync::Mutex::new(None);
+                let error = spawn_registered(
+                    command("/bin/sleep", &["30"]),
+                    |mut command| {
+                        let child = command.spawn()?;
+                        let identity = super::super::inspect(child.id() as i32)?;
+                        *started.lock().unwrap() = Some(identity);
+                        drop(child); // like tokio: the std child is dropped unwaited
+                        Err::<std::process::Child, _>(std::io::Error::other(
+                            "injected wrap failure",
+                        ))
+                    },
+                    |child| Some(child.id()),
+                )
+                .err()
+                .expect("the launch failure is reported");
+                assert_eq!(error.to_string(), "injected wrap failure");
+                let started = started.lock().unwrap().take().expect("program started");
+                assert!(
+                    super::super::inspect(started.pid)
+                        .map_or(true, |now| now.token != started.token),
+                    "the started engine is still running or unreaped"
+                );
+                assert!(lock().spawned.is_empty(), "registration released");
+                assert!(clean_boundary(), "no child left behind");
             },
         );
     }
@@ -525,9 +587,9 @@ pub(super) mod tests {
         isolated("only_a_spawn_at_a_clean_boundary_is_exclusive", || {
             let identity =
                 |child: &std::process::Child| super::super::inspect(child.id() as i32).unwrap();
-            let (mut first, first_claim) = gated(Command::new("/bin/sleep").arg("30")).unwrap();
+            let (mut first, first_claim) = gated(command("/bin/sleep", &["30"])).unwrap();
             assert!(lock().exclusive(&identity(&first)).is_some());
-            let (mut second, second_claim) = gated(Command::new("/bin/sleep").arg("30")).unwrap();
+            let (mut second, second_claim) = gated(command("/bin/sleep", &["30"])).unwrap();
             assert!(
                 lock().exclusive(&identity(&second)).is_none(),
                 "a live child"
@@ -540,7 +602,7 @@ pub(super) mod tests {
             while !identity(&first).zombie {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let (mut third, third_claim) = gated(Command::new("/bin/sleep").arg("30")).unwrap();
+            let (mut third, third_claim) = gated(command("/bin/sleep", &["30"])).unwrap();
             assert!(
                 lock().exclusive(&identity(&third)).is_none(),
                 "a zombie child"
@@ -550,7 +612,7 @@ pub(super) mod tests {
             third.kill().unwrap();
             third.wait().unwrap();
             third_claim.reaped();
-            let (mut fourth, fourth_claim) = gated(Command::new("/bin/sleep").arg("30")).unwrap();
+            let (mut fourth, fourth_claim) = gated(command("/bin/sleep", &["30"])).unwrap();
             assert!(
                 lock().exclusive(&identity(&fourth)).is_some(),
                 "clean again"

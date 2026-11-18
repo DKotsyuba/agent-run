@@ -259,7 +259,7 @@ impl Process {
             None
         };
         let redactor = Redactor::from_environment(&environment);
-        let mut command = Command::new(&plan.binary);
+        let mut command = std::process::Command::new(&plan.binary);
         command
             .args(&plan.args)
             .current_dir(&plan.cwd)
@@ -267,13 +267,16 @@ impl Process {
             .envs(&environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
+            .stderr(Stdio::piped());
         use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-        // Registered by exact identity before the engine program runs.
-        let gate = process::SpawnGate::install(command.as_std_mut())?;
-        let (mut child, spawned) = gate.spawn(|| command.spawn(), Child::id)?;
+        command.process_group(0);
+        // One launch, registered by exact identity before the engine program
+        // runs; a failure after it started still kills and reaps it.
+        let (mut child, spawned) = process::spawn_registered(
+            command,
+            |command| Command::from(command).kill_on_drop(false).spawn(),
+            Child::id,
+        )?;
         let pid = child
             .id()
             .ok_or_else(|| Error::Runtime("child PID unavailable".into()))?
@@ -976,6 +979,9 @@ impl Drop for Process {
         for t in &self.tasks {
             t.abort();
         }
+        // Captured orphans that exited after the last observation must not
+        // outlive this owner as zombies of the supervisor.
+        self.owner.reap_captured_zombies();
     }
 }
 
