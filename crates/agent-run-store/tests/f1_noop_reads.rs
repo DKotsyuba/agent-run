@@ -73,7 +73,7 @@ fn proof(run: &AgentId, token: &str, digest: String) -> WorkerCatalogProof {
         run_id: run.clone(),
         attempt_id: "attempt".into(),
         token: token.into(),
-        version: agent_run_domain::worker::POOL_CATALOG_VERSION,
+        version: agent_run_domain::worker::WORKER_CATALOG_VERSION,
         digest,
     }
 }
@@ -96,7 +96,7 @@ fn under_foreign_lock(home: &std::path::Path, preflights: impl FnOnce()) {
 #[test]
 fn preflights_answer_under_a_held_write_lock_without_writing() {
     let (home, run) = running();
-    let digest = agent_run_domain::worker::pool_catalog_digest();
+    let digest = agent_run_domain::worker::worker_catalog_digest();
     let reader = StoreReader::open(home.path()).unwrap();
     under_foreign_lock(home.path(), || {
         assert!(!timed(|| reader

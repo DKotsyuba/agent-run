@@ -9,38 +9,73 @@ use agent_run_domain::{
 };
 use serde_json::json;
 
-/// Shared operator dispatch returns an idempotent release and bounded pin list.
+/// Only the batch credential can release the exact pin, including on replay.
 #[tokio::test]
-async fn history_pins_dispatch_lists_and_releases_exact_key() {
-    use agent_run_domain::{batch::PinId, domain::AgentId};
+async fn history_pins_dispatch_requires_credential_and_conceals_absence() {
+    use agent_run_domain::{
+        batch::{PinId, PinReleaseToken},
+        domain::AgentId,
+    };
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let store = agent_run_store::fixture::initialize(root).unwrap();
     let agent = AgentId::new();
-    let pin = PinId::new();
-    store
-        .conn
-        .execute(
-            "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
-            rusqlite::params![pin.as_str(), agent.as_str()],
-        )
-        .unwrap();
+    let token = PinReleaseToken::mint();
+    let pin = PinId::from_release_digest(&token.digest(), &agent);
+    let legacy = PinId::new();
+    for (request_id, pin) in [("batch-1", &pin), ("legacy-key", &legacy)] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                rusqlite::params![pin.as_str(), agent.as_str()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+            rusqlite::params![request_id, "a".repeat(64), json!({"jobs":[{"pin_id":pin}]}).to_string()],
+        ).unwrap();
+    }
     let writer = common::writer::Harness::start(root);
     let service = Service::new(root.to_owned()).with_writer(writer.broker());
-    let first = agent_run_core::dispatch::call(
-        &service,
-        "history_pins",
-        json!({"action":"list","status":"active"}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(first["pins"].as_array().unwrap().len(), 1);
-    assert_eq!(first["pins"][0]["pin_id"], pin.as_str());
+    let call = |method, args| agent_run_core::dispatch::call(&service, method, args);
+    let first = call("history_pins_list", json!({"status":"active"}))
+        .await
+        .unwrap();
+    assert_eq!(first["pins"].as_array().unwrap().len(), 2);
+    assert!(!first.to_string().contains("batch-1"));
+    assert!(
+        first["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|pin| pin.get("release_token").is_none())
+    );
+    let removed = call("history_pins", json!({"action":"release","pin_id":pin}))
+        .await
+        .unwrap_err();
+    assert!(removed.to_string().contains("unknown tool"), "{removed}");
+    for old in [
+        json!({"pin_id":pin}),
+        json!({"pin_id":legacy,"request_id":"legacy-key"}),
+    ] {
+        let error = call("history_pins_release", old).await.unwrap_err();
+        assert_eq!(error.machine_code().as_str(), "ValidationError");
+    }
+    let foreign = PinReleaseToken::mint();
+    for (target, credential) in [(&pin, &foreign), (&legacy, &token), (&PinId::new(), &token)] {
+        let error = call(
+            "history_pins_release",
+            json!({"pin_id":target,"release_token":credential}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.machine_code().as_str(), "RequestConflict");
+    }
     for already in [false, true] {
-        let response = agent_run_core::dispatch::call(
-            &service,
-            "history_pins",
-            json!({"action":"release","pin_id":pin}),
+        let response = call(
+            "history_pins_release",
+            json!({"pin_id":pin,"release_token":token}),
         )
         .await
         .unwrap();
@@ -48,36 +83,27 @@ async fn history_pins_dispatch_lists_and_releases_exact_key() {
         assert_eq!(response["status"], "released");
         assert_eq!(response["already_released"], already);
     }
-    let list = agent_run_core::dispatch::call(
-        &service,
-        "history_pins",
-        json!({"action":"list","status":"released"}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(list["pins"][0]["agent_id"], agent.as_str());
-    let missing = agent_run_core::dispatch::call(
-        &service,
-        "history_pins",
-        json!({"action":"release","pin_id":PinId::new()}),
+    let error = call(
+        "history_pins_release",
+        json!({"pin_id":pin,"release_token":foreign}),
     )
     .await
     .unwrap_err();
-    assert!(matches!(missing, Error::PinNotFound(_)));
-    assert_eq!(missing.machine_code().as_str(), "PinNotFound");
-    assert!(
-        agent_run_core::dispatch::call(
-            &service,
-            "history_pins",
-            json!({"action":"list","limit":1001})
-        )
+    assert_eq!(error.machine_code().as_str(), "RequestConflict");
+    let active = call("history_pins_list", json!({"status":"active"}))
         .await
-        .is_err()
+        .unwrap();
+    assert_eq!(active["pins"].as_array().unwrap().len(), 1);
+    assert_eq!(active["pins"][0]["pin_id"], legacy.as_str());
+    assert!(
+        call("history_pins_list", json!({"limit":1001}))
+            .await
+            .is_err()
     );
     assert!(
         !agent_run_domain::tools::worker_registry()
             .iter()
-            .any(|tool| tool.name == "history_pins")
+            .any(|tool| tool.name.starts_with("history_pins"))
     );
 }
 
@@ -202,10 +228,7 @@ async fn batch_replay_after_admission_does_not_launch_or_reload_config() {
     assert_eq!(before, after, "lookup must not enqueue writes");
     let mut conflict = request.clone();
     conflict.jobs[0].task = "changed".into();
-    assert!(matches!(
-        service.batch_receipt(conflict).await,
-        Err(Error::Conflict)
-    ));
+    assert!(!service.batch_receipt(conflict).await.unwrap().found);
     let mut wrong_store = request.clone();
     wrong_store.expected_store_id = Some("store_ffffffffffffffffffffffffffffffff".parse().unwrap());
     assert!(matches!(
@@ -499,10 +522,7 @@ async fn batch_preconditions_cross_writer_and_read_only_lookup() {
         Some(accepted.receipt)
     );
     guarded.preconditions.as_mut().unwrap()[0].sequence = 2;
-    assert!(matches!(
-        service.batch_receipt(guarded).await,
-        Err(Error::Conflict)
-    ));
+    assert!(!service.batch_receipt(guarded).await.unwrap().found);
 }
 
 /// A lookup while admission is paused can be false even though that admission later commits.

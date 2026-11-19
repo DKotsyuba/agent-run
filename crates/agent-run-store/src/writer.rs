@@ -1191,6 +1191,26 @@ impl OfflineWriterGuard {
         crate::migrations::migrate(&self.home.join("state.db"))
     }
 
+    /// Recovers a public batch pin while excluding online writers and native owners.
+    /// The database owner must invoke this against the original store and batch.
+    pub fn release_history_pin(
+        &mut self,
+        pin_id: &agent_run_domain::batch::PinId,
+        expected: &agent_run_domain::StoreId,
+        request_id: &str,
+    ) -> Result<Option<agent_run_domain::batch::HistoryPinRelease>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(self.home.join("state.db"))?;
+        // SAFETY: geteuid only reads the process identity.
+        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(agent_run_domain::error::invalid(
+                "offline pin release requires the database owner",
+            ));
+        }
+        self.store()?
+            .release_history_pin_offline(pin_id, expected, request_id)
+    }
+
     /// The read-write store under this guard (opened on first use).
     pub fn store(&mut self) -> Result<&mut Store<'static>> {
         if self.store.is_none() {

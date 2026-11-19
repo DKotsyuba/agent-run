@@ -270,6 +270,18 @@ async fn mcp_call(home: &Path, tool: &str, request: &Value) -> Value {
     result.expect("MCP call timed out").expect("MCP reply")
 }
 
+/// Asserts orchestrator MCP refuses a socket-only service method as unknown.
+async fn assert_mcp_refuses(home: &Path, tool: &str, request: &Value) {
+    let reply = mcp_call(home, tool, request).await;
+    assert!(reply["result"].is_null(), "{tool} reached MCP: {reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown tool")),
+        "{tool}: {reply}"
+    );
+}
+
 /// A failed second admission rolls back; CLI admission and MCP replay share one receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
@@ -285,12 +297,8 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
             .get("store_id")
             .is_none()
     );
-    let mcp_default = mcp_call(&broker.home, "capabilities", &json!({})).await;
-    assert!(
-        mcp_default["result"]["structuredContent"]
-            .get("store_id")
-            .is_none()
-    );
+    // Service integration reads are operator-socket only, never orchestrator MCP.
+    assert_mcp_refuses(&broker.home, "capabilities", &json!({})).await;
     let capabilities = socket
         .call("capabilities", Some(json!({"include_store_id":true})))
         .await
@@ -301,16 +309,6 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     assert!(status.success(), "capabilities CLI: {error}");
     assert_eq!(
         serde_json::from_str::<Value>(&output).unwrap()["store_id"],
-        store_id.as_str()
-    );
-    let mcp_capabilities = mcp_call(
-        &broker.home,
-        "capabilities",
-        &json!({"include_store_id":true}),
-    )
-    .await;
-    assert_eq!(
-        mcp_capabilities["result"]["structuredContent"]["store_id"],
         store_id.as_str()
     );
     let request = json!({"request_id":"socket-batch", "retain_history":true, "expected_store_id":store_id, "jobs":[
@@ -327,11 +325,37 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
             .unwrap(),
         json!({"found":false})
     );
-    let mcp_missing = mcp_call(&broker.home, "batch_receipt", &request).await;
-    assert_eq!(
-        mcp_missing["result"]["structuredContent"],
-        json!({"found":false})
-    );
+    assert_mcp_refuses(&broker.home, "batch_receipt", &request).await;
+
+    // A retained notification cannot admit a batch that has no reply channel
+    // for the release credential. The following request observes the same socket.
+    let mut notification = request.clone();
+    notification["request_id"] = json!("retained-notification");
+    notification["jobs"].as_array_mut().unwrap().truncate(1);
+    let mut raw = tokio::net::UnixStream::connect(broker.home.join("api.sock"))
+        .await
+        .unwrap();
+    raw.write_all(
+        format!(
+            "{}\n{}\n",
+            json!({"jsonrpc":"2.0","method":"start_batch","params":notification}),
+            json!({"jsonrpc":"2.0","id":1,"method":"batch_receipt","params":notification}),
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::io::BufReader::new(raw).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let lookup: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(lookup["id"], 1);
+    assert_eq!(lookup["result"], json!({"found":false}));
 
     // The first job fits; the second reaches the writer's one-slot cap.
     let (status, _, error) = cli(&broker.home, &args).await;
@@ -350,10 +374,47 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     drop(db);
 
     configure(&broker.home, 3);
-    let (status, output, error) = cli(&broker.home, &args).await;
+    let token_file = broker.home.join("new-release-token");
+    let private_args = [
+        "start-batch",
+        "--spec",
+        spec.to_str().unwrap(),
+        "--release-token-file",
+        token_file.to_str().unwrap(),
+    ];
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let occupied = broker.home.join("occupied-token");
+    std::fs::write(&occupied, "already present").unwrap();
+    for use_symlink in [false, true] {
+        if use_symlink {
+            symlink(&occupied, &token_file).unwrap();
+        } else {
+            std::fs::write(&token_file, "already present").unwrap();
+        }
+        let (status, _, _) = cli(&broker.home, &private_args).await;
+        assert!(!status.success());
+        assert_eq!(
+            std::fs::read_to_string(&token_file).unwrap(),
+            "already present"
+        );
+        std::fs::remove_file(&token_file).unwrap();
+    }
+    assert_eq!(
+        socket
+            .call("batch_receipt", Some(request.clone()))
+            .await
+            .unwrap(),
+        json!({"found":false})
+    );
+    let (status, output, error) = cli(&broker.home, &private_args).await;
     assert!(status.success(), "batch admission: {error}");
     let first: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(first["replayed"], false, "{first}");
+    assert!(first.get("release_token").is_none());
+    assert_eq!(
+        std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert_eq!(first["receipt"]["request_id"], "socket-batch");
     assert_eq!(first["receipt"]["store_id"], store_id.as_str());
     let jobs = first["receipt"]["jobs"].as_array().unwrap();
@@ -384,8 +445,6 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
         .unwrap();
     assert_eq!(lookup["found"], true);
     assert_eq!(lookup["receipt"], first["receipt"]);
-    let mcp_lookup = mcp_call(&broker.home, "batch_receipt", &request).await;
-    assert_eq!(mcp_lookup["result"]["structuredContent"], lookup);
     let (lookup_status, lookup_output, lookup_error) = cli(
         &broker.home,
         &["batch-receipt", "--spec", spec.to_str().unwrap()],
@@ -425,12 +484,7 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     assert_eq!(status["view"]["match"], "verified");
     assert_eq!(status["view"]["status_scope"], "selected_execution_raw");
     assert!(!status.to_string().contains("process_group_id"));
-    let mcp_status = mcp_call(&broker.home, "status", &status_request).await;
-    assert_ne!(mcp_status["result"]["isError"], true, "{mcp_status}");
-    assert_eq!(
-        mcp_status["result"]["structuredContent"]["items"][0]["match"],
-        "verified"
-    );
+    assert_mcp_refuses(&broker.home, "status", &status_request).await;
     let status_spec = broker.home.join("status.json");
     std::fs::write(&status_spec, status_request.to_string()).unwrap();
     let (code, output, error) = cli(
@@ -474,28 +528,45 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
         serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
         "RequestConflict"
     );
-    let error = socket
-        .call("batch_receipt", Some(changed.clone()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.machine_code().as_str(), "RequestConflict");
-    let conflict = mcp_call(&broker.home, "batch_receipt", &changed).await;
-    assert_eq!(conflict["result"]["isError"], true);
     assert_eq!(
-        conflict["result"]["structuredContent"]["code"],
-        "RequestConflict"
+        socket.call("batch_receipt", Some(changed)).await.unwrap(),
+        json!({"found":false})
     );
-    let (status, _, error) = cli(
+    let (status, output, error) = cli(
         &broker.home,
         &["batch-receipt", "--spec", spec.to_str().unwrap()],
     )
     .await;
-    assert_eq!(status.code(), Some(2), "{error}");
+    assert!(status.success(), "{error}");
     assert_eq!(
-        serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
-        "RequestConflict"
+        serde_json::from_str::<Value>(&output).unwrap(),
+        json!({"found":false})
     );
+    assert!(lookup.get("release_token").is_none());
+    assert!(replay.get("release_token").is_none());
 
+    // The known public batch idempotency key does not authorize release.
+    let old_request = json!({"pin_id":pins[0],"request_id":"socket-batch"});
+    let error = socket
+        .call("history_pins_release", Some(old_request))
+        .await
+        .unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "ValidationError");
+    let wrong = json!({"pin_id":pins[0],"release_token":"a".repeat(64)});
+    let error = socket
+        .call("history_pins_release", Some(wrong))
+        .await
+        .unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "RequestConflict");
+    let credential = std::fs::read_to_string(&token_file).unwrap();
+    let credential = credential.trim();
+    assert_eq!(credential.len(), 64);
+    assert_mcp_refuses(
+        &broker.home,
+        "history_pins_release",
+        &json!({"pin_id":pins[0],"release_token":credential}),
+    )
+    .await;
     for already in [false, true] {
         let (status, output, error) = cli(
             &broker.home,
@@ -504,6 +575,8 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
                 "release",
                 "--pin-id",
                 pins[0].as_str(),
+                "--release-token-file",
+                token_file.to_str().unwrap(),
                 "--expected-store-id",
                 store_id.as_str(),
             ],
@@ -514,6 +587,16 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
         assert_eq!(release["pin_id"], pins[0].as_str());
         assert_eq!(release["status"], "released");
         assert_eq!(release["already_released"], already);
+    }
+    for path in ["state.db", "state.db-wal", "broker.stderr"] {
+        if let Ok(contents) = std::fs::read(broker.home.join(path)) {
+            assert!(
+                !contents
+                    .windows(credential.len())
+                    .any(|window| window == credential.as_bytes()),
+                "{path} contains a release credential"
+            );
+        }
     }
     let (status, output, error) = cli(
         &broker.home,
@@ -527,24 +610,33 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     let missing = agent_run_domain::batch::PinId::new();
     let (status, _, error) = cli(
         &broker.home,
-        &["history-pins", "release", "--pin-id", missing.as_str()],
+        &[
+            "history-pins",
+            "release",
+            "--pin-id",
+            missing.as_str(),
+            "--release-token-file",
+            token_file.to_str().unwrap(),
+        ],
     )
     .await;
     assert_eq!(status.code(), Some(2), "{error}");
     assert_eq!(
         serde_json::from_str::<Value>(&error).unwrap()["error"]["type"],
-        "PinNotFound"
+        "RequestConflict"
     );
-    let released_page = mcp_call(
-        &broker.home,
-        "history_pins",
-        &json!({"action":"list","status":"released"}),
-    )
-    .await;
-    assert_ne!(released_page["result"]["isError"], true, "{released_page}");
-    assert_eq!(
-        released_page["result"]["structuredContent"]["pins"][0]["pin_id"],
-        pins[0].as_str()
+    let released_page = socket
+        .call("history_pins_list", Some(json!({"status":"released"})))
+        .await
+        .unwrap();
+    assert_eq!(released_page["pins"][0]["pin_id"], pins[0].as_str());
+    let removed = socket
+        .call("history_pins", Some(json!({"action":"list"})))
+        .await
+        .unwrap_err();
+    assert!(
+        removed.to_string().contains("method not found"),
+        "{removed}"
     );
     let after_release = mcp_call(&broker.home, "start_batch", &request).await;
     assert_eq!(
@@ -596,6 +688,277 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     assert!(!home.exists(), "owned fixture home was not removed");
 }
 
+/// A supervised Claude fixture records the stdout and stderr of its nested
+/// CLI command. Only the inherited private descriptor receives the bearer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_cli_batch_bearer_stays_out_of_transcript_and_mcp() {
+    let broker = Broker::start().await;
+    configure(&broker.home, 3);
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let store_id = client
+        .call("capabilities", Some(json!({"include_store_id":true})))
+        .await
+        .unwrap()["store_id"]
+        .clone();
+    let job = json!({"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
+        "task":"fixture:answer","workdir":broker.home});
+    let request = json!({"request_id":"nested-retained-canary","expected_store_id":store_id,
+        "retain_history":true,"jobs":[job.clone()]});
+    let spec = broker.home.join("batch-canary-spec.json");
+    std::fs::write(&spec, request.to_string()).unwrap();
+    let alias = command(&broker.home);
+    let refused = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"exec "$1" --home "$2" start-batch --spec "$3" --release-token-fd 3 3>&1"#,
+            "alias-canary",
+            env!("CARGO_BIN_EXE_agent-run"),
+        ])
+        .arg(&broker.home)
+        .arg(&spec)
+        .env_clear()
+        .envs(
+            alias
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("separate from standard streams"));
+    assert_eq!(
+        client
+            .call("batch_receipt", Some(request.clone()))
+            .await
+            .unwrap(),
+        json!({"found":false})
+    );
+    let exposed = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"umask 022; exec "$1" --home "$2" start-batch --spec "$3" --release-token-fd 3 3>"$4""#,
+            "fd-permissions-canary",
+            env!("CARGO_BIN_EXE_agent-run"),
+        ])
+        .arg(&broker.home)
+        .arg(&spec)
+        .arg(broker.home.join("public-token-fd"))
+        .env_clear()
+        .envs(alias.get_envs().filter_map(|(key, value)| value.map(|value| (key, value))))
+        .output().await.unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let exposed_file = std::fs::metadata(broker.home.join("public-token-fd")).unwrap();
+    assert_eq!(exposed_file.permissions().mode() & 0o777, 0o644);
+    assert_eq!(exposed_file.len(), 0);
+    assert_eq!(exposed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&exposed.stderr).contains("Use --release-token-file"));
+    assert_eq!(
+        client
+            .call("batch_receipt", Some(request.clone()))
+            .await
+            .unwrap(),
+        json!({"found":false})
+    );
+    std::fs::write(
+        broker.home.join("batch-canary-cli"),
+        env!("CARGO_BIN_EXE_agent-run"),
+    )
+    .unwrap();
+
+    let mut outer = job.clone();
+    outer["task"] = json!("fixture:batch-token-canary");
+    let launched = client.call("start", Some(outer)).await.unwrap();
+    let outer_id = launched["agent_id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !quiescent(&broker.home) {
+        assert!(
+            Instant::now() < deadline,
+            "nested batch fixture did not stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        std::fs::metadata(broker.home.join("batch-canary-token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let token = std::fs::read_to_string(broker.home.join("batch-canary-token")).unwrap();
+    let token = token.trim();
+    assert_eq!(token.len(), 64);
+    let journal: String = read_store(&broker.home).query_row(
+        "SELECT group_concat(content, char(10)) FROM messages WHERE agent_id=? AND role='tool_result'",
+        [outer_id], |row| row.get(0),
+    ).unwrap();
+    assert!(journal.contains("nested-retained-canary"));
+    assert!(!journal.contains(token) && !journal.contains("release_token"));
+    let transcript = client
+        .call("transcript", Some(json!({"agent_id":outer_id})))
+        .await
+        .unwrap()
+        .to_string();
+    assert!(transcript.contains("nested-retained-canary"));
+    assert!(!transcript.contains(token) && !transcript.contains("release_token"));
+
+    let lookup = client
+        .call("batch_receipt", Some(request.clone()))
+        .await
+        .unwrap();
+    let pin = &lookup["receipt"]["jobs"][0]["pin_id"];
+    let released = client
+        .call(
+            "history_pins_release",
+            Some(json!({
+                "pin_id":pin,"release_token":token,"expected_store_id":store_id
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(released["status"], "released");
+
+    let mut discard = request.clone();
+    discard["request_id"] = json!("cli-discarded-canary");
+    std::fs::write(&spec, discard.to_string()).unwrap();
+    let (status, stdout, stderr) = cli(
+        &broker.home,
+        &["start-batch", "--spec", spec.to_str().unwrap()],
+    )
+    .await;
+    assert!(status.success());
+    assert!(stderr.is_empty());
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["receipt"]["request_id"], "cli-discarded-canary");
+    assert_eq!(output["replayed"], false);
+    assert!(output.get("release_token").is_none());
+
+    let mut mcp_request = request;
+    mcp_request["request_id"] = json!("mcp-retained-canary");
+    let mcp = mcp_call(&broker.home, "start_batch", &mcp_request).await;
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["receipt"]["request_id"],
+        "mcp-retained-canary"
+    );
+    assert_eq!(mcp["result"]["structuredContent"]["replayed"], false);
+    assert!(!mcp.to_string().contains("release_token"));
+}
+
+/// The local owner can recover a public legacy pin offline, with an exact
+/// store and receipt match. Durable managed enrollments remain Pool-owned.
+#[tokio::test]
+async fn legacy_pin_recovery_requires_offline_owner_and_exact_receipt() {
+    use agent_run_domain::batch::PinId;
+    let broker = Broker::start().await;
+    let store_id = BrokerClient::new(broker.home.join("api.sock"))
+        .call("capabilities", Some(json!({"include_store_id":true})))
+        .await
+        .unwrap()["store_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let public_pin = PinId::new();
+    let managed_pin = PinId::new();
+    let args = |pin: &PinId, request_id: &str| {
+        [
+            "history-pins",
+            "release-offline",
+            "--pin-id",
+            pin.as_str(),
+            "--request-id",
+            request_id,
+            "--expected-store-id",
+            &store_id,
+        ]
+        .map(str::to_owned)
+    };
+    let live_args = args(&public_pin, "old-public");
+    let (status, _, error) = cli(
+        &broker.home,
+        &live_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    assert!(!status.success());
+    assert!(error.contains("stop the resident broker"), "{error}");
+    drop(broker);
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    std::fs::create_dir(home.join("tmp")).unwrap();
+    let (status, _, error) = cli(home, &["init"]).await;
+    assert!(status.success(), "{error}");
+    let db = agent_run_store::fixture::open(home).unwrap();
+    let store_id = agent_run_store::store_identity::read(&db.conn)
+        .unwrap()
+        .to_string();
+    let public_root = AgentId::new();
+    let managed_root = AgentId::new();
+    for (pin, key, root) in [
+        (&public_pin, "old-public", &public_root),
+        (&managed_pin, "old-managed", &managed_root),
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                (pin.as_str(), root.as_str()),
+            )
+            .unwrap();
+        db.conn.execute(
+            "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+            (key, "a".repeat(64), json!({"jobs":[{"pin_id":pin}]}).to_string()),
+        ).unwrap();
+    }
+    db.conn.execute(
+        "INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,grant_json,receipt_id,receipt_json)
+         VALUES('{}','pool','owned',1,?,'admitted','{}','receipt',?)",
+        ("a".repeat(64), json!({"jobs":[{"pin_id":managed_pin}]}).to_string()),
+    ).unwrap();
+    db.conn.execute(
+        "INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index)
+         VALUES(?,'{}','pool','fixture','owned','member',0)",
+        [managed_root.as_str()],
+    ).unwrap();
+    drop(db);
+    let release = |pin, key| {
+        let store_id = &store_id;
+        async move {
+            cli(
+                home,
+                &[
+                    "history-pins",
+                    "release-offline",
+                    "--pin-id",
+                    pin,
+                    "--request-id",
+                    key,
+                    "--expected-store-id",
+                    store_id,
+                ],
+            )
+            .await
+        }
+    };
+    for (pin, key) in [
+        (&public_pin, "foreign"),
+        (&managed_pin, "old-public"),
+        (&managed_pin, "old-managed"),
+        (&managed_pin, "p3_managed"),
+    ] {
+        let (status, _, _) = release(pin.as_str(), key).await;
+        assert!(!status.success());
+    }
+    for already in [false, true] {
+        let (status, output, error) = release(public_pin.as_str(), "old-public").await;
+        assert!(status.success(), "{error}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap()["already_released"],
+            already
+        );
+    }
+}
+
 /// A key or pin from one database cannot replay, admit, list or release in another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_identity_fences_batch_and_pin_across_distinct_homes() {
@@ -635,12 +998,6 @@ async fn store_identity_fences_batch_and_pin_across_distinct_homes() {
         .await
         .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "StoreIdentityMismatch");
-    let mismatch = mcp_call(&b.home, "batch_receipt", &request_a).await;
-    assert_eq!(mismatch["result"]["isError"], true);
-    assert_eq!(
-        mismatch["result"]["structuredContent"]["code"],
-        "StoreIdentityMismatch"
-    );
     let spec = b.home.join("foreign-batch.json");
     std::fs::write(&spec, request_a.to_string()).unwrap();
     let (status, _, error) = cli(
@@ -667,24 +1024,24 @@ async fn store_identity_fences_batch_and_pin_across_distinct_homes() {
     assert_eq!(error.machine_code().as_str(), "StoreIdentityMismatch");
     let error = client_b
         .call(
-            "history_pins",
-            Some(json!({"action":"release","pin_id":pin_a,"expected_store_id":store_a})),
+            "history_pins_release",
+            Some(json!({"pin_id":pin_a,"release_token":receipt_a["release_token"],"expected_store_id":store_a})),
         )
         .await
         .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "StoreIdentityMismatch");
     let error = client_b
         .call(
-            "history_pins",
-            Some(json!({"action":"list","expected_store_id":store_a})),
+            "history_pins_list",
+            Some(json!({"expected_store_id":store_a})),
         )
         .await
         .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "StoreIdentityMismatch");
     let page = client_b
         .call(
-            "history_pins",
-            Some(json!({"action":"list","status":"active","expected_store_id":store_b})),
+            "history_pins_list",
+            Some(json!({"status":"active","expected_store_id":store_b})),
         )
         .await
         .unwrap();
@@ -752,16 +1109,12 @@ async fn batch_preconditions_cross_all_public_transports() {
         .await
         .unwrap();
     assert_eq!(lookup["receipt"], admitted["receipt"]);
-    assert_eq!(
-        mcp_call(&broker.home, "batch_receipt", &dependent).await["result"]["structuredContent"],
-        lookup
-    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while !quiescent(&broker.home) {
         assert!(Instant::now() < deadline, "dependent fixture did not stop");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    socket.call("history_pins", Some(json!({"action":"release","pin_id":condition["pin_id"],"expected_store_id":store_id}))).await.unwrap();
+    socket.call("history_pins_release", Some(json!({"pin_id":condition["pin_id"],"release_token":seed_result["release_token"],"expected_store_id":store_id}))).await.unwrap();
     let replay = socket
         .call("start_batch", Some(dependent.clone()))
         .await
@@ -836,7 +1189,7 @@ async fn batch_preconditions_cross_all_public_transports() {
     assert_eq!(count, 2, "refused requests created a receipt");
 }
 
-/// Real socket/MCP export preserves a pinned fake-engine transcript, reconstructs
+/// Real socket export (refused by orchestrator MCP) preserves a pinned fake-engine transcript, reconstructs
 /// escaped UTF-8 chunks, and refuses wrong stores and released pins without data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transcript_exact_crosses_live_socket_and_mcp_with_pin_fences() {
@@ -902,9 +1255,9 @@ async fn transcript_exact_crosses_live_socket_and_mcp_with_pin_fences() {
             .call("transcript_exact", Some(params.clone()))
             .await
             .unwrap();
-        let mcp = mcp_call(&broker.home, "transcript_exact", &params).await;
-        assert_ne!(mcp["result"]["isError"], true, "{mcp}");
-        assert_eq!(mcp["result"]["structuredContent"], value);
+        if chunks == 0 {
+            assert_mcp_refuses(&broker.home, "transcript_exact", &params).await;
+        }
         assert_eq!(value["store_id"], store_id);
         assert_eq!(value["selector"], selector);
         let page: TranscriptExactResponse = serde_json::from_value(value).unwrap();
@@ -970,32 +1323,14 @@ async fn transcript_exact_crosses_live_socket_and_mcp_with_pin_fences() {
         .await
         .unwrap_err();
     assert_eq!(wrong.machine_code().as_str(), "StoreIdentityMismatch");
-    let mcp_wrong = mcp_call(&broker.home, "transcript_exact", &wrong_store).await;
-    assert_eq!(mcp_wrong["result"]["isError"], true);
-    assert!(mcp_wrong["result"]["structuredContent"].is_null());
-    assert!(
-        mcp_wrong["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("StoreIdentityMismatch")
-    );
 
-    socket.call("history_pins", Some(json!({"action":"release","expected_store_id":store_id,"pin_id":selector["pin_id"]}))).await.unwrap();
+    socket.call("history_pins_release", Some(json!({"expected_store_id":store_id,"release_token":admitted["release_token"],"pin_id":selector["pin_id"]}))).await.unwrap();
     let continuation = serde_json::to_value(request).unwrap();
     let released = socket
         .call("transcript_exact", Some(continuation.clone()))
         .await
         .unwrap_err();
     assert_eq!(released.machine_code().as_str(), "TranscriptExportAborted");
-    let mcp_released = mcp_call(&broker.home, "transcript_exact", &continuation).await;
-    assert_eq!(mcp_released["result"]["isError"], true);
-    assert!(mcp_released["result"]["structuredContent"].is_null());
-    assert!(
-        mcp_released["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("TranscriptExportAborted")
-    );
 }
 
 /// A real broker admits, recovers and releases a hold without persisting its proof.
@@ -1114,8 +1449,8 @@ async fn lineage_hold_socket_keeps_proof_private_and_replays_safely() {
     assert!(
         socket
             .call(
-                "history_pins",
-                Some(json!({"action":"release",
+                "history_pins_release",
+                Some(json!({"release_token":admitted["release_token"],
         "expected_store_id":store_id,"pin_id":job["pin_id"]}))
             )
             .await
@@ -1176,8 +1511,8 @@ async fn lineage_hold_socket_keeps_proof_private_and_replays_safely() {
     );
     socket
         .call(
-            "history_pins",
-            Some(json!({"action":"release",
+            "history_pins_release",
+            Some(json!({"release_token":admitted["release_token"],
         "expected_store_id":store_id,"pin_id":job["pin_id"]})),
         )
         .await
@@ -1205,7 +1540,8 @@ async fn lineage_hold_socket_keeps_proof_private_and_replays_safely() {
     }
 }
 
-/// Exact initial task pages agree across live socket, CLI and MCP, and fail closed.
+/// Exact initial task pages agree across live socket and CLI, fail closed, and
+/// are refused by orchestrator MCP.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
     use agent_run_domain::initial_task::{
@@ -1239,16 +1575,12 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
         default.get("initial_task").is_none(),
         "support flag is opt-in"
     );
-    let mcp_caps = mcp_call(
+    assert_mcp_refuses(
         &broker.home,
         "capabilities",
         &json!({"include_initial_task":true}),
     )
     .await;
-    assert_eq!(
-        mcp_caps["result"]["structuredContent"]["initial_task"],
-        capabilities["initial_task"]
-    );
     let (status, output, error) =
         cli(&broker.home, &["capabilities", "--include-initial-task"]).await;
     assert!(status.success(), "capabilities CLI: {error}");
@@ -1296,13 +1628,13 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
                 .call("initial_task", Some(params.clone()))
                 .await
                 .unwrap();
-            let mcp = mcp_call(&broker.home, "initial_task", &params).await;
-            assert_ne!(mcp["result"]["isError"], true, "{mcp}");
-            assert_eq!(mcp["result"]["structuredContent"], value);
-            let response: InitialTaskResponse = serde_json::from_value(value).unwrap();
+            if pages == 0 {
+                assert_mcp_refuses(&broker.home, "initial_task", &params).await;
+            }
+            let response: InitialTaskResponse = serde_json::from_value(value.clone()).unwrap();
             response.validate_for(&request).unwrap();
             let InitialTaskResponse::Available(page): InitialTaskResponse = response else {
-                panic!("initial task unavailable: {mcp}");
+                panic!("initial task unavailable: {value}");
             };
             let InitialTaskPage {
                 text,
@@ -1354,9 +1686,6 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
         .await
         .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "StoreIdentityMismatch");
-    let mcp_wrong = mcp_call(&broker.home, "initial_task", &wrong).await;
-    assert_eq!(mcp_wrong["result"]["isError"], true);
-    assert!(mcp_wrong["result"]["structuredContent"].is_null());
     let mut bad_ref = current.clone();
     bad_ref["execution_ref"] = json!(format!("ex1_{}", "0".repeat(64)));
     let refused = socket
@@ -1366,10 +1695,6 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
     assert_eq!(refused["state"], "unavailable");
     assert_eq!(refused["reason"], "execution_ref_mismatch");
     assert!(refused.get("text").is_none());
-    assert_eq!(
-        mcp_call(&broker.home, "initial_task", &bad_ref).await["result"]["structuredContent"],
-        refused
-    );
     let mut bad_sha = current.clone();
     bad_sha["offset"] = json!(4);
     bad_sha["expected_sha256"] = json!("0".repeat(64));
@@ -1380,9 +1705,9 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
     // Releasing the pin withholds the strict text; current mode makes no pin claim.
     socket
         .call(
-            "history_pins",
+            "history_pins_release",
             Some(
-                json!({"action":"release","expected_store_id":store_id,"pin_id":receipt["pin_id"]}),
+                json!({"release_token":admitted["release_token"],"expected_store_id":store_id,"pin_id":receipt["pin_id"]}),
             ),
         )
         .await
@@ -1394,10 +1719,6 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
     assert_eq!(
         (released["state"].as_str(), released["reason"].as_str()),
         (Some("unavailable"), Some("pin_released"))
-    );
-    assert_eq!(
-        mcp_call(&broker.home, "initial_task", &strict).await["result"]["structuredContent"],
-        released
     );
     let still = socket.call("initial_task", Some(current)).await.unwrap();
     assert_eq!(still["state"], "available");

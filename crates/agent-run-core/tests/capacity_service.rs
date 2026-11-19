@@ -53,26 +53,31 @@ fn seed(home: &common::Home, runtime: &str, remaining: f64, route_ids: &[&str]) 
     ).unwrap();
 }
 
-/// Legacy quota facts cannot bypass the schema-2 migration requirement.
+/// Legacy quota facts reach no presentation: the quota reads are removed and
+/// the schema-1 guide still demands migration to schema 2.
 #[tokio::test]
 async fn dispatch_requires_schema_two_even_with_legacy_quota_facts() {
     let home = common::Home::new();
     config(&home);
     seed(&home, "enabled", 20.0, &["route-a", "route-b"]);
     let service = Service::new(home.path.clone());
-    for method in ["capacity_order", "limits"] {
+    for method in ["capacity_order", "limits", "models"] {
         let error = dispatch::call(&service, method, json!({}))
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, agent_run_domain::Error::Unsupported(_)),
-            "{method}: {error}"
-        );
-        assert!(
-            error.to_string().contains("schema_version 2"),
+            error.to_string().contains("unknown tool"),
             "{method}: {error}"
         );
     }
+    let error = dispatch::call(&service, "delegation_guide", json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, agent_run_domain::Error::Unsupported(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("schema_version 2"), "{error}");
 }
 
 /// Legacy runtime configuration still resolves its own explicit priority overrides.

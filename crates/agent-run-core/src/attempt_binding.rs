@@ -2011,6 +2011,67 @@ mod tests {
             1
         );
         drop(stored);
+        // Managed pins require the existing authenticated route.
+        let pin = first["jobs"][0]["pin_id"].clone();
+        for (proof, code) in [
+            (json!({"request_id":"good"}), "ValidationError"),
+            (
+                json!({"release_token":agent_run_domain::batch::PinReleaseToken::mint()}),
+                "RequestConflict",
+            ),
+        ] {
+            let mut request = proof;
+            request["pin_id"] = pin.clone();
+            let error = crate::dispatch::call(&service, "history_pins_release", request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.machine_code().as_str(), code);
+        }
+        // Another Pool request key on the same authenticated route is not the owner.
+        let release = |request_id: &str| json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"request_id":request_id,"pin_id":pin});
+        let foreign = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_pin_release_v1",
+            release("other"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::attempt_wire::dispatch_error(
+                &foreign,
+                "_managed_pin_release_v1",
+                &sid.to_string()
+            )["code"],
+            "intent_conflict"
+        );
+        for already in [false, true] {
+            let released = crate::attempt_wire::dispatch(
+                &service,
+                &grant,
+                &bridge,
+                &OutcomePool,
+                "_managed_pin_release_v1",
+                release("good"),
+            )
+            .await
+            .unwrap();
+            crate::attempt_wire::assert_reply_keys(
+                &released,
+                &[
+                    "version",
+                    "store_id",
+                    "pin_id",
+                    "status",
+                    "already_released",
+                ],
+            );
+            assert_eq!(released["pin_id"], pin);
+            assert_eq!(released["status"], "released");
+            assert_eq!(released["already_released"], already);
+        }
         std::fs::write(root.join("config.toml"), config(false, "pool_get")).unwrap();
         let replay = crate::attempt_wire::dispatch(
             &service,

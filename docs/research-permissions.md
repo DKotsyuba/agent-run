@@ -14,7 +14,7 @@ list, strict first-party MCP settings, no plugin directories, disabled slash
 commands and Chrome, and explicit refusal of Bash, Agent, Task, Skill, native
 file tools and NotebookEdit. GLM uses the same adapter; live qualification
 has not been completed. Research retains only native web
-and the first-party completion/pool-message tools plus the report writer.
+and the first-party completion/report tools plus the report writer.
 Global MCP servers and plugin execution paths are excluded.
 
 Codex research uses native hosted web and the native isolated composition host.

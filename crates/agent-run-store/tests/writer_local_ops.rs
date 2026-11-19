@@ -476,6 +476,85 @@ fn delivery_claim_and_completion_follow_the_lease() {
     );
 }
 
+/// Historical legacy Run pool notices (the common completion and the
+/// enrollment attention) are retired at claim: they end failed with
+/// `legacy_pool_retired`, are never leased or rendered, and the ordinary
+/// completion queued behind them is still delivered.
+#[test]
+fn legacy_pool_notices_are_retired_at_claim() {
+    let mut f = Fixture::new();
+    let id = f.admitted();
+    f.sql(
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('s','codex_queue','thread',1,1)",
+        [],
+    );
+    f.sql(
+        "UPDATE agents SET status='succeeded',finished_at=5,orchestrator_session_id='s' WHERE id=?",
+        [id.as_str()],
+    );
+    f.sql(
+        "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,4,'pool_completed','{\"notice\":\"done\"}')",
+        [id.as_str()],
+    );
+    f.sql(
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) \
+         VALUES('ntf_pool',?,'s',(SELECT MAX(seq) FROM events),'pending',0)",
+        [id.as_str()],
+    );
+    f.sql(
+        "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at,completed_at,completion_delivery_id) \
+         VALUES('pool-20260101-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','completed',1,1,4,'ntf_pool')",
+        [],
+    );
+    f.sql(
+        "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,4.5,'pool_join_needs_action','{\"pool_id\":\"pool-20260101-000000-0123456789\",\"notice\":\"join\"}')",
+        [id.as_str()],
+    );
+    f.sql(
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) \
+         VALUES('ntf_attention',?,'s',(SELECT MAX(seq) FROM events),'pending',0)",
+        [id.as_str()],
+    );
+    f.sql(
+        "INSERT INTO events(agent_id,at,kind,from_status,to_status,data_json) VALUES(?,5,'status','running','succeeded','{}')",
+        [id.as_str()],
+    );
+    f.sql(
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) \
+         VALUES('ntf_test',?,'s',(SELECT MAX(seq) FROM events),'pending',1)",
+        [id.as_str()],
+    );
+    let claim = |f: &mut Fixture| {
+        f.commit_remote(RemoteOp::from(ClaimDelivery {
+            owner: "owner-1".into(),
+            at: 100.0,
+            policy: policy(),
+        }))
+        .result
+    };
+    assert_eq!(claim(&mut f), serde_json::Value::Null);
+    assert_eq!(claim(&mut f), serde_json::Value::Null);
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM deliveries WHERE id IN ('ntf_pool','ntf_attention') AND state='failed' AND last_error='legacy_pool_retired' AND lease_owner IS NULL AND ambiguous_result=0"),
+        2
+    );
+    let ordinary = claim(&mut f);
+    assert_eq!(ordinary["delivery_id"], "ntf_test");
+    assert_eq!(ordinary["payload"]["kind"], "completion");
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM pools WHERE state='completed'"),
+        1,
+        "the legacy row stays readable and unchanged"
+    );
+    // No new legacy pool command can be queued.
+    assert!(
+        f.home
+            .store()
+            .enqueue(&id, "pool", &json!({"seq": 1}))
+            .is_err()
+    );
+}
+
 /// Reconciliation applies only proof-gated, ownership-exact transitions: a
 /// mismatched expectation changes nothing and the exact one marks lost;
 /// orphaned ownership is never released for a running execution, an

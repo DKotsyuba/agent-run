@@ -227,10 +227,10 @@ impl BrokerClient {
                             crate::error::invalid("invalid batch receipt"),
                         ));
                     }
-                    if method == "history_pins"
-                        && params
-                            .as_ref()
-                            .is_none_or(|params| !valid_history_pin_response(&value, params))
+                    if HISTORY_PIN_METHODS.contains(&method)
+                        && params.as_ref().is_none_or(|params| {
+                            !valid_history_pin_response(method, &value, params)
+                        })
                     {
                         *connection = None;
                         return Err(Error::Runtime(
@@ -484,15 +484,12 @@ const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_METHODS: &[&str] = &[
     "start",
     "start_batch",
-    "history_pins",
+    "history_pins_release",
     "_lineage_hold_acquire",
     "_lineage_hold_release",
     "resume",
     "cancel",
     "steer",
-    "start_pool",
-    "pool_post",
-    "pool_replace",
     "_hook_bind",
 ];
 /// Steady database maintenance interval: expiry found no work and compaction
@@ -914,6 +911,9 @@ const SERVICE_RESTART_METHODS: &[&str] = &[
     "_service_restart_claim",
 ];
 
+/// Split operator pin methods whose responses are correlated before success.
+const HISTORY_PIN_METHODS: &[&str] = &["history_pins_list", "history_pins_release"];
+
 /// Generic hold controls are operator-socket methods, never MCP model tools.
 const LINEAGE_HOLD_METHODS: &[&str] = &[
     "_lineage_hold_acquire",
@@ -1038,8 +1038,14 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
             Some(err(id, -32602, "params must be an object", None))
         };
     }
-    // Do not create an unacknowledged hold or release through a notification.
-    if notification && matches!(method, "_lineage_hold_acquire" | "_lineage_hold_release") {
+    // A retained batch needs a reply to deliver its new release credential.
+    if notification
+        && (matches!(
+            method,
+            "_lineage_hold_acquire" | "_lineage_hold_release" | "history_pins_release"
+        ) || (method == "start_batch"
+            && params.get("retain_history") == Some(&Value::Bool(true))))
+    {
         return None;
     }
     let known = dispatch::is_tool(method)
@@ -1342,9 +1348,8 @@ fn valid_start_frame(raw: &[u8], method: &str) -> bool {
                 .map(|frame| frame.params)
                 .is_ok()
         }
-        "start_pool" => {
-            serde_json::from_slice::<Frame<agent_run_domain::pool::PoolStartRequest>>(raw)
-                .map(|frame| frame.params)
+        "history_pins_release" => {
+            serde_json::from_slice::<Frame<agent_run_domain::batch::HistoryPinReleaseRequest>>(raw)
                 .is_ok()
         }
         "transcript_exact" => serde_json::from_slice::<
@@ -2941,7 +2946,7 @@ pub(crate) fn valid_batch_response(value: &Value, params: &Value) -> bool {
     else {
         return false;
     };
-    result.validate_for_request(&request).is_ok()
+    result.validate_admission_response(&request).is_ok()
 }
 
 /// Validates a read-only receipt lookup against its exact scoped batch intent.
@@ -2959,26 +2964,34 @@ pub(crate) fn valid_batch_receipt_response(value: &Value, params: &Value) -> boo
     output.validate_for(&request).is_ok()
 }
 
-/// Verifies a pin response against the operator request before reporting success.
-pub(crate) fn valid_history_pin_response(value: &Value, params: &Value) -> bool {
+/// Verifies a pin response against the operator request before reporting
+/// success. `method` selects `history_pins_list` or `history_pins_release`;
+/// any other method (including the removed `history_pins`) is never valid.
+pub(crate) fn valid_history_pin_response(method: &str, value: &Value, params: &Value) -> bool {
     use agent_run_domain::batch::{
-        HistoryPinFilter, HistoryPinRelease, HistoryPinState, HistoryPinsPage, HistoryPinsRequest,
+        HistoryPinFilter, HistoryPinRelease, HistoryPinReleaseRequest, HistoryPinState,
+        HistoryPinsListRequest, HistoryPinsPage,
     };
-    let Ok(request) = serde_json::from_value::<HistoryPinsRequest>(params.clone()) else {
-        return false;
-    };
-    match request {
-        HistoryPinsRequest::Release { pin_id, .. } => {
+    match method {
+        "history_pins_release" => {
+            let Ok(request) = serde_json::from_value::<HistoryPinReleaseRequest>(params.clone())
+            else {
+                return false;
+            };
             serde_json::from_value::<HistoryPinRelease>(value.clone()).is_ok_and(|response| {
-                response.pin_id == pin_id && response.status == HistoryPinState::Released
+                response.pin_id == request.pin_id && response.status == HistoryPinState::Released
             })
         }
-        HistoryPinsRequest::List {
-            status,
-            limit,
-            after_pin_id,
-            ..
-        } => {
+        "history_pins_list" => {
+            let Ok(HistoryPinsListRequest {
+                status,
+                limit,
+                after_pin_id,
+                ..
+            }) = serde_json::from_value::<HistoryPinsListRequest>(params.clone())
+            else {
+                return false;
+            };
             let Ok(page) = serde_json::from_value::<HistoryPinsPage>(value.clone()) else {
                 return false;
             };
@@ -3000,6 +3013,7 @@ pub(crate) fn valid_history_pin_response(value: &Value, params: &Value) -> bool 
                 page.pins.len() == limit && page.pins.last().is_some_and(|pin| &pin.pin_id == next)
             })
         }
+        _ => false,
     }
 }
 
@@ -3147,7 +3161,9 @@ async fn client_with_wait_deadlines(
                 crate::error::invalid("invalid batch receipt"),
             ));
         }
-        if method == "history_pins" && !valid_history_pin_response(&result, &params) {
+        if HISTORY_PIN_METHODS.contains(&method)
+            && !valid_history_pin_response(method, &result, &params)
+        {
             return Err(Error::Runtime(
                 "history pin result is invalid; reconcile release by pin_id".into(),
             ));
@@ -3163,26 +3179,42 @@ mod tests {
     fn history_pin_responses_are_correlated_and_bounded() {
         let first = "pin_550e8400e29b41d4a716446655440000";
         let next = "pin_550e8400e29b41d4a716446655440001";
-        let request = json!({"action":"release","pin_id":first});
+        let release = "history_pins_release";
+        let request = json!({"pin_id":first,"release_token":"a".repeat(64)});
         let mut result = json!({"pin_id":first,"status":"released","already_released":false});
-        assert!(valid_history_pin_response(&result, &request));
+        assert!(valid_history_pin_response(release, &result, &request));
+        // The removed combined method and the old action shape never validate.
+        assert!(!valid_history_pin_response(
+            "history_pins",
+            &result,
+            &request
+        ));
+        let old = json!({"action":"release","pin_id":first});
+        assert!(!valid_history_pin_response(release, &result, &old));
+        // A release without the ownership proof is not a valid request.
+        assert!(!valid_history_pin_response(
+            release,
+            &result,
+            &json!({"pin_id":first})
+        ));
         result["status"] = json!("active");
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(release, &result, &request));
         result["status"] = json!("released");
         result["pin_id"] = json!(next);
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(release, &result, &request));
 
-        let request = json!({"action":"list","status":"active","limit":1});
+        let list = "history_pins_list";
+        let request = json!({"status":"active","limit":1});
         let mut result = json!({"pins":[{"pin_id":first,"agent_id":"ag-20260826-120000-0123456789","status":"active"}],"next_after_pin_id":first});
-        assert!(valid_history_pin_response(&result, &request));
+        assert!(valid_history_pin_response(list, &result, &request));
         result["next_after_pin_id"] = json!(next);
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(list, &result, &request));
         result["next_after_pin_id"] = json!(null);
         result["pins"][0]["status"] = json!("released");
-        assert!(!valid_history_pin_response(&result, &request));
+        assert!(!valid_history_pin_response(list, &result, &request));
     }
 
-    /// A batch receipt must provide exactly the requested set of pin IDs.
+    /// A new retained batch needs a token that verifies every exact pin.
     #[test]
     fn batch_pin_receipt_matches_requested_retention() {
         let job = json!({"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"});
@@ -3194,13 +3226,34 @@ mod tests {
         assert!(valid_batch_response(&result, &request));
         request["retain_history"] = json!(true);
         assert!(!valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][0]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440000");
+        use agent_run_domain::batch::{PinId, PinReleaseToken};
+        let token = PinReleaseToken::mint();
+        let pins: Vec<_> = result["receipt"]["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| {
+                let root = serde_json::from_value(job["agent_id"].clone()).unwrap();
+                PinId::from_release_digest(&token.digest(), &root)
+            })
+            .collect();
+        result["release_token"] = json!(token);
+        result["receipt"]["jobs"][0]["pin_id"] = json!(pins[0]);
         assert!(!valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][1]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440001");
+        result["receipt"]["jobs"][1]["pin_id"] = json!(pins[1]);
         assert!(valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][1]["pin_id"] = result["receipt"]["jobs"][0]["pin_id"].clone();
+        result["receipt"]["jobs"][1]["pin_id"] = json!(pins[0]);
         assert!(!valid_batch_response(&result, &request));
-        result["receipt"]["jobs"][1]["pin_id"] = json!("pin_550e8400e29b41d4a716446655440001");
+        result["receipt"]["jobs"][1]["pin_id"] = json!(pins[1]);
+        result["release_token"] = json!(PinReleaseToken::mint());
+        assert!(!valid_batch_response(&result, &request));
+        result.as_object_mut().unwrap().remove("release_token");
+        assert!(!valid_batch_response(&result, &request));
+        result["replayed"] = json!(true);
+        assert!(valid_batch_response(&result, &request));
+        result["release_token"] = json!(token);
+        assert!(!valid_batch_response(&result, &request));
+        result.as_object_mut().unwrap().remove("release_token");
         request["expected_store_id"] = json!("store_0123456789abcdef0123456789abcdef");
         assert!(valid_batch_response(&result, &request));
         result["receipt"]["store_id"] = json!("store_ffffffffffffffffffffffffffffffff");
@@ -3683,16 +3736,20 @@ mod tests {
             .unwrap();
     }
 
-    /// Pool discovery consumes only the read lane and no control reservation.
+    /// Discovery consumes only the read lane and no control reservation; the
+    /// removed legacy pool methods are no longer control methods.
     #[test]
-    fn list_pools_uses_the_read_lane() {
+    fn discovery_uses_the_read_lane() {
         let lanes = Lanes::new(0);
-        let read = lanes.try_acquire("list_pools").unwrap();
-        assert!(lanes.try_acquire("list_agents").is_none());
-        assert!(lanes.try_acquire("start_pool").is_some());
+        let read = lanes.try_acquire("list_agents").unwrap();
+        assert!(lanes.try_acquire("transcript").is_none());
+        assert!(lanes.try_acquire("start").is_some());
         assert!(lanes.try_acquire("start_batch").is_some());
         drop(read);
-        assert!(lanes.try_acquire("list_pools").is_some());
+        assert!(lanes.try_acquire("list_agents").is_some());
+        for removed in ["start_pool", "pool_post", "pool_replace"] {
+            assert!(!CONTROL_METHODS.contains(&removed));
+        }
     }
 
     /// A cancelled batch wait cannot release control capacity while work is running.

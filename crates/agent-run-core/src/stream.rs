@@ -222,7 +222,7 @@ struct ResultInputs {
     sent: std::collections::BTreeSet<String>,
     /// Native notification UUIDs observed on the owned session; never task authority.
     native_context: std::collections::BTreeSet<String>,
-    /// Most recent initial task or written steering input; pool notes do not replace it.
+    /// Most recent initial task or written steering input; injected native notes do not replace it.
     task: Option<String>,
     /// Native replay acknowledgements since the preceding terminal frame, in order.
     replayed: Vec<String>,
@@ -488,10 +488,6 @@ fn native_init_inventory(frame: &Value) -> Value {
         "TodoWrite",
         "AskUserQuestion",
         "mcp__agent_run_worker__notify_orchestrator",
-        "mcp__agent_run_worker__pool_post",
-        "mcp__agent_run_worker__pool_read",
-        "mcp__agent_run_worker__pool_propose",
-        "mcp__agent_run_worker__pool_vote",
         "mcp__agent_run_worker__save_report",
         "mcp__agent_run_worker__finish",
     ];
@@ -613,7 +609,7 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// The function journals recognized events, services bounded control commands, and
 /// returns malformed stream data or persistence failures as domain errors.
 /// Native input UUIDs and replay batches correlate results to the latest task or
-/// steering input; pool-only results cannot complete it. Every result is observed
+/// steering input; note-only results cannot complete it. Every result is observed
 /// and validated, errors stay fatal, and uncorrelated multiple results fail closed.
 /// A single legacy result remains compatible. Success requires a nonblank native
 /// answer, EOF, exit zero, and no uncertain input write.
@@ -1253,47 +1249,6 @@ async fn run_inner(
                                 cid,
                                 &json!({"accepted":false,"reason":"empty_steer_text"}),
                             ))
-                            .await?;
-                    }
-                } else if command == "pool" {
-                    // Same stdin path and deadline as steer. A successful
-                    // write is `written` only — never engine acceptance or
-                    // consumption — and any error may follow a partial write,
-                    // so it is `unknown`, not "not delivered". The durable log
-                    // keeps the entry either way.
-                    let mut written = false;
-                    let result = match commands::pool_push_text(store, &record.id, &payload) {
-                        Ok(text) => {
-                            let id = uuid::Uuid::new_v4().to_string();
-                            let open = process.input.is_some();
-                            if send_user_text(process, &text, &id, deadline).await {
-                                native_idle = false;
-                                inputs.sent(id, false);
-                                written = true;
-                                commands::pool_result("written", "stdin_write")
-                            } else {
-                                inputs.uncertain_write |= open;
-                                commands::pool_result("unknown", "stdin_write_failed")
-                            }
-                        }
-                        Err(refusal) => refusal,
-                    };
-                    if written {
-                        // Observed stdin write: result and worker turn are one atomic
-                        // operation (transport evidence only, not consumption).
-                        process
-                            .observing(store.observed_command_result(
-                                &record.id,
-                                cid,
-                                &result,
-                                "stdin_written",
-                                Some(false),
-                                Vec::new(),
-                            ))
-                            .await?;
-                    } else {
-                        process
-                            .observing(store.complete_command(&record.id, cid, &result))
                             .await?;
                     }
                 } else {
@@ -1995,7 +1950,7 @@ fn runtime_result_usage(result: &Value) -> Value {
 }
 
 /// Writes one user text message with the caller's fresh correlation `id` before
-/// `deadline`; shared by operator steering and pool delivery. The ID is native
+/// `deadline`; shared by operator steering and native owner input. The ID is native
 /// framing only, not a public agent identity or a delivery/consumption proof.
 /// `false` after a possible partial write is not proof that nothing was sent.
 async fn send_user_text(
@@ -2391,6 +2346,11 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             host_id: "host".into(),
             role_digest: "a".repeat(64),
             inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+            bridge_hook: agent_run_config::config::Hook {
+                event: "PreToolUse".into(),
+                command: vec!["/fixture/bridge-hook".into()],
+                matcher: Some("mcp__pool__.*".into()),
+            },
             codex: None,
         };
         let mut args =
@@ -2480,6 +2440,11 @@ if line:
                 host_id: "host".into(),
                 role_digest: "b".repeat(64),
                 inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
+                bridge_hook: agent_run_config::config::Hook {
+                    event: "PreToolUse".into(),
+                    command: vec!["/fixture/bridge-hook".into()],
+                    matcher: Some("mcp__pool__.*".into()),
+                },
                 codex: None,
             };
             // As discovered from a real Pool: the deny complement is not empty.

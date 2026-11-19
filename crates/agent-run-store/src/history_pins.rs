@@ -1,4 +1,8 @@
 //! Permanent pin keys and bounded operator observation for retained lineages.
+//!
+//! Public pins carry a one-way credential verifier in the pin ID. Managed
+//! pins use the durable enrollment record bound to the authenticated Pool route.
+//! All releases observe the same active lineage hold fence.
 
 use crate::Store;
 use agent_run_domain::{
@@ -6,9 +10,24 @@ use agent_run_domain::{
     batch::{
         HistoryPin, HistoryPinFilter, HistoryPinRelease, HistoryPinState, HistoryPinsPage, PinId,
     },
+    domain::AgentId,
     error::invalid,
 };
 use rusqlite::{OptionalExtension, params};
+
+/// Release proof reduced by the broker before it reaches the writer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum ReleaseAuthority {
+    /// Digest of the public bearer credential, never the credential itself.
+    Credential([u8; 32]),
+    /// Durable enrollment named on its authenticated Pool route.
+    ManagedEnrollment {
+        /// Route identity verified by the private attempt channel.
+        route: agent_run_domain::attempt_binding::Route,
+        /// The original Pool enrollment key.
+        request_id: String,
+    },
+}
 
 impl Store<'_> {
     /// Lists matching pins in exclusive key order without joining retained history.
@@ -89,32 +108,98 @@ impl Store<'_> {
         })
     }
 
-    /// Releases a known pin once; its permanent tombstone is never reactivated.
+    /// Releases a known pin without any proof in test fixtures.
+    #[cfg(feature = "test-fixtures")]
     pub fn release_history_pin(&mut self, pin_id: &PinId) -> Result<Option<HistoryPinRelease>> {
-        self.release_history_pin_scoped(pin_id, None)
+        self.release_history_pin_checked(pin_id, None, |_, _| Ok(true), false)
     }
 
-    /// Checks database scope and conflicts while any active hold protects the exact pin.
+    /// Authenticates the broker's proof in the same transaction as release.
+    /// Public callers get the same conflict for an absent pin or invalid proof.
     pub fn release_history_pin_scoped(
         &mut self,
         pin_id: &PinId,
         expected: Option<&StoreId>,
+        authority: &ReleaseAuthority,
+    ) -> Result<Option<HistoryPinRelease>> {
+        self.release_history_pin_checked(
+            pin_id,
+            expected,
+            |tx, root| match authority {
+                ReleaseAuthority::Credential(digest) => {
+                    let root: AgentId = root
+                        .parse()
+                        .map_err(|_| Error::Integrity("invalid stored pin root".into()))?;
+                    // The compared value is public. It grants no authority as input.
+                    Ok(PinId::from_release_digest(digest, &root) == *pin_id)
+                }
+                ReleaseAuthority::ManagedEnrollment { route, request_id } => {
+                    let route_json = serde_json::to_string(route)?;
+                    Ok(tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM managed_enrollment_members m \
+                         JOIN managed_enrollments e USING(pool_route_json,pool_store_id,request_id), \
+                         json_each(e.receipt_json,'$.jobs') j \
+                         WHERE m.lineage_root_id=?1 AND m.pool_route_json=?2 AND m.pool_store_id=?3 \
+                         AND m.request_id=?4 AND e.state='admitted' AND j.key=m.member_index \
+                         AND json_extract(j.value,'$.pin_id')=?5)",
+                        params![root, route_json, route.component_store_id, request_id, pin_id.as_str()],
+                        |row| row.get(0),
+                    )?)
+                }
+            },
+            matches!(authority, ReleaseAuthority::Credential(_)),
+        )
+    }
+
+    /// Releases a public batch pin under exclusive offline owner authority.
+    /// The exact receipt prevents a mistaken pin/key pairing or managed release.
+    pub(crate) fn release_history_pin_offline(
+        &mut self,
+        pin_id: &PinId,
+        expected: &StoreId,
+        request_id: &str,
+    ) -> Result<Option<HistoryPinRelease>> {
+        agent_run_domain::domain::external_id("request_id", request_id)?;
+        if agent_run_domain::batch::is_reserved_internal_key(request_id) {
+            return Err(invalid("request_id uses a reserved internal prefix"));
+        }
+        self.release_history_pin_checked(
+            pin_id,
+            Some(expected),
+            |tx, root| offline_receipt_contains_pin(tx, request_id, pin_id, root),
+            false,
+        )
+    }
+
+    /// Verifies authorization even for tombstones and applies the hold fence.
+    fn release_history_pin_checked(
+        &mut self,
+        pin_id: &PinId,
+        expected: Option<&StoreId>,
+        authorize: impl FnOnce(&rusqlite::Connection, &str) -> Result<bool>,
+        conceal_absence: bool,
     ) -> Result<Option<HistoryPinRelease>> {
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if expected.is_some() {
             crate::store_identity::require(&tx, expected)?;
         }
-        let state: Option<i64> = tx
+        let row: Option<(i64, String)> = tx
             .query_row(
-                "SELECT released FROM history_pins WHERE pin_id=?",
+                "SELECT released,root_agent_id FROM history_pins WHERE pin_id=?",
                 [pin_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(state) = state else {
+        let Some((state, root)) = row else {
+            if conceal_absence {
+                return Err(Error::Conflict);
+            }
             tx.commit()?;
             return Ok(None);
         };
+        if !authorize(&tx, &root)? {
+            return Err(Error::Conflict);
+        }
         let already_released = match state {
             0 => false,
             1 => true,
@@ -137,4 +222,20 @@ impl Store<'_> {
             already_released,
         }))
     }
+}
+
+/// Checks whether the permanent receipt minted this exact pin in this snapshot.
+fn offline_receipt_contains_pin(
+    conn: &rusqlite::Connection,
+    key: &str,
+    pin_id: &PinId,
+    root: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM start_batch_receipts r, json_each(r.receipt_json,'$.jobs') j \
+         WHERE r.request_id=?1 AND json_extract(j.value,'$.pin_id')=?2 \
+         AND NOT EXISTS(SELECT 1 FROM managed_enrollment_members WHERE lineage_root_id=?3))",
+        params![key, pin_id.as_str(), root],
+        |row| row.get(0),
+    )?)
 }

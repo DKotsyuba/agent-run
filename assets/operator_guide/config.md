@@ -71,8 +71,8 @@ for native harness limits. Harnesses
 own native settings, hooks, plugins and workspace roots. Provider models carry
 explicit native aliases, effort settings, recommendations and restrictions.
 
-`harnesses.codex.fast_mode = true` forces Fast for every Codex provider/model
-and pool member, without a per-call flag. Default false keeps explicit `fast`.
+`harnesses.codex.fast_mode = true` forces Fast for every Codex provider/model,
+without a per-call flag. Default false keeps explicit `fast`.
 Resume reads the current flag; retries keep the admitted effective mode. Running
 processes do not change. Other harnesses reject true; reasoning effort is separate.
 Fast uses subscription limits/credits at higher rates.
@@ -95,7 +95,8 @@ The broker checks configuration every 60 seconds and at request boundaries.
 Invalid revisions retain the last valid configuration. Existing runs keep their
 frozen settings; new runs receive the validated revision. Agent Quota owns quota
 collection; see its operator documentation to configure collection. Use
-`agent-run limits` to inspect available quota and its completeness marker.
+Agent Quota (for example `agent-quota limits`) to inspect available quota and
+its completeness marker; Run no longer presents quota.
 The old `agent-run capacity collect` and `capacity launchd` commands are no
 longer available. Existing scheduled jobs are not changed automatically;
 moving a macOS launchd job requires a separate migration.

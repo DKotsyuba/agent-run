@@ -8,7 +8,6 @@ members = [
     "crates/agent-run-adapters",
     "crates/agent-run-core",
     "crates/agent-run",
-    "crates/agent-run-tui",
     "xtask",
 ]
 exclude = ["vendor/tokio-rusqlite"]
@@ -32,7 +31,6 @@ ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std
 fs2 = "0.4"
 libc = "0.2"
 minijinja = { version = "=2.24.0", default-features = false, features = ["serde", "fuel"] }
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 regex = "1.11"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "=0.41.1", features = ["bundled", "backup", "functions", "hooks", "fallible_uint"] }

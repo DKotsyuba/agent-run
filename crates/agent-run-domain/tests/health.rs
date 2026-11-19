@@ -81,11 +81,11 @@ fn health_reply_is_closed_and_bounded() {
     assert!(serde_json::from_value::<PingReply>(input).is_err());
 }
 
-/// v3 introduced the private reply and v4 declares polling-guard effects.
-/// Pin actual previous compiled ordinary/research fingerprints rather than
-/// deriving history from a newer catalog whose annotations have changed.
+/// The legacy Run pool tools were removed from every worker catalog. The
+/// historical pool-capable v2/v3 fingerprints are no longer recognized, while
+/// the current explicit catalogs keep exactly one `health_reply`.
 #[test]
-fn health_catalog_preserves_legacy_and_research_grants() {
+fn health_catalog_excludes_retired_pool_catalogs() {
     use agent_run_domain::worker::*;
     assert!(
         !agent_run_domain::tools::worker_tools_json()
@@ -112,19 +112,16 @@ fn health_catalog_preserves_legacy_and_research_grants() {
                 .count(),
             1
         );
-        let old: Vec<_> = current
-            .into_iter()
-            .filter(|t| t["name"] != "health_reply")
-            .collect();
-        let digest = agent_run_domain::canonical::sha256_hex(&json!(old), true);
         assert!(
-            !known_pool_catalog(2, &digest),
-            "new effect hints are not an old v2 catalog"
+            current
+                .iter()
+                .all(|t| !t["name"].as_str().unwrap().starts_with("pool_"))
         );
-        assert!(known_pool_catalog(2, old2));
-        assert!(!known_pool_catalog(3, old2));
-        assert!(known_pool_catalog(3, old3));
-        assert!(known_pool_catalog(
+        for version in [2, 3, FINISH_CATALOG_VERSION] {
+            assert!(!known_worker_catalog(version, old2));
+            assert!(!known_worker_catalog(version, old3));
+        }
+        assert!(known_worker_catalog(
             FINISH_CATALOG_VERSION,
             &finish_catalog_digest(research)
         ));

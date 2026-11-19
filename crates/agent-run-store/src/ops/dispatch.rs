@@ -73,14 +73,12 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::RegisterAccount
             | K::DisableAccount
             | K::CancelDelivery
-            | K::BindPool
             | K::BootstrapServiceProcess
             | K::ClaimServiceProcessIdentity
             | K::RegisterWorkerCatalog
             | K::AcceptWorkerFinish
             | K::HealthTick
             | K::AcceptHealthReply
-            | K::ReportPoolReadLoop
             | K::NotifyOrchestrator
             | K::RecordSupervisorLaunch
             | K::RecordStartupOwner
@@ -104,13 +102,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::AcquireLineageHold
             | K::ReleaseLineageHold
             | K::AdmitProviderResume
-            | K::AdmitPool
-            | K::ReplacePoolMember
-            | K::ReconcilePoolEnrollments
             | K::PersistRecoveryObservation
-            | K::PoolWrite
-            | K::PoolOperatorPost
-            | K::SettlePool
             | K::ExpireUnboundDeliveries
             | K::PruneIncidentLedger
             | K::PruneReceipts
@@ -204,8 +196,7 @@ pub(crate) fn remote_facts(op: &RemoteOp) -> Facts {
         R::BindOrchestrator(op) => exec(&op.execution),
         R::BootstrapServiceProcess(op) => (None, None, Some(op.generation.clone())),
         R::ClaimServiceProcessIdentity(op) => (None, None, Some(op.generation.clone())),
-        R::BindPool(_)
-        | R::CancelDelivery(_)
+        R::CancelDelivery(_)
         | R::PersistCapacitySamples(_)
         | R::RecordQuotaSnapshot(_)
         | R::RegisterAccount(_)
@@ -278,10 +269,8 @@ pub(crate) fn local_facts(op: &LocalOp) -> Facts {
         ),
         L::AcceptWorkerFinish(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::AcceptHealthReply(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
-        L::ReportPoolReadLoop(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::HealthTick(op) => (Some(op.execution.clone()), None, None),
         L::NotifyOrchestrator(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
-        L::PoolWrite(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::ReconcileReapedAgent(op) => exec(&op.execution),
         L::ReleaseOrphanedAttempt(op) => {
             (Some(op.execution.clone()), Some(op.attempt.clone()), None)
@@ -495,7 +484,6 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::CompleteDelivery(op) => out(store.complete_delivery_attempt(&op.completion)?),
         R::PrepareBridgeDelivery(op) => out(store.prepare_bridge_delivery(&op)?),
         R::CancelDelivery(op) => out(store.cancel_delivery(&op.delivery_id)?),
-        R::BindPool(op) => out(store.bind_pool(&op.pool_id, &op.reference, op.at)?),
         R::BootstrapServiceProcess(op) => {
             out(store.remember_processes("service", &op.generation, &op.snapshot)?)
         }
@@ -614,13 +602,6 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             &op.input,
             op.at,
         )?),
-        L::ReportPoolReadLoop(op) => out(store.report_pool_read_loop(
-            &op.execution,
-            &op.attempt,
-            &op.token,
-            op.revision,
-            op.at,
-        )?),
         L::NotifyOrchestrator(op) => out(store.notify_orchestrator(
             &op.execution,
             &op.attempt,
@@ -669,15 +650,18 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                     inputs: inputs(&job.inputs),
                 })
                 .collect();
-            out(store.admit_batch(crate::batch_admission::BatchAdmission {
-                request_id: &op.request_id,
-                fingerprint: &op.fingerprint,
-                retain_history: op.retain_history,
-                expected_store_id: op.expected_store_id.as_ref(),
-                preconditions: op.preconditions.as_deref(),
-                catalog: &op.catalog,
-                jobs,
-            })?)
+            out(store.admit_batch_with_pin_digest(
+                crate::batch_admission::BatchAdmission {
+                    request_id: &op.request_id,
+                    fingerprint: &op.fingerprint,
+                    retain_history: op.retain_history,
+                    expected_store_id: op.expected_store_id.as_ref(),
+                    preconditions: op.preconditions.as_deref(),
+                    catalog: &op.catalog,
+                    jobs,
+                },
+                op.pin_digest.as_ref(),
+            )?)
         }
         L::PrepareManagedEnrollment(op) => {
             out(store.managed_enrollment_prepare(&op.key, &op.grant, &op.request)?)
@@ -711,9 +695,11 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 },
             )?)
         }
-        L::ReleaseHistoryPin(op) => {
-            out(store.release_history_pin_scoped(&op.pin_id, op.expected_store_id.as_ref())?)
-        }
+        L::ReleaseHistoryPin(op) => out(store.release_history_pin_scoped(
+            &op.pin_id,
+            op.expected_store_id.as_ref(),
+            &op.authority,
+        )?),
         L::AcquireLineageHold(op) => out(store.acquire_lineage_hold(&op.acquire)?),
         L::ReleaseLineageHold(op) => {
             out(store.release_lineage_hold(&op.hold_id, &op.expected_store_id, op.signature())?)
@@ -806,87 +792,6 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 },
             )?)
         }
-        L::AdmitPool(op) => {
-            let members = op
-                .members
-                .iter()
-                .map(|member| crate::pool_admission::PoolMemberAdmission {
-                    id: member.id.clone(),
-                    slot: member.slot,
-                    name: member.name.clone(),
-                    role: member.role.clone(),
-                    personal_task: member.personal_task.clone(),
-                    source: match &member.source {
-                        PoolMemberSource::New(spec) => {
-                            crate::pool_admission::PoolAdmissionSource::New(inputs(spec))
-                        }
-                        PoolMemberSource::Existing(existing) => {
-                            crate::pool_admission::PoolAdmissionSource::Existing(
-                                (**existing).clone(),
-                            )
-                        }
-                    },
-                })
-                .collect();
-            out(store.admit_pool(crate::pool_admission::PoolAdmissionInput {
-                pool_id: &op.pool_id,
-                request_namespace: &op.request_namespace,
-                request_id: &op.request_id,
-                request_sha256: &op.request_sha256,
-                goal: &op.goal,
-                acceptance: &op.acceptance,
-                catalog: &op.catalog,
-                members,
-                orchestrator: op.orchestrator.as_ref(),
-            })?)
-        }
-        L::ReplacePoolMember(op) => {
-            let replaced = store.replace_pool_member(crate::pool_replace::PoolReplaceInput {
-                pool_id: &op.pool_id,
-                old: &op.old,
-                request_id: &op.request_id,
-                request_sha256: &op.request_sha256,
-                expected_roster_revision: op.expected_roster_revision,
-                new_id: op.new_id.clone(),
-                name: &op.name,
-                personal_task: &op.personal_task,
-                catalog: &op.catalog,
-                inputs: inputs(&op.inputs),
-            })?;
-            out(match replaced {
-                Ok(replacement) => PoolOutcome::Done(replacement),
-                Err(denial) => PoolOutcome::Denied(denial),
-            })
-        }
-        L::ReconcilePoolEnrollments(op) => out(store.reconcile_pool_enrollments(&op.pool)?),
-        L::PoolWrite(op) => {
-            let write = match op.write {
-                PoolWriteSpec::Message(message) => crate::pool_log::PoolWrite::Message(message),
-                PoolWriteSpec::Proposal(proposal) => crate::pool_log::PoolWrite::Proposal(proposal),
-                PoolWriteSpec::Vote(vote) => crate::pool_log::PoolWrite::Vote(vote),
-            };
-            out(pool_outcome(store.pool_write(
-                &op.execution,
-                &op.attempt,
-                &op.token,
-                write,
-            )?))
-        }
-        L::PoolOperatorPost(op) => out(pool_outcome(store.pool_operator_post(
-            &op.pool_id,
-            &op.request_id,
-            &op.message,
-        )?)),
-        L::SettlePool(op) => out(match op.target {
-            SettleTarget::Pool { pool_id } => json!({ "settled": store.settle_pool(&pool_id)? }),
-            SettleTarget::Of { agent_id } => json!({ "settled": store.settle_pool_of(&agent_id)? }),
-            SettleTarget::Open { limit, seed } => {
-                if limit == 0 || limit > 64 {
-                    return Err(invalid("pool settlement batch must be 1..=64"));
-                }
-                json!({ "settled": store.settle_open_pools(limit, seed)? })
-            }
-        }),
         L::ExpireUnboundDeliveries(op) => {
             out(store.expire_unbound_batch(op.at, Some(EXPIRY_BATCH))?)
         }
@@ -927,23 +832,6 @@ fn inputs(spec: &AdmissionSpec) -> crate::provider_admission::AdmissionInputs<'_
         global_cap: spec.global_cap,
         harness_cap: spec.harness_cap,
         pinned: spec.pinned.as_ref(),
-    }
-}
-
-/// A pool append outcome as its typed receipt result.
-fn pool_outcome(
-    result: std::result::Result<
-        crate::pool_log::PoolWriteReceipt,
-        agent_run_domain::pool::PoolDenial,
-    >,
-) -> PoolOutcome<PoolWriteOutput> {
-    match result {
-        Ok(receipt) => PoolOutcome::Done(PoolWriteOutput {
-            pool_id: receipt.pool_id,
-            seq: receipt.seq,
-            duplicate: receipt.duplicate,
-        }),
-        Err(denial) => PoolOutcome::Denied(denial),
     }
 }
 

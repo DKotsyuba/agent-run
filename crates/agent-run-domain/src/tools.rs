@@ -39,6 +39,12 @@ pub struct ToolDefinition {
     /// This internal routing metadata never appears in the MCP tool object.
     #[serde(default, skip_serializing)]
     pub legacy_for: Option<String>,
+    /// Transport audience. Omission means the orchestrator MCP surface (and,
+    /// like every method, the operator socket and CLI); `socket` marks a
+    /// service integration method served only by the operator socket and CLI,
+    /// never by orchestrator MCP discovery or dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<ToolSurface>,
     /// Discovery guidance, including the completion-notice contract for start.
     pub description: String,
     /// Reviewed effect hints from this asset, never transport-local defaults.
@@ -51,6 +57,16 @@ pub struct ToolDefinition {
     /// Optional product result declaration; absent on the current SDK wire.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_shape: Option<Value>,
+}
+
+/// Narrower transport audience of a registry method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurface {
+    /// Service integration method (Agent Pool, Hub, operator CLI): served by
+    /// the operator socket and listed by its `tools` method, but absent from
+    /// orchestrator MCP discovery and refused by orchestrator MCP dispatch.
+    Socket,
 }
 
 /// One input argument derived from a tool's JSON Schema.
@@ -165,16 +181,23 @@ impl ToolDefinition {
             "batch_receipt" => &[
                 MachineCode::ValidationError,
                 MachineCode::StoreIdentityMismatch,
-                MachineCode::RequestConflict,
                 MachineCode::Unsupported,
                 MachineCode::AnswerIntegrityError,
                 MachineCode::RuntimeError,
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
-            "history_pins" => &[
+            "history_pins_list" => &[
                 MachineCode::ValidationError,
-                MachineCode::PinNotFound,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::BrokerUnavailable,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "history_pins_release" => &[
+                MachineCode::ValidationError,
+                MachineCode::RequestConflict,
                 MachineCode::StoreIdentityMismatch,
                 MachineCode::BrokerUnavailable,
                 MachineCode::RuntimeError,
@@ -251,11 +274,6 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
-            "list_pools" => &[
-                MachineCode::ValidationError,
-                MachineCode::IOError,
-                MachineCode::StorageError,
-            ],
             "agent_integration" => &[
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,
@@ -270,35 +288,8 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
-            "capacity_order" | "models" | "limits" | "delegation_guide" => &[
+            "delegation_guide" => &[
                 MachineCode::ValidationError,
-                MachineCode::Unsupported,
-                MachineCode::RuntimeError,
-                MachineCode::IOError,
-                MachineCode::StorageError,
-            ],
-            "start_pool" => &[
-                MachineCode::ValidationError,
-                MachineCode::PathEscapeError,
-                MachineCode::RequestConflict,
-                MachineCode::SelectionBusy,
-                MachineCode::NoEligibleAccount,
-                MachineCode::QuotaExhausted,
-                MachineCode::CapacityExhausted,
-                MachineCode::Unsupported,
-                MachineCode::RuntimeError,
-                MachineCode::IOError,
-                MachineCode::StorageError,
-            ],
-            "pool_post" | "pool_replace" | "pool" => &[
-                MachineCode::ValidationError,
-                MachineCode::AgentNotFound,
-                MachineCode::StateTransitionError,
-                MachineCode::RequestConflict,
-                MachineCode::CapacityExhausted,
-                MachineCode::SelectionBusy,
-                MachineCode::NoEligibleAccount,
-                MachineCode::QuotaExhausted,
                 MachineCode::Unsupported,
                 MachineCode::RuntimeError,
                 MachineCode::IOError,
@@ -357,9 +348,39 @@ pub fn is_tool(name: &str) -> bool {
     tool(name).is_some()
 }
 
-/// Renders the shared discovery projection, omitting call-only compatibility
-/// entries. Direct lookup retains their original schemas for legacy calls.
+/// Reports whether a method belongs to the orchestrator MCP surface: an
+/// advertised or call-only registry method that is not socket-only.
+pub fn is_orchestrator_tool(name: &str) -> bool {
+    tool(name).is_some_and(|definition| definition.surface.is_none())
+}
+
+/// Renders the orchestrator MCP discovery projection, omitting call-only
+/// compatibility entries and socket-only service methods. Direct lookup
+/// retains their original schemas for legacy calls.
 pub fn tools_json() -> Vec<Value> {
+    registry()
+        .iter()
+        .filter(|definition| definition.legacy_for.is_none() && definition.surface.is_none())
+        .cloned()
+        .map(orchestrator_tool_json)
+        .collect()
+}
+
+/// Projects one MCP definition with the same receipt shape as tool discovery.
+pub fn orchestrator_tool_json(mut definition: ToolDefinition) -> Value {
+    if definition.name == "start_batch"
+        && let Some(schema) = &mut definition.output_schema
+        && let Some(properties) = schema["properties"].as_object_mut()
+    {
+        properties.remove("release_token");
+    }
+    serde_json::to_value(definition).expect("tool definition is JSON")
+}
+
+/// Renders the operator-socket `tools` listing: every advertised method,
+/// including socket-only service methods (each carrying `"surface":"socket"`),
+/// so socket clients such as Hub keep detecting them with one `tools` call.
+pub fn socket_tools_json() -> Vec<Value> {
     registry()
         .iter()
         .filter(|definition| definition.legacy_for.is_none())
@@ -379,21 +400,16 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         | ("resume", "request_id" | "orchestrator")
         | ("list_agents", "orchestrator" | "after_revision")
         | ("doc", "topic")
-        | ("models" | "delegation_guide", "provider" | "profile" | "model")
-        | ("capacity_order", "model") => Some(ArgumentDefault::Null),
-        ("start_pool", "acceptance" | "orchestrator")
-        | ("pool_replace", "start")
-        | ("pool", "after_seq" | "before_seq" | "limit") => Some(ArgumentDefault::Null),
+        | ("delegation_guide", "provider" | "profile" | "model") => Some(ArgumentDefault::Null),
         ("resume" | "cancel" | "steer" | "answer" | "transcript", "run_id") => {
             Some(ArgumentDefault::Null)
         }
-        ("list_pools", "state") => Some(ArgumentDefault::Null),
-        ("list_pools", "limit") => Some(ArgumentDefault::Integer(50)),
-        ("history_pins", "limit") => Some(ArgumentDefault::Integer(100)),
-        ("history_pins", "after_pin_id") => Some(ArgumentDefault::Null),
-        ("history_pins" | "start_batch" | "status", "expected_store_id") => {
-            Some(ArgumentDefault::Null)
-        }
+        ("history_pins_list", "limit") => Some(ArgumentDefault::Integer(100)),
+        ("history_pins_list", "after_pin_id") => Some(ArgumentDefault::Null),
+        (
+            "history_pins_list" | "history_pins_release" | "start_batch" | "status",
+            "expected_store_id",
+        ) => Some(ArgumentDefault::Null),
         ("status", "include_view") => Some(ArgumentDefault::Bool(false)),
         ("start_batch" | "batch_receipt", "retain_history") => Some(ArgumentDefault::Bool(false)),
         ("capabilities", "include_store_id") => Some(ArgumentDefault::Bool(false)),
@@ -402,9 +418,7 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         }
         ("answer_chunk" | "initial_task", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
         ("initial_task", "offset") => Some(ArgumentDefault::Integer(0)),
-        ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
-            Some(ArgumentDefault::Integer(0))
-        }
+        ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
         ("list_agents", "after_message_revision") => Some(ArgumentDefault::Null),
         ("transcript", "view") => Some(ArgumentDefault::Null),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),

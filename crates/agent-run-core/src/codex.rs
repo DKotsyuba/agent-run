@@ -1489,61 +1489,6 @@ async fn run_inner(
                             ))
                             .await?;
                     }
-                } else if kind == "pool" {
-                    // Same bounded exchange as steer, with explicit finite
-                    // push dispositions: only a correlated native reply is
-                    // `native_accepted` (never delivery or consumption), a
-                    // pre-send failure is `unsent`, and every bounded end
-                    // after a possible write is `unknown`. The durable log
-                    // keeps the entry in every case.
-                    let mut native_accepted = false;
-                    let result = match commands::pool_push_text(store, &record.id, &payload) {
-                        Ok(text) => match turn_input(
-                            process,
-                            &mut session,
-                            &tid,
-                            &mut turn_id,
-                            &mut idle,
-                            &text,
-                            record.request.effort.as_deref(),
-                            tokio::time::Instant::now() + Duration::from_secs(30),
-                        )
-                        .await
-                        {
-                            Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => {
-                                native_accepted = true;
-                                commands::pool_result("native_accepted", "native_replied")
-                            }
-                            Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
-                                commands::pool_result("rejected", "native_rejected")
-                            }
-                            Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
-                                commands::pool_result("unsent", "backlog_pressure_unsent")
-                            }
-                            Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
-                                commands::pool_result("unknown", reason.reason())
-                            }
-                            // Only pre-send validation returns Err.
-                            Err(_) => commands::pool_result("unsent", "exchange_not_sent"),
-                        },
-                        Err(refusal) => refusal,
-                    };
-                    if native_accepted {
-                        process
-                            .observing(store.observed_command_result(
-                                &record.id,
-                                cid,
-                                &result,
-                                "native_accepted",
-                                Some(false),
-                                Vec::new(),
-                            ))
-                            .await?;
-                    } else {
-                        process
-                            .observing(store.complete_command(&record.id, cid, &result))
-                            .await?;
-                    }
                 } else {
                     process
                         .observing(store.complete_command(
@@ -2947,7 +2892,7 @@ async fn turn_input(
 }
 
 /// Sends one text input to the active turn through the bounded native steer
-/// exchange; shared by operator steering and pool delivery so both keep the
+/// exchange; shared by operator steering and native owner input so both keep the
 /// same one-second-class 30 s bound and disposition semantics.
 async fn turn_steer(
     process: &mut agent_run_adapters::io::Process,
@@ -2980,6 +2925,11 @@ mod tests {
             host_id: "host".into(),
             role_digest: "a".repeat(64),
             inventory: BTreeMap::new(),
+            bridge_hook: agent_run_config::config::Hook {
+                event: "PreToolUse".into(),
+                command: vec!["/fixture/bridge-hook".into()],
+                matcher: Some("mcp__agent-pool__.*".into()),
+            },
             codex: Some(agent_run_adapters::managed_role::CodexSelection {
                 pool_server: "agent-pool".into(),
                 pool_namespace: "agent_pool".into(),

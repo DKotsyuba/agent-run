@@ -167,7 +167,7 @@ socket, credential and shared-service setup for other installations.
 ```bash
 agent-run delegation-guide             # read before choosing a delegation route
 agent-run delegation-guide --provider codex --profile review  # exact optional filters
-agent-run limits                       # optional quota/reset/priority diagnosis
+
 agent-run start --provider codex --model gpt-6.1-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
@@ -195,10 +195,10 @@ the Claude runtime journals assistant fragments and the completion tail of one
 message under its native message id (or one producer-owned fallback per
 message boundary when the engine omits ids), so each message renders as one
 continuous row and distinct messages stay distinct. Other commands
-include `steer`, `cancel`, `delivery status`, and `doc`. The legacy
-`models` and `capacity order` CLI commands remain compatibility reads with
-their original structured responses; ordinary routing uses `delegation-guide`
-and optional `limits` diagnostics.
+include `steer`, `cancel`, `delivery status`, and `doc`. Quota windows,
+reset times and capacity standing are presented by Agent Quota (for example
+`agent-quota limits`), not by Run; Run keeps only the Quota read its admission
+needs and refuses an exhausted choice with `QuotaExhausted`.
 
 ## Use the MCP server
 
@@ -208,14 +208,16 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It advertises 24 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
-`answer`, `transcript`, `transcript_exact`, `initial_task`, `doc`, `delegation_guide`, `limits`, `start_pool`,
-`pool_post`, `pool_replace`, `pool`, `list_pools`, `agent_integration`,
-`capabilities`, and `answer_chunk`. Use `delegation_guide`
-with optional exact `provider`, `model`, and `profile` filters for routing;
-use `limits` for quota windows plus numerical provider/model standing.
-`models` and `capacity_order` remain callable compatibility methods with their
-original CLI/socket JSON shapes, but do not appear in MCP discovery.
+It advertises the orchestrator tools `start`, `start_batch`, `resume`,
+`cancel`, `steer`, `list_agents`, `answer`, `transcript`, `delegation_guide`
+and `doc`. Use `delegation_guide` with optional exact `provider`, `model`, and
+`profile` filters for routing; it carries no quota standing. Service
+integration methods used by Agent Pool and Hub — `status`, `batch_receipt`,
+`capabilities`, `transcript_exact`, `initial_task`, `answer_chunk`,
+`agent_integration`, `history_pins_list` and `history_pins_release` — are
+served only by the operator socket and CLI; the socket `tools` method lists
+them with `"surface":"socket"`. See
+[the API reference](docs/api.md#transport-surfaces).
 
 `start_batch` atomically admits 1–20 independent jobs and returns a permanent
 receipt of their stable IDs, execution sequences and opaque execution references. An identical request ID
@@ -225,15 +227,27 @@ request still has to fit the existing transport and writer limits. Automatic
 multi-agent hook binding is not provided: pass an explicit `orchestrator` for
 each job that needs its own completion notice.
 
-Set `retain_history:true` to keep each admitted lineage's database history until
-its returned pin is released with `agent-run history-pins release --pin-id PIN_ID`.
+Set `retain_history:true` to keep each admitted lineage's database history
+through an owner release. Direct socket clients receive the batch's
+`release_token` in the first admission response and pass it with the pin ID
+to `history_pins_release`. CLI callers can capture it with
+`start-batch --release-token-file PATH` or `--release-token-fd N`, then release
+with `agent-run history-pins release --pin-id PIN_ID --release-token-file PATH`.
+MCP and CLI standard output carry the receipt only. The offline database owner
+can recover legacy pins and pins with no saved token using
+`agent-run history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id BATCH_REQUEST_ID`.
 Active pins also retain process-ownership evidence and recovery details for the
-lineage. They do not grant additional authority.
+lineage. See the [pin release contract](docs/api.md#agent-pool-migration-for-history-pins).
 
-New schema-2 workers receive a separate built-in MCP with five fixed tools:
-`notify_orchestrator` plus four pool tools authorized by live membership.
-`start_pool` can mix new members with supported independent RUNNING workers;
-attached workers keep their work and must acknowledge enrollment before voting. Ordinary work MCPs remain profile-controlled.
+New schema-2 workers receive a separate built-in MCP: `notify_orchestrator`,
+plus `health_reply` and `finish` in explicit-completion mode (research roles
+add `save_report`). Ordinary work MCPs remain profile-controlled.
+
+Agent Run 0.32.0 removed its legacy cooperative pools (`start_pool`, `pool`,
+`pool_post`, `pool_replace`, `list_pools`, the worker `pool_*` tools and the
+matching CLI commands). Agent Pool owns groups, membership, messages and
+consensus; old pool rows stay readable through read-only SQL
+(`agent-run doc completion`).
 See [worker reports](docs/worker-mcp.md) for bounds, replies and upgrade behavior.
 
 ## Use the socket API
@@ -242,22 +256,12 @@ The broker binds `<home>/api.sock` with mode `0600`. It accepts newline-framed
 JSON-RPC 2.0 and provides the tool methods plus `ping`, `tools`, and `wait`.
 See [docs/api.md](docs/api.md).
 
-## Observe with the terminal UI
+## Observe sessions
 
-The release installer installs both `agent-run` and the separate `agent-run-tui`
-binary at the same version. Start the observer with `agent-run-tui`.
-
-After updating, quit and reopen existing observer windows: a running process
-keeps its previous binary. Check `agent-run --version` and
-`agent-run-tui --version` to confirm that both commands select the new release.
-The redesigned observer includes Sessions and Pools tabs; press `1` or `2`
-to switch between them. A binary launched directly from a development worktree
-is independent of the installed release.
-
-`agent-run-tui` is a read-only terminal observer for the resident broker: it
-lists sessions live and shows any selected session's transcript, keyed with
-the mouse and the same JSON-RPC surface as the CLI. See
-[docs/tui.md](docs/tui.md).
+The `agent-run-tui` terminal observer was removed in 0.32.0; use Agent Hub, or
+`agent-run agents` and `agent-run transcript`. Releases still seal
+`bin/agent-run-tui` as a fixed compatibility shim that reports the move and
+exits non-zero, so an existing launcher keeps a clear message.
 
 ## Reliability contract
 

@@ -13,7 +13,7 @@ binary/home, hooks, plugin assets, workspace policy, and unowned native
 settings. Account weights and prose recommendations live only in TOML.
 
 `[harnesses.codex].fast_mode = true` forces Fast for every provider/model/account
-using Codex, including pool members. Omission or `false` preserves explicit
+using Codex, including batch jobs. Omission or `false` preserves explicit
 per-request `fast` behavior. Starts capture the effective value once; retries
 keep it. Each resume captures the current flag while preserving the parent
 role, native session and sealed assets. Turning off the flag stops forcing
@@ -373,7 +373,12 @@ lowercase SHA-256 values `pool_executable_sha256` and `bridge_hook_sha256`;
 `codex_code_mode_host_sha256` is optional (see Codex Code Mode below).
 The selector refuses plugins, skills, non-stdio or unrestricted MCP servers,
 unapproved component binaries, non-explicit completion, research and broader
-roles. The selected Pool command must be the pinned binary with exactly
+roles. Of the harness hooks, a managed launch receives exactly one: the
+`PreToolUse` declaration whose matcher is `mcp__<pool_server>__.*` (the Bridge
+hook, pinned by `bridge_hook_sha256`). Hooks with any other matcher, such as a
+pool-leader hook, are delivered only to ordinary launches; a missing or
+duplicated Pool-matcher hook, or one on another event, refuses the managed
+role. The selected Pool command must be the pinned binary with exactly
 `mcp --config <absolute-path>` and an explicit safe tool subset; the private
 worker surface is limited to `finish` and `health_reply`: the supervisor sets
 `AGENT_RUN_WORKER_MANAGED=1` and the worker MCP then serves only those two
@@ -589,7 +594,9 @@ pins, both when the launch plan is built and when the role is selected, while
 the execution identity keeps its admission snapshot. Role semantics stay frozen: the role payload (and so the role
 digest Run attests to Pool), harness kind, explicit finish, the selector's
 `role_name`, `pool_server` and `host_id`, the `[mcp.<pool_server>]`
-declaration including `allowed_tools`, and the harness hook declarations. A
+declaration including `allowed_tools`, and the harness hook declarations
+carrying the Pool matcher (other harness hooks never reach a managed launch,
+so adding or changing them does not refuse a frozen managed role). A
 resume whose current configuration changes any of these is refused as
 `managed role changed since admission` rather than adopting it; start a new
 member instead. System routes keep their admission snapshot. Preserve old
@@ -619,3 +626,49 @@ launch can no longer be woken, but its explicit finish still settles it: a
 Codex finish result that arrives after its turn went idle is the observed
 receipt. Other peer authentication failures (including an unsupported
 filesystem or replaced inode) are `peer_not_authorized/none`.
+
+## Agent Pool leader profiles (Claude Code)
+
+An Agent Pool leader is an ordinary Run launch, not a managed attempt: it
+coordinates a pool through a second Pool MCP server, `agent-pool-leader`,
+whose calls Bridge gates with its own `PreToolUse` hook. Declare the server
+with the leader tool cap, add the leader hook beside the managed Pool hook on
+the `claude-code` harness, and select the server from a dedicated profile:
+
+```toml
+[mcp.agent-pool-leader]
+transport = "stdio"
+command = "/path/to/agent-pool"
+args = ["mcp", "--config", "/path/to/leader.toml"]
+approval_mode = "approve"
+allowed_tools = [
+  "pool_create", "pool_list", "pool_get", "pool_update", "pool_close",
+  "pool_add", "pool_start_agent", "pool_start_batch", "pool_replace",
+  "pool_cancel_replacement", "pool_member_update", "pool_remove",
+  "pool_release_history", "pool_post", "pool_send_member", "pool_propose",
+  "pool_enrollment_get", "pool_enrollment_resolve",
+]
+
+[harnesses.claude-code]
+# binary, home, ... as before
+hooks = [
+  # The managed Pool hook (matcher mcp__<pool_server>__.*), unchanged.
+  { event = "PreToolUse", command = ["/path/to/bridge-hook", "<channel>", "claude-code"], matcher = "mcp__agent-pool__.*" },
+  # The pool-leader hook.
+  { event = "PreToolUse", command = ["/path/to/bridge-hook", "<channel>", "claude-code"], matcher = "mcp__agent-pool-leader__.*" },
+]
+```
+
+The `pool-leader` profile's front matter selects only that server, for example
+`mcp = ["agent-pool-leader"]`, and the leader starts with explicit completion
+(the default; do not pass `--legacy-completion`). Run then materializes both
+hooks into every ordinary Claude Code launch on that harness; each hook fires
+only for calls to its own server. A managed attempt still receives exactly the
+Pool hook (see Managed attempt selector above), so the selector's hook contract
+and pins are unchanged.
+
+Leaders are Claude Code only for now. Run rewrites only the managed Pool
+matcher to Codex's native tool names (see Codex tool names); an ordinary Codex
+launch receives configured matchers verbatim, and Codex names the leader's
+tools `mcp__agent_pool_leader__<tool>`, so the hook above would not gate them.
+Do not run a pool leader on Codex.

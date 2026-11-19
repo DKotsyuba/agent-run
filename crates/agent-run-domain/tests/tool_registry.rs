@@ -1,27 +1,101 @@
 //! Golden and metadata contracts for the one public tool registry.
 
-use agent_run_domain::{ArgumentDefault, registry, tool, tools_json};
+use agent_run_domain::{
+    ArgumentDefault, registry, tool,
+    tools::{ToolSurface, is_orchestrator_tool, socket_tools_json},
+    tools_json,
+};
 use serde_json::Value;
 
-/// Tools added after the frozen Python table: the guide read and the five
-/// cooperative-pool operator tools and native integration and observation reads, pinned separately.
-const ADDITIVE: [&str; 15] = [
+/// Tools added after the frozen Python table: the guide read and native
+/// integration and observation reads, pinned separately.
+const ADDITIVE: [&str; 11] = [
     "delegation_guide",
-    "start_pool",
-    "pool_post",
-    "pool_replace",
-    "pool",
-    "list_pools",
     "agent_integration",
     "capabilities",
     "answer_chunk",
     "start_batch",
-    "history_pins",
+    "history_pins_list",
+    "history_pins_release",
     "status",
     "batch_receipt",
     "transcript_exact",
     "initial_task",
 ];
+
+/// Frozen Python tools removed in 0.32.0 when quota presentation moved to
+/// Agent Quota. The historical fixture keeps them; comparisons skip them.
+const REMOVED: [&str; 3] = ["capacity_order", "models", "limits"];
+
+/// Legacy Run pool tools removed in 0.32.0; pools moved to Agent Pool.
+const LEGACY_POOL: [&str; 5] = [
+    "start_pool",
+    "pool_post",
+    "pool_replace",
+    "pool",
+    "list_pools",
+];
+
+/// The orchestrator MCP surface is exactly the execution tools plus the guide
+/// and doc; service integration methods are socket-only, and the socket
+/// `tools` listing keeps advertising them (marked) for feature detection.
+#[test]
+fn orchestrator_surface_excludes_socket_only_service_methods() {
+    let orchestrator: Vec<String> = tools_json()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        orchestrator,
+        [
+            "start",
+            "cancel",
+            "steer",
+            "list_agents",
+            "transcript",
+            "answer",
+            "resume",
+            "doc",
+            "delegation_guide",
+            "start_batch",
+        ]
+    );
+    let service = [
+        "batch_receipt",
+        "history_pins_list",
+        "history_pins_release",
+        "status",
+        "agent_integration",
+        "capabilities",
+        "answer_chunk",
+        "transcript_exact",
+        "initial_task",
+    ];
+    let socket = socket_tools_json();
+    for name in service {
+        let definition = tool(name).unwrap();
+        assert_eq!(definition.surface, Some(ToolSurface::Socket), "{name}");
+        assert!(!is_orchestrator_tool(name), "{name}");
+        let listed = socket
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from socket tools"));
+        assert_eq!(listed["surface"], "socket", "{name}");
+    }
+    for name in &orchestrator {
+        assert!(is_orchestrator_tool(name), "{name}");
+        assert!(socket.iter().any(|entry| entry["name"] == name.as_str()));
+    }
+    assert!(
+        tools_json()
+            .iter()
+            .all(|entry| entry.get("surface").is_none())
+    );
+    for removed in REMOVED.iter().chain(&LEGACY_POOL).chain(&["history_pins"]) {
+        assert!(tool(removed).is_none(), "{removed}");
+        assert!(!socket.iter().any(|entry| entry["name"] == *removed));
+    }
+}
 
 /// Observation methods share strict schemas, stable errors and read-only hints;
 /// no private worker capability gains these operator reads.
@@ -322,18 +396,16 @@ fn golden() -> Vec<Value> {
 /// itself is never edited to conceal the expected difference.
 #[test]
 fn registry_matches_python_golden_field_by_field() {
-    let expected = golden();
+    let expected: Vec<Value> = golden()
+        .into_iter()
+        .filter(|tool| !REMOVED.contains(&tool["name"].as_str().unwrap_or_default()))
+        .collect();
     let actual: Vec<Value> = registry()
         .iter()
         .map(|definition| serde_json::to_value(definition).unwrap())
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 24);
-    for (name, canonical) in [("models", "delegation_guide"), ("capacity_order", "limits")] {
-        assert_eq!(tool(name).unwrap().legacy_for.as_deref(), Some(canonical));
-        assert!(!tools_json().iter().any(|entry| entry["name"] == name));
-        assert!(tool(canonical).unwrap().legacy_for.is_none());
-    }
+    assert!(registry().iter().all(|tool| tool.legacy_for.is_none()));
     assert_eq!(actual.len(), expected.len());
 
     for (definition, (actual, mut expected)) in registry()
@@ -342,45 +414,6 @@ fn registry_matches_python_golden_field_by_field() {
         .zip(actual.iter().zip(expected))
     {
         assert_eq!(actual["name"], expected["name"]);
-        // The schema-2 catalog reads extend the baseline: their descriptions
-        // retain the Python opening after explicit compatibility guidance,
-        // and add only the exact
-        // optional nullable string filters pinned here.
-        let filters: &[&str] = match definition.name.as_str() {
-            "models" => &["model", "profile", "provider"],
-            "capacity_order" => &["model"],
-            _ => &[],
-        };
-        if !filters.is_empty() {
-            // The schema-2 catalog reads were re-described for the compact
-            // MCP text surface: only the baseline opening sentence must be
-            // preserved verbatim.
-            let text = expected["description"].as_str().unwrap().to_owned();
-            let base = text
-                .find(". ")
-                .map(|end| text[..end + 1].to_owned())
-                .unwrap_or(text);
-            let prefix = match definition.name.as_str() {
-                "models" => {
-                    "Call-only compatibility method; not advertised. Use delegation_guide for provider/model/profile guidance. Existing responses and handlers are unchanged. "
-                }
-                "capacity_order" => {
-                    "Call-only compatibility method; not advertised. Use limits for quota windows and ranked provider/model diagnosis. Existing responses and handlers are unchanged. "
-                }
-                _ => unreachable!(),
-            };
-            let historical = actual["description"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(prefix)
-                .expect("exact compatibility guidance prefix");
-            assert!(historical.starts_with(base.as_str()));
-            expected["description"] = actual["description"].clone();
-            for name in filters {
-                expected["inputSchema"]["properties"][name] =
-                    serde_json::json!({"type": ["string", "null"]});
-            }
-        }
         // Schema-2 cutover changes the runtime selector to provider; the
         // optional human-label input is the exact additive delta below.
         if definition.name == "start" {
@@ -453,11 +486,6 @@ fn registry_matches_python_golden_field_by_field() {
             expected["inputSchema"]["properties"]["before_cursor"] = serde_json::json!({
                 "type":["integer","null"],"minimum":1
             });
-        }
-        if definition.name == "limits" {
-            expected["description"] = serde_json::json!(
-                "Diagnose stored quota windows, percentages, resets and freshness plus ranked provider/model standing, numeric priorities and provider multipliers from one committed snapshot. Unknown or stale capacity remains explicit; no collection or model turn is started. MCP text omits private account and pool identities. Schema 1 retains its historical quota-window response."
-            );
         }
         // Preserve the historical schema; research adds exactly one reviewed
         // constraint value to its existing request-side enum.
@@ -586,28 +614,16 @@ fn annotations_preserve_effect_and_worker_boundaries() {
         let hints = &definition.annotations;
         let write = matches!(
             definition.name.as_str(),
-            "start"
-                | "start_batch"
-                | "history_pins"
-                | "resume"
-                | "cancel"
-                | "steer"
-                | "start_pool"
-                | "pool_post"
-                | "pool_replace"
+            "start" | "start_batch" | "history_pins_release" | "resume" | "cancel" | "steer"
         );
         assert_eq!(hints.read_only_hint, !write, "{}", definition.name);
         assert_eq!(
             hints.destructive_hint,
-            matches!(
-                definition.name.as_str(),
-                "cancel" | "pool_replace" | "history_pins"
-            ),
+            matches!(definition.name.as_str(), "cancel" | "history_pins_release"),
             "{}",
             definition.name
         );
-        // Pool writes require a scoped key; ordinary admissions/controls do
-        // not guarantee one identical call has no additional durable effect.
+        // Ordinary admissions/controls do not guarantee one identical call has no additional durable effect.
         let unkeyed = matches!(
             definition.name.as_str(),
             "start" | "resume" | "cancel" | "steer"
@@ -620,14 +636,11 @@ fn annotations_preserve_effect_and_worker_boundaries() {
                 | "resume"
                 | "cancel"
                 | "steer"
-                | "models"
-                | "start_pool"
-                | "pool_replace"
                 | "agent_integration"
                 | "status"
         );
         assert_eq!(hints.open_world_hint, external, "{}", definition.name);
-        if write && !unkeyed && definition.name != "history_pins" {
+        if definition.name == "start_batch" {
             assert!(
                 definition
                     .arguments()
@@ -635,12 +648,18 @@ fn annotations_preserve_effect_and_worker_boundaries() {
                     .any(|argument| argument.name == "request_id" && argument.required)
             );
         }
-        if definition.name == "history_pins" {
+        if definition.name == "history_pins_release" {
             assert!(
                 definition
                     .arguments()
                     .iter()
-                    .any(|argument| argument.name == "pin_id")
+                    .any(|argument| argument.name == "pin_id" && argument.required)
+            );
+            assert!(
+                definition
+                    .arguments()
+                    .iter()
+                    .any(|a| a.name == "release_token" && a.required)
             );
         }
     }
@@ -650,30 +669,12 @@ fn annotations_preserve_effect_and_worker_boundaries() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        [
-            "notify_orchestrator",
-            "pool_post",
-            "pool_read",
-            "pool_propose",
-            "pool_vote"
-        ]
+        ["notify_orchestrator"]
     );
     for definition in worker {
         let hints = &definition.annotations;
-        assert_eq!(
-            hints.read_only_hint,
-            definition.name == "pool_read",
-            "{}",
-            definition.name
-        );
-        // Proposals replace consensus and votes can revoke readiness; append-only
-        // storage does not make those effects non-destructive.
-        assert_eq!(
-            hints.destructive_hint,
-            matches!(definition.name.as_str(), "pool_propose" | "pool_vote"),
-            "{}",
-            definition.name
-        );
+        assert!(!hints.read_only_hint, "{}", definition.name);
+        assert!(!hints.destructive_hint, "{}", definition.name);
         assert!(hints.idempotent_hint, "{}", definition.name);
         assert_eq!(
             hints.open_world_hint,
@@ -720,7 +721,17 @@ fn delegation_guide_is_the_additive_twelfth_tool() {
     assert_eq!(definition.arguments().len(), 3);
     assert_eq!(
         definition.input_schema,
-        tool("models").unwrap().input_schema
+        golden()
+            .into_iter()
+            .find(|tool| tool["name"] == "models")
+            .map(|mut tool| {
+                for name in ["model", "profile", "provider"] {
+                    tool["inputSchema"]["properties"][name] =
+                        serde_json::json!({"type": ["string", "null"]});
+                }
+                tool["inputSchema"].take()
+            })
+            .unwrap()
     );
     assert!(
         definition
@@ -784,55 +795,24 @@ fn rename_runtime_to_provider(tool: &mut Value) {
     }
 }
 
-/// The cooperative-pool tools are strict objects sharing the one registry,
-/// each declaring its required inputs and a typed error set; none of them
-/// accepts an author, a pool owner on the worker side, or a caller-supplied
-/// runtime alias.
+/// The legacy Run pool tools were removed from both registries; no public
+/// or private tool name is reachable for them.
 #[test]
-fn pool_tools_are_strict_registry_entries() {
-    for (name, required) in [
-        ("start_pool", &["request_id", "goal", "members"][..]),
-        ("pool_post", &["pool_id", "request_id", "message"][..]),
-        ("pool_replace", &["pool_id", "agent_id", "request_id"][..]),
-        ("pool", &["pool_id"][..]),
-        ("list_pools", &[][..]),
+fn legacy_pool_tools_are_absent() {
+    for name in [
+        "start_pool",
+        "pool_post",
+        "pool_replace",
+        "pool",
+        "list_pools",
     ] {
-        let definition = tool(name).unwrap_or_else(|| panic!("{name} registered"));
-        assert_eq!(
-            definition.input_schema["additionalProperties"], false,
-            "{name}"
-        );
-        let mut required = required.to_vec();
-        required.sort_unstable();
-        let mut declared: Vec<_> = definition
-            .arguments()
-            .into_iter()
-            .filter(|a| a.required)
-            .map(|a| a.name)
-            .collect();
-        declared.sort_unstable();
-        assert_eq!(declared, required, "{name}");
-        assert!(!definition.error_classes().is_empty());
-        let properties = definition.input_schema["properties"].as_object().unwrap();
-        for forbidden in [
-            "author",
-            "author_kind",
-            "runtime",
-            "run_id",
-            "attempt_id",
-            "token",
-        ] {
-            assert!(
-                !properties.contains_key(forbidden),
-                "{name} must not accept {forbidden}"
-            );
-        }
+        assert!(tool(name).is_none(), "{name}");
+        assert!(!tools_json().iter().any(|entry| entry["name"] == name));
     }
-    let members = &tool("start_pool").unwrap().input_schema["properties"]["members"];
-    assert_eq!(
-        (members["minItems"].as_i64(), members["maxItems"].as_i64()),
-        (Some(2), Some(5))
-    );
+    let worker = agent_run_domain::tools::worker_registry();
+    for name in ["pool_post", "pool_read", "pool_propose", "pool_vote"] {
+        assert!(!worker.iter().any(|tool| tool.name == name), "{name}");
+    }
 }
 
 /// Integration has one stable selector and a positive exact receipt; no private

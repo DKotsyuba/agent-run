@@ -130,10 +130,6 @@ inventory! {
     1 AdmitStart "admit_start" L N n;
     2 AdmitProvider "admit_provider" L N n;
     3 AdmitProviderResume "admit_provider_resume" L N n;
-    4 AdmitPool "admit_pool" L N n;
-    5 ReplacePoolMember "replace_pool_member" L N n;
-    6 AcknowledgeEnrollment "acknowledge_enrollment" L N n;
-    7 ReconcilePoolEnrollments "reconcile_pool_enrollments" L B n;
     8 RecordSupervisorLaunch "record_supervisor_launch" L C y;
     9 RecordStartupOwner "record_startup_owner" L C y;
     10 BeginSupervisorHandoff "begin_supervisor_handoff" L C y;
@@ -173,11 +169,6 @@ inventory! {
     44 RegisterWorkerCatalog "register_worker_catalog" L N y;
     45 AcceptWorkerFinish "accept_worker_finish" L N y;
     46 NotifyOrchestrator "notify_orchestrator" L N n;
-    47 PoolWrite "pool_write" L N n;
-    48 PoolOperatorPost "pool_operator_post" L N n;
-    49 FanoutEntry "fanout_entry" L N n;
-    50 SettlePool "settle_pool" L N n;
-    51 BindPool "bind_pool" R N n;
     52 ClaimDelivery "claim_delivery" R N n;
     53 CompleteDelivery "complete_delivery" R N n;
     56 CancelDelivery "cancel_delivery" R N n;
@@ -218,7 +209,6 @@ inventory! {
     92 PrepareBridgeDelivery "prepare_bridge_delivery" R N n;
     93 HealthTick "health_tick" L B y;
     94 AcceptHealthReply "accept_health_reply" L N y;
-    95 ReportPoolReadLoop "report_pool_read_loop" L N y;
     96 BeginServiceRestart "begin_service_restart" L C n;
     97 AdvanceServiceRestart "advance_service_restart" L C n;
     98 RememberServiceRestartCaller "remember_service_restart_caller" L N n;
@@ -255,6 +245,12 @@ inventory! {
     131 AdmitManagedEnrollment "admit_managed_enrollment" L N n;
 }
 
+/// Wire ids of removed inventory rows. They are never reused: a frame naming
+/// one is refused as an unknown operation kind. Rows 4-7, 47-51 and 95 were
+/// the legacy Run pool operations (removed in 0.32.0); 54, 55, 58, 103 and
+/// 104 were retired earlier.
+pub const RESERVED_WIRE_IDS: [u16; 15] = [4, 5, 6, 7, 47, 48, 49, 50, 51, 54, 55, 58, 95, 103, 104];
+
 /// Seals one payload and binds it to its inventory row and typed output.
 macro_rules! op {
     ($($name:ident => $output:ty;)*) => {
@@ -287,10 +283,6 @@ op! {
     AcquireLineageHold => crate::lineage_holds::LineageHoldAcquireResult;
     ReleaseLineageHold => Option<crate::lineage_holds::LineageHoldRelease>;
     AdmitProviderResume => crate::provider_admission::ProviderAdmission;
-    AdmitPool => crate::pool_admission::PoolAdmission;
-    ReplacePoolMember => PoolOutcome<crate::pool_replace::PoolReplacement>;
-    AcknowledgeEnrollment => ();
-    ReconcilePoolEnrollments => ();
     RecordSupervisorLaunch => ();
     RecordStartupOwner => ();
     BeginSupervisorHandoff => bool;
@@ -350,13 +342,7 @@ op! {
     AcceptWorkerFinish => agent_run_domain::worker::FinishReceipt;
     HealthTick => bool;
     AcceptHealthReply => bool;
-    ReportPoolReadLoop => bool;
     NotifyOrchestrator => agent_run_domain::worker::NotifyReceipt;
-    PoolWrite => PoolOutcome<PoolWriteOutput>;
-    PoolOperatorPost => PoolOutcome<PoolWriteOutput>;
-    FanoutEntry => ();
-    SettlePool => Value;
-    BindPool => String;
     ClaimDelivery => Option<Value>;
     CompleteDelivery => String;
     PrepareBridgeDelivery => agent_run_domain::bridge::BridgeIntent;
@@ -471,7 +457,6 @@ op_enum! {
         PersistRecoveryObservation,
         FinishTerminal,
         PersistRunStats,
-        BindPool,
         ClaimDelivery,
         CompleteDelivery,
         PrepareBridgeDelivery,
@@ -493,7 +478,7 @@ op_enum! {
 
 op_enum! {
     /// Broker-only operations, constructed in-process and never decodable
-    /// from a request frame. Rows 44-47 and 94-95 require an explicit `Worker`
+    /// from a request frame. Rows 44-46 and 94 require an explicit `Worker`
     /// authority; all others require `Broker`.
     #[derive(Clone, Serialize)]
     pub enum LocalOp {
@@ -529,10 +514,6 @@ op_enum! {
         FinishAttemptEgress,
         PrepareAttemptRetirement,
         AdmitProviderResume,
-        AdmitPool,
-        ReplacePoolMember,
-        AcknowledgeEnrollment,
-        ReconcilePoolEnrollments,
         RecordSupervisorLaunch,
         RecordStartupOwner,
         BeginSupervisorHandoff,
@@ -541,12 +522,7 @@ op_enum! {
         AcceptWorkerFinish,
         HealthTick,
         AcceptHealthReply,
-        ReportPoolReadLoop,
         NotifyOrchestrator,
-        PoolWrite,
-        PoolOperatorPost,
-        FanoutEntry,
-        SettlePool,
         ExpireUnboundDeliveries,
         ReconcileReapedAgent,
         ReleaseOrphanedAttempt,
@@ -610,9 +586,7 @@ impl OpKindRef {
             | Self::AdmitProvider
             | Self::AdmitBatch
             | Self::AdmitManagedEnrollment
-            | Self::AdmitProviderResume
-            | Self::AdmitPool
-            | Self::ReplacePoolMember => 16 * MIB,
+            | Self::AdmitProviderResume => 16 * MIB,
             kind if kind.is_remote() => 64 * KIB,
             _ => 2 * MIB,
         }
@@ -628,12 +602,9 @@ impl OpKindRef {
     }
 
     /// Whether this row is an internal unit of another operation that is
-    /// refused when submitted on its own (rows 6, 49 and 79).
+    /// refused when submitted on its own (row 79).
     pub fn internal_only(self) -> bool {
-        matches!(
-            self,
-            Self::AcknowledgeEnrollment | Self::FanoutEntry | Self::RetainExhausted
-        )
+        matches!(self, Self::RetainExhausted)
     }
 
     /// Static authority matrix: whether `authority` may submit this row at
@@ -647,9 +618,7 @@ impl OpKindRef {
             Self::RegisterWorkerCatalog
             | Self::AcceptWorkerFinish
             | Self::AcceptHealthReply
-            | Self::ReportPoolReadLoop
-            | Self::NotifyOrchestrator
-            | Self::PoolWrite => matches!(authority, A::Worker { .. }),
+            | Self::NotifyOrchestrator => matches!(authority, A::Worker { .. }),
             kind if !kind.is_remote() => broker,
             Self::ClaimStartup
             | Self::RecordSupervisorOwner
@@ -695,7 +664,6 @@ impl OpKindRef {
             | Self::CompleteDelivery
             | Self::PrepareBridgeDelivery
             | Self::EnqueueCommand
-            | Self::BindPool
             | Self::CancelDelivery
             | Self::BindOrchestrator => broker || matches!(authority, A::Cli { .. }),
             Self::RegisterAccount

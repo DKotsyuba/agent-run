@@ -4,6 +4,97 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Breaking
+
+- Quota presentation moved out of Run to Agent Quota. The orchestrator MCP
+  tools `limits`, `capacity_order` and `models`, their socket methods and the
+  CLI commands `agent-run limits`, `agent-run models` and
+  `agent-run capacity order` are removed and return unknown-method errors.
+  `delegation_guide` is now a configuration-only catalog: providers in
+  configured order with models, admissible profiles, params, restrictions and
+  recommendations, without quota standing, capacity order or a `limits`
+  pointer. The UserPromptSubmit `_hook_context` carries only the active-agent
+  block; its "Provider capacity order" block is gone (Agent Quota provides its
+  own hook context). Admission keeps its minimal Quota read: one fresh
+  snapshot per decision, account ranking with Run's configured multipliers
+  and the `QuotaExhausted` refusal.
+- The orchestrator MCP surface is now `start`, `start_batch`, `resume`,
+  `cancel`, `steer`, `list_agents`, `answer`, `transcript`, `delegation_guide`
+  and `doc`. The service integration methods `status`, `batch_receipt`,
+  `capabilities`, `transcript_exact`, `initial_task`, `answer_chunk`,
+  `agent_integration` and the history-pin methods are served only by the
+  operator socket and CLI: MCP discovery omits them and MCP calls reject them as
+  unknown tools. The socket `tools` method still lists them, marked
+  `"surface":"socket"`, so Hub feature detection keeps working.
+  `schemas/tools.json` now exports the orchestrator MCP discovery only. The MCP
+  `answer` text points large-answer retrieval to the file or
+  `agent-run answer-chunk`.
+- `history_pins_list` lists pins. Public `history_pins_release` requires the
+  batch bearer token (`release_token`) issued only by the original retained
+  socket `start_batch` response. CLI admission can route it to a private
+  file or inherited descriptor. CLI standard streams and MCP omit it.
+  CLI release reads the token from a file or stdin. Read-only batch
+  receipt lookup returns `found:false` for unused keys and mismatched intents.
+  Agent Pool continues to release managed enrollment pins with
+  `_managed_pin_release_v1` on its authenticated route. Legacy public pins
+  and pins with a lost token require an explicit offline database-owner
+  release. See the [Agent Pool migration note](docs/api.md#agent-pool-migration-for-history-pins).
+- Legacy Run cooperative pools are removed (owner decision; Agent Pool owns
+  groups, membership, messages and consensus). Gone: the orchestrator tools
+  `start_pool`, `pool`, `pool_post`, `pool_replace` and `list_pools`; the worker
+  tools `pool_post`, `pool_read`, `pool_propose` and `pool_vote`; the CLI
+  commands `start-pool`, `pool-post`, `pool-replace`, `pool`, `pools`/`list-pools`
+  and `bind --pool`; whole-pool hook binding; pool settlement, push commands,
+  read guards, health wait evidence and the `agent-run.pool-completion` /
+  `agent-run.pool-attention` notices. The socket answers removed methods as
+  unknown (`-32601`). Nothing is migrated into Agent Pool.
+- The `agent-run-tui` crate and binary are removed. Native releases seal the
+  fixed `assets/tui-compat.sh` shim as `bin/agent-run-tui`, so an installed
+  launcher reports the move to Agent Hub instead of failing silently.
+- Worker catalogs no longer contain pool tools. Ordinary workers serve only
+  `notify_orchestrator`; explicit-completion workers add `health_reply` and
+  `finish` (research adds `save_report`). Catalog versions are unchanged, the
+  managed catalog bytes are identical, and catalogs registered by earlier
+  binaries (including the historical v2/v3 pool-capable digests) are no
+  longer recognized.
+
+### Changed
+
+- A harness may now declare more hooks than the managed Pool Bridge hook, so
+  an ordinary Agent Pool leader profile can carry its own `PreToolUse` hook
+  (matcher `mcp__agent-pool-leader__.*`) beside the managed one on the
+  `claude-code` harness. Managed role selection picks the single `PreToolUse`
+  hook whose matcher is `mcp__<pool_server>__.*` and refuses the role when it
+  is missing, duplicated or on another event; a managed home materializes
+  exactly that hook, while ordinary launches receive every configured hook.
+  A frozen managed role compares only its Pool-matcher hooks with the current
+  configuration, so adding a leader hook does not refuse its next launch.
+  Leaders are Claude Code only; Codex matcher rewriting is unchanged. See
+  "Agent Pool leader profiles" in `docs/provider-config-v2.md`.
+
+### Data
+
+- No schema change and no DROP migration: legacy pool tables and the
+  `pool_membership_ever` fence stay readable. Binary rollback keeps schema
+  compatibility. Delivery rows already held, retired or expired keep those
+  states after switching binaries. Ordinary retention may still release a
+  whole expired legacy pool.
+- Writer operations 4-7, 47-51 and 95 are removed and their wire ids are
+  reserved (`ops::RESERVED_WIRE_IDS`); a frame naming one is refused as an
+  unknown kind.
+- A due delivery with native attempts and no Bridge intent ends `failed` with
+  `legacy_delivery_held` and retained evidence. Other due legacy pool
+  completion and enrollment attention notices end `failed` with
+  `legacy_pool_retired`. Unbound terminal agent notices expire after one hour
+  on a claim sweep, with legacy pool completion rows excluded. Queued legacy
+  `pool` commands and tagged pool-loop or enrollment steers complete without
+  native input. Stored health snapshots with old pool evidence still decode.
+- An exact historical provider resume can replay through its durable legacy
+  pool binding. For a new resume that relied on that shared destination,
+  supply it explicitly. Pool membership no longer suppresses individual
+  completion notices.
+- Archival access is read-only SQL documented in `agent-run doc completion`.
+
 ## 0.31.8
 
 ### Fixed

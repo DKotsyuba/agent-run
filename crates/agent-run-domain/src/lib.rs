@@ -24,7 +24,6 @@ pub mod lineage_hold_wire;
 pub mod observation;
 /// Strict managed native-owner v2 outbox and request contracts.
 pub mod owner_v2;
-pub mod pool;
 mod provider_connection;
 pub mod provider_start;
 /// Draft bounded database-only execution status proofs.
@@ -61,8 +60,7 @@ pub use types::{
     PositiveFinite, ProcessBirthProof, RelativeOwnedPath, RuntimeName, Sha256Digest, StoreId,
 };
 pub use views::{
-    AgentPage, AgentView, AnswerView, CapacityOrderQuery, CleanupView, CommandView, DeliveryView,
-    ListPoolsView, MessageView, ModelsQuery, PoolListMemberView, PoolListView, StartResult,
-    TranscriptPage,
+    AgentPage, AgentView, AnswerView, CleanupView, CommandView, DeliveryView, MessageView,
+    ModelsQuery, StartResult, TranscriptPage,
 };
 pub use worker::{NotifyReceipt, NotifyRequest, WorkerCall, WorkerMessageKind, WorkerNotice};

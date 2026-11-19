@@ -95,7 +95,7 @@ Schema 2 requires canonical role files with explicit `revision`, `write`,
 `required_constraints` fields. Migration does not rewrite legacy role files.
 Preserve the old profile directory for rollback, prepare a separate canonical
 catalog, and point `profiles.directory` at it before admitting agents. Verify
-that `models` lists the expected roles for each provider. Claude Code loads
+that `delegation_guide` lists the expected profiles for each provider. Claude Code loads
 plugins as a whole: every plugin-exported skill must appear in the selected
 role's skill list, or the launch is refused before the engine starts.
 

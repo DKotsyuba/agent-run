@@ -83,15 +83,6 @@ impl CliService for FakeService {
             .map(|(_, page)| page.clone())
             .ok_or_else(|| invalid("missing transcript fixture"))
     }
-    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(async { Ok(json!([])) })
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
-    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
     /// Returns empty text for this fixture's guide query without catalog I/O.
     fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
         Box::pin(async { Ok(Value::String(String::new())) })
@@ -218,9 +209,12 @@ async fn batch_cli_rejects_missing_or_malformed_execution_ref_as_unknown() {
     }
 }
 
-/// One CLI command uses the shared pin wire for release and list actions.
+/// The CLI uses the split pin methods; release reads the credential from a file.
 #[tokio::test]
 async fn history_pins_cli_uses_exact_release_key_and_list_page() {
+    let token_file = tempfile::NamedTempFile::new().unwrap();
+    let token = "a".repeat(64);
+    std::fs::write(token_file.path(), format!("{token}\n")).unwrap();
     let pin = "pin_550e8400e29b41d4a716446655440000";
     let first = json!({"pin_id":pin,"status":"released","already_released":false});
     let second = json!({"pin_id":pin,"status":"released","already_released":true});
@@ -232,8 +226,22 @@ async fn history_pins_cli_uses_exact_release_key_and_list_page() {
     ]));
     let output = Arc::new(Mutex::new(Vec::new()));
     for args in [
-        vec!["history-pins", "release", "--pin-id", pin],
-        vec!["history-pins", "release", "--pin-id", pin],
+        vec![
+            "history-pins",
+            "release",
+            "--pin-id",
+            pin,
+            "--release-token-file",
+            token_file.path().to_str().unwrap(),
+        ],
+        vec![
+            "history-pins",
+            "release",
+            "--pin-id",
+            pin,
+            "--release-token-file",
+            token_file.path().to_str().unwrap(),
+        ],
         vec!["history-pins", "list", "--status", "released"],
     ] {
         agent_run::cli::run_with(
@@ -249,12 +257,13 @@ async fn history_pins_cli_uses_exact_release_key_and_list_page() {
     }
     assert_eq!(output.lock().unwrap().as_slice(), &[first, second, page]);
     let calls = broker.calls.lock().unwrap();
-    assert!(calls.iter().all(|(method, _)| method == "history_pins"));
-    assert_eq!(calls[0].1, json!({"action":"release","pin_id":pin}));
-    assert_eq!(calls[1].1, calls[0].1);
+    assert_eq!(calls[0].0, "history_pins_release");
+    assert_eq!(calls[0].1, json!({"pin_id":pin,"release_token":token}));
+    assert_eq!(calls[1], calls[0]);
+    assert_eq!(calls[2].0, "history_pins_list");
     assert_eq!(
         calls[2].1,
-        json!({"action":"list","status":"released","limit":100,"after_pin_id":null})
+        json!({"status":"released","limit":100,"after_pin_id":null})
     );
 }
 
@@ -528,43 +537,46 @@ async fn observation_cli_uses_shared_broker_methods() {
     assert!(broker.calls.lock().unwrap().is_empty());
 }
 
-/// Both CLI discovery spellings forward validated pages through the broker;
-/// default output preserves JSON and --text reuses the compact MCP presentation.
-#[tokio::test]
-async fn pools_cli_uses_broker_and_supports_human_output() {
-    let page = json!({"items":[],"total":0,"offset":2,"limit":3,
-        "next_offset":null,"complete":true});
-    for command in ["pools", "list-pools"] {
-        let broker = Arc::new(FakeBroker::new(vec![page.clone()]));
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let service = Arc::new(FakeService::new(vec![], false));
-        let text = Arc::new(Mutex::new(String::new()));
-        let mut deps = dependencies(service, broker.clone(), output.clone());
-        let captured = text.clone();
-        deps.text_output = Arc::new(move |chunk| {
-            captured.lock().unwrap().push_str(chunk);
-            Ok(())
-        });
-        let mut argv = vec![command, "--state", "open", "--offset", "2", "--limit", "3"];
-        if command == "list-pools" {
-            argv.push("--text");
-        }
-        agent_run::cli::run_with(parse(&argv), deps).await.unwrap();
-        assert_eq!(
-            broker.calls.lock().unwrap().as_slice(),
-            &[(
-                "list_pools".to_owned(),
-                json!({"state":"open","offset":2,"limit":3})
-            )]
+/// The removed legacy pool commands no longer parse; `bind` requires an agent.
+#[test]
+fn removed_pool_commands_do_not_parse() {
+    for argv in [
+        &["start-pool", "--spec", "-"][..],
+        &[
+            "pool-post",
+            "--pool-id",
+            "p",
+            "--request-id",
+            "r",
+            "--text",
+            "t",
+        ][..],
+        &[
+            "pool-replace",
+            "--pool-id",
+            "p",
+            "--agent-id",
+            "a",
+            "--request-id",
+            "r",
+        ][..],
+        &["pool", "--pool-id", "p"][..],
+        &["pools"][..],
+        &["list-pools"][..],
+        &[
+            "bind",
+            "--pool",
+            "p",
+            "--session-transport",
+            "codex_queue",
+            "--session-id",
+            "s",
+        ][..],
+    ] {
+        assert!(
+            Cli::try_parse_from(std::iter::once("agent-run").chain(argv.iter().copied())).is_err(),
+            "{argv:?}"
         );
-        if command == "pools" {
-            assert_eq!(
-                output.lock().unwrap().as_slice(),
-                std::slice::from_ref(&page)
-            );
-        } else {
-            assert!(text.lock().unwrap().contains("agent-run pools: 0 of 0"));
-        }
     }
 }
 
@@ -1754,15 +1766,6 @@ impl CliService for PausingService {
             )
         }
     }
-    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(async { Ok(json!([])) })
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
-    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
     /// Returns empty text for this fixture's guide query without catalog I/O.
     fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
         Box::pin(async { Ok(Value::String(String::new())) })
@@ -2027,15 +2030,6 @@ impl CliService for FollowService {
     }
     fn transcript(&self, _id: &AgentId, _cursor: i64, _limit: usize) -> agent_run::Result<Value> {
         Ok(json!({"messages":[]}))
-    }
-    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(async { Ok(json!([])) })
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
-    }
-    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(async { Ok(json!({})) })
     }
     /// Returns empty text for this fixture's guide query without catalog I/O.
     fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {

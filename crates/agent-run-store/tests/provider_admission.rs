@@ -267,9 +267,34 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
             .unwrap();
         assert_eq!(count, 0, "mismatch cannot admit {table}");
     }
+    use agent_run_store::history_pins::ReleaseAuthority;
+    let foreign = ReleaseAuthority::Credential([42; 32]);
     assert!(matches!(
-        store.release_history_pin_scoped(&pins[0], Some(&other_id)),
+        store.release_history_pin_scoped(&pins[0], Some(&other_id), &foreign),
         Err(Error::StoreIdentityMismatch)
+    ));
+    // Existing random public pins have no bearer credential or durable Pool
+    // enrollment, even when the caller knows their exact batch key.
+    for authority in [
+        foreign.clone(),
+        ReleaseAuthority::ManagedEnrollment {
+            route: agent_run_domain::attempt_binding::Route {
+                component_store_id: "pool-fixture".into(),
+                route_id: "fixture".into(),
+                worker_uid: 0,
+            },
+            request_id: request.request_id.clone(),
+        },
+    ] {
+        assert!(matches!(
+            store.release_history_pin_scoped(&pins[0], Some(&store_id), &authority),
+            Err(Error::Conflict)
+        ));
+    }
+    let unknown = agent_run_domain::batch::PinId::new();
+    assert!(matches!(
+        store.release_history_pin_scoped(&unknown, Some(&store_id), &foreign),
+        Err(Error::Conflict)
     ));
     assert!(matches!(
         store.history_pins_scoped(
@@ -397,6 +422,10 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
                 .already_released
         );
     }
+    assert!(matches!(
+        store.release_history_pin_scoped(&pins[0], Some(&store_id), &foreign),
+        Err(Error::Conflict)
+    ));
     assert_eq!(
         store
             .replay_batch(&request.request_id, &fingerprint)
@@ -851,7 +880,6 @@ mod p3 {
                     .unwrap(),
                 1
             );
-            assert!(store.existing_pool_member(&job.lineage_root_id).is_err());
         }
         assert!(
             store
@@ -877,16 +905,46 @@ mod p3 {
         assert!(
             matches!(store.managed_enrollment_admit(&late_key,&grant,&revision,&digests,submit()),Err(Error::Validation(ref text)) if text == "enrollment aborted")
         );
-        assert!(
+        // A historical enrollment may use a different internal batch key.
+        // Release uses the durable Pool enrollment and its original route.
+        use agent_run_store::history_pins::ReleaseAuthority;
+        let pin = &accepted.receipt.jobs[0].pin_id;
+        let mut wrong_route = grant.pool_route.clone();
+        wrong_route.route_id.push_str("-changed");
+        assert!(matches!(
+            store.release_history_pin_scoped(
+                pin,
+                Some(&key.expected_store_id),
+                &ReleaseAuthority::ManagedEnrollment {
+                    route: wrong_route,
+                    request_id: key.request_id.clone(),
+                }
+            ),
+            Err(Error::Conflict)
+        ));
+        let released = store
+            .release_history_pin_scoped(
+                pin,
+                Some(&key.expected_store_id),
+                &ReleaseAuthority::ManagedEnrollment {
+                    route: grant.pool_route.clone(),
+                    request_id: key.request_id.clone(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!released.already_released);
+        // The external-independence fence survives pin release.
+        assert_eq!(
             store
-                .release_history_pin(&accepted.receipt.jobs[0].pin_id)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .existing_pool_member(&accepted.receipt.jobs[0].lineage_root_id)
-                .is_err()
+                .conn
+                .query_row(
+                    "SELECT pool_membership_ever FROM agents WHERE id=?",
+                    [accepted.receipt.jobs[0].lineage_root_id.as_str()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
         );
         assert_eq!(
             store

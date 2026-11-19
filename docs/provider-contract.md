@@ -163,7 +163,7 @@ resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
 `ValidationError`; there is no runtime alias. A repeated `request_id` returns
 the original admission (`created=false`). `[harnesses.codex].fast_mode = true`
-forces the effective Fast option for all Codex starts/pool members. Resume reads
+forces the effective Fast option for all Codex starts and batch jobs. Resume reads
 the current override; each admitted execution and its retries retain that value.
 Raw requests, replay digests and parent native configuration remain unchanged.
 `fast` is carried to the codex
@@ -281,8 +281,8 @@ published length limit is applied.
 Before creating a durable agent/attempt or reserving account capacity, provider
 admission resolves the frozen canonical role and checks the executable, shared
 role policy, credential-reference connection shape and Codex grant compiler
-used by real launch. Single starts, new
-pool members and replacements share prepare_provider; historical start uses
+used by real launch. Single starts, batch jobs and managed Pool enrollments
+share prepare_provider; historical start uses
 the same native grant compiler. Replays still return their original admission
 before consulting mutable state. Unsupported writable Codex external read roots
 are typed errors in the start call, with no partial admission.
@@ -312,11 +312,11 @@ runtime_protocol_failed categories; actual cleanup ownership is unchanged.
 
 Claude's persistent input stream can produce several native results, including
 one result for a coalesced input batch. The shared runner assigns a fresh UUID
-to each initial task, steering input and pool message, and requests
+to each initial task, steering input and injected native-owner note, and requests
 `--replay-user-messages`. A result's `user_message_uuid` must match a known
 input and, when acknowledgements are present, the last input in that replay
 batch. A batch completes the current task only if it includes the latest
-initial/steering input. Pool-only successful results do not finish the task.
+initial/steering input. Note-only successful results do not finish the task.
 These UUIDs are native framing, not public agent identifiers, and are omitted
 from diagnostic metadata.
 
@@ -327,7 +327,7 @@ produce `ambiguous_result`. A single legacy result remains compatible only
 when no additional task or context inputs were written; even one uncorrelated
 result after multiple inputs is ambiguous.
 A genuine empty task result stays `empty_result` even when assistant progress
-or a later pool-only answer is nonblank. A possibly partial control write
+or a later note-only answer is nonblank. A possibly partial control write
 cannot certify success. EOF, exit zero, durable answer and verified process
 cleanup remain required; transcript text is never an answer fallback.
 
@@ -426,52 +426,31 @@ Executable boundary coverage lives beside the contracts:
 
 ## C6 Public catalog reads
 
-`delegation_guide` and `limits` are the advertised routing reads in the shared
-`assets/tools.json` registry and CLI/socket/MCP dispatcher. `models` and
-`capacity_order` retain their original call-only compatibility views. These
-reads use one validated config revision from the service's exact-byte
-last-valid cache, canonical role files, one fresh Quota response, and one local
-committed read. The guide renders that one response without fetching again.
-They never collect quota, call a harness, reserve, consume reset credits,
-write samples or start agents.
+`delegation_guide` is the advertised routing read in the shared
+`assets/tools.json` registry and CLI/socket/MCP dispatcher. It uses one
+validated config revision from the service's exact-byte last-valid cache,
+canonical role files and one local committed read. It never reads, collects or
+presents quota, calls a harness, reserves, consumes reset credits, writes
+samples or starts agents. Quota windows and capacity standing are presented by
+Agent Quota; the former `limits`, `models` and `capacity_order` reads were
+removed in 0.32.0.
 
-* `delegation_guide` renders compact account-free routing text, optionally
-  filtered by exact provider/model/profile names on CLI, socket and MCP. It
-  reuses catalog admission rules, efforts, restrictions and recommendations;
-  unknown names are typed validation errors and omitted filters retain defaults.
-* `limits` keeps Quota windows, percentages, resets and freshness and adds
-  schema-2 provider/model ranking from the same Quota response and local read.
-  `observed_at` equals `ranking.ranked_at`; `coverage` reports the source state,
-  a separate `incomplete` flag and Quota's nullable `evaluated_at`. A partial
-  or unavailable response leaves unreported quota unknown. Truncation at 1000
-  rows also sets `incomplete`; MCP refuses a page exceeding its smaller budget
-  rather than hiding that marker. Schema 1 returns `Unsupported` with guidance
-  to migrate to schema 2.
-* Compatibility `capacity_order` returns providers, never provider/account pairs, ranked
-  by `capacity::provider_ranking` (known before unknown; exhausted, disabled
-  and ineligible accounts excluded). Each offered model keeps its own
-  `status` and `best_priority`; the optional exact `model` filter ranks
-  providers by that model alone.
-* Compatibility `models` adds the explicit offerings (`native_model`, `params`,
+* The guide renders compact account-free routing text, optionally filtered by
+  exact provider/model/profile names on CLI, socket and MCP. Providers and
+  models appear in configured order with explicit offerings (`params`,
   `allowed_params`, `restrictions`, `recommendations`), provider
-  recommendations, harness and connection kind, canonical role grants, and
-  for each offering the roles admission would accept: the role loads as a
-  canonical provider role, its plan resolves, and the effective policy with
-  the model's restrictions admits on that harness — the same checks a start
-  applies. Exact `provider`/`profile`/`model` filters; unknown values are
-  validation errors.
-* Results carry `config_revision`, local `capacity_revision`, `ranked_at`,
-  account-free `quota_coverage` with Quota's `evaluated_at`, and (`models`)
-  `roles_sha256`. Registry status, cooldowns and the local capacity revision
-  come from one committed local read; Quota facts come from its separate
-  response. `ranked_at` is not the clock at which Quota computed its score,
-  and revision equality does not freeze time or prove fresh quota. Schema-1
-  `capacity_order` also returns `Unsupported` with migration guidance. Raw CLI/socket
-  `limits` keeps account-bound rows distinct by `account` and physical `pool`;
-  MCP diagnostic text omits those identities and retains existing byte/row
-  bounds. Guide and provider/model ranking emit no account id, label or secret
-  reference. The orchestrator chooses provider, model, effort and profile;
-  there is no automatic model choice or ability score.
+  recommendations, harness, and for each offering the roles admission would
+  accept: the role loads as a canonical provider role, its plan resolves, and
+  the effective policy with the model's restrictions admits on that harness —
+  the same checks a start applies. A profile filter keeps only offerings that
+  role can use. Unknown names are typed validation errors and omitted filters
+  retain defaults; schema 1 returns `Unsupported`.
+* Admission still ranks eligible accounts from one fresh Quota snapshot with
+  Run's configured account and provider multipliers
+  (`capacity::provider_ranking`) and refuses an exhausted choice with
+  `QuotaExhausted`. No account id, label or secret reference is emitted. The
+  orchestrator chooses provider, model, effort and profile; there is no
+  automatic model choice or ability score.
 
 ### Next attempt on one logical agent (store primitive)
 

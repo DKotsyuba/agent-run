@@ -1587,7 +1587,12 @@ mod tests {
         );
         assert_eq!(kept.persistence.as_ref().unwrap().attempts, 3);
         assert_eq!(kept.persistence.unwrap().wait_ms, 7);
-        let fallback = failure(OpKindRef::BindPool, RejectStage::Acquire, sql(5), started);
+        let fallback = failure(
+            OpKindRef::BindOrchestrator,
+            RejectStage::Acquire,
+            sql(5),
+            started,
+        );
         assert_eq!(
             fallback.persistence.as_ref().unwrap().operation,
             PersistenceOperation::WriterApply

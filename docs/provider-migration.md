@@ -92,6 +92,6 @@ The exact commands, refusal rules, and recovery sequence are in the embedded
 
 The migration does not rewrite legacy profile files. Before admitting agents
 under schema 2, select a separate catalog of complete canonical roles and
-confirm `models` lists eligible roles for each intended provider. Claude Code
+confirm `delegation-guide` lists eligible roles for each intended provider. Claude Code
 loads declared plugins as a whole, so each role must list every skill those
 plugins export; an undeclared export is refused before launch.

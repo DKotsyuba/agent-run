@@ -86,11 +86,11 @@ not replace Codex sandboxing or residual auto-review.
 
 Current Codex and Claude Code children receive only the MCP servers selected
 by their effective revisioned profile, plus the separate built-in
-`agent_run_worker` for newly admitted schema-2 roles. Its private pool tools
-coordinate members without granting operator authority. New admissions also
+`agent_run_worker` for newly admitted schema-2 roles. It grants no operator
+authority. New admissions also
 receive `finish(summary)`; only this authenticated callback supplies their
 immutable final answer. A native turn end leaves the same run/session idle
-for pool, steering or owned native-job events, without a lifetime timeout.
+for steering or owned native-job events, without a lifetime timeout.
 `explicit_finish=false` retains the legacy catalog/completion contract.
 Restricted research retains its confined `save_report` without gaining shell.
 `notify_orchestrator` queues a bounded material report to the current run's

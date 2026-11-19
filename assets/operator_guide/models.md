@@ -8,59 +8,28 @@ and existing sessions retain their admitted model identity.
 
 ### Verifying
 
-`agent-run models` reports each configured runtime's declared models together
-with the availability evidence its adapter can obtain. A missing model is a
-configuration or provider-roster error; fix the runtime declaration before
-admitting work with that model.
+Schema 1 has no provider catalog read; migrate to schema 2 and use the
+delegation guide below.
 
 ## Schema 2: the provider catalog
 
-MCP discovery exposes two routing reads: `delegation_guide` and `limits`.
-Schema 2 keeps `models` and `capacity_order` as call-only compatibility views.
-They read valid config, canonical role files and committed quota observations;
-they never collect quota, probe a harness, reserve capacity or start work.
-The caller picks provider, model, effort and profile; configured guidance is
-prose, not an automatic model-suitability decision.
+MCP discovery exposes one routing read: `delegation_guide`. It reads valid
+config, canonical role files and one committed local snapshot; it never reads,
+collects or presents quota, probes a harness, reserves capacity or starts work.
+Quota windows, reset times and capacity standing are presented by Agent Quota
+(`agent-quota limits` or its MCP); the former Run `limits`, `models` and
+`capacity_order` reads were removed in 0.32.0. Admission still reads one fresh
+Quota snapshot per decision and refuses an exhausted choice with
+`QuotaExhausted`. The caller picks provider, model, effort and profile;
+configured guidance is prose, not an automatic model-suitability decision.
 
-Filters are exact identifiers; an unknown value is a `ValidationError`:
-
-```sh
-agent-run models --provider codex --profile review --model gpt-main
-agent-run capacity order --model gpt-main
-```
-
-The same filters remain accepted by direct compatibility calls to `models` /
-`capacity_order` over MCP and the broker socket (`{"provider":..,"profile":..,"model":..}`,
-`{"model":..}`). Each result carries `config_revision` (SHA-256 of the exact
-`config.toml` bytes), `capacity_revision` (the committed quota/registry
-snapshot it was read from) and `ranked_at` (the clock the standing was
-evaluated at — not a sample age); `models` also carries `roles_sha256` over
-the listed role grants. Registry status, samples and exhaustion facts all
-come from that one committed read. Reuse a result only while
-`config_revision`, `capacity_revision` and `roles_sha256` all match: role
-files can change without a config edit.
-
-`models` lists, per provider (in capacity order): `harness`, connection
-`kind`/`protocol`, `auth_family`, `limits_source`, `priority_multiplier`,
-`score` (best available priority times the multiplier, saturating at the
-largest finite double, or `null` when nothing is available; equal scores
-order by status, then provider id), provider `recommendations`, and every
-explicit offering with its
-`native_model`, default `params`, `allowed_params` (for example efforts; a
-chosen `effort` outside the list is refused at start and resume),
-hard `restrictions`, model `recommendations`, the canonical `profiles`
-admission would accept for it, and cached `quota`: `status` (`available`,
-`unknown` = no usable known standing, `priority_overflow`, `exhausted`,
-`no_eligible_account`), `best_priority`, `evidence` (`fresh` = a current
-sample or an active exhaustion fact decided it, `stale` = samples exist but
-yield no usable known standing, `missing` = never observed), `newest_observed_at`
-(the newest sample timestamp on that lane) and `exhausted_until` (the
-earliest known reset when exhausted). These are cached facts, not health
-claims; `unknown`/`stale` alone do not prove an expired validity timestamp.
-With a `profile` filter, providers are ranked over only the
-offerings that role can use. No account id, label or credential reference
-appears; per-account facts stay in `limits` (each account-bound row names
-its `account` and physical `pool`) and `accounts list`.
+For each provider (in configured order) the guide shows its harness and
+recommendations and every explicit offering with its default `params`,
+`allowed_params` (for example efforts; a chosen `effort` outside the list is
+refused at start and resume), hard `restrictions`, model `recommendations`
+and the canonical `profiles` admission would accept for it. With a `profile`
+filter, only offerings that role can use are listed. No account id, label or
+credential reference appears; per-account facts stay in `accounts list`.
 
 Edit provider/model `recommendations` in `config.toml`; valid reload changes
 the next guide/catalog result and its `config_revision`. Skills need no model
@@ -79,8 +48,7 @@ recommendations = ["broad coding"]
 Omitted effort uses `params.effort`. Other parameter keys are rejected until a
 launch adapter can execute them. See `agent-run doc config` for full config.
 
-A schema-1 file keeps its historical runtime roster and route order; the
-filters are `Unsupported` there.
+A schema-1 file has no provider catalog; the guide is `Unsupported` there.
 
 ### GLM effort through Claude Code
 
@@ -96,19 +64,6 @@ maps `minimal|light|low` to `low`, `medium|high` to `high`, and
 toggle and provider default. This describes wire behavior, not a model-ability
 ranking; only use values admitted by the configured `allowed_params`.
 
-## MCP compact presentation
-
-Use `delegation_guide` for compact provider/model guidance and `limits` for
-diagnosis. Limits retain quota windows, percentages, reset times and freshness
-and add schema-2 provider/model standing, scores and provider multipliers in
-`ranking`. Windows and ranking share one committed snapshot, config revision
-and advice clock (`observed_at` equals `ranking.ranked_at`); the existing ranker
-considers every governing window and exhaustion fact. Unknown/stale capacity
-is never presented as healthy. MCP text omits account/pool identities and
-retains whole-response size/row bounds; CLI/socket diagnostic JSON keeps those
-original physical-window identities. Call-only `models` and `capacity_order`
-retain their original compact MCP layouts and structured CLI/socket shapes.
-
 ## Delegation guide
 
 `agent-run delegation-guide` and the `delegation_guide` MCP/socket read accept
@@ -119,17 +74,16 @@ the same exact optional `provider`, `model`, and `profile` filters, with typed
 agent-run delegation-guide --provider codex --model gpt-main --profile review
 ```
 
-Omitted filters retain the default guide. One Quota response and one local
-read snapshot render a compact operating header, providers in capacity order
-with harness/guidance, and each exact selectable model: quota status/evidence,
-sample age and reset horizon derived from Run's `ranked_at`, admissible canonical profiles
-(`profiles: none` means no role may use it), nonempty default/allowed params,
-restrictions and configured guidance. Schema 1 is `Unsupported`; an empty
-catalog is explicit. Text omits skills, MCP arrays, hashes, accounts,
-credentials and endpoints, normalizes recommendation whitespace/control
-characters, and adds no model-ability ranking or facts beyond its inputs.
-Quota standings are evaluated at Quota's separate `evaluated_at`; the two
-services do not share an atomic snapshot.
+Omitted filters retain the default guide. One local read snapshot renders a
+compact operating header, providers in configured order with
+harness/guidance, and each exact selectable model: admissible canonical
+profiles (`profiles: none` means no role may use it), nonempty default/allowed
+params, restrictions and configured guidance. It carries no quota standing;
+read current capacity from Agent Quota before choosing. Schema 1 is
+`Unsupported`; an empty catalog is explicit. Text omits skills, MCP arrays,
+hashes, accounts, credentials and endpoints, normalizes recommendation
+whitespace/control characters, and adds no model-ability ranking or facts
+beyond its inputs.
 
 Before delegating a task, the orchestrator must call this tool and read its
 output before choosing provider, model, effort or profile. Keep task-suitability

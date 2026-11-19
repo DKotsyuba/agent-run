@@ -130,14 +130,19 @@ fn replay(
     request_id: &str,
     fingerprint: &str,
     expected: Option<&StoreId>,
+    lookup_only: bool,
 ) -> Result<(StoreId, Option<StartBatchResult>)> {
     // One SQL statement binds the identity and receipt to the same read snapshot.
     type ScopedReceiptRow = (String, Option<u32>, Option<String>, Option<String>);
-    let row: Option<ScopedReceiptRow> = conn.query_row(
-        "SELECT s.store_id,r.fingerprint_version,r.fingerprint,r.receipt_json \
-         FROM store_identity s LEFT JOIN start_batch_receipts r ON r.request_id=? WHERE s.singleton=1",
-        [request_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    ).optional()?;
+    let row: Option<ScopedReceiptRow> = conn
+        .query_row(
+            "SELECT s.store_id,r.fingerprint_version,r.fingerprint,r.receipt_json \
+         FROM store_identity s LEFT JOIN start_batch_receipts r \
+         ON r.request_id=?1 AND (NOT ?2 OR r.fingerprint=?3) WHERE s.singleton=1",
+            params![request_id, lookup_only, fingerprint],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
     let (raw_id, version, stored, raw) =
         row.ok_or_else(|| Error::Integrity("store identity is missing".into()))?;
     let store_id: StoreId = raw_id
@@ -172,6 +177,7 @@ fn replay(
         Some(StartBatchResult {
             receipt,
             replayed: true,
+            release_token: None,
         }),
     ))
 }
@@ -193,13 +199,33 @@ impl Store<'_> {
         fingerprint: &str,
         expected: Option<&StoreId>,
     ) -> Result<Option<StartBatchResult>> {
-        replay(&self.conn, request_id, fingerprint, expected).map(|(_, result)| result)
+        replay(&self.conn, request_id, fingerprint, expected, false).map(|(_, result)| result)
+    }
+
+    /// Observes only an exact receipt. A different intent is indistinguishable
+    /// from an unused key on the read-only public socket method.
+    pub fn lookup_batch_receipt(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+        expected: Option<&StoreId>,
+    ) -> Result<Option<StartBatchResult>> {
+        replay(&self.conn, request_id, fingerprint, expected, true).map(|(_, result)| result)
+    }
+
+    /// Commits an internal or fixture batch, minting random IDs for its pins.
+    pub fn admit_batch(&self, batch: BatchAdmission<'_>) -> Result<StartBatchResult> {
+        self.admit_batch_with_pin_digest(batch, None)
     }
 
     /// Commits every ordinary admission and its permanent receipt, or none.
     /// Replays run before restart/capacity checks and never authorize a launch.
     /// Every new member's quota clock fence is rechecked before the shared commit.
-    pub fn admit_batch(&self, batch: BatchAdmission<'_>) -> Result<StartBatchResult> {
+    pub(crate) fn admit_batch_with_pin_digest(
+        &self,
+        batch: BatchAdmission<'_>,
+        pin_digest: Option<&[u8; 32]>,
+    ) -> Result<StartBatchResult> {
         external_id("request_id", batch.request_id)?;
         if !(1..=MAX_BATCH_JOBS).contains(&batch.jobs.len())
             || batch
@@ -223,6 +249,7 @@ impl Store<'_> {
             batch.request_id,
             batch.fingerprint,
             batch.expected_store_id,
+            false,
         )?;
         if let Some(result) = replayed {
             if result.receipt.preconditions.as_deref() != batch.preconditions {
@@ -251,7 +278,9 @@ impl Store<'_> {
                         Error::Integrity("invalid first provider attempt identity".into())
                     })?;
             let pin_id = if batch.retain_history {
-                let pin_id = PinId::new();
+                let pin_id = pin_digest.map_or_else(PinId::new, |digest| {
+                    PinId::from_release_digest(digest, &admitted.agent_id)
+                });
                 tx.execute(
                     "INSERT INTO history_pins(pin_id,root_agent_id,released) VALUES(?,?,0)",
                     params![pin_id.as_str(), admitted.agent_id.as_str()],
@@ -277,6 +306,7 @@ impl Store<'_> {
                 preconditions: batch.preconditions.map(<[_]>::to_vec),
             },
             replayed: false,
+            release_token: None,
         };
         output
             .receipt

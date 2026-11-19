@@ -6,22 +6,20 @@ use crate::{
     error::invalid,
     service::{Query, Service},
 };
-pub use agent_run_domain::tools::{is_tool, tool, tools_json};
+pub use agent_run_domain::tools::{
+    is_orchestrator_tool, is_tool, socket_tools_json, tool, tools_json,
+};
 use agent_run_domain::{
     storage::WriteAuthority,
     worker::{WorkerCatalogProof, known_worker_catalog},
 };
 use agent_run_store::{
-    ops::{
-        AcceptWorkerFinish, NotifyOrchestrator, PoolOutcome, PoolWrite, PoolWriteSpec,
-        RegisterWorkerCatalog,
-    },
+    ops::{AcceptWorkerFinish, NotifyOrchestrator, RegisterWorkerCatalog},
     writer::{CatalogPreflight, StoreReader},
 };
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
 
 /// Maximum encoded CLI transcript page, matching the existing 64 MiB native-history input bound.
 pub const CLI_TRANSCRIPT_MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -29,7 +27,8 @@ pub const CLI_TRANSCRIPT_MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Socket-only retry code for a transcript page changed between fragments.
 pub const CLI_TRANSCRIPT_PAGE_CHANGED_CODE: &str = "TranscriptPageChanged";
 
-/// Returns the one domain-owned, Python-compatible public discovery table.
+/// Returns the one domain-owned, Python-compatible orchestrator MCP discovery
+/// table; socket-only service methods are listed by [`socket_tools_json`].
 pub fn tools() -> Vec<Value> {
     tools_json()
 }
@@ -452,13 +451,9 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"agent-run: restart wait recorded; retry after the restart notice."}}),
                 );
             }
-            let bound = crate::hooks::bind::run_hook_bound(
-                &service.home,
-                &hook.payload,
-                &hook.transport,
-                None,
-            )
-            .await?;
+            let bound =
+                crate::hooks::bind::run_hook(&service.home, &hook.payload, &hook.transport, None)
+                    .await?;
             let configured = agent_run_config::provider_config::ProviderConfig::load(&service.home)
                 .map(|(config, _)| config.delivery.bridge.is_some())
                 .or_else(|_| {
@@ -473,14 +468,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     } else {
                         "Bridge notification configuration could not be verified"
                     };
-                    match &bound {
-                        crate::hooks::bind::HookBound::Agent(value) => {
-                            format!("agent-run: agent {} is bound; {detail}.", value.agent_id)
-                        }
-                        crate::hooks::bind::HookBound::Pool(value) => {
-                            format!("agent-run: pool {} is bound; {detail}.", value.pool_id)
-                        }
-                    }
+                    format!("agent-run: agent {} is bound; {detail}.", bound.agent_id)
                 }
             };
             Ok(
@@ -550,7 +538,8 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 })
                 .await
         }
-        "history_pins" => service.history_pins(args(raw)?).await,
+        "history_pins_list" => service.history_pins_list(args(raw)?).await,
+        "history_pins_release" => service.history_pins_release(args(raw)?).await,
         "_lineage_hold_acquire"
         | "_lineage_hold_lookup"
         | "_lineage_hold_list"
@@ -685,37 +674,6 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             .await
             .map_err(|_| crate::Error::Runtime("CLI transcript status read failed".into()))?
         }
-        "start_pool" => {
-            service
-                .start_pool(args::<agent_run_domain::pool::PoolStartRequest>(raw)?)
-                .await
-        }
-        "pool_post" => {
-            let request: agent_run_domain::pool::PoolPost = args(raw)?;
-            service
-                .pool_post(request)
-                .await?
-                .map_err(agent_run_domain::pool::PoolDenial::into_error)
-        }
-        "pool_replace" => service
-            .replace_pool_member(args::<agent_run_domain::pool::PoolReplace>(raw)?)
-            .await?
-            .map_err(agent_run_domain::pool::PoolDenial::into_error),
-        "pool" => {
-            let query: agent_run_domain::pool::PoolQuery = args(raw)?;
-            let service = service.clone();
-            tokio::task::spawn_blocking(move || service.pool_status(query))
-                .await
-                .map_err(|_| crate::Error::Runtime("pool read failed".into()))??
-                .map_err(agent_run_domain::pool::PoolDenial::into_error)
-        }
-        "list_pools" => {
-            let query = args::<agent_run_domain::pool::ListPoolsQuery>(raw)?;
-            let service = service.clone();
-            tokio::task::spawn_blocking(move || service.list_pools(query))
-                .await
-                .map_err(|_| crate::Error::Runtime("pool list failed".into()))?
-        }
         "list_agents" => service.list_public(args::<Query>(raw)?).await,
         "agent_integration" => {
             let selection: Integration = args(raw)?;
@@ -731,19 +689,16 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             let topic = a.topic.as_deref().unwrap_or("index");
             Ok(json!({"topic":topic,"text":doc(topic)?}))
         }
-        "models" => service.models(args(raw)?).await,
-        "limits" => {
-            let _: Empty = args(raw)?;
-            service.limits().await
-        }
-        "capacity_order" => service.capacity_order(args(raw)?).await,
         "delegation_guide" => service.delegation_guide_filtered(args(raw)?).await,
         // Socket-only control/discovery methods; absent from public tool discovery.
         "tools" => {
             let _: Empty = args(raw)?;
             // The private socket discovery method predates MCP and returns the
-            // table itself, not an MCP-shaped wrapper.
-            Ok(Value::Array(tools()))
+            // table itself, not an MCP-shaped wrapper. It lists every socket
+            // method, including socket-only service methods marked
+            // `"surface":"socket"`, so feature detection such as Hub's
+            // `answer_chunk`/`capabilities`/`initial_task` probes keeps working.
+            Ok(Value::Array(socket_tools_json()))
         }
         "ping" => {
             let options: Ping = args(raw)?;
@@ -788,78 +743,15 @@ pub fn doc(topic: &str) -> Result<&'static str> {
     crate::doc::topic_text(topic)
 }
 
-/// Three empty forward reads of the same actual pool revision form one
-/// polling episode. Bounded process-local hints never grant authority; every
-/// read/report still authenticates its exact attempt in the store.
-#[derive(Default)]
-pub(crate) struct PoolReadGuards(std::collections::BTreeMap<String, (String, u64, u8, bool)>);
-impl PoolReadGuards {
-    /// Whether the prior episode needs bounded backpressure; cursor arguments
-    /// cannot reset this because the key is the actual durable log revision.
-    fn waiting(&self, key: &str) -> bool {
-        self.0.get(key).is_some_and(|v| v.2 >= 3)
-    }
-    /// Observe one authenticated forward page. Returns (guarded, needs report).
-    /// A failed report remains retryable until its durable acknowledgement.
-    /// New data/revision rearms; old attempts consume at most 256 small slots.
-    fn observe(&mut self, key: String, page: &Value) -> (bool, bool) {
-        if page["before_seq"].is_number() {
-            return (false, false);
-        }
-        if page["entries"].as_array().is_some_and(|v| !v.is_empty()) {
-            self.0.remove(&key);
-            return (false, false);
-        }
-        let Some(revision) = page["log_revision"].as_u64() else {
-            return (false, false);
-        };
-        let pool = page["pool_id"].as_str().unwrap_or("").to_owned();
-        if !self.0.contains_key(&key) && self.0.len() >= 256 {
-            self.0.pop_first();
-        }
-        let state = self
-            .0
-            .entry(key)
-            .or_insert((pool.clone(), revision, 0, false));
-        if state.0 != pool || state.1 != revision {
-            *state = (pool, revision, 0, false);
-        }
-        state.2 = state.2.saturating_add(1).min(3);
-        (state.2 >= 3, state.2 >= 3 && !state.3)
-    }
-    /// Mark only the observed revision after the writer acknowledged its
-    /// idempotent notice/control unit. A delayed old reply cannot mark new work.
-    fn reported(&mut self, key: &str, revision: u64) {
-        if let Some(state) = self.0.get_mut(key)
-            && state.1 == revision
-        {
-            state.3 = true;
-        }
-    }
-}
-
-/// Maximum seconds one private `pool_read` may hold for a new entry, kept
-/// below the broker socket's per-request deadline so the wait never outlives
-/// its transport.
-const POOL_READ_WAIT_SECONDS: f64 = 25.0;
-
 /// Routes one authenticated private worker tool through the shared broker.
 ///
-/// Every tool authenticates the hidden capability server-side; pool denials
-/// are returned in-band as one typed `{error: {code, message}}` object so the
-/// worker transport can render a typed refusal instead of guessing from
-/// prose. The read wait is bounded, holds no database lock across awaits,
-/// and ends as soon as the attempt stops being usable.
+/// Every tool authenticates the hidden capability server-side.
 async fn worker_tool_call(
     service: &Service,
     call: agent_run_domain::worker::WorkerToolCall,
     tool: agent_run_domain::worker::WorkerTool,
 ) -> Result<Value> {
-    use agent_run_domain::pool::{PoolDenial, PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
     use agent_run_domain::worker::WorkerTool;
-    let denial = |denial: PoolDenial| {
-        Ok(json!({"error": {"code": denial.code(), "message": denial.message()}}))
-    };
     match tool {
         WorkerTool::HealthReply => {
             let input: agent_run_domain::health::PingReply = serde_json::from_value(call.input)
@@ -939,158 +831,10 @@ async fn worker_tool_call(
                 .await?;
             Ok(serde_json::to_value(receipt)?)
         }
-        WorkerTool::PoolPost | WorkerTool::PoolPropose | WorkerTool::PoolVote => {
-            let write = match tool {
-                WorkerTool::PoolPost => PoolWriteSpec::Message(
-                    serde_json::from_value::<PoolMessage>(call.input)
-                        .map_err(|_| invalid("invalid pool_post arguments"))?,
-                ),
-                WorkerTool::PoolPropose => PoolWriteSpec::Proposal(
-                    serde_json::from_value::<PoolPropose>(call.input)
-                        .map_err(|_| invalid("invalid pool_propose arguments"))?,
-                ),
-                _ => PoolWriteSpec::Vote(
-                    serde_json::from_value::<PoolVote>(call.input)
-                        .map_err(|_| invalid("invalid pool_vote arguments"))?,
-                ),
-            };
-            let outcome = service
-                .lane("workers")?
-                .local_as(
-                    worker_authority(&call.run_id, &call.attempt_id),
-                    PoolWrite {
-                        execution: call.run_id,
-                        attempt: call.attempt_id,
-                        token: call.token,
-                        write,
-                    },
-                    BROKER_BUDGET,
-                )
-                .await?;
-            match outcome {
-                PoolOutcome::Done(receipt) => Ok(json!({
-                    "pool_id": receipt.pool_id,
-                    "seq": receipt.seq,
-                    "duplicate": receipt.duplicate,
-                    "recorded": true,
-                    "note": "recorded durably and readable through pool_read; not pushed or read by anyone",
-                })),
-                PoolOutcome::Denied(reason) => denial(reason),
-            }
-        }
-        WorkerTool::PoolRead => {
-            let request: PoolReadRequest = serde_json::from_value(call.input)
-                .map_err(|_| invalid("invalid pool_read arguments"))?;
-            request.validate()?;
-            let after_seq = request.after_seq.unwrap_or(0).min(i64::MAX as u64);
-            let limit = request.limit.unwrap_or(50);
-            let run = call.run_id.clone();
-            let attempt = call.attempt_id.clone();
-            let explicit = service
-                .read(move |store| store.pool_read_guard_enabled(&run, &attempt))
-                .await?;
-            let guard_key = format!("{}:{}", call.run_id, call.attempt_id);
-            let guarded = explicit && service.pool_read_guards().waiting(&guard_key);
-            // The bounded optional wait: one short store probe per interval,
-            // never a lock across awaits, ended by data, deadline or a
-            // stopped attempt. A reverse page never waits.
-            let deadline = tokio::time::Instant::now()
-                + Duration::from_secs_f64(if request.before_seq.is_some() {
-                    0.0
-                } else if explicit {
-                    if guarded { POOL_READ_WAIT_SECONDS } else { 0.0 }
-                } else {
-                    request
-                        .wait_seconds
-                        .unwrap_or(0.0)
-                        .min(POOL_READ_WAIT_SECONDS)
-                });
-            loop {
-                let home = service.home.clone();
-                let (run_id, attempt_id, token) = (
-                    call.run_id.clone(),
-                    call.attempt_id.clone(),
-                    call.token.clone(),
-                );
-                let probe_after = after_seq;
-                let ready = tokio::task::spawn_blocking(move || {
-                    StoreReader::open(&home)?.pool_has_entries_after(
-                        &run_id,
-                        &attempt_id,
-                        &token,
-                        probe_after,
-                    )
-                })
-                .await
-                .map_err(|_| crate::Error::Runtime("worker pool read failed".into()))??;
-                match ready {
-                    Err(reason) => return denial(reason),
-                    Ok(true) => break,
-                    Ok(false) => {
-                        if tokio::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                    }
-                }
-            }
-            let home = service.home.clone();
-            let (run_id, attempt_id, token) = (
-                call.run_id.clone(),
-                call.attempt_id.clone(),
-                call.token.clone(),
-            );
-            let page = tokio::task::spawn_blocking(move || {
-                StoreReader::open(&home)?.pool_read(
-                    &run_id,
-                    &attempt_id,
-                    &token,
-                    after_seq,
-                    request.before_seq.map(|before| before.min(i64::MAX as u64)),
-                    limit,
-                )
-            })
-            .await
-            .map_err(|_| crate::Error::Runtime("worker pool read failed".into()))??;
-            match page {
-                Ok(mut page) => {
-                    if explicit {
-                        let (guarded, first) =
-                            service.pool_read_guards().observe(guard_key.clone(), &page);
-                        page["suspend_inference"] =
-                            json!(guarded || page["entries"].as_array().is_some_and(Vec::is_empty));
-                        if first {
-                            let _newly_reported = service
-                                .lane("workers")?
-                                .local_as(
-                                    worker_authority(&call.run_id, &call.attempt_id),
-                                    agent_run_store::ops::ReportPoolReadLoop {
-                                        execution: call.run_id.clone(),
-                                        attempt: call.attempt_id.clone(),
-                                        token: call.token.clone(),
-                                        revision: page["log_revision"].as_u64().ok_or_else(
-                                            || invalid("pool page has no log revision"),
-                                        )?,
-                                        at: crate::domain::now(),
-                                    },
-                                    BROKER_BUDGET,
-                                )
-                                .await?;
-                            service.pool_read_guards().reported(
-                                &guard_key,
-                                page["log_revision"].as_u64().expect("validated above"),
-                            );
-                        }
-                    }
-                    Ok(page)
-                }
-                Err(reason) => denial(reason),
-            }
-        }
     }
 }
 
-/// Worker authority of one authenticated tool call (rows 44-47 accept no other).
+/// Worker authority of one authenticated tool call (rows 44-46 accept no other).
 fn worker_authority(run: &AgentId, attempt: &str) -> WriteAuthority {
     WriteAuthority::Worker {
         execution: run.clone(),
@@ -1098,7 +842,7 @@ fn worker_authority(run: &AgentId, attempt: &str) -> WriteAuthority {
     }
 }
 
-/// Registers one worker's pool catalog proof.
+/// Registers one worker's catalog proof.
 ///
 /// A read-only preflight answers the unauthenticated, conflicting and
 /// already-registered cases with local values; only a first registration
@@ -1106,7 +850,7 @@ fn worker_authority(run: &AgentId, attempt: &str) -> WriteAuthority {
 async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Result<Value> {
     if !known_worker_catalog(proof.version, &proof.digest) {
         return Err(crate::Error::Unsupported(
-            "worker pool catalog is not supported".into(),
+            "worker catalog is not supported".into(),
         ));
     }
     let at = crate::domain::now();
@@ -1201,43 +945,6 @@ mod cli_transcript_snapshot_tests {
             let page: Value = serde_json::from_str(next["content"].as_str().unwrap()).unwrap();
             assert_eq!(page["messages"].as_array().unwrap().len(), 2);
             assert_eq!(page["messages"][1]["content"], "after");
-        }
-    }
-}
-
-#[cfg(test)]
-mod pool_read_guard_tests {
-    use super::*;
-    /// Caller cursors cannot evade the guard. Actual new entries/revisions
-    /// rearm it, repeated reads emit one corrective episode, and reverse
-    /// pagination remains available without being mistaken for polling.
-    #[test]
-    fn empty_pool_reads_are_bounded_per_actual_revision() {
-        let mut guard = PoolReadGuards::default();
-        let mut page =
-            json!({"pool_id":"p","log_revision":41,"entries":[],"before_seq":null,"after_seq":41});
-        assert_eq!(guard.observe("attempt".into(), &page), (false, false));
-        page["after_seq"] = json!(999);
-        assert_eq!(guard.observe("attempt".into(), &page), (false, false));
-        assert_eq!(guard.observe("attempt".into(), &page), (true, true));
-        assert_eq!(
-            guard.observe("attempt".into(), &page),
-            (true, true),
-            "unacknowledged report remains retryable"
-        );
-        guard.reported("attempt", 41);
-        for _ in 0..100 {
-            assert_eq!(guard.observe("attempt".into(), &page), (true, false));
-        }
-        assert!(guard.waiting("attempt"));
-        page["entries"] = json!([{"seq":42}]);
-        page["log_revision"] = json!(42);
-        assert_eq!(guard.observe("attempt".into(), &page), (false, false));
-        assert!(!guard.waiting("attempt"));
-        page["entries"] = json!([]);
-        page["before_seq"] = json!(42);
-        for _ in 0..5 {
-            assert_eq!(guard.observe("attempt".into(), &page), (false, false));
         }
     }
 }

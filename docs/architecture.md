@@ -1,7 +1,8 @@
 # agent-run architecture
 
-agent-run is one Rust workspace with the `agent-run` executable and a separate
-read-only `agent-run-tui` observer, published at the same version. It owns
+agent-run is one Rust workspace with the `agent-run` executable (the former
+`agent-run-tui` observer was removed in 0.32.0; releases seal only a fixed
+compatibility shim under that name). It owns
 durable admission, detached supervision, runtime materialization, evidence, and
 completion delivery for providers using Codex and Claude Code. Historical GLM
 adapter records remain readable. For the local wire contract, see
@@ -155,117 +156,42 @@ No online direct-write fallback exists. History maintenance advances a volatile
 keyset cursor between bounded pages, rechecking complete durable evidence inside
 the writer before deletion. See [the reusable crate](../crates/sqlite-access/README.md).
 
-Schema 25 lays the foundation for cooperative pools (a small roster of
-ordinary executions sharing one goal) with `pools`, `pool_members` and
-`pool_entries`. The schema, the validated domain types, the compact entry renderer and
-atomic batch admission share one immediate transaction: new executions,
-reservations and the roster commit together (or none), and the core
-composes each member's task with the common goal, its own seat and every peer's
-stable identity before any member is launched. Replay is keyed by the original
-client request, never by the composed text. Schema 26 adds attempt-pinned
-`pool_enrollments`, observed worker catalog proof, and a permanent per-root
-membership marker. A mixed batch can attach supported independent RUNNING
-workers without another execution or reservation; the transaction rechecks the
-exact attempt, immutable launch facts and compatible binding.
-The membership marker also covers new seats and replacements and survives pool
-history collection; historical independence remains unknown conservatively.
-Existing seats receive durable context and remain pending until an authenticated
-`pool_post` summary matches their opaque challenge. Replays authenticate the
-pinned attempt before idempotent lookup; native transport receipts never imply
-awareness. Unjoined seats cannot vote or settle. Their overlay is retained with
-active pool history and removed before eligible entry/member GC. Failure queues
-one broker-authored attention through the existing outbox, suppressed by an
-already queued individual error. All external notices use the same Bridge route.
+## Legacy Run pools (removed in 0.32.0)
 
-All current workers carry a fixed private
-worker catalog — `notify_orchestrator`, `pool_post`, `pool_read`,
-`pool_propose` and `pool_vote` — served over one private broker route that
-authenticates the hidden per-attempt capability and stamps the author (kind,
-name, role, stable identity) from durable membership inside the same
-transaction; refusals such as `not_pool_member`, `pool_completed` or
-`stale_proposal` are typed codes, never prose. Members pull their pool: the
-append-only log pages by immutable cursor (optionally holding a bounded wait
-for a new entry), renders each entry as one compact plain-text block through
-the shared renderer, and reports derived status — current roster, current
-proposal and each member's vote validity with its reason. Ordinary chat is
-budgeted while proposals, votes, blocks and revokes stay possible, and
-agreement is reported without completing the pool. Every appended entry also enqueues
-one `pool` command, holding only its sequence number, for each current peer's
-tip in the same transaction (a member's `notify_orchestrator` report likewise
-writes one linked team-copy entry, and the orchestrator's notice is rendered
-from that entry with the same stamped sender, direction and stable identity). The command
-claims after cancel and steer, re-checks that the recipient is still a current
-member's tip of that entry's pool, and records only a finite push disposition:
-`native_accepted` for a correlated Codex reply, `written` for a Claude/GLM stdin
-write, `rejected`, `unsent`, `refused` (with a typed reason) or `unknown` after
-a possible write. None of them means the member consumed the entry; the log
-remains the source of truth and members catch up through `pool_read`.
-The operator operations (public tools `start_pool`, `pool_post`, `pool_replace`
-and `pool`, one CLI command each, MCP and the broker socket from the one shared
-tool table; the private worker catalog stays the fixed five tools): posting a message stamped as the operator (fanned out through the
-same path and chat budget, idempotent by key), reading a pool's status and
-cursor-paged log through the projection members read, and replacing one current
-member. A replacement is refused with `member_busy` unless the member's latest
-execution is terminal and every attempt of its lineage has verified cleanup
-(decided again inside the same immediate transaction as the write); it admits
-the new execution, retires the old seat while keeping its row, installs the new
-seat in the same slot, bumps the roster revision, appends one broker roster
-entry to the peers and records the original request digest, so a repeat of the
-same key returns the same new identity even after later replacements. An omitted
-start restores the seat's original user spec (never the account a prior
-automatic choice picked). The new execution's task names the goal, the current
-roster and a catch-up instruction; peers' frozen prompts are corrected by the
-roster entry, never rewritten.
+Schemas 25, 26 and 28 created the legacy cooperative pool tables (`pools`,
+`pool_members`, `pool_entries`, `pool_enrollments`), the per-root
+`agents.pool_membership_ever` marker and the `worker_capabilities.pool_catalog_*`
+catalog-proof columns. The pool domain, broker dispatch, public tools
+(`start_pool`, `pool`, `pool_post`, `pool_replace`, `list_pools`), worker tools
+(`pool_post`, `pool_read`, `pool_propose`, `pool_vote`), CLI commands,
+`bind --pool`, settlement, push commands, pool notices and the terminal
+observer were removed; Agent Pool owns groups, membership and consensus.
+Nothing was migrated.
 
-A pool completes only by formal verification at one consistent moment inside one
-immediate transaction: the current proposal has a valid ready vote, covering
-every acceptance criterion, from every current member for the current roster
-revision; every current member's latest execution `succeeded`; and every attempt
-of every member lineage has verified cleanup. Agreement while anyone still runs,
-a failed, timed-out, cancelled or lost member, uncleared ownership, a missing,
-revoked, blocking or stale vote, or a roster that moved never completes the
-pool; no timer or heuristic infers success, and agent-run never judges whether
-the result is right. Completion freezes one immutable `pool_completed` event on
-a member row (goal, criteria, accepted proposal, stable roster, votes and proofs,
-plus the compact notice text) and one linked outbox row, then marks the pool
-completed, all in the same transaction, so concurrent or repeated settlement
-records exactly one of each. It is attempted after votes, after every supervisor
-terminal path through `complete_terminal`, and by the bounded maintenance sweep
-(at most twenty open pools per pass, rotating) that also converges cleanup proof
-which arrives after the terminal write. A completed pool's status is read from
-the frozen record: a member resumed later does not change it or mint another
-notice, and the closed pool refuses further writes and replacements.
+The schema is unchanged: no table or column is dropped and every migration
+stays replayable, so an older binary still opens the database. No code path
+inserts or updates the legacy pool tables. Their writer operations are removed
+from the closed inventory and their wire ids (4-7, 47-51, 95) stay reserved:
+a frame naming one is refused as an unknown kind and the id is never reused.
+A due notice with historical native attempts and no Bridge intent ends
+`failed` with `legacy_delivery_held`. Other due legacy pool completion and
+enrollment attention notices end `failed` with `legacy_pool_retired` at claim.
+Unbound terminal agent notices expire after one hour on a claim sweep, with
+legacy pool completion rows excluded. A queued `pool` command completes
+without a push (`unsupported_command`, or `agent_terminal` once the run
+ended). Legacy pool-loop and enrollment steers are refused before native
+input, and stored health snapshots carrying old pool wait
+evidence still decode. Pool membership no longer suppresses individual
+completion notices. The `pool_membership_ever` independence fence (and its
+immutability trigger) remains durable; managed Agent Pool enrollment still
+sets it. The `pool_catalog_*` columns keep recording the current worker
+catalog proof under their historical names.
 
-The notice is a broker conclusion for the whole pool, delivered over the
-existing outbox as a frozen pool payload rendered by Agent Run and published
-through Bridge with kind `agent-run.pool-completion`.
-It names the stable pool ID, goal, accepted result and roster, never a
-run, attempt or session identity; a result longer than the 4096-byte bound is
-shortened with an explicit marker naming the full proposal entry in the pool
-log. An unbound pool still completes: its notice stays `waiting_binding`
-(exempt from the one-hour binding window and not activated by binding a single
-member) until the pool itself is bound, which the store's `bind_pool` does for
-the pool and every current member tip. `agent-run bind --pool <id>` and the
-post-tool hook (a structured `start_pool` reply, recognized before any
-single-agent receipt) call it; a conflict with an existing binding changes
-nothing, and the binding is immutable. Replacements and resumed members join the
-pool's actual stored session, not the reference frozen at the first start.
-
-Retention treats a pool as a unit. Every member lineage, replaced members
-included, stays stored (with its native history, seals and cleanup evidence)
-until every execution of every member has expired by the ordinary rule
-(fourteen days, or ranked outside the newest hundred logical sessions), none
-owns an attempt or lacks verified cleanup, and no linked notice is pending,
-retrying or being sent. Then pool entries, members and the pool row are purged
-before the underlying agent, delivery and session rows, as the foreign keys
-require; a common notice still `waiting_binding` at that point is expired
-explicitly (`pool_binding_expired`) rather than lingering. The read-only
-preflight uses the same predicate, so protected-only pools never wake the
-writer. The maintenance sweep for completion likewise evaluates readiness
-read-only and takes the writer lock only for a pool that can actually complete.
-The tables retain replaced members, keep one current member per slot, store
-an immutable author stamped at send time, and reference agents and deliveries
-without cascades so a later purge can delete pool rows first.
+Retention still treats an old pool as a unit: every member lineage stays
+protected until all of them expire by the ordinary rule, then entries, members
+and the pool row are deleted before the agent, delivery and session rows, as
+the foreign keys require. Archival reads use read-only SQL
+(`agent-run doc completion`).
 
 Large payloads live under the run directory and are referenced by path, size,
 and SHA-256. A terminal success must be reproducible from stored state and
@@ -281,7 +207,7 @@ Idle compaction returns unused SQLite pages to disk. See
 ## Completion delivery
 
 Bound terminal runs create durable notice rows. Agent Bridge is the sole external
-sender for completion, worker reports, pool completion and pool attention. The
+sender for completion, worker reports and maintenance notices. The
 pinned SDK publishes Address/Message/KeepAll without expiry or caller-registration
 authority. MCP runs directly; Agent Run has no native message frontend, Claude
 inbox sender, relay inventory/probe or fallback process.
@@ -312,15 +238,15 @@ acknowledgement or its evidence.
 
 ## Capacity and diagnostics
 
-Agent Quota collects observations and computes quota standings independently.
-With schema 2, Run reads one Quota snapshot and combines it with its own local
-account, cooldown and reservation snapshot. `delegation_guide` provides compact
-routing guidance with exact provider/model/profile filters; `limits`, `models`
-and `capacity_order` expose the corresponding standings and completeness. The
-Quota evaluation time and Run's local ranking time are separate, and the read
-does not make the two services atomic. Schema-1 `limits` and `capacity_order`
-require migration to schema 2. Missing, stale or unavailable quota is unknown,
-not an invented zero; Run may still attempt a launch.
+Agent Quota collects observations, computes quota standings and presents
+quota windows and capacity to operators and orchestrators. With schema 2, Run
+keeps only the read its admission needs: each admission decision reads one
+fresh Quota snapshot, combines it with its own local account, cooldown,
+multiplier and reservation snapshot, selects the account, and refuses an
+exhausted choice with `QuotaExhausted`. Run presents no quota: since 0.32.0
+`delegation_guide` is a configuration-only catalog and the UserPromptSubmit
+context carries only active agents. Missing, stale or unavailable quota is
+unknown, not an invented zero; Run may still attempt a launch.
 
 `agent-run doctor` checks configuration, binaries, role assets, state,
 schema-2 provider bindings against a read-only account-registry snapshot,

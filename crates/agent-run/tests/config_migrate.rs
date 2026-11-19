@@ -703,10 +703,14 @@ fn apply_and_rollback_move_the_whole_pair() {
         rows,
         "historical rows keep their bytes"
     );
-    let (ok, models) = run(&home.root, &["models", "--provider", "codex"], false);
+    let (ok, guide) = run(
+        &home.root,
+        &["delegation-guide", "--provider", "codex"],
+        false,
+    );
     assert!(
-        ok && models.to_string().contains("Default for well-specified"),
-        "{models}"
+        ok && guide.to_string().contains("Default for well-specified"),
+        "{guide}"
     );
     let frozen: Vec<(String, String)> = [
         "config.v1.toml",

@@ -111,7 +111,7 @@ impl WorkerProxy {
             version: if self.explicit_finish {
                 agent_run_domain::worker::FINISH_CATALOG_VERSION
             } else {
-                agent_run_domain::worker::POOL_CATALOG_VERSION
+                agent_run_domain::worker::WORKER_CATALOG_VERSION
             },
             digest: if self.explicit_finish && self.managed {
                 agent_run_domain::worker::managed_catalog_digest()
@@ -120,7 +120,7 @@ impl WorkerProxy {
             } else if self.research {
                 agent_run_domain::worker::research_catalog_digest()
             } else {
-                agent_run_domain::worker::pool_catalog_digest()
+                agent_run_domain::worker::worker_catalog_digest()
             },
         };
         if let Ok(value) = serde_json::to_value(proof)
@@ -138,8 +138,7 @@ impl WorkerProxy {
 
     /// Validate model arguments locally, attach immutable hidden context and
     /// route one fixed catalog tool through the private broker method. Unknown
-    /// tools/arguments cannot reach an operator dispatch path, and denials
-    /// arrive typed instead of guessed from prose.
+    /// tools/arguments cannot reach an operator dispatch path.
     async fn call(&self, name: &str, arguments: Value) -> rmcp::model::CallToolResult {
         let tool = match agent_run_domain::worker::WorkerTool::parse(name) {
             Some(tool) => tool,
@@ -151,7 +150,6 @@ impl WorkerProxy {
             }
         };
         // The broker repeats these strict domain checks authoritatively.
-        use agent_run_domain::pool::{PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
         use agent_run_domain::worker::WorkerTool;
         let validated = match tool {
             WorkerTool::HealthReply => validated_input(
@@ -170,10 +168,6 @@ impl WorkerProxy {
                 name,
                 agent_run_domain::worker::SaveReportRequest::validate,
             ),
-            WorkerTool::PoolRead => validated_input(arguments, name, PoolReadRequest::validate),
-            WorkerTool::PoolPost => validated_input(arguments, name, PoolMessage::validate),
-            WorkerTool::PoolPropose => validated_input(arguments, name, PoolPropose::validate),
-            WorkerTool::PoolVote => validated_input(arguments, name, PoolVote::validate),
         };
         let arguments = match validated {
             Ok(arguments) => arguments,
@@ -216,7 +210,7 @@ impl WorkerProxy {
         }
     }
 
-    /// Renders a validated in-band pool denial or one closed typed tool view.
+    /// Renders one closed typed tool view.
     /// Receipt capture precedes presentation, preserving writes and retry identities.
     fn render(
         &self,
@@ -263,14 +257,6 @@ impl WorkerProxy {
                 ),
             };
         }
-        if let Some(error) = value.get("error") {
-            return match pool_denial(error) {
-                Ok((denial, message)) => super::mcp_text::error_result(denial.code(), &message),
-                Err(error) => {
-                    super::mcp_text::failure_result(tool.as_str(), &error, request_id, None)
-                }
-            };
-        }
         super::mcp_text::success_result_with_request(tool.as_str(), &value, request_id)
     }
 }
@@ -292,34 +278,6 @@ fn validated_input<T: serde::de::DeserializeOwned + serde::Serialize>(
     let input: T = serde_json::from_value(arguments).map_err(|_| invalid())?;
     validate(&input)?;
     serde_json::to_value(input).map_err(|_| invalid())
-}
-
-/// Decodes only the known pool-denial codes; unknown or malformed responses
-/// remain uncertain. Bounded broker messages carry canonical typed diagnostics,
-/// never arbitrary error metadata or capability context.
-fn pool_denial(error: &Value) -> Result<(agent_run_domain::pool::PoolDenial, String)> {
-    use agent_run_domain::pool::PoolDenial;
-    let denied = || Error::Runtime("invalid worker pool denial".into());
-    let message = error["message"]
-        .as_str()
-        .filter(|s| s.len() <= 1024)
-        .ok_or_else(denied)?;
-    let denial = match error["code"].as_str() {
-        Some("not_pool_member") => PoolDenial::NotPoolMember,
-        Some("pool_completed") => PoolDenial::PoolCompleted,
-        Some("stale_proposal") => PoolDenial::StaleProposal { current: None },
-        Some("stale_roster") => PoolDenial::StaleRoster { current: 0 },
-        Some("conflict") => PoolDenial::Conflict,
-        Some("chat_budget_exhausted") => PoolDenial::ChatBudgetExhausted,
-        Some("proposal_budget_exhausted") => PoolDenial::ProposalBudgetExhausted,
-        Some("vote_budget_exhausted") => PoolDenial::VoteBudgetExhausted,
-        Some("malformed_checks") => PoolDenial::MalformedChecks,
-        Some("pool_not_found") => PoolDenial::PoolNotFound,
-        Some("member_busy") => PoolDenial::MemberBusy,
-        Some("member_not_current") => PoolDenial::MemberNotCurrent,
-        _ => return Err(denied()),
-    };
-    Ok((denial, message.to_owned()))
 }
 
 /// The historical report-argument rejection text.
@@ -644,11 +602,11 @@ mod tests {
             managed: false,
         };
         let ordinary = proxy.tools().unwrap();
-        assert_eq!(ordinary.len(), 5);
+        assert_eq!(ordinary.len(), 1);
         assert!(proxy.get_tool("save_report").is_none());
         proxy.research = true;
         let research = proxy.tools().unwrap();
-        assert_eq!(research.len(), 6);
+        assert_eq!(research.len(), 2);
         assert!(
             ordinary
                 .iter()
@@ -658,7 +616,7 @@ mod tests {
         for research in [false, true] {
             proxy.research = research;
             proxy.explicit_finish = true;
-            assert_eq!(proxy.tools().unwrap().len(), if research { 8 } else { 7 });
+            assert_eq!(proxy.tools().unwrap().len(), if research { 4 } else { 3 });
             assert!(proxy.get_tool("finish").is_some());
             assert!(proxy.get_tool("health_reply").is_some());
             assert_eq!(proxy.get_tool("save_report").is_some(), research);
@@ -686,8 +644,7 @@ mod tests {
         }
     }
 
-    /// The managed proof names the managed catalog, which the broker accepts
-    /// as a worker catalog but never as a pool-capable one.
+    /// The managed proof names the managed catalog at the completion version.
     #[tokio::test]
     async fn managed_catalog_proof_is_completion_only() {
         let broker = Arc::new(Broker::default());
@@ -710,71 +667,10 @@ mod tests {
             calls[0].1["version"].as_u64().unwrap() as u32,
             digest
         ));
-        assert!(!agent_run_domain::worker::known_pool_catalog(
-            agent_run_domain::worker::FINISH_CATALOG_VERSION,
-            digest
-        ));
-    }
-
-    /// Every private pool write keeps its own strict input and durable receipt.
-    /// Invalid destination injection is rejected before broker contact; unknown
-    /// transport replies never advise creating a replacement mutation.
-    #[tokio::test]
-    async fn private_pool_writes_keep_independent_receipts() {
-        let broker = Arc::new(Broker::default());
-        let proxy = WorkerProxy {
-            broker: broker.clone(),
-            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
-            attempt_id: "attempt".into(),
-            token: "a".repeat(64),
-            catalog_registered: Arc::new(AtomicBool::new(false)),
-            research: false,
-            explicit_finish: false,
-            managed: false,
-        };
-        for (tool, input) in [
-            (
-                "pool_post",
-                json!({"request_id":"post","message":"bounded"}),
-            ),
-            (
-                "pool_propose",
-                json!({"request_id":"propose","message":"bounded","snapshot":"exact"}),
-            ),
-            (
-                "pool_vote",
-                json!({"request_id":"vote","proposal_seq":1,"decision":"block","checks":[],"message":"blocked"}),
-            ),
-        ] {
-            let mut forged = input.clone();
-            forged["pool_id"] = json!("foreign");
-            assert_eq!(proxy.call(tool, forged).await.is_error, Some(true));
-            let result = proxy.call(tool, input.clone()).await;
-            let wire = serde_json::to_string(&result).unwrap();
-            assert_eq!(result.is_error, Some(false), "{wire}");
-            assert!(wire.contains("#7") && wire.contains(input["request_id"].as_str().unwrap()));
-            assert!(!wire.contains(&proxy.token));
-        }
-        assert_eq!(broker.0.lock().unwrap().len(), 3);
-        let refused = proxy.render(
-            agent_run_domain::worker::WorkerTool::PoolPost,
-            json!({"error":{"code":"pool_completed","message":"the pool is completed; no further writes are accepted"}}),
-            Some("original"),
+        assert_eq!(
+            calls[0].1["version"],
+            agent_run_domain::worker::FINISH_CATALOG_VERSION
         );
-        assert_eq!(refused.is_error, Some(true));
-        assert!(
-            !serde_json::to_string(&refused)
-                .unwrap()
-                .contains("ACCEPTED")
-        );
-        let unknown = proxy.render(
-            agent_run_domain::worker::WorkerTool::PoolVote,
-            json!({"error":{"code":"unknown_future","message":"SECRET_CANARY"}}),
-            Some("original"),
-        );
-        let wire = serde_json::to_string(&unknown).unwrap();
-        assert!(wire.contains("OUTCOME_UNKNOWN") && wire.contains("original"));
-        assert!(!wire.contains("SECRET_CANARY"));
     }
 
     use super::*;
@@ -788,13 +684,8 @@ mod tests {
         /// Return a compact fake queue receipt while retaining the private request for assertions.
         fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
             Box::pin(async move {
-                let pool = params["tool"] != "notify_orchestrator";
                 self.0.lock().unwrap().push((method.into(), params));
-                Ok(if pool {
-                    json!({"pool_id":"p","seq":7,"duplicate":false})
-                } else {
-                    json!({"notification_id":"ntf_test","state":"pending","duplicate":false})
-                })
+                Ok(json!({"notification_id":"ntf_test","state":"pending","duplicate":false}))
             })
         }
     }
@@ -870,16 +761,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "notify_orchestrator",
-                "pool_post",
-                "pool_read",
-                "pool_propose",
-                "pool_vote"
-            ]
-        );
+        assert_eq!(names, ["notify_orchestrator"]);
         for name in [
             "start",
             "resume",

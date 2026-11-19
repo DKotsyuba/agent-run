@@ -6,10 +6,16 @@ three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
-Workers use a [separate fixed five-tool MCP surface](worker-mcp.md):
-`notify_orchestrator`, `pool_post`, `pool_read`, `pool_propose` and `pool_vote`.
-Pool actions require live authenticated membership. Private worker broker routes are not in operator
-discovery and requires the current run/attempt capability on every call.
+Workers use a [separate fixed MCP surface](worker-mcp.md): `notify_orchestrator`,
+plus `health_reply` and `finish` in explicit-completion mode. Private worker
+broker routes are not in operator discovery and require the current
+run/attempt capability on every call.
+
+The legacy cooperative pool methods (`start_pool`, `pool_post`, `pool_replace`,
+`pool`, `list_pools`) and the worker `pool_*` tools were removed in 0.32.0;
+the socket answers them as unknown methods (`-32601`). Agent Pool owns groups.
+Old pool rows remain readable only through read-only SQL; see
+`agent-run doc completion`.
 
 Audience: an integrating agent or developer who has never seen this repo.
 Everything needed to connect is on this page.
@@ -179,10 +185,11 @@ Discover the authoritative surface at runtime:
 ordinary provider start requests. A job must omit its own `request_id` or set
 it to null. Optional `retain_history` defaults to false and is part of the
 batch identity. When true, each job receives a distinct `pin_id` in its
-receipt and the pins commit with all jobs and the receipt. All jobs and one
-permanent batch receipt commit together, or no
-job is admitted. The shared key is scoped to this Run home, not to a caller
-identity. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
+receipt and the direct socket client receives a batch `release_token` in the
+original admission response. All
+jobs, pins and the permanent receipt commit together. A retained socket
+`start_batch` requires a JSON-RPC ID so the broker can acknowledge admission.
+The shared key is scoped to this Run home. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
 Pool enrollment namespace; `start_batch` and `batch_receipt` refuse them as
 invalid input, so a public caller can neither pre-claim nor read such a key. Exact replay requires the same durable database; replacing it under
 the same socket or restoring an older copy cannot preserve absent receipts or
@@ -228,26 +235,74 @@ Separate CLI/MCP processes do not remember earlier outcomes for the caller.
 An active history pin retains the database execution and attempt rows, including
 cleanup proofs, for its entire lineage and future resumes, against both age and
 count retention. It does not prevent resume or promise to retain process files.
-The operator group calls `history_pins {"action":"release","pin_id":"..."}`
-to release it; both `already_released:false` and `true` confirm release.
-The permanent released tombstone prevents an old batch replay from reviving it.
-`PinNotFound`, timeout or an absent reply does not confirm release and does not
-restore a missing tombstone. Retry the same pin ID to reconcile an uncertain
-release. A pin ID itself grants no authority.
+Release public pins through the operator socket with
+`history_pins_release {"pin_id":"...","release_token":"...","expected_store_id":"..."}`.
+Run mints the 64-character bearer token for the batch and returns it only in
+the original successful socket `start_batch` response, outside `receipt`.
+The public pin ID contains a one-way verifier bound to the lineage. MCP tool
+responses, pin listings, receipt reads and admission replays omit the token. A missing pin, a mismatched
+credential or an active lineage hold returns `RequestConflict`. Both
+`already_released:false` and `true` confirm release. The released tombstone
+prevents old batch replays from reviving the pin. After a timeout or missing
+reply, retry the same pin and credential to reconcile release.
 
-`history_pins {"action":"list"}` lists active and released pins, with optional
+`history_pins_list` lists active and released pins, with optional
 `status` (`active`, `released` or `all`), `limit` (default 100, maximum 1000),
 and exclusive `after_pin_id`. Continue with `next_after_pin_id`; null marks the
-last page. The ordering is by pin ID; concurrent new pins can require a fresh
-scan. CLI equivalents are `agent-run history-pins list` and
-`agent-run history-pins release --pin-id PIN_ID`.
-Both list and release also accept optional `expected_store_id`; their database
-scope check shares the list snapshot or release transaction respectively.
-CLI supplies it with `--expected-store-id` and obtains an ID with
-`agent-run capabilities --include-store-id`.
+last page. Both methods accept optional `expected_store_id`, checked inside
+the same list snapshot or release transaction. Discover the ID with
+`agent-run capabilities --include-store-id`. The removed `history_pins`
+method returns method-not-found.
 
-The receipt proves admission, not process launch or task completion. Supervisor
-handoffs happen separately, and a lost reply, timeout, or uncertain commit must
+The CLI equivalents are `agent-run history-pins list` and
+`agent-run history-pins release --pin-id PIN_ID --release-token-file FILE`.
+Supply `-` for standard input. Use a private file or a pipe for the token.
+Use `--expected-store-id` to fence either command.
+
+For CLI admission, choose `start-batch --spec FILE --release-token-file PATH`
+or `--release-token-fd N` to capture a newly issued token, one line of plain
+text. The file is created exclusively with mode 0600 before submission.
+Existing paths and symlinks are refused. The descriptor must be inherited,
+writable, above 2 and separate from standard streams. A regular file must
+belong to the caller and grant no group or other permissions. Use a private sink.
+CLI standard streams carry only the receipt or a closed error. With neither
+flag, admission still succeeds and discards the token. A newly created file
+will be empty if no token was available, including replays. If writing the
+token fails after admission, reconcile the durable receipt and coordinate
+offline recovery.
+
+#### Agent Pool migration for history pins
+
+Update Pool before switching Run. The socket `tools` schema for
+`history_pins_release` advertises the required `release_token` field.
+
+- For new **public** retained batches, capture the top-level `release_token`
+  from the first successful `start_batch` response. Persist it privately
+  with the Run store ID and admitted pins before marking the local admission
+  resolved. Keep it until every pin in that batch is released. Send it as
+  `release_token` with the pin and recorded `expected_store_id` after close.
+  Remove `request_id` from the online release request. Keep the batch
+  request ID and exact intent for admission reconciliation.
+- For **managed enrollment** pins, including ones admitted before 0.32, keep
+  using the pinned, authenticated Pool attempt channel. The call is
+  `_managed_pin_release_v1 {"version":1,"expected_store_id":"...","pool_store_id":"...","request_id":"...","pin_id":"..."}`.
+  Use Pool's original enrollment key. Run checks the pin against the permanent
+  managed enrollment receipt on the same authenticated Pool route.
+  Discover support as `managed_pin_release_v1` in `_attempt_capabilities_v1`.
+- **Legacy public pins** have no online release credential. The same recovery
+  applies to a public batch with a lost token, a batch admitted over MCP, or a
+  CLI admission without a credential destination. Keep the pin and
+  batch binding and coordinate release after close with the Run database owner.
+  With the broker, service manager and all recorded workers stopped, the owner
+  can run `agent-run --home HOME history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id ORIGINAL_BATCH_ID`.
+  This command checks the exact store and original public receipt, retains the
+  hold fence, and supports idempotent retries. It refuses managed receipts.
+  Without the original receipt association, keep the pin active.
+
+#### Batch admission reconciliation
+
+The receipt records durable admission. Supervisor handoffs happen separately,
+and a lost reply, timeout, or uncertain commit must
 be reconciled using the same key and exact intent. `BatchOutcomeUnknown` is the
 stable error code when admission may have committed; a missing or malformed
 response remains unknown even if no code arrives. Batch transport loss is not
@@ -264,16 +319,19 @@ state database cannot preserve a receipt absent from that database.
 intent, including `request_id`, ordered `jobs`, `retain_history`, optional
 ordered `preconditions`, and a required non-null `expected_store_id`. It uses the same strict decoder and fingerprint,
 without loading workdirs, configuration or quota. A committed exact match
-returns `{"found":true,"receipt":{...}}`; an absent receipt returns only
-`{"found":false}`. Absence is a snapshot fact: an earlier in-flight request
-may still commit. Wrong database or conflicting intent returns the existing
-typed error and does not establish the outcome of an earlier unknown request.
+returns `{"found":true,"receipt":{...}}`. An unused key and a mismatched intent
+both return `{"found":false}`. Absence describes the exact intent in that
+snapshot. An earlier in-flight request may still commit. A wrong database
+returns `StoreIdentityMismatch`. A mutating `start_batch` with reused key and
+different intent still returns `RequestConflict`.
 CLI uses `agent-run batch-receipt --spec FILE` (or `--spec -`).
 For a new scoped batch, admission checks that its normalized lookup fits a
 compact MCP JSON-RPC frame with an encoded ID of up to 1024 bytes and a trailing
 LF; the same bound covers the shorter socket envelope. Extra metadata, whitespace
 or noncompact escaping still consume frame space. Existing exact replays are
 checked first. Unscoped batches cannot use the scoped receipt lookup.
+
+#### Exact status
 
 `status` reads one to twenty exact selectors in one SQLite snapshot:
 `{"version":1,"expected_store_id":"store_…","targets":[{"agent_id":"ag-…","sequence":1,"execution_ref":"ex1_…","pin_id":"pin_…"}]}`.
@@ -304,28 +362,6 @@ the logical outcome.
 The store's row/byte/time checks are cooperative and do not impose a hard
 deadline on an individual SQLite query.
 
-Cooperative pools use five strict methods from the same table: `start_pool`
-(two to five members sharing one goal and acceptance criteria, admitted
-atomically; each member supplies exactly one `start` or `existing_agent_id` plus
-`role`; returns the stable `pool_id` and each member's `agent_id`,
-name, role and status), `pool_post` (an operator message stamped as the
-orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
-`request_id` returns the same new member) and `pool` (status plus a cursor-paged
-log), and `list_pools` (read-only discovery). The first three ride the control
-lane; `pool` and `list_pools` use the read lane. Refusals use the shared error codes
-with the pool code leading the message (`member_busy`, `pool_completed`,
-`pool_not_found`, ...). A pool completes only by formal verification (every
-member voted ready on one proposal, ended successfully, cleanup verified) and
-delivers exactly one common notice; that is not proof the result is correct.
-
-An attached existing member keeps its current owned RUNNING execution, task,
-account, grants, native session and reservation. Its admission
-member row adds `existing: true` and an `enrollment` view (`state`, optional failure reason); ordinary new-only member shapes stay unchanged.
-The worker-only `pool_read` adds its own attempt-pinned ACK challenge. Only an
-exact `pool_post` summary using that challenge changes `pending` to `joined`;
-unjoined members cannot vote or settle. `needs_action` reports failed awareness
-without restarting or cancelling old work. See [worker enrollment](worker-mcp.md).
-
 Over MCP, existing tool results render as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
 additionally keep `structuredContent` `{"agent_id": ..., "sequence": ...}` so
@@ -333,14 +369,14 @@ automatic PostToolUse binding can pin its exact admission. The numeric counter
 is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
-The additive `capabilities`, `answer_chunk`, and `start_batch` methods return
-their exact structured result in MCP `structuredContent`, with a fixed text summary.
+`start_batch` returns the durable receipt and replay flag in MCP
+`structuredContent`, with a fixed text summary.
 When an answer exceeds the MCP text budget, `answer` returns a bounded summary
 with the verified artifact size, SHA-256 and execution sequence, plus a link to
 the existing local answer file where its managed path permits one. Access to
-that file follows operating-system permissions; `answer_chunk` provides the
-content over MCP without direct filesystem access. The artifact remains subject
-to the existing history retention policy.
+that file follows operating-system permissions. The CLI and operator socket
+provide verified chunks through `answer-chunk` and `answer_chunk` respectively.
+The artifact remains subject to the existing history retention policy.
 
 The current MCP contract, byte/row budgets, protocol-versus-business error
 channels, and status-preserving presentation fallback are documented in
@@ -349,14 +385,31 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-Shared MCP/socket discovery advertises 20 tools: `start`, `start_batch`, `resume`, `cancel`,
-`steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
-`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, `history_pins`, and
-`agent_integration`, `capabilities`, and `answer_chunk`.
-`models` and `capacity_order` remain call-only compatibility methods in the
-same registry/dispatcher; their original structured CLI/socket responses and
-direct MCP calls by known name remain available. Schema-1 `capacity_order`
-and `limits` return `Unsupported` with guidance to migrate to schema 2.
+### Transport surfaces
+
+One registry (`assets/tools.json`) and one dispatcher serve CLI, MCP and the
+operator socket, but the orchestrator MCP surface is narrower:
+
+- **Orchestrator MCP** discovery and dispatch: `start`, `start_batch`,
+  `resume`, `cancel`, `steer`, `list_agents`, `answer`, `transcript`,
+  `delegation_guide` and `doc`.
+- **Operator socket and CLI only** (registry entries marked
+  `"surface":"socket"`): `status`, `batch_receipt`, `capabilities`,
+  `transcript_exact`, `initial_task`, `answer_chunk`, `agent_integration`,
+  `history_pins_list` and `history_pins_release`. MCP `tools/list` omits them
+  and MCP `tools/call` rejects them as unknown tools.
+
+The socket `tools` method lists every socket method, including the
+socket-only ones with `"surface":"socket"`, so a socket client keeps detecting
+features from one `tools` call (Hub checks `answer_chunk`, `capabilities` and
+`initial_task` this way). `capabilities` remains the versioned detector for
+transport limits, lineage holds and `initial_task` support.
+`schemas/tools.json` is the orchestrator MCP discovery export.
+
+Quota presentation left Run in 0.32.0: `limits`, `models` and
+`capacity_order` (MCP, CLI and socket) are removed and return unknown-method
+errors. Agent Quota presents quota windows and capacity. Run keeps only the
+Quota read its admission needs.
 
 ### Operator lineage holds (v1)
 
@@ -475,8 +528,8 @@ Stable failures are `ExecutionChanged` (sequence changed, including after resume
 answer), `AnswerIntegrityError` (corrupt/missing artifact, invalid UTF-8 or seal),
 and `PathEscapeError` (unsafe/no-follow path). These are JSON-RPC `-32000`, except
 path rejection is `-32602`. Invalid ranges/boundaries/budgets/arguments use
-`ValidationError` / `-32602`. Unknown agents retain `AgentNotFound`. CLI and MCP
-preserve the same machine categories. Filesystem/store errors remain typed.
+`ValidationError` / `-32602`. Unknown agents retain `AgentNotFound`. The CLI
+preserves the socket machine categories. Filesystem/store errors remain typed.
 
 The CLI equivalent is `agent-run answer-chunk AGENT_ID --sequence N
 --expected-sha256 HASH --offset-bytes N [--max-bytes N]`.
@@ -487,38 +540,6 @@ that frame cap falls back to metadata with `content:null` and
 `inline_complete:false`, retaining proof and availability. The metadata form is
 checked again; other oversized replies keep the existing error. No text is
 silently truncated and no wire limit is increased.
-
-`list_pools` accepts a strict object with optional `state` (`"open"` or
-`"completed"`; omitted/null means all), `limit` (integer 1..200, default 50)
-and `offset` (nonnegative integer, default 0). It returns one consistent read
-snapshot, an exact filtered `total`, and `items` ordered by `created_at`
-descending with `pool_id` descending as the tie-breaker. `next_offset` is null
-at the end; `complete` also holds for an offset beyond the total. Offset pages
-may shift if pools are admitted or purged between calls.
-
-Each item has `pool_id`, `state`, a `goal` excerpt capped at 512 UTF-8 bytes
-on a character boundary, `goal_truncated`, `created_at` (UTC epoch seconds),
-`last_seq` (greatest retained log sequence, zero for an empty log), nullable
-`completed_at`, `roster_revision`, `members_count`, `ready`, nullable
-`current_proposal_seq`, and `members` in ascending slot order. Member rows
-contain only `slot`, `name`, `role`, stable `agent_id` and `tip_status`.
-`ready` counts only members whose derived `pool` status has `counts: true`;
-raw ready decisions invalidated by a changed roster, tip or failed execution
-do not count. Completed summaries reuse the frozen completion evidence even
-if a member resumes later. Full criteria, proposal snapshots and log bodies
-are available through `pool`, and are absent from discovery.
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"list_pools","params":{"state":"open","limit":1,"offset":0}}
-{"jsonrpc":"2.0","id":2,"result":{"items":[{"pool_id":"pool-20261004-120000-0123456789","state":"open","goal":"Ship the observer","goal_truncated":false,"created_at":1791115200.0,"last_seq":7,"completed_at":null,"roster_revision":1,"members_count":2,"ready":1,"current_proposal_seq":4,"members":[{"slot":1,"name":"Reviewer","role":"review","agent_id":"ag-20261004-120000-0123456789","tip_status":"running"},{"slot":2,"name":"Builder","role":"implement","agent_id":"ag-20261004-120000-abcdef0123","tip_status":"running"}]}],"total":2,"offset":0,"limit":1,"next_offset":1,"complete":false}}
-```
-
-The CLI equivalent is `agent-run pools [--state open|completed] [--offset N]
-[--limit N]`, alias `list-pools`; default output is JSON and `--text` prints
-the compact MCP page. No worker capability is accepted. Discovery has no
-long-poll: operator pool posts do not advance the existing event revision,
-so it would miss changes to `last_seq`. Members provide the join with
-`list_agents`; `AgentView` remains unchanged.
 
 See [continuations](continuations.md) for native-context `resume`, inherited
 authority, idempotency and history availability.
@@ -680,22 +701,6 @@ New rows also expose immutable `policy` evidence with the runtime/platform and
 one entry for every known constraint: actual enforcement, support, whether the
 caller required it, exact scope, and reason. Historical rows return `null`.
 
-With schema 2, `capacity_order` accepts an optional exact `model` filter and
-returns provider-only advice: `schema_version`, `config_revision`,
-`capacity_revision`, `ranked_at`, account-free `quota_coverage`, and ordered `providers`. Each provider has its
-id, `priority_multiplier`, nullable `score`, and models with `native_model`
-and Quota-provided `quota` standing. It does not expose accounts or legacy physical-route
-aliases. An unknown model is a `ValidationError`. The view uses one newly fetched
-Quota response and one separate local read without collecting quota, reserving
-capacity or starting work. `quota_coverage.evaluated_at` is the Quota score's
-source clock, while `ranked_at` is the local projection time; local revision
-equality does not establish score freshness or cross-service atomicity.
-
-The CLI equivalent is `agent-run capacity order [--model MODEL]`. Select a
-compatible model and canonical role using `delegation_guide`; `models` is a
-structured compatibility read for existing clients.
-Schema 1 returns `Unsupported` and suggests migration to schema 2.
-
 Three methods exist only on this socket transport: `tools` and `ping` above,
 plus:
 
@@ -736,33 +741,19 @@ Notes for the loop:
   string of at most 512 UTF-8 bytes, and delivery attempt evidence accepts only
   its declared fields. The `wait`
   example above is for an unbound API caller, not a bound-chat polling loop.
-  Successful members of an open pool are represented by its single common pool
-  completion notice; failed or otherwise non-successful members still receive
-  individual completion notices.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
-- Use `limits` for available Quota windows, percentages, reset times and
-  freshness. Schema 2 adds `ranking` and `coverage` (`state`, `incomplete`,
-  nullable `evaluated_at`); unreported quota is unknown when coverage is
-  incomplete. Quota unavailability produces unknown coverage, not a confirmed
-  empty history. `observed_at` equals the local `ranking.ranked_at`; score
-  evaluation uses Quota's separate clock. At most 1000 rows are returned and
-  truncation marks coverage incomplete. MCP omits account/pool identities and
-  refuses a page over its whole-response budget. Schema 1 returns `Unsupported`
-  with migration guidance. Historical storage and low-level latch code do not
-  supply these schema-2 reads; the
-  supervisor no longer writes native failures to that latch.
-- `models` and `capacity_order` retain their structured compatibility responses
-  for existing CLI/socket clients, without joining the advertised MCP catalog.
+- Quota windows, reset times and capacity standing come from Agent Quota, not
+  Run. Admission still reads one fresh Quota snapshot per decision and refuses
+  an exhausted choice with `QuotaExhausted`.
 - `delegation_guide` (optional exact `provider`, `model`, `profile` filters;
   schema 2 only) returns one compact plain-text
-  routing guide — providers in capacity order with each exact model id, cached
-  quota standing, admissible profiles, params, restrictions, and configured
-  guidance prose — instead of reading the full `models` JSON just to pick a
-  route. Its result is a JSON string here and real MCP text content on the MCP
+  routing guide — providers in configured order with each exact model id,
+  admissible profiles, params, restrictions, and configured guidance prose. It
+  carries no quota standing. Its result is a JSON string here and real MCP text content on the MCP
   transport; the CLI equivalent is `agent-run delegation-guide` with optional
   `--provider`, `--model`, and `--profile` filters.
   Unknown filters are `ValidationError`; omitted filters keep default guidance.
@@ -796,12 +787,12 @@ rendered as `RuntimeError`.
 
 ## Versioning and compatibility
 
-- The tool surface is pinned to the MCP surface by a parity test; new
-  tools appear in both transports simultaneously. Re-read `tools` after
-  an agent-run upgrade instead of caching schemas across versions.
+- The shared registry records which tools are available on each transport.
+  Re-read socket `tools` or MCP `tools/list` after an upgrade to get the
+  current schemas for that transport.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 40, reached through the paired
+- The current database schema is version 42, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.
 
@@ -813,11 +804,10 @@ without a bound leader is unresolved; recovery must not infer that no child ran.
 
 ### Exact pinned transcript export (v1)
 
-`transcript_exact` is a read-only public tool on the same CLI/socket/MCP registry.
+`transcript_exact` is a read-only operator socket method.
 `capabilities.read_methods` publishes its input and output schemas. The CLI reads
 one page with `agent-run transcript-exact --spec request.json` (`--spec -` uses stdin).
-MCP returns the same complete JSON result in `structuredContent`, with a fixed text
-label; transcript text is not interpreted or rendered as instructions.
+Both return transcript text as JSON data.
 
 ```json
 {
@@ -892,14 +882,12 @@ and stays empty when its watermark is echoed after later appends.
 
 ### Exact initial task (v1)
 
-`initial_task` is a read-only public tool on the same CLI/socket/MCP registry
-(one dispatcher entry). It returns the exact initial task text of one retained
-**root** execution (sequence 1), in verified pages, or a typed `unavailable`
+`initial_task` is a read-only operator socket method. It returns the exact
+initial task text of one retained **root** execution (sequence 1), in verified pages, or a typed `unavailable`
 state. It never reconstructs a system prompt, a Pool binding or any text from
 another string, never truncates, and does not change retention. The CLI reads one
 page with `agent-run initial-task --spec request.json` (`--spec -` uses stdin).
-MCP returns the same complete JSON in `structuredContent` with a fixed text
-label; the task is data, not instructions or authority.
+Both return the task as JSON data.
 
 **Capability.** `capabilities` with `{"include_initial_task":true}` (CLI:
 `agent-run capabilities --include-initial-task`) adds

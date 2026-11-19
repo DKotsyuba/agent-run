@@ -142,8 +142,14 @@ async fn python_hook_bind_reads_raw_json_stdin_and_is_idempotent() {
 /// Mirrors Python `test_context_hook.py::test_first_prompt_creates_receipt_dedups_and_reuses_later_binding`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn python_hook_context_injects_once_then_returns_an_empty_object() {
-    let (home, _) = fake_agent_home();
+    let (home, agent_id) = fake_agent_home();
     let _broker = test_broker::broker_for(home.path()).await;
+    // Run context carries only the session's active agents, so bind one first.
+    hook(
+        home.path(),
+        "bind",
+        json!({"session_id":"session-1","hook_event_name":"PostToolUse","tool_response":{"agent_id":agent_id}}),
+    );
     let payload = json!({"session_id":"session-1","hook_event_name":"UserPromptSubmit"});
     let first = hook(home.path(), "context", payload.clone());
     let second = hook(home.path(), "context", payload);
@@ -155,7 +161,7 @@ async fn python_hook_context_injects_once_then_returns_an_empty_object() {
         first["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("context")
-            .contains("migrate configuration to schema_version 2")
+            .starts_with("Active agents (1)")
     );
     assert_eq!(second, json!({}));
 }

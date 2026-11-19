@@ -6,6 +6,7 @@ use crate::{
     error::invalid,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{fmt, marker::PhantomData, str::FromStr};
 
 /// Deserializes a struct only from a map, retaining its own duplicate-key checks.
@@ -82,6 +83,21 @@ impl PinId {
         Self(format!("pin_{}", uuid::Uuid::new_v4().simple()))
     }
 
+    /// Encodes a credential verifier bound to this lineage in the existing pin
+    /// format. The UUID version and variant leave 122 digest bits in the ID.
+    pub fn from_release_digest(digest: &[u8; 32], root: &AgentId) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"agent-run/history-pin/v1");
+        hash.update(digest);
+        hash.update(root.as_str().as_bytes());
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&hash.finalize()[..16]);
+        Self(format!(
+            "pin_{}",
+            uuid::Builder::from_random_bytes(bytes).into_uuid().simple()
+        ))
+    }
+
     /// Returns its fixed 36-byte public spelling.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -147,34 +163,105 @@ pub enum HistoryPinFilter {
     Released,
 }
 
-/// One shared operator operation for release and bounded observation.
+/// Operator-socket `history_pins_list`: pins after an exclusive canonical
+/// key, up to 1000 at a time. Read-only; never discloses the release proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HistoryPinsRequest {
-    /// Idempotently release one exact durable pin.
-    Release {
-        /// Exact pin key.
-        pin_id: PinId,
-        /// Optional database scope checked in the release transaction.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_store_id: Option<StoreId>,
-    },
-    /// List pins after an exclusive canonical key, up to 1000 at a time.
-    List {
-        /// Filter both states by default.
-        #[serde(default)]
-        status: HistoryPinFilter,
-        /// Page size, default 100 and maximum 1000.
-        #[serde(default = "default_pin_limit")]
-        limit: usize,
-        /// Exclusive prior pin ID, independent of row retention.
-        #[serde(default)]
-        after_pin_id: Option<PinId>,
-        /// Optional database scope checked in the same read snapshot.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_store_id: Option<StoreId>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct HistoryPinsListRequest {
+    /// Filter both states by default.
+    #[serde(default)]
+    pub status: HistoryPinFilter,
+    /// Page size, default 100 and maximum 1000.
+    #[serde(default = "default_pin_limit")]
+    pub limit: usize,
+    /// Exclusive prior pin ID, independent of row retention.
+    #[serde(default)]
+    pub after_pin_id: Option<PinId>,
+    /// Optional database scope checked in the same read snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_store_id: Option<StoreId>,
 }
+
+/// Bearer credential returned once to the admitter of a retained public batch.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PinReleaseToken(String);
+
+impl PinReleaseToken {
+    /// Mints a batch credential with 244 random bits from two v4 UUIDs.
+    pub fn mint() -> Self {
+        Self(format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Produces the internal proof used by the broker-local writer.
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.0.as_bytes()).into()
+    }
+
+    /// Confirms this token binds every pin in the new admission response.
+    fn matches_receipt(&self, receipt: &StartBatchReceipt) -> bool {
+        let digest = self.digest();
+        receipt.jobs.iter().all(|job| {
+            job.pin_id.as_ref() == Some(&PinId::from_release_digest(&digest, &job.agent_id))
+        })
+    }
+}
+
+impl fmt::Debug for PinReleaseToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PinReleaseToken([redacted])")
+    }
+}
+
+impl TryFrom<String> for PinReleaseToken {
+    type Error = crate::Error;
+
+    /// Accepts the fixed lowercase hex spelling without exposing invalid input.
+    fn try_from(value: String) -> Result<Self> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(invalid("invalid pin release token"));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for PinReleaseToken {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Operator-socket `history_pins_release`: idempotently release one exact pin
+/// with the credential returned by its original public batch admission.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryPinReleaseRequest {
+    /// Exact pin key.
+    pub pin_id: PinId,
+    /// The admitting batch's bearer credential.
+    pub release_token: PinReleaseToken,
+    /// Optional database scope checked in the release transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_store_id: Option<StoreId>,
+}
+
+object_only_deserialize!(HistoryPinReleaseRequest {
+    pin_id: PinId,
+    release_token: PinReleaseToken,
+    #[serde(default)]
+    expected_store_id: Option<StoreId>,
+});
 
 fn default_pin_limit() -> usize {
     100
@@ -503,6 +590,9 @@ pub struct StartBatchResult {
     pub receipt: StartBatchReceipt,
     /// A replay never launches another supervisor.
     pub replayed: bool,
+    /// Returned only in the original retained public admission response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_token: Option<PinReleaseToken>,
 }
 
 /// A permanent receipt lookup at one database snapshot.
@@ -557,12 +647,21 @@ object_only_deserialize!(StartBatchReceipt {
 object_only_deserialize!(StartBatchResult {
     receipt: StartBatchReceipt,
     replayed: bool,
+    #[serde(default, deserialize_with = "present_release_token")]
+    release_token: Option<PinReleaseToken>,
 });
 object_only_deserialize!(BatchReceiptLookup {
     found: bool,
     #[serde(default, deserialize_with = "present_receipt")]
     receipt: Option<StartBatchReceipt>,
 });
+
+/// An issued credential is always a string. A replay omits the field entirely.
+fn present_release_token<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<PinReleaseToken>, D::Error> {
+    PinReleaseToken::deserialize(deserializer).map(Some)
+}
 
 fn present_receipt<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -580,6 +679,7 @@ impl BatchReceiptLookup {
             (Some(receipt), true) => StartBatchResult {
                 receipt: receipt.clone(),
                 replayed: true,
+                release_token: None,
             }
             .validate_for_request(&request),
             _ => Err(invalid("invalid batch receipt lookup response")),
@@ -602,6 +702,16 @@ impl StartBatchResult {
             return Err(invalid("batch receipt preconditions do not match request"));
         }
         Ok(())
+    }
+
+    /// Validates the public admission response, including its one-time credential.
+    pub fn validate_admission_response(&self, request: &StartBatchRequest) -> Result<()> {
+        self.validate_for_request(request)?;
+        match (&self.release_token, self.replayed, request.retain_history) {
+            (Some(token), false, true) if token.matches_receipt(&self.receipt) => Ok(()),
+            (None, true, _) | (None, false, false) => Ok(()),
+            _ => Err(invalid("invalid batch release credential")),
+        }
     }
 
     /// Validates the receipt and its correlation with the original batch intent.
@@ -714,6 +824,7 @@ mod tests {
         let output = serde_json::to_value(StartBatchResult {
             receipt,
             replayed: false,
+            release_token: None,
         })
         .unwrap();
         assert!(crate::storage::encoded_len(&output) <= crate::storage::MAX_RESULT_BYTES);
@@ -879,6 +990,7 @@ mod tests {
                 preconditions: request.preconditions.clone(),
             },
             replayed: false,
+            release_token: None,
         };
         receipt.validate_for_request(&request).unwrap();
         let mut wrong = receipt.clone();

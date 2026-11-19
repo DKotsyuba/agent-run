@@ -74,102 +74,58 @@ async fn retained_agent_tools_dispatch() {
     );
 }
 
-/// Service and shared dispatch expose the same exact, filtered discovery page;
-/// bad pagination, lifecycle values and unknown wait arguments stay typed.
+/// The removed legacy pool tools are not in the shared registry and every
+/// transport refuses them before any store read or write.
 #[tokio::test]
-async fn list_pools_service_and_dispatch_share_strict_read_projection() {
-    use agent_run_domain::pool::{ListPoolsQuery, PoolState};
+async fn removed_legacy_pool_tools_are_refused() {
     let home = common::Home::new();
-    let store = home.store();
-    for (id, state, at) in [
-        ("pool-20260101-000000-012345678a", "open", 1.0),
-        ("pool-20260102-000000-012345678b", "completed", 2.0),
-    ] {
-        store.conn.execute(
-            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at,completed_at) \
-             VALUES(?,'ns',?,?, 'goal','[]',?,1,?,?)",
-            rusqlite::params![id, id, "0".repeat(64), state, at,
-                (state == "completed").then_some(3.0)],
-        ).unwrap();
-    }
     let service = Service::new(home.path.clone());
-    let revision = store.revision().unwrap();
-    let first = dispatch::call(&service, "list_pools", json!({"limit": 1}))
-        .await
-        .unwrap();
-    assert_eq!(first["total"], 2);
-    assert_eq!(
-        first["items"][0]["pool_id"],
-        "pool-20260102-000000-012345678b"
-    );
-    assert_eq!(first["next_offset"], 1);
-    let filtered = service
-        .list_pools(ListPoolsQuery {
-            state: Some(PoolState::Open),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(filtered["total"], 1);
-    assert_eq!(
-        filtered["items"][0]["pool_id"],
-        "pool-20260101-000000-012345678a"
-    );
-    let page = dispatch::call(&service, "list_pools", json!({"offset":1,"limit":1}))
-        .await
-        .unwrap();
-    assert_eq!(page["items"], filtered["items"]);
-    assert_eq!(page["complete"], true);
-    assert_eq!(store.revision().unwrap(), revision);
-    for bad in [
-        json!({"limit":0}),
-        json!({"limit":201}),
-        json!({"offset":-1}),
-        json!({"state":"closed"}),
-        json!({"after_revision":0}),
-        json!({"wait_seconds":1}),
+    let revision = home.store().revision().unwrap();
+    for method in [
+        "start_pool",
+        "pool_post",
+        "pool_replace",
+        "pool",
+        "list_pools",
     ] {
-        assert!(matches!(
-            dispatch::call(&service, "list_pools", bad).await,
-            Err(agent_run_domain::Error::Validation(_))
-        ));
+        assert!(!dispatch::is_tool(method), "{method}");
+        assert!(
+            dispatch::call(&service, method, json!({})).await.is_err(),
+            "{method}"
+        );
     }
+    assert_eq!(home.store().revision().unwrap(), revision);
 }
 
-/// Legacy models remain callable; quota reads demand schema 2 and never
-/// fabricate a complete empty result when Quota is unavailable.
+/// Quota presentation moved to Agent Quota: the former `models`, `limits` and
+/// `capacity_order` methods are unknown on every configuration schema.
 #[tokio::test]
-async fn restored_operator_tools_dispatch() {
+async fn removed_quota_tools_are_unknown_on_every_schema() {
     let home = common::Home::new();
     let service = Service::new(home.path.clone());
-    let legacy = dispatch::call(&service, "models", json!({})).await.unwrap();
-    assert!(legacy.get("mock").is_some());
-    for method in ["limits", "capacity_order"] {
-        let error = dispatch::call(&service, method, json!({}))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, agent_run_domain::Error::Unsupported(_)),
-            "{method}: {error}"
-        );
-        assert!(error.to_string().contains("schema_version 2"));
+    for schema in ["schema_version=1\n", "schema_version=2\n"] {
+        std::fs::write(home.path.join("config.toml"), schema).unwrap();
+        for method in ["models", "limits", "capacity_order"] {
+            let error = dispatch::call(&service, method, json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.machine_code().as_str(), "ValidationError", "{method}");
+            assert!(
+                error.to_string().contains("unknown tool"),
+                "{method}: {error}"
+            );
+        }
     }
-
-    std::fs::write(home.path.join("config.toml"), "schema_version=2\n").unwrap();
-    let models = dispatch::call(&service, "models", json!({})).await.unwrap();
-    assert_eq!(models["schema_version"], 2);
-    assert_eq!(models["providers"], json!([]));
-    assert_eq!(models["quota_coverage"]["state"], "unknown");
-    assert_eq!(models["quota_coverage"]["incomplete"], true);
-    let limits = dispatch::call(&service, "limits", json!({})).await.unwrap();
-    assert_eq!(limits["items"], json!([]));
-    assert_eq!(limits["coverage"]["state"], "unknown");
-    assert_eq!(limits["coverage"]["incomplete"], true);
-    let order = dispatch::call(&service, "capacity_order", json!({}))
+    // The delegation guide remains, configuration-only.
+    let guide = dispatch::call(&service, "delegation_guide", json!({}))
         .await
         .unwrap();
-    assert_eq!(order["providers"], json!([]));
-    assert_eq!(order["quota_coverage"]["state"], "unknown");
-    assert_eq!(order["quota_coverage"]["incomplete"], true);
+    assert!(
+        guide
+            .as_str()
+            .unwrap()
+            .contains("No providers are currently configured.")
+    );
 }
 
 /// Mirrors `tests/test_dispatch.py::test_cancel_returns_the_current_agent_view`.

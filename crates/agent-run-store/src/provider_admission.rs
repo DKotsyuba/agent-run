@@ -621,6 +621,68 @@ impl Store<'_> {
         replay(self, request)
     }
 
+    /// Resolves the exact child in its original admission namespace first,
+    /// including a historical Pool binding when the caller omitted a destination.
+    /// An unrelated admission in the requested namespace still conflicts if
+    /// neither binding identifies this child. All reads share one snapshot.
+    pub fn replay_provider_resume(
+        &self,
+        parent: &Record,
+        request: &ProviderStartRequest,
+        allow_legacy_pool: bool,
+    ) -> Result<Option<ProviderAdmission>> {
+        let Some(request_id) = &request.request_id else {
+            return Ok(None);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let child = tx
+            .query_row(
+                "SELECT * FROM agents WHERE parent_agent_id=? AND request_id=?",
+                params![parent.id.as_str(), request_id],
+                Record::read,
+            )
+            .optional()?;
+        if let Some(child) = child {
+            let original = child.request.orchestrator.as_ref();
+            let ordinary = match (original, &request.orchestrator) {
+                (None, None) => true,
+                (Some(old), Some(new)) => {
+                    old.external_session_id == new.external_session_id
+                        && old.canonical_transport()? == new.canonical_transport()?
+                }
+                _ => false,
+            };
+            if ordinary {
+                return replayed(&tx, &child, request).map(Some);
+            }
+            if allow_legacy_pool && let Some(original) = original {
+                let pool_bound: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pool_members m JOIN pools p ON p.id=m.pool_id \
+                     JOIN orchestrator_sessions s ON s.id=p.orchestrator_session_id \
+                     WHERE m.agent_id=?1 AND s.external_session_id=?2 AND s.transport IN (?3,?4))",
+                    params![
+                        parent.root_agent_id.as_str(),
+                        original.external_session_id,
+                        original.canonical_transport()?,
+                        original.legacy_transport()?
+                    ],
+                    |row| row.get(0),
+                )?;
+                if pool_bound {
+                    let mut historical = request.clone();
+                    historical.orchestrator = Some(original.clone());
+                    return replayed(&tx, &child, &historical).map(Some);
+                }
+            }
+        }
+        // The original request bears the admission binding. A later update to
+        // orchestrator_session_id cannot qualify a child for an exact replay.
+        if admission::replay_request(self, &request.storage_projection())?.is_some() {
+            return Err(Error::Conflict);
+        }
+        Ok(None)
+    }
+
     /// Atomically validates the committed candidate rank, current registry,
     /// account scope, global/harness caps and reservations, then creates one
     /// logical agent, owned attempt, exact physical keys, and initial events.

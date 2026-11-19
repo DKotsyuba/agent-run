@@ -21,9 +21,6 @@ idempotency: use the same nonempty request_id and unchanged arguments for an
 identical retry. Steer is additive but repeated calls can enqueue additional
 commands. Cancel is destructive and is not declared unconditionally idempotent.
 Worker reports require a request key scoped to their immutable run context.
-Pool admission, messages, replacements, proposals and votes likewise require
-their documented request keys. Replacements and superseding proposals/votes
-carry conservative destructive hints; read pages remain read-only.
 Hints are descriptive, never authorization.
 
 `schemas/mcp-registration.json` is host-neutral metadata: actual commands,
@@ -49,17 +46,16 @@ revisions are recorded independently of host qualification in `family.toml`.
 
 ## Presentation policy
 
-The additive `capabilities` and `answer_chunk` observation methods return typed
-full `structuredContent` plus a fixed text summary. Their registered output
-schemas describe the same CLI/socket values. They do not duplicate answer text
-in both channels. Chunk content is capped at 128 KiB before escaping; the complete
-encoded MCP result still passes the existing wire reserve check. Existing tools
-retain the text-first presentation policy below.
+`start_batch` returns the durable receipt and replay flag in
+`structuredContent` with a fixed text summary. The release credential is
+omitted from MCP responses. The operator socket and CLI expose `capabilities`
+and `answer_chunk`. Answer chunks are capped at 128 KiB before escaping.
 
 An oversized verified `answer` instead returns bounded metadata, including its
 execution sequence and answer SHA-256, and links the existing local artifact
 when its managed path is recognizable. The file link requires host filesystem
-access; `answer_chunk` retrieves the same verified bytes over MCP. No new file
+access. The CLI `agent-run answer-chunk` command and operator socket
+`answer_chunk` method retrieve the same verified bytes. No new file
 or separate retention policy is introduced. A single oversized transcript block
 is marked incomplete and carries a bounded UTF-8 preview and its cursor.
 
@@ -81,21 +77,14 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 | Tools | Hard UTF-8 text cap | Whole-row cap | Exact content cap |
 |---|---:|---:|---:|
 | start, resume | 4096 | 8 displayed MCP selections, plus explicit omitted count | none |
-| start_pool, pool_replace | 8192 | 5 members | none |
-| pool_post, pool_propose, pool_vote | 8192 | none | none |
-| pool, pool_read | 614400 | 50 entries, every entry displayed or the page refused | 563200 |
-| list_pools | 524288 | 200 | 524288 |
 | cancel, steer, notify_orchestrator, routine errors | 2048 | 8 | none |
 | list_agents | 8192 | 20 | none |
-| limits | 8192 | 20 windows; ranking retains 100 providers and 100 models total | none |
 | transcript | 16384 | 100 | 14336 |
 | answer, doc, delegation_guide | 16384 | none | 14336 |
-| models, capacity_order (call-only compatibility methods) | 16384 | 100 providers and 100 models in total | none |
 
 Admission replies reserve the original request key, whose existing contract
 allows 512 characters; reversible quoting can expand it beyond 2 KiB. These
-are text byte limits, not token counts. Pool pages retain a larger justified
-profile for exact shared messages and proposal snapshots. The presenter also
+are text byte limits, not token counts. The presenter also
 serializes privately through a bounded writer to check the encoded MCP result,
 reserving 4096 bytes within the one-MiB frame for protocol framing. JSON escaping
 can exceed the wire budget even when text fits: a read fails safely when no
@@ -107,7 +96,7 @@ writer. Every page row is displayed in source order or the entire page is
 refused, except for the explicitly marked single-block transcript preview.
 No partial buffer, shortened critical value or upstream continuation
 for undisplayed rows is published. Narrow delegation guidance with exact
-provider/model/profile filters (also retained by the call-only models method);
+provider/model/profile filters;
 request smaller list/transcript limits; use CLI/socket for full documents or
 answer artifacts. No new detail-reference service is invented.
 
@@ -115,10 +104,7 @@ Semantic execution receipts are captured before presentation. Degradation after
 accepted admission, steering or enqueue keeps the confirmed identity, original
 request key and no-replay advice with isError=false. A valid admission counter
 keeps the tiny agent_id/sequence structured mirror for PostToolUse binding.
-Pool admission keeps the tiny pool_id binding mirror. Pool mutation degradation
-also preserves request identity, log position and a replacement agent identity
-when known. Shared entries use the domain's stamped untrusted-body formatter;
-reverse/block transcript pages preserve omission, error and continuation data.
+Reverse/block transcript pages preserve omission, error and continuation data.
 Invalid counters never bind, even when acceptance is known. Unknown writes stay
 unknown with isError=true and reconciliation advice; expected business failures
 stay errors. Fallback never emits raw JSON, Debug values, context or error chains.

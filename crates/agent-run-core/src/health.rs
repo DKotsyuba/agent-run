@@ -3,9 +3,8 @@ use crate::{Result, domain::AgentId, persist::Persist, process, service::Service
 use agent_run_adapters::io::Process;
 use serde_json::{Value, json};
 
-/// Consume a non-model ping or refuse stale health/pool corrections before input.
-/// Pool-loop corrections may enter only the same still-active inference turn;
-/// unlike opted-in health probes, they never wake an idle model.
+/// Consume a non-model ping or refuse stale health corrections before input.
+/// Historical pool-loop corrections and enrollment introductions are refused.
 /// The loop's exact native owner, attempt, idle boundary and current task work
 /// are verified without invoking the model. Returns true only when this command
 /// is completed here; ordinary commands and valid model probes remain with the
@@ -18,18 +17,20 @@ pub async fn command(
     idle: bool,
 ) -> Result<bool> {
     let (id, kind, payload) = command;
-    if kind == "steer" && payload.get("pool_read_guard").is_some() {
-        if idle || !store.pool_poll_guard_current(run, payload)? {
-            process
-                .observing(store.complete_command(
-                    run,
-                    id,
-                    &json!({"accepted":false,"reason":"stale_pool_read_guard"}),
-                ))
-                .await?;
-            return Ok(true);
-        }
-        return Ok(false);
+    let legacy_refusal = if payload.get("pool_read_guard").is_some() {
+        Some("stale_pool_read_guard")
+    } else if payload.get("pool_enrollment").is_some() {
+        Some("legacy_pool_retired")
+    } else {
+        None
+    };
+    if kind == "steer"
+        && let Some(reason) = legacy_refusal
+    {
+        process
+            .observing(store.complete_command(run, id, &json!({"accepted":false,"reason":reason})))
+            .await?;
+        return Ok(true);
     }
     let model = kind == "steer" && payload.get("health_ping").is_some();
     if kind != "ping" && !model {

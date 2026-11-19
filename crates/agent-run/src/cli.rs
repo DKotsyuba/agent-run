@@ -18,6 +18,10 @@ use serde_json::{Value, json};
 use std::{
     future::Future,
     io::Write,
+    os::{
+        fd::{AsFd, FromRawFd},
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -124,12 +128,7 @@ pub trait CliService: Send + Sync {
             self.transcript(id, query.cursor, query.limit)
         }
     }
-    /// Return the configured model roster or schema-2 provider catalog.
-    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
-    /// Return the configured capacity limits.
-    fn limits(&self) -> CliFuture<'_>;
-    /// Return the ordered capacity view, optionally for one exact model.
-    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_>;
+
     /// Returns account-free guide text for the exact catalog filters; omitted
     /// filters retain default guidance, and invalid names preserve typed errors.
     fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> CliFuture<'_>;
@@ -198,15 +197,7 @@ impl CliService for Service {
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript_public(self, id, cursor, limit)
     }
-    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
-        Box::pin(Service::models(self, query))
-    }
-    fn limits(&self) -> CliFuture<'_> {
-        Box::pin(Service::limits(self))
-    }
-    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
-        Box::pin(Service::capacity_order(self, query))
-    }
+
     /// Forwards the CLI's exact optional filters to the shared guide service.
     fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
         Box::pin(Service::delegation_guide_filtered(self, query))
@@ -337,6 +328,12 @@ pub enum Command {
         /// JSON file or `-`: request_id and ordered jobs.
         #[arg(long)]
         spec: String,
+        /// Write the new release token to a private file created exclusively.
+        #[arg(long, conflicts_with = "release_token_fd", value_name = "PATH")]
+        release_token_file: Option<PathBuf>,
+        /// Write the new release token to an inherited writable descriptor above 2.
+        #[arg(long, value_name = "N")]
+        release_token_fd: Option<i32>,
     },
     /// Look up the permanent receipt for an exact scoped batch intent.
     BatchReceipt {
@@ -362,54 +359,12 @@ pub enum Command {
         #[arg(long)]
         spec: String,
     },
-    /// List or release durable lineage history pins.
+    /// List durable lineage history pins, or release one as its owner.
     HistoryPins {
         #[command(subcommand)]
         command: HistoryPinsCommand,
     },
     Resume(Resume),
-    /// Start a cooperative pool from one JSON request (`-` reads stdin).
-    StartPool {
-        /// JSON file or `-`: request_id, goal, optional acceptance, members.
-        #[arg(long)]
-        spec: String,
-        #[command(flatten)]
-        session: SessionArgs,
-    },
-    /// Post a message, stamped as from the operator, to every pool member.
-    PoolPost {
-        #[arg(long)]
-        pool_id: String,
-        #[arg(long)]
-        request_id: String,
-        /// Message text; `-` reads standard input.
-        #[arg(long)]
-        text: String,
-    },
-    /// Replace one terminal, fully cleaned pool member.
-    PoolReplace {
-        #[arg(long)]
-        pool_id: String,
-        /// Stable agent id of the current member.
-        #[arg(long)]
-        agent_id: String,
-        #[arg(long)]
-        request_id: String,
-        /// Optional JSON file or `-` with an explicit replacement start.
-        #[arg(long)]
-        spec: Option<String>,
-    },
-    /// Read a pool's status and one cursor page of its log.
-    Pool {
-        #[arg(long)]
-        pool_id: String,
-        #[arg(long)]
-        after_seq: Option<u64>,
-        #[arg(long)]
-        before_seq: Option<u64>,
-        #[arg(long)]
-        limit: Option<u32>,
-    },
     Bind(Bind),
     Cancel {
         /// Stable agent id, or a historical run alias for that agent.
@@ -428,22 +383,6 @@ pub enum Command {
         text: String,
     },
     Agents(Agents),
-    /// Discover pools through the resident broker, newest-created first.
-    #[command(alias = "list-pools")]
-    Pools {
-        /// Optional exact state filter.
-        #[arg(long, value_parser = ["open", "completed"])]
-        state: Option<String>,
-        /// Matching pools to skip.
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
-        /// Page size, 1..=200.
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        /// Print a compact human page instead of structured JSON.
-        #[arg(long)]
-        text: bool,
-    },
     /// Report the resident broker's versioned read schemas and transport limits.
     Capabilities {
         /// Explicitly read the current database identity.
@@ -509,20 +448,7 @@ pub enum Command {
         #[arg(long, value_enum)]
         format: Option<TranscriptFormat>,
     },
-    /// Model roster, or the schema-2 provider catalog with exact filters.
-    Models {
-        /// Exact configured provider id.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Exact canonical role/profile name.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Exact provider-visible model id.
-        #[arg(long)]
-        model: Option<String>,
-    },
-    Limits,
-    /// Prints compact routing guidance, with the same exact filters as models.
+    /// Prints compact routing guidance for exact provider/profile/model filters.
     DelegationGuide {
         /// Exact configured provider id.
         #[arg(long)]
@@ -556,10 +482,6 @@ pub enum Command {
     Api {
         #[command(subcommand)]
         command: Api,
-    },
-    Capacity {
-        #[command(subcommand)]
-        command: Capacity,
     },
     Delivery {
         #[command(subcommand)]
@@ -654,14 +576,29 @@ pub enum HistoryPinsCommand {
         #[arg(long)]
         expected_store_id: Option<String>,
     },
-    /// Release one exact pin idempotently.
+    /// Release one exact pin idempotently with its batch release credential.
     Release {
         /// Canonical pin identifier from a batch receipt.
         #[arg(long)]
         pin_id: String,
+        /// File containing the release token, or '-' for standard input.
+        #[arg(long)]
+        release_token_file: PathBuf,
         /// Refuse a database different from the recorded store identity.
         #[arg(long)]
         expected_store_id: Option<String>,
+    },
+    /// Recover a public batch pin as the offline database owner.
+    ReleaseOffline {
+        /// Canonical pin identifier from the original batch receipt.
+        #[arg(long)]
+        pin_id: agent_run_domain::batch::PinId,
+        /// Public idempotency key of the exact original batch.
+        #[arg(long)]
+        request_id: String,
+        /// Store identity from that batch's permanent receipt.
+        #[arg(long)]
+        expected_store_id: agent_run_domain::StoreId,
     },
 }
 
@@ -809,11 +746,7 @@ pub struct Resume {
 #[derive(Args, Debug)]
 pub struct Bind {
     /// Stable agent whose selected execution should be bound.
-    #[arg(required_unless_present = "pool", conflicts_with = "pool")]
-    pub agent_id: Option<AgentId>,
-    /// Bind a whole pool and every current member together instead of one agent.
-    #[arg(long)]
-    pub pool: Option<String>,
+    pub agent_id: AgentId,
     /// Legacy execution selector, retained for older callers.
     #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
@@ -1108,15 +1041,6 @@ pub enum StorageCommand {
     Recover,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum Capacity {
-    /// Capacity order; schema 2 lists providers, optionally for one model.
-    Order {
-        /// Exact provider-visible model id.
-        #[arg(long)]
-        model: Option<String>,
-    },
-}
 /// Completion-delivery commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Delivery {
@@ -1157,6 +1081,73 @@ fn read_input(p: &Path, max: usize) -> Result<String> {
     let bytes = fs::Dir::open(parent)?.read(Path::new(name), max)?;
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
 }
+/// Reserve the output name before admission so filesystem collisions cannot leave
+/// an admitted pin without its requested credential sink.
+fn create_release_token_file(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(absolute(path)?)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// Duplicates a private inherited descriptor without taking over the caller's
+/// descriptor. Regular files must belong to the caller and allow owner access only.
+fn duplicate_release_token_fd(fd: i32) -> Result<std::fs::File> {
+    if fd <= 2 {
+        return Err(invalid("release token descriptor must be above 2"));
+    }
+    // SAFETY: F_GETFD inspects a raw descriptor with no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    // SAFETY: F_GETFL returns the raw file status flags or an error.
+    let access = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::FD_CLOEXEC != 0
+        || access < 0
+        || !matches!(access & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+    {
+        return Err(invalid(
+            "release token descriptor must be inherited and writable",
+        ));
+    }
+    // SAFETY: F_DUPFD_CLOEXEC creates our own fd or returns -1 with errno.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if copy < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: the successful fcntl result is a newly owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(copy) };
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
+    if !(kind.is_file() || kind.is_fifo() || kind.is_socket()) {
+        return Err(invalid(
+            "release token descriptor must refer to a file, pipe or socket",
+        ));
+    }
+    for stdio in [
+        std::io::stdin().as_fd(),
+        std::io::stdout().as_fd(),
+        std::io::stderr().as_fd(),
+    ] {
+        let stdio = std::fs::File::from(stdio.try_clone_to_owned()?).metadata()?;
+        if (meta.dev(), meta.ino()) == (stdio.dev(), stdio.ino()) {
+            return Err(invalid(
+                "release token descriptor must be separate from standard streams",
+            ));
+        }
+    }
+    // SAFETY: geteuid only reads the current process identity.
+    if kind.is_file() && (meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0) {
+        return Err(invalid(
+            "release token descriptor file must be owned by the caller and have no group or other permissions. Use --release-token-file.",
+        ));
+    }
+    Ok(file)
+}
+
 /// Reads bounded UTF-8 standard input for Python-compatible `-` task values.
 fn read_stdin(max: usize) -> Result<String> {
     use std::io::Read;
@@ -1169,26 +1160,6 @@ fn read_stdin(max: usize) -> Result<String> {
         return Err(invalid("stdin exceeds the maximum input size"));
     }
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
-}
-
-/// Reads one bounded JSON object from a file, or from standard input for `-`.
-fn spec_json(source: &str) -> Result<Value> {
-    const MAX: usize = 1024 * 1024;
-    let text = if source == "-" {
-        read_stdin(MAX)?
-    } else {
-        let bytes = std::fs::read(source).map_err(|_| invalid("spec file is unreadable"))?;
-        if bytes.len() > MAX {
-            return Err(invalid("spec file exceeds the maximum input size"));
-        }
-        String::from_utf8(bytes).map_err(|_| invalid("spec must be UTF-8"))?
-    };
-    let value: Value =
-        serde_json::from_str(&text).map_err(|_| invalid("spec must be a JSON object"))?;
-    if !value.is_object() {
-        return Err(invalid("spec must be a JSON object"));
-    }
-    Ok(value)
 }
 
 /// Reads a task argument, interpreting exactly `-` as bounded standard input.
@@ -1813,14 +1784,11 @@ fn client_command(command: &Command) -> bool {
             | Command::Status { .. }
             | Command::TranscriptExact { .. }
             | Command::InitialTask { .. }
-            | Command::HistoryPins { .. }
+            | Command::HistoryPins {
+                command: HistoryPinsCommand::List { .. } | HistoryPinsCommand::Release { .. }
+            }
             | Command::Restart(_)
             | Command::Resume(_)
-            | Command::StartPool { .. }
-            | Command::PoolPost { .. }
-            | Command::PoolReplace { .. }
-            | Command::Pool { .. }
-            | Command::Pools { .. }
             | Command::Capabilities { .. }
             | Command::AnswerChunk { .. }
             | Command::Doc { .. }
@@ -1839,13 +1807,8 @@ fn operator_client_command(command: &Command) -> bool {
                 | Command::Transcript { .. }
                 | Command::Cancel { .. }
                 | Command::Steer { .. }
-                | Command::Models { .. }
-                | Command::Limits
                 | Command::DelegationGuide { .. }
                 | Command::Hook { .. }
-                | Command::Capacity {
-                    command: Capacity::Order { .. }
-                }
         )
 }
 
@@ -2420,9 +2383,6 @@ async fn run_client_command(
                 if let Some(turn) = normalized.reference.external_turn_id {
                     safe["external_turn_id"] = json!(turn);
                 }
-                if let Some(pool) = normalized.pool_id {
-                    safe["pool_id"] = json!(pool);
-                }
                 if let Some(agent) = normalized.agent_id {
                     safe["agent_id"] = json!(agent);
                 }
@@ -2519,7 +2479,11 @@ async fn run_client_command(
             let result = broker.call("resume", arguments).await?;
             (output)(&admission_output(&result)?)?;
         }
-        Command::StartBatch { spec } => {
+        Command::StartBatch {
+            spec,
+            release_token_file,
+            release_token_fd,
+        } => {
             let text = if spec == "-" {
                 read_stdin(1024 * 1024)?
             } else {
@@ -2528,12 +2492,24 @@ async fn run_client_command(
             let mut request: agent_run_domain::batch::StartBatchRequest =
                 serde_json::from_str(&text).map_err(|_| invalid("invalid batch spec"))?;
             request.validate_intent()?;
+            let mut sink = match (release_token_file, release_token_fd) {
+                (Some(path), None) => Some(create_release_token_file(&path)?),
+                (None, Some(fd)) => Some(duplicate_release_token_fd(fd)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => return Err(invalid("choose one release token destination")),
+            };
             let params = serde_json::to_value(request)?;
-            let result = broker.call("start_batch", params.clone()).await?;
+            let mut result = broker.call("start_batch", params.clone()).await?;
             if !transport::socket::valid_batch_response(&result, &params) {
                 return Err(Error::BatchOutcomeUnknown {
                     source: Box::new(invalid("invalid batch receipt")),
                 });
+            }
+            let token = result
+                .as_object_mut()
+                .and_then(|fields| fields.remove("release_token"));
+            if let (Some(sink), Some(token)) = (&mut sink, token.as_ref().and_then(Value::as_str)) {
+                writeln!(sink, "{token}")?;
             }
             (output)(&result)?;
         }
@@ -2605,116 +2581,60 @@ async fn run_client_command(
             (output)(&result)?;
         }
         Command::HistoryPins { command } => {
-            let (mut params, expected_store_id) = match command {
+            let (method, mut params, expected_store_id) = match command {
                 HistoryPinsCommand::List {
                     status,
                     limit,
                     after_pin_id,
                     expected_store_id,
                 } => (
-                    json!({
-                        "action":"list", "status":status, "limit":limit, "after_pin_id":after_pin_id
-                    }),
+                    "history_pins_list",
+                    json!({"status":status, "limit":limit, "after_pin_id":after_pin_id}),
                     expected_store_id,
                 ),
                 HistoryPinsCommand::Release {
                     pin_id,
+                    release_token_file,
                     expected_store_id,
-                } => (
-                    json!({"action":"release", "pin_id":pin_id}),
-                    expected_store_id,
-                ),
+                } => {
+                    let text = if release_token_file == Path::new("-") {
+                        read_stdin(128)?
+                    } else {
+                        read_input(&release_token_file, 128)?
+                    };
+                    (
+                        "history_pins_release",
+                        json!({"pin_id":pin_id, "release_token":text.trim()}),
+                        expected_store_id,
+                    )
+                }
+                HistoryPinsCommand::ReleaseOffline { .. } => {
+                    return Err(unsupported_operator_command());
+                }
             };
             if let Some(id) = expected_store_id {
                 params["expected_store_id"] = json!(id);
             }
-            let request: agent_run_domain::batch::HistoryPinsRequest =
-                serde_json::from_value(params.clone())
-                    .map_err(|_| invalid("invalid history pin request"))?;
-            if matches!(request, agent_run_domain::batch::HistoryPinsRequest::List { limit, .. } if !(1..=1000).contains(&limit))
-            {
-                return Err(invalid("history pin limit must be 1..=1000"));
+            if method == "history_pins_list" {
+                let request: agent_run_domain::batch::HistoryPinsListRequest =
+                    serde_json::from_value(params.clone())
+                        .map_err(|_| invalid("invalid history pin request"))?;
+                if !(1..=1000).contains(&request.limit) {
+                    return Err(invalid("history pin limit must be 1..=1000"));
+                }
+            } else {
+                serde_json::from_value::<agent_run_domain::batch::HistoryPinReleaseRequest>(
+                    params.clone(),
+                )
+                .map_err(|_| invalid("invalid history pin request"))?;
             }
-            let result = broker.call("history_pins", params.clone()).await?;
-            if !transport::socket::valid_history_pin_response(&result, &params) {
+            let result = broker.call(method, params.clone()).await?;
+            if !transport::socket::valid_history_pin_response(method, &result, &params) {
                 return Err(Error::Runtime(
                     "history pin result is invalid; reconcile release by pin_id".into(),
                 ));
             }
             (output)(&result)?;
-        }
-        Command::StartPool { spec, session } => {
-            let mut request = spec_json(&spec)?;
-            if let Some(reference) = session.resolve()? {
-                request["orchestrator"] = serde_json::to_value(reference)?;
-            }
-            let result = broker.call("start_pool", request).await?;
-            (output)(&result)?;
-        }
-        Command::PoolPost {
-            pool_id,
-            request_id,
-            text,
-        } => {
-            let message = task_text(&text, agent_run_domain::pool::MAX_BODY_BYTES)?;
-            let result = broker
-                .call(
-                    "pool_post",
-                    json!({"pool_id": pool_id, "request_id": request_id, "message": message}),
-                )
-                .await?;
-            (output)(&result)?;
-        }
-        Command::PoolReplace {
-            pool_id,
-            agent_id,
-            request_id,
-            spec,
-        } => {
-            let start = spec.as_deref().map(spec_json).transpose()?;
-            let result = broker
-                .call(
-                    "pool_replace",
-                    json!({"pool_id": pool_id, "agent_id": agent_id, "request_id": request_id, "start": start}),
-                )
-                .await?;
-            (output)(&result)?;
-        }
-        Command::Pool {
-            pool_id,
-            after_seq,
-            before_seq,
-            limit,
-        } => {
-            let result = broker
-                .call(
-                    "pool",
-                    json!({"pool_id": pool_id, "after_seq": after_seq, "before_seq": before_seq, "limit": limit}),
-                )
-                .await?;
-            (output)(&result)?;
-        }
-        Command::Pools {
-            state,
-            offset,
-            limit,
-            text,
-        } => {
-            let query: agent_run_domain::pool::ListPoolsQuery =
-                serde_json::from_value(json!({"state": state, "offset": offset, "limit": limit}))
-                    .map_err(|_| invalid("invalid pool list arguments"))?;
-            query.validate()?;
-            let result = broker
-                .call("list_pools", serde_json::to_value(query)?)
-                .await?;
-            if text {
-                (text_output)(&format!(
-                    "{}\n",
-                    crate::transport::mcp_text::list_pools_text(&result)?
-                ))?;
-            } else {
-                (output)(&result)?;
-            }
         }
         Command::Capabilities {
             include_store_id,
@@ -2840,21 +2760,6 @@ async fn run_client_command(
                     .await?,
             )?;
         }
-        Command::Models {
-            provider,
-            profile,
-            model,
-        } => {
-            (output)(
-                &broker
-                    .call(
-                        "models",
-                        json!({"provider":provider,"profile":profile,"model":model}),
-                    )
-                    .await?,
-            )?;
-        }
-        Command::Limits => (output)(&broker.call("limits", json!({})).await?)?,
         Command::DelegationGuide {
             provider,
             profile,
@@ -2870,15 +2775,6 @@ async fn run_client_command(
                 .as_str()
                 .ok_or_else(|| invalid("delegation guide must be text"))?;
             (text_output)(&format!("{text}\n"))?;
-        }
-        Command::Capacity {
-            command: Capacity::Order { model },
-        } => {
-            (output)(
-                &broker
-                    .call("capacity_order", json!({"model":model}))
-                    .await?,
-            )?;
         }
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
@@ -2925,6 +2821,20 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
         .await;
     }
     match cli.command {
+        Command::HistoryPins {
+            command:
+                HistoryPinsCommand::ReleaseOffline {
+                    pin_id,
+                    request_id,
+                    expected_store_id,
+                },
+        } => {
+            let released = crate::offline::acquire(&home)?
+                .guard
+                .release_history_pin(&pin_id, &expected_store_id, &request_id)?
+                .ok_or_else(|| Error::PinNotFound(pin_id.to_string()))?;
+            (dependencies.output)(&serde_json::to_value(released)?)?;
+        }
         Command::Init => (dependencies.output)(&crate::init::initialize(&home)?)?,
         Command::Doctor { .. } => {
             let report = (dependencies.doctor)(&home)?;
@@ -2966,26 +2876,8 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_turn_id: a.session_turn_id,
             };
             let store = Store::open(&home)?;
-            if let Some(pool) = &a.pool {
-                let pool: agent_run_domain::pool::PoolId = pool.parse()?;
-                operator(&home)
-                    .call(
-                        agent_run_store::ops::BindPool {
-                            pool_id: pool.clone(),
-                            reference: reference.clone(),
-                            at: crate::domain::now(),
-                        },
-                        agent_run_core::broker_writer::BROKER_BUDGET,
-                    )
-                    .await?;
-                (dependencies.output)(&json!({"pool_id": pool, "bound": true}))?;
-                return Ok(0);
-            }
-            let agent_id = a
-                .agent_id
-                .ok_or_else(|| invalid("agent id or --pool is required"))?;
             let run =
-                agent_run_core::agent_identity::resolve(&store, &agent_id, a.run_id.as_ref())?;
+                agent_run_core::agent_identity::resolve(&store, &a.agent_id, a.run_id.as_ref())?;
             hooks::bind::bind(&home, run.id.clone(), reference, crate::domain::now()).await?;
             (dependencies.output)(&agent_run_core::agent_identity::result(
                 &run,
@@ -3031,8 +2923,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                         return Ok(0);
                     }
                     let result =
-                        hooks::bind::run_hook_bound(&home, &payload, &transport.transport, None)
-                            .await?;
+                        hooks::bind::run_hook(&home, &payload, &transport.transport, None).await?;
                     (dependencies.output)(
                         &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
                     )?;
@@ -3099,21 +2990,6 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             )
             .await?;
         }
-        Command::Models {
-            provider,
-            profile,
-            model,
-        } => (dependencies.output)(
-            &dependencies
-                .service
-                .models(agent_run_domain::ModelsQuery {
-                    provider,
-                    profile,
-                    model,
-                })
-                .await?,
-        )?,
-        Command::Limits => (dependencies.output)(&dependencies.service.limits().await?)?,
         Command::DelegationGuide {
             provider,
             profile,
@@ -3196,14 +3072,6 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 stdout_log.unwrap_or_else(|| home.join("logs/api.log")),
                 stderr_log.unwrap_or_else(|| home.join("logs/api.err.log")),
             )?)?,
-        },
-        Command::Capacity { command } => match command {
-            Capacity::Order { model } => (dependencies.output)(
-                &dependencies
-                    .service
-                    .capacity_order(agent_run_domain::CapacityOrderQuery { model })
-                    .await?,
-            )?,
         },
         Command::Delivery { command } => match command {
             Delivery::Status { agent_id, run_id } => {

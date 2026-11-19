@@ -96,7 +96,8 @@ fn prompt() -> Value {
     json!({"hook_event_name":"UserPromptSubmit", "session_id":"context-probe", "prompt":"PRIVATE_PROMPT_CONTEXT_CANARY"})
 }
 
-/// Checks exit, JSON, prepared priority and active-agent preservation, and limits.
+/// Checks exit, JSON, prepared active-agent preservation (the only Run
+/// context component; no provider capacity block), and limits.
 fn preserved(output: &Output, agent: &str) {
     assert_eq!(
         output.status.code(),
@@ -108,10 +109,9 @@ fn preserved(output: &Output, agent: &str) {
     let text = value["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("prepared context must survive");
-    assert!(
-        text.contains("migrate configuration to schema_version 2"),
-        "{text}"
-    );
+    assert!(text.starts_with("Active agents"), "{text}");
+    assert!(!text.contains("Provider capacity order"), "{text}");
+    assert!(!text.contains("schema_version"), "{text}");
     assert!(text.contains(agent), "{text}");
     assert!(text.chars().count() <= 2500);
     assert!(
@@ -166,10 +166,7 @@ async fn no_writer_retains_context_and_recovery_restores_deduplication() {
             .as_str()
             .unwrap();
         assert!(text.contains(&unbound));
-        assert!(
-            !text.contains("migrate configuration to schema_version 2"),
-            "unchanged priority must stay deduplicated"
-        );
+        assert!(text.starts_with("Active agents (2)"), "{text}");
         broker.stop().await;
     }
 }
@@ -509,7 +506,11 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
         let receiver = bridge::start(home.path(), false);
         let context = hook(home.path(), "context", transport, prompt()).await;
         assert_eq!(context.status.code(), Some(0));
-        assert!(serde_json::from_slice::<Value>(&context.stdout).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("migrate configuration to schema_version 2"));
+        // No active agent and no capacity block: nothing to inject.
+        assert_eq!(
+            serde_json::from_slice::<Value>(&context.stdout).unwrap(),
+            json!({})
+        );
         let broker = test_broker::TestBroker::start(home.path()).await;
         let payload = json!({"hook_event_name":"PostToolUse", "session_id":"context-probe", "tool_response":{"agent_id":id}});
         for _ in 0..2 {
