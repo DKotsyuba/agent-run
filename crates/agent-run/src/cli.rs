@@ -1095,7 +1095,7 @@ fn create_release_token_file(path: &Path) -> Result<std::fs::File> {
 }
 
 /// Duplicates a private inherited descriptor without taking over the caller's
-/// descriptor. Rejects stdio aliases, terminal devices and runtime-owned FDs.
+/// descriptor. Regular files must belong to the caller and allow owner access only.
 fn duplicate_release_token_fd(fd: i32) -> Result<std::fs::File> {
     if fd <= 2 {
         return Err(invalid("release token descriptor must be above 2"));
@@ -1138,6 +1138,12 @@ fn duplicate_release_token_fd(fd: i32) -> Result<std::fs::File> {
                 "release token descriptor must be separate from standard streams",
             ));
         }
+    }
+    // SAFETY: geteuid only reads the current process identity.
+    if kind.is_file() && (meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0) {
+        return Err(invalid(
+            "release token descriptor file must be owned by the caller and have no group or other permissions. Use --release-token-file.",
+        ));
     }
     Ok(file)
 }

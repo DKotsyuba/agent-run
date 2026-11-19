@@ -263,7 +263,8 @@ For CLI admission, choose `start-batch --spec FILE --release-token-file PATH`
 or `--release-token-fd N` to capture a newly issued token, one line of plain
 text. The file is created exclusively with mode 0600 before submission.
 Existing paths and symlinks are refused. The descriptor must be inherited,
-writable, above 2 and separate from standard streams. Use a private sink.
+writable, above 2 and separate from standard streams. A regular file must
+belong to the caller and grant no group or other permissions. Use a private sink.
 CLI standard streams carry only the receipt or a closed error. With neither
 flag, admission still succeeds and discards the token. A newly created file
 will be empty if no token was available, including replays. If writing the

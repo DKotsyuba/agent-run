@@ -2763,12 +2763,11 @@ async fn unbound_provider_resume_replays_after_later_legacy_pool_binding() {
     assert!(store.get(&child_id).unwrap().request.orchestrator.is_none());
     start.task = "fixture:answer".into();
     start.request_id = Some("late-pool-bind".into());
-    assert!(
-        store
-            .replay_legacy_pool_resume(&parent, &start)
-            .unwrap()
-            .is_none()
-    );
+    start.orchestrator = Some(reference);
+    assert!(matches!(
+        store.replay_provider_resume(&parent, &start, false),
+        Err(agent_run::Error::Conflict)
+    ));
     drop(store);
     let replay = resume().await.unwrap();
     assert_eq!(replay["created"], false);
@@ -2787,8 +2786,19 @@ async fn unbound_provider_resume_replays_after_later_legacy_pool_binding() {
 async fn provider_resume_continues_the_proven_native_session() {
     let (_temp, home) = home();
     let service = fixture_service(home.clone()).await;
+    let mut start = request(&home);
+    start.orchestrator = None;
+    let mut unrelated = start.clone();
+    unrelated.request_id = Some("resume-1".into());
+    unrelated.task = "fixture:answer".into();
+    let unrelated = service
+        .admit_provider_trusted(unrelated, candidates(committed(&home)))
+        .await
+        .unwrap();
+    let unrelated_id: AgentId = serde_json::from_value(unrelated["agent_id"].clone()).unwrap();
+    run_to_end(&home, &unrelated_id).await;
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .admit_provider_trusted(start, candidates(committed(&home)))
         .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
@@ -2925,14 +2935,20 @@ async fn provider_resume_continues_the_proven_native_session() {
         [],
     ).unwrap();
     let parent_row = store.get(&id).unwrap();
-    assert_ne!(
-        parent_row
-            .request
-            .orchestrator
-            .as_ref()
-            .unwrap()
-            .external_session_id,
-        orchestrator.external_session_id
+    assert!(parent_row.request.orchestrator.is_none());
+    let unrelated = store.get(&unrelated_id).unwrap();
+    assert!(unrelated.parent_agent_id.is_none());
+    assert!(unrelated.request.orchestrator.is_none());
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE request_id='resume-1'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2,
     );
     drop(store);
     let replay = service

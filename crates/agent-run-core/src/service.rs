@@ -1832,13 +1832,10 @@ impl Service {
             request.orchestrator = orchestrator;
         }
         request.validate_intent()?;
-        // Ordinary replay also covers children bound after admission. Consult
-        // the retired pool destination only when ordinary replay finds no row.
+        // Resolve the parent's committed child before considering conflicts
+        // from unrelated admissions in another replay namespace.
         let store = Store::open(&self.home)?;
-        let replay = match store.replay_provider_request(&request)? {
-            None if allow_legacy_replay => store.replay_legacy_pool_resume(parent, &request)?,
-            replay => replay,
-        };
+        let replay = store.replay_provider_resume(parent, &request, allow_legacy_replay)?;
         if let Some(replay) = replay {
             let row = store.get(&replay.agent_id)?;
             if row.parent_agent_id.as_ref() != Some(&parent.id) {

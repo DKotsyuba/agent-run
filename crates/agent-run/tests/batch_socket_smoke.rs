@@ -734,6 +734,32 @@ async fn supervised_cli_batch_bearer_stays_out_of_transcript_and_mcp() {
             .unwrap(),
         json!({"found":false})
     );
+    let exposed = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"umask 022; exec "$1" --home "$2" start-batch --spec "$3" --release-token-fd 3 3>"$4""#,
+            "fd-permissions-canary",
+            env!("CARGO_BIN_EXE_agent-run"),
+        ])
+        .arg(&broker.home)
+        .arg(&spec)
+        .arg(broker.home.join("public-token-fd"))
+        .env_clear()
+        .envs(alias.get_envs().filter_map(|(key, value)| value.map(|value| (key, value))))
+        .output().await.unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let exposed_file = std::fs::metadata(broker.home.join("public-token-fd")).unwrap();
+    assert_eq!(exposed_file.permissions().mode() & 0o777, 0o644);
+    assert_eq!(exposed_file.len(), 0);
+    assert_eq!(exposed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&exposed.stderr).contains("Use --release-token-file"));
+    assert_eq!(
+        client
+            .call("batch_receipt", Some(request.clone()))
+            .await
+            .unwrap(),
+        json!({"found":false})
+    );
     std::fs::write(
         broker.home.join("batch-canary-cli"),
         env!("CARGO_BIN_EXE_agent-run"),
@@ -752,6 +778,14 @@ async fn supervised_cli_batch_bearer_stays_out_of_transcript_and_mcp() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(
+        std::fs::metadata(broker.home.join("batch-canary-token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     let token = std::fs::read_to_string(broker.home.join("batch-canary-token")).unwrap();
     let token = token.trim();
     assert_eq!(token.len(), 64);
