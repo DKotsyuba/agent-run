@@ -1455,7 +1455,7 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
         move || {
             let deadline = Instant::now() + Duration::from_secs(12);
             let mut requests = Vec::new();
-            while requests.len() < 8 {
+            while requests.len() < 12 {
                 let (mut stream, _) = match listener.accept() {
                     Ok(peer) => peer,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1476,20 +1476,31 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let mut response = json!({"jsonrpc":"2.0","id": request["id"]});
                 match requests.len() {
-                    0 | 1 | 6 => {
-                        response["error"] = json!({"code":-32601,"message":"method not found"})
+                    0 | 1 | 7 => {
+                        // Exact uncorrelated managed-ingress refusal from Pool feb4c3e.
+                        response = json!({"id":"","error":{
+                            "version":1,"code":"peer_not_authorized","recovery":"none"
+                        }});
                     }
+                    6 => response["error"] = json!({"code":-32601,"message":"method not found"}),
                     2 => response["result"] = json!({"version":1,"tools":tools}),
                     3 => {
                         response["result"] =
                             json!({"version":1,"content":"malformed","is_error":false})
                     }
-                    7 => {
+                    8 => {
+                        response["error"] = json!({"code":-32000,"message":"admission pending",
+                            "data":{"kind":"admission_pending","retry_after_ms":125}});
+                    }
+                    9 => {
+                        response["result"] = json!({"version":1,"content":[null],"is_error":false})
+                    }
+                    11 => {
                         // Lose the acknowledgement entirely for this operation.
                         requests.push(request);
                         continue;
                     }
-                    4 => {
+                    4 | 10 => {
                         response["result"] = json!({"version":1,"content":content,"is_error":false})
                     }
                     5 => {
@@ -1509,7 +1520,7 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
         old["message"]
             .as_str()
             .unwrap()
-            .contains("does not support chat v1")
+            .contains("Agent Pool does not support chat v1 (upgrade Pool)")
     );
     old_peer.finish();
 
@@ -1540,7 +1551,25 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
     let unsupported = call(&mut member, 5);
     assert_eq!(unsupported["isError"], true);
     assert!(unsupported.to_string().contains("does not support chat v1"));
-    let uncertain = call(&mut member, 6);
+    let legacy = call(&mut member, 6);
+    assert_eq!(legacy["isError"], true);
+    assert!(
+        legacy
+            .to_string()
+            .contains("Agent Pool does not support chat v1 (upgrade Pool)")
+    );
+    let pending = call(&mut member, 7);
+    assert_eq!(pending["isError"], true);
+    assert_eq!(
+        pending["structuredContent"],
+        json!({"kind":"admission_pending","retry_after_ms":125})
+    );
+    assert!(pending.to_string().contains("Retry after ~125 ms"));
+    // A malformed block also needs a same-ID retry before the worker can decode it.
+    let recovered = call(&mut member, 8);
+    assert_eq!(recovered["content"], content);
+    assert_eq!(recovered["isError"], false);
+    let uncertain = call(&mut member, 9);
     assert_eq!(uncertain["isError"], true);
     assert!(uncertain.to_string().contains("may have committed"));
     let requests = peer.join().unwrap();
@@ -1549,6 +1578,7 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
         assert_eq!(req["params"], json!({"version":1}));
     }
     assert_eq!(requests[3]["params"], requests[4]["params"]);
+    assert_eq!(requests[9]["params"], requests[10]["params"]);
     for req in &requests[3..] {
         assert_eq!(req["method"], "member_call_v1");
         let params = &req["params"];
@@ -1566,7 +1596,7 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
         requests[4]["params"]["request_id"],
         requests[5]["params"]["request_id"]
     );
-    let unavailable = call(&mut member, 7);
+    let unavailable = call(&mut member, 10);
     assert_eq!(unavailable["isError"], true);
     assert!(unavailable.to_string().contains("request was not sent"));
     member.finish();

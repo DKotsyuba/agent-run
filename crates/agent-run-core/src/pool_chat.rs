@@ -9,7 +9,9 @@ use agent_run_domain::{
 };
 use agent_run_platform::frame;
 use agent_run_store::{store_identity, worker::authenticate_attempt};
+use rmcp::model::ContentBlock;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -123,6 +125,7 @@ enum RpcError {
     Uncertain,
     Rejected(&'static str),
     MemberRefused(&'static str),
+    AdmissionPending(u64),
 }
 
 impl RpcError {
@@ -132,6 +135,7 @@ impl RpcError {
             Self::Unsent(message) | Self::Rejected(message) | Self::MemberRefused(message) => {
                 message
             }
+            Self::AdmissionPending(_) => "Agent Pool seat is awaiting admission",
             Self::Uncertain => {
                 "Agent Pool did not confirm the outcome. The operation may have committed. Check Pool state before issuing it again."
             }
@@ -148,6 +152,8 @@ async fn rpc(
 ) -> std::result::Result<Value, RpcError> {
     const UNAVAILABLE: RpcError =
         RpcError::Unsent("Agent Pool is unavailable. The request was not sent.");
+    const UNSUPPORTED: RpcError =
+        RpcError::Rejected("Agent Pool does not support chat v1 (upgrade Pool)");
     let id = uuid::Uuid::new_v4().to_string();
     let request = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":parameters});
     let mut encoded = serde_json::to_vec(&request)
@@ -177,20 +183,35 @@ async fn rpc(
             .map_err(|_| RpcError::Uncertain)?
             .ok_or(RpcError::Uncertain)?;
         let mut reply: Value = serde_json::from_slice(&bytes).map_err(|_| RpcError::Uncertain)?;
+        // Before chat v1, Pool routed unknown methods into managed ingress.
+        // Its exact pre-store refusal has no JSON-RPC marker or correlation ID.
+        if reply["id"] == ""
+            && reply
+                == json!({
+                    "id":"","error":{"version":1,"code":"peer_not_authorized","recovery":"none"}
+                })
+        {
+            return Err(UNSUPPORTED);
+        }
         if reply["jsonrpc"] != "2.0" || reply["id"] != id {
             return Err(RpcError::Uncertain);
         }
         if let Some(error) = reply.get("error") {
-            if reply.get("result").is_some()
-                || !error["code"].is_i64()
-                || !error["message"].is_string()
+            if reply.get("result").is_some() {
+                return Err(RpcError::Uncertain);
+            }
+            let data = &error["data"];
+            if error["code"] == -32000
+                && data["kind"] == "admission_pending"
+                && let Some(delay) = data["retry_after_ms"].as_u64()
             {
+                return Err(RpcError::AdmissionPending(delay));
+            }
+            if !error["code"].is_i64() || !error["message"].is_string() {
                 return Err(RpcError::Uncertain);
             }
             if error["code"] == -32601 {
-                return Err(RpcError::Rejected(
-                    "Agent Pool does not support chat v1 (method not found)",
-                ));
+                return Err(UNSUPPORTED);
             }
             if error["code"] == -32000 {
                 for kind in ["not_member", "seat_retired", "pool_closed"] {
@@ -222,10 +243,15 @@ async fn rpc(
 }
 
 /// Interprets a member response before deciding whether the original send
-/// needs a retry. Missing result fields leave the outcome uncertain.
+/// needs a retry. Validate with the worker SDK and forward Pool’s original content.
 async fn member_call(path: &Path, parameters: &Value) -> std::result::Result<Value, RpcError> {
     let mut result = rpc(path, "member_call_v1", parameters).await?;
-    if !result["content"].is_array() || !result["is_error"].is_boolean() {
+    let valid_content = result["content"].as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .all(|block| ContentBlock::deserialize(block).is_ok())
+    });
+    if !valid_content || !result["is_error"].is_boolean() {
         return Err(RpcError::Uncertain);
     }
     Ok(json!({"content":result["content"].take(), "isError":result["is_error"]}))
@@ -346,6 +372,11 @@ impl Service {
                 Ok(json!({"content":[{"type":"text","text":text}],
                     "structuredContent":{"kind":kind}, "isError":true}))
             }
+            Err(RpcError::AdmissionPending(delay)) if !retry => Ok(json!({
+                "content":[{"type":"text","text":format!("Pool seat not ready yet. Retry after ~{delay} ms.")}],
+                "structuredContent":{"kind":"admission_pending","retry_after_ms":delay},
+                "isError":true
+            })),
             Err(_) if retry => Err(Error::Runtime(RpcError::Uncertain.message().into())),
             Err(error) => Err(Error::Runtime(error.message().into())),
         }
