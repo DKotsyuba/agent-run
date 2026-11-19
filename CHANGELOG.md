@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.32.0
+
 ### Breaking
 
 - Quota presentation moved out of Run to Agent Quota. The orchestrator MCP
