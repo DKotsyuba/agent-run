@@ -422,6 +422,7 @@ fn main() {
         let id = context.get("uuid").cloned().unwrap_or(Value::Null);
         let mut replay = context;
         replay["isReplay"] = json!(true);
+        replay["session_id"] = json!(session);
         emit(replay);
         emit(json!({"type":"result","subtype":"success","is_error":false,
             "session_id":session,"user_message_uuid":id,
@@ -431,9 +432,7 @@ fn main() {
         && task != "fixture:legacy-after-steer"
     {
         replay["isReplay"] = json!(true);
-        if is_resumed {
-            replay["session_id"] = json!(session);
-        }
+        replay["session_id"] = json!(session);
         emit(replay);
     }
     if task == "fixture:restart-worker" {
@@ -473,6 +472,7 @@ fn main() {
         }
         result_input = replay.get("uuid").cloned().unwrap_or(Value::Null);
         replay["isReplay"] = json!(true);
+        replay["session_id"] = json!(session);
         emit(replay);
     }
     if task == "fixture:empty-then-result" || task == "fixture:ambiguous-then-error" {
@@ -502,7 +502,7 @@ fn main() {
         for n in 0..200 {
             let id = format!("load-tool-{n}");
             emit(
-                json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":id,"name":"fixture_tool"}}}),
+                json!({"type":"stream_event","session_id":session,"event":{"type":"content_block_start","content_block":{"type":"tool_use","id":id,"name":"fixture_tool"}}}),
             );
             emit(
                 json!({"type":"assistant","session_id":session,"message":{"id":format!("load-message-{n}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":"fixture_tool","input":{}}]}}),
@@ -660,7 +660,7 @@ fn main() {
         // normal completion path runs.
         wait_marker("follow-tools");
         emit(
-            json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"shell"}}}),
+            json!({"type":"stream_event","session_id":session,"event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"shell"}}}),
         );
         emit(
             json!({"type":"assistant","session_id":session,"message":{"id":"msg_one","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"ls"}}]}}),

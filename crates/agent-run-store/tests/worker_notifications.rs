@@ -65,6 +65,52 @@ fn stability_legacy_transport_alias_reports() {
     }
 }
 
+/// Only authenticated workers with a persisted Pool seat get the owner-tool guidance.
+#[test]
+fn unbound_pool_worker_is_directed_to_owner_tool() {
+    let (_home, mut store, run, attempt) = running();
+    store
+        .issue_worker_capability(&run, &attempt, TOKEN, 100.0)
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO lineage_pool_chat VALUES(?,?)",
+        params![run.as_str(), r#"{"version":1,"pool_id":"00000000-0000-4000-8000-000000000001","seat_id":"00000000-0000-4000-8000-000000000002","pool_store_id":"store_00000000000000000000000000000003"}"#],
+    ).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET orchestrator_session_id=NULL WHERE id=?",
+            [run.as_str()],
+        )
+        .unwrap();
+    for (token, expected) in [
+        (
+            TOKEN,
+            "Pool chat worker has no bound orchestrator. Use pool_notify_owner to contact the Pool owner.",
+        ),
+        (&"b".repeat(64), "worker attempt is not active or bound"),
+    ] {
+        assert!(matches!(
+            store.notify_orchestrator(&run, &attempt, token, &report("pool"), 191.0),
+            Err(Error::Validation(message)) if message == expected
+        ));
+    }
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET orchestrator_session_id='session' WHERE id=?",
+            [run.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("pool"), 191.0)
+            .unwrap()
+            .state,
+        "pending"
+    );
+}
+
 /// Live attempts retain report authority regardless of age; replay and per-report spacing remain exact.
 #[test]
 fn active_report_replay_has_no_lifetime_expiry() {

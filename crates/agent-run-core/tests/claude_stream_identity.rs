@@ -309,9 +309,11 @@ async fn background_notification_preserves_task_answer() {
 #[tokio::test]
 async fn background_notification_rejects_session_rebind_with_safe_reason() {
     let home = common::Home::new();
+    let mut request = home.request();
+    request.explicit_finish = true;
     let (id, _) = home
         .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
+        .admit(&request, &home.config, &json!({}), None)
         .unwrap();
     let mut store = home.store();
     let record = store.get(&id).unwrap();

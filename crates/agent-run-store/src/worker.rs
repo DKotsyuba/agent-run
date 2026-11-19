@@ -170,6 +170,7 @@ impl Store<'_> {
 
     /// Authenticates the exact running attempt and atomically queues one report.
     /// Idempotent replays bypass volume limits but never bypass authentication.
+    /// Authenticated Pool members without a binding are directed to their owner tool.
     pub fn notify_orchestrator(
         &mut self,
         run_id: &AgentId,
@@ -183,34 +184,44 @@ impl Store<'_> {
             return Err(Error::Validation("invalid worker report".into()));
         }
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
-        let auth = authenticate_attempt(&tx, run_id, attempt_id, token, at)?
-            .filter(|auth| auth.running)
-            .and_then(|auth| {
-                // The report route additionally requires the exact historical
-                // binding predicate: an optional session on a delivery
-                // transport, resolved inside the same transaction.
-                auth.orchestrator_session_id
-                    .as_deref()
-                    .and_then(|session| {
-                        tx.query_row(
-                            "SELECT transport FROM orchestrator_sessions WHERE id=?",
-                            [session],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .transpose()
-                    })
+        let auth =
+            authenticate_attempt(&tx, run_id, attempt_id, token, at)?.filter(|auth| auth.running);
+        if let Some(auth) = &auth
+            && auth.orchestrator_session_id.is_none()
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lineage_pool_chat WHERE root_agent_id=?)",
+                [auth.root_agent_id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(Error::Validation(
+                "Pool chat worker has no bound orchestrator. Use pool_notify_owner to contact the Pool owner.".into(),
+            ));
+        }
+        let auth = auth.and_then(|auth| {
+            // The report route additionally requires the exact historical
+            // binding predicate: an optional session on a delivery
+            // transport, resolved inside the same transaction.
+            auth.orchestrator_session_id
+                .as_deref()
+                .and_then(|session| {
+                    tx.query_row(
+                        "SELECT transport FROM orchestrator_sessions WHERE id=?",
+                        [session],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
                     .transpose()
-                    .ok()
-                    .flatten()
-                    .filter(|transport| {
-                        agent_run_domain::domain::OrchestratorRef::canonical_transport_name(
-                            transport,
-                        )
+                })
+                .transpose()
+                .ok()
+                .flatten()
+                .filter(|transport| {
+                    agent_run_domain::domain::OrchestratorRef::canonical_transport_name(transport)
                         .is_ok()
-                    })
-                    .map(|_| auth)
-            });
+                })
+                .map(|_| auth)
+        });
         let Some(auth) = auth else {
             return Err(Error::Validation(
                 "worker attempt is not active or bound".into(),

@@ -180,8 +180,11 @@ impl Manager {
             return Err(invalid("managed service lock is not an owned regular file"));
         }
         lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        lock.try_lock_exclusive()
-            .map_err(|_| invalid("another broker owns managed services for this home"))?;
+        sqlite_access::lease::lock_exclusive_settled(
+            &lock,
+            sqlite_access::lease::PREDECESSOR_SETTLE,
+        )
+        .map_err(|_| invalid("another broker owns managed services for this home"))?;
         Ok(Self {
             home: home.to_owned(),
             executable,

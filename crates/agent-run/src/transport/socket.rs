@@ -1398,6 +1398,52 @@ fn valid_hold_frame<T: serde::de::DeserializeOwned>(raw: &[u8], method: &str) ->
     serde_json::from_slice::<JsonObject<HoldFrame<T>>>(raw)
         .is_ok_and(|JsonObject(frame)| frame.jsonrpc == "2.0" && frame.method == method)
 }
+/// Takes a broker bind lock, waiting only the bounded predecessor-settle time.
+///
+/// A broker terminated by SIGKILL or the out-of-memory killer holds its bind
+/// locks until the kernel finishes tearing it down; an immediate successor
+/// retries instead of reporting a live broker. Returns whether the lock is held.
+async fn lock_startup(lock: &File) -> bool {
+    use agent_run_core::predecessor::{PREDECESSOR_SETTLE, SETTLE_POLL};
+    let deadline = tokio::time::Instant::now() + PREDECESSOR_SETTLE;
+    loop {
+        if lock.try_lock_exclusive().is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// Probes a pre-existing socket path while this process holds its bind lock.
+///
+/// The lock proves no cooperating broker serves the path, so an accepted
+/// connection can only be the still-open listener of a predecessor in
+/// teardown (or a foreign listener): retry briefly before reporting it live.
+/// The same deadline bounds retries and pending connections; timeout refuses
+/// reclamation because it is not evidence that the listener is stale.
+async fn probe_listener<F>(mut connect: impl FnMut() -> F) -> std::io::Result<UnixStream>
+where
+    F: std::future::Future<Output = std::io::Result<UnixStream>>,
+{
+    use agent_run_core::predecessor::SETTLE_POLL;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            match connect().await {
+                Ok(_) if tokio::time::Instant::now() + SETTLE_POLL < deadline => {
+                    tokio::time::sleep(SETTLE_POLL).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket probe timed out"))?
+}
+
 /// Binds one private same-user broker socket under its exclusive startup lock.
 ///
 /// The adjacent `.<name>.lock` file fences stale-socket probing and binding for
@@ -1433,15 +1479,16 @@ pub(crate) async fn bind_private(socket_path: &Path) -> Result<(UnixListener, So
         ));
     }
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
-    lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("API socket is already in use"))?;
+    if !lock_startup(&lock).await {
+        return Err(crate::error::invalid("API socket is already in use"));
+    }
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         if !meta.file_type().is_socket() || meta.uid() != uid {
             return Err(crate::error::invalid(
                 "refusing to replace non-socket or foreign socket path",
             ));
         }
-        match UnixStream::connect(&path).await {
+        match probe_listener(|| UnixStream::connect(&path)).await {
             Ok(_) => return Err(crate::error::invalid("another broker is listening")),
             Err(e)
                 if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)].contains(&e.raw_os_error()) =>
@@ -1475,6 +1522,21 @@ pub(crate) async fn bind_private(socket_path: &Path) -> Result<(UnixListener, So
 /// Binds a shared socket without changing the host-configured owner, group or
 /// mode. The OS umask and parent directory determine who can connect.
 pub(crate) async fn bind_shared(path: &Path) -> Result<(UnixListener, SocketGuard)> {
+    bind_shared_with_startup(path, SharedStartup::Immediate).await
+}
+
+/// Selects whether a shared endpoint can belong to a terminating broker.
+#[derive(Clone, Copy)]
+enum SharedStartup {
+    Immediate,
+    Broker,
+}
+
+/// Binds a shared endpoint using the caller's startup policy.
+async fn bind_shared_with_startup(
+    path: &Path,
+    startup: SharedStartup,
+) -> Result<(UnixListener, SocketGuard)> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(crate::error::invalid("shared socket path must be absolute"));
     }
@@ -1493,17 +1555,30 @@ pub(crate) async fn bind_shared(path: &Path) -> Result<(UnixListener, SocketGuar
     if !lock.metadata()?.is_file() {
         return Err(crate::error::invalid("shared socket lock is not a file"));
     }
-    lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("shared socket is already in use"))?;
+    let locked = match startup {
+        SharedStartup::Immediate => lock.try_lock_exclusive().is_ok(),
+        SharedStartup::Broker => lock_startup(&lock).await,
+    };
+    if !locked {
+        return Err(crate::error::invalid("shared socket is already in use"));
+    }
     if let Ok(previous) = std::fs::symlink_metadata(path) {
         if !previous.file_type().is_socket() {
             return Err(crate::error::invalid(
                 "refusing to replace a non-socket path",
             ));
         }
-        match tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
-            Ok(Ok(_)) => return Err(crate::error::invalid("another worker is listening")),
-            Ok(Err(error))
+        let connection = match startup {
+            SharedStartup::Immediate => {
+                tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path))
+                    .await
+                    .map_err(|_| crate::error::invalid("shared socket probe timed out"))?
+            }
+            SharedStartup::Broker => probe_listener(|| UnixStream::connect(path)).await,
+        };
+        match connection {
+            Ok(_) => return Err(crate::error::invalid("another worker is listening")),
+            Err(error)
                 if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)]
                     .contains(&error.raw_os_error()) =>
             {
@@ -1517,8 +1592,7 @@ pub(crate) async fn bind_shared(path: &Path) -> Result<(UnixListener, SocketGuar
                 }
                 std::fs::remove_file(path)?;
             }
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => return Err(crate::error::invalid("shared socket probe timed out")),
+            Err(error) => return Err(error.into()),
         }
     }
     let listener = UnixListener::bind(path)?;
@@ -1669,8 +1743,9 @@ pub(super) async fn bind_operator(path: &Path, gid: u32) -> Result<(UnixListener
             "operator startup lock is not private and owned",
         ));
     }
-    lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("operator socket is already in use"))?;
+    if !lock_startup(&lock).await {
+        return Err(crate::error::invalid("operator socket is already in use"));
+    }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_socket()
@@ -1682,8 +1757,8 @@ pub(super) async fn bind_operator(path: &Path, gid: u32) -> Result<(UnixListener
                     "refusing to replace an untrusted operator socket",
                 ));
             }
-            match tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
-                Ok(Err(error))
+            match probe_listener(|| UnixStream::connect(path)).await {
+                Err(error)
                     if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)]
                         .contains(&error.raw_os_error()) =>
                 {
@@ -1697,13 +1772,12 @@ pub(super) async fn bind_operator(path: &Path, gid: u32) -> Result<(UnixListener
                     }
                     std::fs::remove_file(path)?;
                 }
-                Ok(Ok(_)) => {
+                Ok(_) => {
                     return Err(crate::error::invalid(
                         "another operator broker is listening",
                     ));
                 }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) => return Err(crate::error::invalid("operator socket probe timed out")),
+                Err(error) => return Err(error.into()),
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1915,7 +1989,7 @@ async fn serve_endpoints(
     let operator_endpoint = match operator {
         Some((path, gid)) if system.is_some() => {
             let _ = gid;
-            Some(bind_shared(path).await?)
+            Some(bind_shared_with_startup(path, SharedStartup::Broker).await?)
         }
         #[cfg(target_os = "linux")]
         Some((path, gid)) => Some(bind_operator(path, gid).await?),
@@ -1926,11 +2000,13 @@ async fn serve_endpoints(
     let mut operator_endpoints: Vec<_> = operator_endpoint.into_iter().collect();
     if let Some(settings) = &system {
         for path in &settings.operator_sockets {
-            operator_endpoints.push(bind_shared(path).await?);
+            operator_endpoints.push(bind_shared_with_startup(path, SharedStartup::Broker).await?);
         }
     }
     let system_endpoint = match &system {
-        Some(settings) => Some(bind_shared(&settings.writer_socket).await?),
+        Some(settings) => {
+            Some(bind_shared_with_startup(&settings.writer_socket, SharedStartup::Broker).await?)
+        }
         None => None,
     };
     // Explicitly configured readers retain exact-key recovery after disabling
@@ -3176,6 +3252,71 @@ async fn client_with_wait_deadlines(
 
 #[cfg(test)]
 mod tests {
+    /// A pending Unix socket connection must not outlive the broker probe budget.
+    #[tokio::test]
+    async fn broker_socket_probe_times_out() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::probe_listener(std::future::pending),
+        )
+        .await
+        .expect("the probe has its own deadline");
+        let error = result.expect_err("a pending connection must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.raw_os_error().is_none());
+    }
+
+    /// A live listener without the broker lock still prevents stale reclaim.
+    #[tokio::test]
+    async fn broker_socket_refuses_live_listener() {
+        use super::{UnixListener, UnixStream, bind_private};
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let original = std::fs::symlink_metadata(&path).unwrap();
+        let result = bind_private(&path).await;
+        assert!(
+            matches!(result, Err(crate::Error::Validation(message)) if message == "another broker is listening")
+        );
+        let current = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (original.dev(), original.ino())
+        );
+        let _client = UnixStream::connect(path).await.unwrap();
+        listener.accept().await.unwrap();
+    }
+
+    /// A dropped listener leaves a stale inode that a new broker can reclaim.
+    #[tokio::test]
+    async fn broker_socket_reclaims_stale_listener() {
+        use super::{UnixListener, UnixStream, bind_private};
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("api.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let (listener, guard) = bind_private(&path).await.unwrap();
+        let _client = UnixStream::connect(&path).await.unwrap();
+        listener.accept().await.unwrap();
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    /// The account launcher refuses its own held bind lock without settling.
+    #[tokio::test]
+    async fn account_socket_keeps_immediate_lock_refusal() {
+        use super::bind_shared;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("launch.sock");
+        let (_listener, _guard) = bind_shared(&path).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), bind_shared(&path))
+            .await
+            .expect("account launcher does not wait for a locked socket");
+        assert!(
+            matches!(result, Err(crate::Error::Validation(message)) if message == "shared socket is already in use")
+        );
+    }
+
     /// A pin acknowledgement must match the exact release or requested page.
     #[test]
     fn history_pin_responses_are_correlated_and_bounded() {
