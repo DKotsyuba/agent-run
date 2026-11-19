@@ -290,6 +290,19 @@ inputs; Run no longer executes them. Previously installed collection jobs
 must be migrated separately; old Run history does not feed new selection.
 The former `lua` and `codex_appserver` choices are retired.
 
+## Pool chat v1
+
+Set the Agent Pool resident's private Unix socket:
+
+```toml
+[pool_chat]
+socket = "/absolute/path/to/pool.sock"
+```
+
+Run checks that the connected peer has Run's effective UID. Omitting this
+section disables chat. Members use their ordinary profiles. Run fetches the
+tool catalog at worker MCP startup and caches it for the attempt.
+
 ## OpenCode v2
 
 OpenCode CLI runs as an owned `serve --stdio --port 0` child. Stdin is

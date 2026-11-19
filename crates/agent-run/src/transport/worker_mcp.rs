@@ -12,8 +12,8 @@ use agent_run_domain::{
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
 };
@@ -22,7 +22,7 @@ use std::path::Component;
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -48,6 +48,8 @@ pub struct WorkerProxy {
     /// Supervisor-selected managed role: with explicit finish, the surface is
     /// exactly `health_reply` and `finish`.
     managed: bool,
+    /// Pool-owned schemas for this exact attempt, alongside its normal tools.
+    pool_tools: Arc<OnceLock<Vec<Tool>>>,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -68,6 +70,15 @@ impl WorkerProxy {
     /// Explicit mode adds only finish, with no additional role authority. A
     /// managed role serves only the completion tools.
     fn tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
+        let mut tools = self.base_tools()?;
+        if let Some(pool_tools) = self.pool_tools.get() {
+            tools.extend(pool_tools.iter().cloned());
+        }
+        Ok(tools)
+    }
+
+    /// Loads the embedded profile inventory used by the existing health proof.
+    fn base_tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
         if self.explicit_finish {
             let catalog = if self.managed {
                 agent_run_domain::worker::managed_tools_json()
@@ -94,6 +105,48 @@ impl WorkerProxy {
                 })
             })
             .collect()
+    }
+
+    /// Fetches this attempt's Pool schemas from the authenticated broker.
+    async fn load_pool_tools(&self) -> Result<()> {
+        use agent_run_domain::pool_chat::{CATALOG_METHOD, CatalogRequest};
+        let request = CatalogRequest {
+            run_id: self.run_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            token: self.token.clone(),
+        };
+        let value = self
+            .broker
+            .call(CATALOG_METHOD, serde_json::to_value(request)?)
+            .await?;
+        let tools = serde_json::from_value(value)
+            .map_err(|_| Error::Runtime("invalid Agent Pool tool catalog".into()))?;
+        let _ = self.pool_tools.set(tools);
+        Ok(())
+    }
+
+    /// Forwards arguments verbatim and renders Pool's original MCP content.
+    async fn call_pool(&self, name: &str, input: Value) -> CallToolResult {
+        let call = WorkerToolCall {
+            run_id: self.run_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            token: self.token.clone(),
+            tool: name.to_owned(),
+            input,
+        };
+        let result = async {
+            let result = self
+                .broker
+                .call(
+                    agent_run_domain::worker::TOOL_METHOD,
+                    serde_json::to_value(call)?,
+                )
+                .await?;
+            serde_json::from_value(result)
+                .map_err(|_| Error::Runtime("invalid Agent Pool MCP content".into()))
+        }
+        .await;
+        result.unwrap_or_else(|error| super::mcp_text::failure_result(name, &error, None, None))
     }
 
     /// Registers this actual native catalog once per exact immutable attempt.
@@ -132,6 +185,15 @@ impl WorkerProxy {
             .await
             && receipt["registered"] == true
         {
+            if !self.managed
+                && receipt["pool_chat"] == true
+                && let Err(error) = self.load_pool_tools().await
+            {
+                eprintln!(
+                    "Agent Pool worker catalog unavailable: {}",
+                    error.public().message
+                );
+            }
             self.catalog_registered.store(true, Ordering::Release);
         }
     }
@@ -351,16 +413,18 @@ impl ServerHandler for WorkerProxy {
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
         self.register_catalog().await;
+        let input = Value::Object(request.arguments.unwrap_or_default());
+        if self
+            .pool_tools
+            .get()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.name == request.name))
+        {
+            return Ok(self.call_pool(&request.name, input).await.into());
+        }
         if self.get_tool(&request.name).is_none() {
             return Err(ErrorData::invalid_params("unknown worker tool", None));
         }
-        Ok(self
-            .call(
-                &request.name,
-                Value::Object(request.arguments.unwrap_or_default()),
-            )
-            .await
-            .into())
+        Ok(self.call(&request.name, input).await.into())
     }
 }
 
@@ -536,6 +600,7 @@ pub async fn serve_from_env(context_file: Option<&std::path::Path>) -> Result<()
         research: context.flag(agent_run_domain::worker::RESEARCH_ENV),
         explicit_finish: context.flag(agent_run_domain::worker::FINISH_ENV),
         managed: context.flag(agent_run_domain::worker::MANAGED_ENV),
+        pool_tools: Arc::default(),
     };
     // The managed surface exists only in explicit, non-research mode; any
     // other combination is a supervisor contract error, never a wider catalog.
@@ -600,6 +665,7 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
         };
         let ordinary = proxy.tools().unwrap();
         assert_eq!(ordinary.len(), 1);
@@ -657,6 +723,7 @@ mod tests {
             research: false,
             explicit_finish: true,
             managed: true,
+            pool_tools: Arc::default(),
         };
         proxy.register_catalog().await;
         let calls = broker.0.lock().unwrap();
@@ -729,6 +796,7 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -755,6 +823,7 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -815,6 +884,7 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

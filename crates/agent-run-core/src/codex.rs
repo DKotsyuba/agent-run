@@ -1028,8 +1028,9 @@ async fn run_inner(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
+    let pooled = managed.is_none() && crate::pool_chat::has_seat(store.conn(), &record.id)?;
     if record.request.explicit_finish && managed.is_none() {
-        finish_inventory_ready(process, &tid, role.research_tools_only()).await?;
+        finish_inventory_ready(process, &tid, role.research_tools_only(), pooled).await?;
     }
     if let Some(managed) = managed {
         let inventory = managed_inventory_settled(process, &tid).await?;
@@ -1063,10 +1064,7 @@ async fn run_inner(
         } else {
             agent_run_domain::worker::research_tools_json()
         };
-        let expected: BTreeSet<&str> = expected
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect();
+        let expected = worker_tool_names(&expected, pooled);
         let tools = servers
             .first()
             .and_then(|server| server["tools"].as_object());
@@ -2112,14 +2110,31 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
     ))
 }
 
+/// Extends the exact native worker inventory only for an admitted chat seat.
+fn worker_tool_names(catalog: &[Value], pooled: bool) -> BTreeSet<&str> {
+    let mut names: BTreeSet<_> = catalog
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    if pooled {
+        names.extend(agent_run_domain::pool_chat::TOOLS);
+    }
+    names
+}
+
 /// Before the first explicit-mode inference turn, verify that the native
 /// first-party callback server is connected with the exact admitted catalog.
 /// The 30-second setup allowance never limits an admitted worker's lifetime.
 /// Other selected role servers remain governed by the existing native grant.
-async fn finish_inventory_ready(process: &mut Process, thread: &str, research: bool) -> Result<()> {
+async fn finish_inventory_ready(
+    process: &mut Process,
+    thread: &str,
+    research: bool,
+    pooled: bool,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let catalog = agent_run_domain::worker::finish_tools_json(research);
-    let expected: BTreeSet<&str> = catalog.iter().filter_map(|t| t["name"].as_str()).collect();
+    let expected = worker_tool_names(&catalog, pooled);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {

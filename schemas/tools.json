@@ -601,6 +601,34 @@
                   "null"
                 ]
               },
+              "pool_chat": {
+                "additionalProperties": false,
+                "description": "Immutable Agent Pool chat v1 seat for this lineage.",
+                "properties": {
+                  "pool_id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "pool_store_id": {
+                    "pattern": "^store_[0-9a-f]{32}$",
+                    "type": "string"
+                  },
+                  "seat_id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "version": {
+                    "const": 1
+                  }
+                },
+                "required": [
+                  "version",
+                  "pool_id",
+                  "seat_id",
+                  "pool_store_id"
+                ],
+                "type": "object"
+              },
               "profile": {
                 "type": "string"
               },

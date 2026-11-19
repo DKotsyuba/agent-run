@@ -19,6 +19,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Trusted prepared inputs for one independent batch member.
 pub struct BatchMember<'a> {
+    /// Optional chat seat fixed by the batch intent.
+    pub pool_chat: Option<&'a agent_run_domain::pool_chat::PoolChat>,
     /// Pre-minted public identity.
     pub id: AgentId,
     /// The same trusted inputs used by a single provider admission.
@@ -269,6 +271,13 @@ impl Store<'_> {
             // This admission creates the exact execution row and its number-one
             // provider attempt together; never derive identity from a later attempt.
             let admitted = admit_in_tx(&tx, batch.catalog, job.id.clone(), &job.inputs, None)?;
+            if let Some(chat) = job.pool_chat {
+                chat.validate()?;
+                tx.execute(
+                    "INSERT INTO lineage_pool_chat(root_agent_id,chat_json) VALUES(?,?)",
+                    params![job.id.as_str(), serde_json::to_string(chat)?],
+                )?;
+            }
             if !admitted.created || admitted.agent_id != job.id {
                 return Err(Error::Integrity("invalid batch admission identity".into()));
             }

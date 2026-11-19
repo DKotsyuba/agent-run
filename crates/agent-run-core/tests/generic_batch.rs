@@ -118,7 +118,8 @@ async fn batch_replay_after_admission_does_not_launch_or_reload_config() {
     std::fs::write(root.join("profiles/review.md"), "+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nReview.\n").unwrap();
     let config = |cap| {
         format!(
-            "schema_version=2\n[core]\nmax_active_agents={cap}\n[harnesses.codex]\nbinary='/usr/bin/true'\nhome='{}'\n[harnesses.claude-code]\nbinary='/usr/bin/true'\nhome='{}'\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='m'\n[[providers.codex.bindings]]\nlabel='test'\naccount='acct'\n",
+            "schema_version=2\n[core]\nmax_active_agents={cap}\n[pool_chat]\nsocket='{}'\n[harnesses.codex]\nbinary='/usr/bin/true'\nhome='{}'\n[harnesses.claude-code]\nbinary='/usr/bin/true'\nhome='{}'\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='m'\n[[providers.codex.bindings]]\nlabel='test'\naccount='acct'\n",
+            root.join("pool.sock").display(),
             root.join("codex").display(),
             root.join("claude").display()
         )
@@ -136,10 +137,13 @@ async fn batch_replay_after_admission_does_not_launch_or_reload_config() {
     let writer = common::writer::Harness::start(root);
     let service = Service::new(root.to_owned()).with_writer(writer.broker());
     let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
-    let request: StartBatchRequest = serde_json::from_value(json!({"request_id":"test-batch", "expected_store_id":store_id, "jobs":[
+    let mut request: StartBatchRequest = serde_json::from_value(json!({"request_id":"test-batch", "expected_store_id":store_id, "jobs":[
         {"provider":"codex","model":"m","profile":"review","task":"first","workdir":root.join("work")},
         {"provider":"codex","model":"m","profile":"review","task":"second","workdir":root.join("work")}
     ]})).unwrap();
+    let chat = json!({"version":1,"pool_id":"00000000-0000-4000-8000-000000000001",
+        "seat_id":"00000000-0000-4000-8000-000000000002","pool_store_id":store_id});
+    request.jobs[0].pool_chat = Some(serde_json::from_value(chat.clone()).unwrap());
     let missing = service.batch_receipt(request.clone()).await.unwrap();
     assert!(!missing.found && missing.receipt.is_none());
     assert!(matches!(
@@ -176,6 +180,31 @@ async fn batch_replay_after_admission_does_not_launch_or_reload_config() {
         .unwrap();
     assert_eq!(pins, 0);
     assert_eq!(count(), 2);
+    let (seat_root, stored): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT root_agent_id,chat_json FROM lineage_pool_chat",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(seat_root, admitted.receipt.jobs[0].agent_id.as_str());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+        chat
+    );
+    assert!(
+        store
+            .conn
+            .execute("UPDATE lineage_pool_chat SET chat_json='{}'", [])
+            .is_err()
+    );
+    let mut changed = request.clone();
+    changed.jobs[0].pool_chat = None;
+    assert!(matches!(
+        service.admit_batch(changed).await,
+        Err(Error::Conflict)
+    ));
     let found = service.batch_receipt(request.clone()).await.unwrap();
     assert!(found.found);
     assert_eq!(found.receipt.as_ref(), Some(&admitted.receipt));
@@ -227,7 +256,7 @@ async fn batch_replay_after_admission_does_not_launch_or_reload_config() {
         .unwrap();
     assert_eq!(before, after, "lookup must not enqueue writes");
     let mut conflict = request.clone();
-    conflict.jobs[0].task = "changed".into();
+    conflict.jobs[0].request.task = "changed".into();
     assert!(!service.batch_receipt(conflict).await.unwrap().found);
     let mut wrong_store = request.clone();
     wrong_store.expected_store_id = Some("store_ffffffffffffffffffffffffffffffff".parse().unwrap());
@@ -332,8 +361,8 @@ async fn scoped_batch_lookup_frame_boundary_is_checked_only_for_new_admission() 
         raw
     };
     let extra = SOCKET_MAX_FRAME_BYTES - frame(&request).len();
-    request.jobs[1].task.push_str(&"b".repeat(extra));
-    assert!(request.jobs[1].task.len() <= 512 * 1024);
+    request.jobs[1].request.task.push_str(&"b".repeat(extra));
+    assert!(request.jobs[1].request.task.len() <= 512 * 1024);
     assert_eq!(frame(&request).len(), SOCKET_MAX_FRAME_BYTES);
     request.validate_new_lookup_frame().unwrap();
     let exact_frame = frame(&request);
@@ -345,7 +374,7 @@ async fn scoped_batch_lookup_frame_boundary_is_checked_only_for_new_admission() 
             .is_some()
     );
     let mut oversized = request.clone();
-    oversized.jobs[1].task.push('b');
+    oversized.jobs[1].request.task.push('b');
     assert_eq!(frame(&oversized).len(), SOCKET_MAX_FRAME_BYTES + 1);
     assert!(oversized.validate_new_lookup_frame().is_err());
     let overflowing_frame = frame(&oversized);
@@ -356,7 +385,7 @@ async fn scoped_batch_lookup_frame_boundary_is_checked_only_for_new_admission() 
             .is_err()
     );
     let mut escaped = request.clone();
-    escaped.jobs[1].task.push('"');
+    escaped.jobs[1].request.task.push('"');
     assert_eq!(frame(&escaped).len(), SOCKET_MAX_FRAME_BYTES + 2);
     assert!(escaped.validate_new_lookup_frame().is_err());
 

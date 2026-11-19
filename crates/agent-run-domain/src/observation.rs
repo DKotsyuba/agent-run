@@ -116,6 +116,9 @@ pub struct CapabilitiesView {
     pub schema_version: u32,
     /// Product name, agent-run.
     pub product: String,
+    /// Whether this binary supports Pool chat v1 when enabled by configuration.
+    #[serde(default)]
+    pub pool_chat_v1: bool,
     /// Current database identity only when explicitly requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_id: Option<crate::StoreId>,

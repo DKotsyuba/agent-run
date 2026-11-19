@@ -1262,3 +1262,251 @@ fn health_attention_survives_cli_socket_and_mcp() {
         "{text}"
     );
 }
+
+/// Real worker stdio and Run broker sockets, with a bounded local fake Pool peer.
+#[test]
+fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() {
+    use agent_run_domain::{domain::AgentId, pool_chat::TOOLS, worker::ENV_NAMES};
+    use std::os::unix::net::UnixListener;
+
+    let mut harness = Harness::new();
+    let pool = harness.home.join("pool.sock");
+    let listener = UnixListener::bind(&pool).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(
+        harness.home.join("config.toml"),
+        format!(
+            "schema_version=2\n[pool_chat]\nsocket='{}'\n",
+            pool.display()
+        ),
+    )
+    .unwrap();
+    let root = AgentId::new();
+    let resume = AgentId::new();
+    let ordinary = AgentId::new();
+    let chat = json!({"version":1, "pool_id":"00000000-0000-4000-8000-000000000001",
+        "seat_id":"00000000-0000-4000-8000-000000000002",
+        "pool_store_id":"store_00000000000000000000000000000003"});
+    let token = "a".repeat(64);
+    let store_id = {
+        let mut store = agent_run_store::fixture::open(&harness.home).unwrap();
+        let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+        for (id, lineage, sequence, attempt) in [
+            (&root, &root, 1, None),
+            (&resume, &root, 2, Some("resume")),
+            (&ordinary, &ordinary, 1, Some("ordinary")),
+        ] {
+            let status = if attempt.is_some() {
+                "running"
+            } else {
+                "failed"
+            };
+            let request = json!({"runtime":"codex","model":"fixture","profile":"review",
+                "task":"fixture","workdir":harness.home,"explicit_finish":true});
+            store.conn.execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+                 status,created_at,finished_at,config_revision,root_agent_id,sequence,
+                 supervisor_pid,supervisor_identity,supervisor_birth_time)
+                 VALUES(?1,'codex','fixture','review','fixture','fixture',?2,?3,?4,100,
+                        CASE WHEN ?4='failed' THEN 101 ELSE NULL END,'fixture',?5,?6,?7,?8,?9)",
+                rusqlite::params![id.as_str(), harness.home.to_str(), request.to_string(), status,
+                    lineage.as_str(), sequence, me.pid, me.token, me.birth],
+            ).unwrap();
+            if let Some(attempt) = attempt {
+                store.conn.execute(
+                    "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active)
+                     VALUES(?,?,1,'running','{}',100,1)",
+                    rusqlite::params![attempt,id.as_str()],
+                ).unwrap();
+                store
+                    .issue_worker_capability(id, attempt, &token, 100.0)
+                    .unwrap();
+                store.begin_worker_lifecycle(id, attempt, 100.0).unwrap();
+            }
+        }
+        store
+            .conn
+            .execute(
+                "INSERT INTO lineage_pool_chat VALUES(?,?)",
+                rusqlite::params![root.as_str(), chat.to_string()],
+            )
+            .unwrap();
+        agent_run_store::store_identity::read(&store.conn).unwrap()
+    };
+    let schema = json!({"type":"object","description":"Pool owns this schema",
+        "properties":{"message":{"type":"string","maxLength":90}}});
+    let tools =
+        json!(TOOLS.map(|name| json!({"name":name,"description":name,"inputSchema":schema})));
+    let content = json!([{"type":"text","text":"delivered"}, {"type":"image","mimeType":"image/png","data":"AA=="}]);
+    let peer = std::thread::spawn({
+        let (tools, content) = (tools.clone(), content.clone());
+        move || {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut requests = Vec::new();
+            while requests.len() < 5 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(peer) => peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "Pool request deadline");
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut response = json!({"jsonrpc":"2.0","id": request["id"]});
+                match requests.len() {
+                    0 => response["result"] = json!({"version":1,"tools":tools}),
+                    1 => {
+                        // Lose the first acknowledgement. The retry must keep its intent and ID.
+                        requests.push(request);
+                        continue;
+                    }
+                    2 => {
+                        response["result"] = json!({"version":1,"content":content,"is_error":false})
+                    }
+                    3 => {
+                        response["result"] = json!({"version":1,"content":[{"type":"text","text":"seat_retired"}],"is_error":true})
+                    }
+                    4 => response["error"] = json!({"code":-32601,"message":"method not found"}),
+                    _ => unreachable!(),
+                }
+                writeln!(stream, "{response}").unwrap();
+                requests.push(request);
+            }
+            requests
+        }
+    });
+    harness.start_broker();
+    let broker_call = |method, params: Value| {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(harness.home.join("api.sock")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    assert_eq!(
+        broker_call("capabilities", json!({}))["result"]["pool_chat_v1"],
+        true
+    );
+    let rejected = broker_call(
+        "worker/call",
+        json!({
+            "run_id":root,"attempt_id":"resume","token":token,"tool":"pool_post","input":{}
+        }),
+    );
+    assert_eq!(rejected["error"]["code"], -32602);
+
+    let worker = |id: &AgentId, attempt, research: bool| {
+        let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("_worker-mcp")
+            .env(ENV_NAMES[0], &harness.home)
+            .env(ENV_NAMES[1], id.as_str())
+            .env(ENV_NAMES[2], attempt)
+            .env(ENV_NAMES[3], &token)
+            .env(agent_run_domain::worker::FINISH_ENV, "1")
+            .env(
+                agent_run_domain::worker::RESEARCH_ENV,
+                if research { "1" } else { "0" },
+            )
+            .env_remove(agent_run_domain::worker::MANAGED_ENV)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut mcp = Mcp::from_child(child);
+        assert!(
+            mcp.send(initialize("2025-11-25"))
+                .unwrap()
+                .get("result")
+                .is_some()
+        );
+        mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        mcp
+    };
+    let list = |mcp: &mut Mcp| {
+        mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+            .unwrap()["result"]["tools"]
+            .clone()
+    };
+    let mut plain = worker(&ordinary, "ordinary", true);
+    let plain_tools = list(&mut plain);
+    assert_eq!(
+        plain_tools,
+        json!(agent_run_domain::worker::finish_tools_json(true))
+    );
+    plain.finish();
+    let mut member = worker(&resume, "resume", false);
+    let definitions = list(&mut member);
+    let base = agent_run_domain::worker::finish_tools_json(false);
+    assert_eq!(definitions.as_array().unwrap()[..base.len()], base);
+    assert_eq!(
+        definitions.as_array().unwrap()[base.len()..],
+        *tools.as_array().unwrap()
+    );
+    let mut reconnect = worker(&resume, "resume", false);
+    assert_eq!(list(&mut reconnect), definitions);
+    reconnect.finish();
+    let forged =
+        json!({"agent_id":ordinary,"seat_id":"impostor","sequence":10,"run_store_id":"impostor"});
+    let call = |mcp: &mut Mcp, id| {
+        mcp.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":"pool_post","arguments":forged}}))
+            .unwrap()["result"]
+            .clone()
+    };
+    let success = call(&mut member, 3);
+    assert_eq!(success["content"], content);
+    assert_eq!(success["isError"], false);
+    assert_eq!(call(&mut member, 4)["content"][0]["text"], "seat_retired");
+    let unsupported = call(&mut member, 5);
+    assert_eq!(unsupported["isError"], true);
+    assert!(unsupported.to_string().contains("does not support chat v1"));
+    let requests = peer.join().unwrap();
+    assert_eq!(requests[0]["method"], "chat_catalog_v1");
+    assert_eq!(requests[0]["params"], json!({"version":1}));
+    assert_eq!(requests[1]["params"], requests[2]["params"]);
+    for req in &requests[1..] {
+        assert_eq!(req["method"], "member_call_v1");
+        let params = &req["params"];
+        assert_eq!(params["version"], 1);
+        assert_eq!(params["agent_id"], root.as_str());
+        assert_eq!(params["sequence"], 2);
+        assert_eq!(params["pool_id"], chat["pool_id"]);
+        assert_eq!(params["seat_id"], chat["seat_id"]);
+        assert_eq!(params["run_store_id"], store_id.as_str());
+        assert_eq!(params["arguments"], forged);
+        assert!(params.get("token").is_none());
+        assert!(params["request_id"].as_str().is_some());
+    }
+    assert_ne!(
+        requests[2]["params"]["request_id"],
+        requests[3]["params"]["request_id"]
+    );
+    let unavailable = call(&mut member, 6);
+    assert_eq!(unavailable["isError"], true);
+    assert!(
+        unavailable
+            .to_string()
+            .contains("Agent Pool is unavailable")
+    );
+    member.finish();
+}

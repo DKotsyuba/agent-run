@@ -48,6 +48,7 @@ pub mod observation;
 pub mod opencode;
 /// Persistence facade of processes other than the resident broker.
 pub mod persist;
+mod pool_chat;
 /// Authenticated, read-only snapshots from the independent quota service.
 pub mod quota_client;
 /// Authenticated workdir-confined report writes for restricted research.

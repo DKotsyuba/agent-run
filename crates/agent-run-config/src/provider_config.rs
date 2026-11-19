@@ -467,6 +467,13 @@ fn one() -> PositiveFinite {
     PositiveFinite::try_from(1.0).expect("one is positive")
 }
 
+/// Same-UID private Agent Pool socket for chat v1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolChatEndpoint {
+    pub socket: PathBuf,
+}
+
 /// Parsed v2 configuration with required legacy harnesses, optional OpenCode and arbitrary providers.
 ///
 /// The v1 `Config` remains the current consumer contract until its launch
@@ -479,6 +486,9 @@ pub struct ProviderConfig {
     /// Explicit opt-in; absent means no managed selector or capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_attempt_binding: Option<Box<ManagedAttemptBinding>>,
+    /// Enables chat seats and configures the destination of worker relays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_chat: Option<PoolChatEndpoint>,
     /// Existing service lifecycle controls.
     #[serde(default)]
     pub core: Core,
@@ -581,6 +591,17 @@ impl ProviderConfig {
     /// A file with neither harnesses nor providers is the explicitly empty
     /// catalog a fresh `init` writes: valid, with nothing to start or collect.
     pub fn validate(&mut self, home: &Path) -> Result<()> {
+        if self.pool_chat.as_ref().is_some_and(|pool| {
+            !pool.socket.is_absolute()
+                || pool
+                    .socket
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        }) {
+            return Err(invalid(
+                "pool_chat.socket must be absolute without parent traversal",
+            ));
+        }
         if let Some(managed) = &self.managed_attempt_binding {
             let name = |s: &str| {
                 !s.is_empty()

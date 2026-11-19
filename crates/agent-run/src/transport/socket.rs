@@ -1059,12 +1059,14 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
             agent_run_domain::worker::METHOD,
             agent_run_domain::worker::TOOL_METHOD,
             agent_run_domain::worker::CATALOG_METHOD,
+            agent_run_domain::pool_chat::CATALOG_METHOD,
         ]
         .contains(&method);
     let worker_method = [
         agent_run_domain::worker::METHOD,
         agent_run_domain::worker::TOOL_METHOD,
         agent_run_domain::worker::CATALOG_METHOD,
+        agent_run_domain::pool_chat::CATALOG_METHOD,
     ]
     .contains(&method);
     let known = known

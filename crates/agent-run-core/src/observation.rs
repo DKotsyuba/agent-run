@@ -17,6 +17,7 @@ pub fn capabilities() -> Value {
     json!({
         "schema_version": 1,
         "product": "agent-run",
+        "pool_chat_v1": true,
         "version": env!("CARGO_PKG_VERSION"),
         "source_revision": null,
         "transports": ["cli", "mcp", "unix_socket"],

@@ -24,6 +24,7 @@ pub mod lineage_hold_wire;
 pub mod observation;
 /// Strict managed native-owner v2 outbox and request contracts.
 pub mod owner_v2;
+pub mod pool_chat;
 mod provider_connection;
 pub mod provider_start;
 /// Draft bounded database-only execution status proofs.
