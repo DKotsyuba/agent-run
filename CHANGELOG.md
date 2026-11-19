@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Resume Claude Code sessions when SessionStart hooks emit provisional session
+  IDs before initialization. Conversation frames still enforce the saved session
+  identity. (#43)
+- Direct Pool chat workers without a bound orchestrator to `pool_notify_owner`
+  when they call `notify_orchestrator`. (#44)
+
 ## 0.33.0
 
 - Add Pool chat v1 for ordinary Agent Pool members. Run retains each seat

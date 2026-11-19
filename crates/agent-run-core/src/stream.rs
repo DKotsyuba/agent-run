@@ -1476,7 +1476,12 @@ async fn run_inner(
         } else {
             None
         };
-        if let Some(s) = v
+        // SessionStart hook frames can carry a provisional ID, even on resume.
+        // Only initialization and conversation frames attest session identity.
+        if matches!(
+            (v["type"].as_str(), v["subtype"].as_str()),
+            (Some("system"), Some("init")) | (Some("assistant" | "user" | "result"), _)
+        ) && let Some(s) = v
             .get("session_id")
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())

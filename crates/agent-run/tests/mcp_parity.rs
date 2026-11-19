@@ -1435,6 +1435,16 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
     );
     plain.finish();
     let mut member = worker(&resume, "resume", false);
+    let report = member.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"notify_orchestrator","arguments":{"request_id":"pool-report","message":"fixture"}
+    }})).unwrap();
+    assert_eq!(report["result"]["isError"], true);
+    assert!(
+        report["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("pool_notify_owner")
+    );
     let catalog_error = |mcp: &mut Mcp| {
         mcp.send(json!({"jsonrpc":"2.0","id":10,"method":"tools/list"}))
             .unwrap()["error"]
