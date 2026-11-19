@@ -422,7 +422,7 @@ pub struct StartBatchJob {
 }
 
 /// Decodes a present seat object without treating null as omission.
-fn present_pool_chat<'de, D: serde::Deserializer<'de>>(
+pub fn present_pool_chat<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<crate::pool_chat::PoolChat>, D::Error> {
     ObjectOnly::<crate::pool_chat::PoolChat>::deserialize(deserializer).map(|chat| Some(chat.0))

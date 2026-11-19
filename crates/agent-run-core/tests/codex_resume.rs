@@ -680,6 +680,23 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
         assert_eq!(replayed["created"], json!(false));
         assert_eq!(replayed["agent_id"], json!(child_id));
     }
+    // A matching seat assertion replays the exact existing child without config.
+    let seat = json!({"version":1,"pool_id":"00000000-0000-4000-8000-000000000001",
+        "seat_id":"00000000-0000-4000-8000-000000000002",
+        "pool_store_id":"store_00000000000000000000000000000003"});
+    home.store()
+        .conn
+        .execute(
+            "INSERT INTO lineage_pool_chat VALUES(?,?)",
+            rusqlite::params![root.as_str(), seat.to_string()],
+        )
+        .unwrap();
+    let asserted = agent_run_core::dispatch::call(&service, "resume", json!({
+        "agent_id": root, "run_id": root, "task": "continue", "request_id": "retry-1", "pool_chat": seat,
+    })).await.unwrap();
+    assert_eq!(asserted["created"], false);
+    assert_eq!(asserted["sequence"], 2);
+
     let other_family = OrchestratorRef {
         transport: "claude_uds".into(),
         ..canonical.clone()

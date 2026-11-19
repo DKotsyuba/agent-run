@@ -1271,8 +1271,6 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
 
     let mut harness = Harness::new();
     let pool = harness.home.join("pool.sock");
-    let listener = UnixListener::bind(&pool).unwrap();
-    listener.set_nonblocking(true).unwrap();
     std::fs::write(
         harness.home.join("config.toml"),
         format!(
@@ -1338,53 +1336,6 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
     let tools =
         json!(TOOLS.map(|name| json!({"name":name,"description":name,"inputSchema":schema})));
     let content = json!([{"type":"text","text":"delivered"}, {"type":"image","mimeType":"image/png","data":"AA=="}]);
-    let peer = std::thread::spawn({
-        let (tools, content) = (tools.clone(), content.clone());
-        move || {
-            let deadline = Instant::now() + Duration::from_secs(12);
-            let mut requests = Vec::new();
-            while requests.len() < 5 {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(peer) => peer,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "Pool request deadline");
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("{error}"),
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                let mut line = String::new();
-                BufReader::new(&stream).read_line(&mut line).unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
-                let mut response = json!({"jsonrpc":"2.0","id": request["id"]});
-                match requests.len() {
-                    0 => response["result"] = json!({"version":1,"tools":tools}),
-                    1 => {
-                        // Lose the first acknowledgement. The retry must keep its intent and ID.
-                        requests.push(request);
-                        continue;
-                    }
-                    2 => {
-                        response["result"] = json!({"version":1,"content":content,"is_error":false})
-                    }
-                    3 => {
-                        response["result"] = json!({"version":1,"content":[{"type":"text","text":"seat_retired"}],"is_error":true})
-                    }
-                    4 => response["error"] = json!({"code":-32601,"message":"method not found"}),
-                    _ => unreachable!(),
-                }
-                writeln!(stream, "{response}").unwrap();
-                requests.push(request);
-            }
-            requests
-        }
-    });
     harness.start_broker();
     let broker_call = |method, params: Value| {
         let mut stream =
@@ -1414,6 +1365,31 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
     );
     assert_eq!(rejected["error"]["code"], -32602);
 
+    let resume_call = |seat: &Value| {
+        broker_call(
+            "resume",
+            json!({
+                "agent_id":root,"task":"continue","pool_chat":seat
+            }),
+        )
+    };
+    // A matching assertion reaches ordinary resume validation for the running tip.
+    assert!(
+        resume_call(&chat)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires a terminal run")
+    );
+    let mut mismatch = chat.clone();
+    mismatch["seat_id"] = json!("00000000-0000-4000-8000-000000000004");
+    let rejected = resume_call(&mismatch);
+    assert_eq!(rejected["error"]["code"], -32602);
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match")
+    );
     let worker = |id: &AgentId, attempt, research: bool| {
         let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
             .arg("_worker-mcp")
@@ -1455,6 +1431,80 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
     );
     plain.finish();
     let mut member = worker(&resume, "resume", false);
+    let catalog_error = |mcp: &mut Mcp| {
+        mcp.send(json!({"jsonrpc":"2.0","id":10,"method":"tools/list"}))
+            .unwrap()["error"]
+            .clone()
+    };
+    let down = catalog_error(&mut member);
+    assert!(
+        down["message"]
+            .as_str()
+            .unwrap()
+            .contains("Agent Pool is unavailable")
+    );
+
+    let listener = UnixListener::bind(&pool).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn({
+        let (tools, content) = (tools.clone(), content.clone());
+        move || {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut requests = Vec::new();
+            while requests.len() < 8 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(peer) => peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "Pool request deadline");
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut response = json!({"jsonrpc":"2.0","id": request["id"]});
+                match requests.len() {
+                    0 | 1 | 6 => {
+                        response["error"] = json!({"code":-32601,"message":"method not found"})
+                    }
+                    2 => response["result"] = json!({"version":1,"tools":tools}),
+                    3 | 7 => {
+                        // Lose the acknowledgement. The first retry keeps its intent and ID.
+                        requests.push(request);
+                        continue;
+                    }
+                    4 => {
+                        response["result"] = json!({"version":1,"content":content,"is_error":false})
+                    }
+                    5 => {
+                        response["error"] = json!({"code":-32000,"message":"fixture refusal","data":{"kind":"seat_retired"}})
+                    }
+                    _ => unreachable!(),
+                }
+                writeln!(stream, "{response}").unwrap();
+                requests.push(request);
+            }
+            requests
+        }
+    });
+    let mut old_peer = worker(&resume, "resume", false);
+    let old = catalog_error(&mut old_peer);
+    assert!(
+        old["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not support chat v1")
+    );
+    old_peer.finish();
+
     let definitions = list(&mut member);
     let base = agent_run_domain::worker::finish_tools_json(false);
     assert_eq!(definitions.as_array().unwrap()[..base.len()], base);
@@ -1476,15 +1526,22 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
     let success = call(&mut member, 3);
     assert_eq!(success["content"], content);
     assert_eq!(success["isError"], false);
-    assert_eq!(call(&mut member, 4)["content"][0]["text"], "seat_retired");
+    let retired = call(&mut member, 4);
+    assert_eq!(retired["isError"], true);
+    assert_eq!(retired["structuredContent"]["kind"], "seat_retired");
     let unsupported = call(&mut member, 5);
     assert_eq!(unsupported["isError"], true);
     assert!(unsupported.to_string().contains("does not support chat v1"));
+    let uncertain = call(&mut member, 6);
+    assert_eq!(uncertain["isError"], true);
+    assert!(uncertain.to_string().contains("may have committed"));
     let requests = peer.join().unwrap();
-    assert_eq!(requests[0]["method"], "chat_catalog_v1");
-    assert_eq!(requests[0]["params"], json!({"version":1}));
-    assert_eq!(requests[1]["params"], requests[2]["params"]);
-    for req in &requests[1..] {
+    for req in &requests[..3] {
+        assert_eq!(req["method"], "chat_catalog_v1");
+        assert_eq!(req["params"], json!({"version":1}));
+    }
+    assert_eq!(requests[3]["params"], requests[4]["params"]);
+    for req in &requests[3..] {
         assert_eq!(req["method"], "member_call_v1");
         let params = &req["params"];
         assert_eq!(params["version"], 1);
@@ -1498,15 +1555,11 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
         assert!(params["request_id"].as_str().is_some());
     }
     assert_ne!(
-        requests[2]["params"]["request_id"],
-        requests[3]["params"]["request_id"]
+        requests[4]["params"]["request_id"],
+        requests[5]["params"]["request_id"]
     );
-    let unavailable = call(&mut member, 6);
+    let unavailable = call(&mut member, 7);
     assert_eq!(unavailable["isError"], true);
-    assert!(
-        unavailable
-            .to_string()
-            .contains("Agent Pool is unavailable")
-    );
+    assert!(unavailable.to_string().contains("request was not sent"));
     member.finish();
 }

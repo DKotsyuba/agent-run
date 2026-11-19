@@ -44,7 +44,7 @@ impl PoolChat {
 }
 
 /// Worker startup identifies its attempt using the existing bearer capability.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogRequest {
     pub run_id: crate::domain::AgentId,

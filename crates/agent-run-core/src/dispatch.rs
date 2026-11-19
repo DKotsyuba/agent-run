@@ -329,6 +329,12 @@ struct Resume {
     #[serde(default)]
     /// Optional delivery destination override; omission inherits the parent.
     orchestrator: Option<OrchestratorRef>,
+    /// Optional assertion of the inherited chat seat.
+    #[serde(
+        default,
+        deserialize_with = "agent_run_domain::batch::present_pool_chat"
+    )]
+    pool_chat: Option<agent_run_domain::pool_chat::PoolChat>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -558,6 +564,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     a.request_id,
                     a.display_name,
                     a.orchestrator,
+                    a.pool_chat.as_ref(),
                 )
                 .await
         }

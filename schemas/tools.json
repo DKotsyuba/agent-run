@@ -409,6 +409,34 @@
           ],
           "description": "Optional external session binding. transport accepts canonical codex_queue or claude_uds and aliases codex or claude."
         },
+        "pool_chat": {
+          "additionalProperties": false,
+          "description": "Optional equality assertion of the inherited Agent Pool chat seat.",
+          "properties": {
+            "pool_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "pool_store_id": {
+              "pattern": "^store_[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "seat_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "version": {
+              "const": 1
+            }
+          },
+          "required": [
+            "version",
+            "pool_id",
+            "seat_id",
+            "pool_store_id"
+          ],
+          "type": "object"
+        },
         "request_id": {
           "type": [
             "string",

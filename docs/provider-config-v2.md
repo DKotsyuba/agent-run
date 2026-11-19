@@ -301,7 +301,9 @@ socket = "/absolute/path/to/pool.sock"
 
 Run checks that the connected peer has Run's effective UID. Omitting this
 section disables chat. Members use their ordinary profiles. Run fetches the
-tool catalog at worker MCP startup and caches it for the attempt.
+tool catalog at worker MCP startup and caches the first successful fetch for
+the attempt. If startup cannot fetch a catalog, tool discovery retries and
+reports the Pool error if it still cannot load the schemas.
 
 ## OpenCode v2
 

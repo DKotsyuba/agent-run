@@ -203,8 +203,9 @@ and batch preconditions accept the reference together with its exact sequence.
 For Pool chat v1, a job may include
 `"pool_chat":{"version":1,"pool_id":"<uuid>","seat_id":"<uuid>","pool_store_id":"<store_…>"}`.
 Run includes the seat in the batch fingerprint and persists it atomically with
-admission. Resumes inherit the lineage's seat. Callers supply it only in
-`start_batch` and replay the same job in `batch_receipt`. The normal provider
+admission. Resumes inherit the lineage's seat and may assert it using the same
+`pool_chat` object. Run rejects a mismatched assertion. Replay the original job
+in `batch_receipt`. The normal provider
 profile applies. `capabilities.pool_chat_v1` advertises protocol support, and
 new pooled jobs require a configured private Pool socket.
 

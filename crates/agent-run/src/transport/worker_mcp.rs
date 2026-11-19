@@ -50,6 +50,8 @@ pub struct WorkerProxy {
     managed: bool,
     /// Pool-owned schemas for this exact attempt, alongside its normal tools.
     pool_tools: Arc<OnceLock<Vec<Tool>>>,
+    /// The broker confirmed this worker has a lineage seat.
+    pooled: Arc<AtomicBool>,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -185,15 +187,10 @@ impl WorkerProxy {
             .await
             && receipt["registered"] == true
         {
-            if !self.managed
-                && receipt["pool_chat"] == true
-                && let Err(error) = self.load_pool_tools().await
-            {
-                eprintln!(
-                    "Agent Pool worker catalog unavailable: {}",
-                    error.public().message
-                );
-            }
+            self.pooled.store(
+                !self.managed && receipt["pool_chat"] == true,
+                Ordering::Release,
+            );
             self.catalog_registered.store(true, Ordering::Release);
         }
     }
@@ -395,6 +392,11 @@ impl ServerHandler for WorkerProxy {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
         self.register_catalog().await;
+        if self.pooled.load(Ordering::Acquire) && self.pool_tools.get().is_none() {
+            self.load_pool_tools()
+                .await
+                .map_err(|error| ErrorData::internal_error(error.public().message, None))?;
+        }
         Ok(super::mcp_cache::tools_list_result(&context, self.tools()?))
     }
 
@@ -601,6 +603,7 @@ pub async fn serve_from_env(context_file: Option<&std::path::Path>) -> Result<()
         explicit_finish: context.flag(agent_run_domain::worker::FINISH_ENV),
         managed: context.flag(agent_run_domain::worker::MANAGED_ENV),
         pool_tools: Arc::default(),
+        pooled: Arc::default(),
     };
     // The managed surface exists only in explicit, non-research mode; any
     // other combination is a supervisor contract error, never a wider catalog.
@@ -608,6 +611,15 @@ pub async fn serve_from_env(context_file: Option<&std::path::Path>) -> Result<()
         return Err(invalid("invalid managed worker context"));
     }
     proxy.register_catalog().await;
+    if proxy.pooled.load(Ordering::Acquire)
+        && let Err(error) = proxy.load_pool_tools().await
+    {
+        // Discovery retries and returns a protocol error if Pool is still unavailable.
+        eprintln!(
+            "Agent Pool worker catalog unavailable: {}",
+            error.public().message
+        );
+    }
     let service = proxy
         .serve((
             super::mcp::BoundedReader::new(),
@@ -666,6 +678,7 @@ mod tests {
             explicit_finish: false,
             managed: false,
             pool_tools: Arc::default(),
+            pooled: Arc::default(),
         };
         let ordinary = proxy.tools().unwrap();
         assert_eq!(ordinary.len(), 1);
@@ -724,6 +737,7 @@ mod tests {
             explicit_finish: true,
             managed: true,
             pool_tools: Arc::default(),
+            pooled: Arc::default(),
         };
         proxy.register_catalog().await;
         let calls = broker.0.lock().unwrap();
@@ -797,6 +811,7 @@ mod tests {
             explicit_finish: false,
             managed: false,
             pool_tools: Arc::default(),
+            pooled: Arc::default(),
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -824,6 +839,7 @@ mod tests {
             explicit_finish: false,
             managed: false,
             pool_tools: Arc::default(),
+            pooled: Arc::default(),
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -885,6 +901,7 @@ mod tests {
             explicit_finish: false,
             managed: false,
             pool_tools: Arc::default(),
+            pooled: Arc::default(),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);
