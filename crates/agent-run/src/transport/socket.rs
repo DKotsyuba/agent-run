@@ -1398,6 +1398,43 @@ fn valid_hold_frame<T: serde::de::DeserializeOwned>(raw: &[u8], method: &str) ->
     serde_json::from_slice::<JsonObject<HoldFrame<T>>>(raw)
         .is_ok_and(|JsonObject(frame)| frame.jsonrpc == "2.0" && frame.method == method)
 }
+/// Takes a broker bind lock, waiting only the bounded predecessor-settle time.
+///
+/// A broker terminated by SIGKILL or the out-of-memory killer holds its bind
+/// locks until the kernel finishes tearing it down; an immediate successor
+/// retries instead of reporting a live broker. Returns whether the lock is held.
+async fn lock_startup(lock: &File) -> bool {
+    use agent_run_core::predecessor::{PREDECESSOR_SETTLE, SETTLE_POLL};
+    let deadline = tokio::time::Instant::now() + PREDECESSOR_SETTLE;
+    loop {
+        if lock.try_lock_exclusive().is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// Probes a pre-existing socket path while this process holds its bind lock.
+///
+/// The lock proves no cooperating broker serves the path, so an accepted
+/// connection can only be the still-open listener of a predecessor in
+/// teardown (or a foreign listener): retry briefly before reporting it live.
+async fn probe_listener(path: &Path) -> std::io::Result<UnixStream> {
+    use agent_run_core::predecessor::SETTLE_POLL;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match UnixStream::connect(path).await {
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(SETTLE_POLL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Binds one private same-user broker socket under its exclusive startup lock.
 ///
 /// The adjacent `.<name>.lock` file fences stale-socket probing and binding for
@@ -1433,15 +1470,16 @@ pub(crate) async fn bind_private(socket_path: &Path) -> Result<(UnixListener, So
         ));
     }
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
-    lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("API socket is already in use"))?;
+    if !lock_startup(&lock).await {
+        return Err(crate::error::invalid("API socket is already in use"));
+    }
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         if !meta.file_type().is_socket() || meta.uid() != uid {
             return Err(crate::error::invalid(
                 "refusing to replace non-socket or foreign socket path",
             ));
         }
-        match UnixStream::connect(&path).await {
+        match probe_listener(&path).await {
             Ok(_) => return Err(crate::error::invalid("another broker is listening")),
             Err(e)
                 if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)].contains(&e.raw_os_error()) =>
@@ -1493,15 +1531,16 @@ pub(crate) async fn bind_shared(path: &Path) -> Result<(UnixListener, SocketGuar
     if !lock.metadata()?.is_file() {
         return Err(crate::error::invalid("shared socket lock is not a file"));
     }
-    lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("shared socket is already in use"))?;
+    if !lock_startup(&lock).await {
+        return Err(crate::error::invalid("shared socket is already in use"));
+    }
     if let Ok(previous) = std::fs::symlink_metadata(path) {
         if !previous.file_type().is_socket() {
             return Err(crate::error::invalid(
                 "refusing to replace a non-socket path",
             ));
         }
-        match tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
+        match tokio::time::timeout(Duration::from_secs(3), probe_listener(path)).await {
             Ok(Ok(_)) => return Err(crate::error::invalid("another worker is listening")),
             Ok(Err(error))
                 if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)]
@@ -1669,8 +1708,9 @@ pub(super) async fn bind_operator(path: &Path, gid: u32) -> Result<(UnixListener
             "operator startup lock is not private and owned",
         ));
     }
-    lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("operator socket is already in use"))?;
+    if !lock_startup(&lock).await {
+        return Err(crate::error::invalid("operator socket is already in use"));
+    }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_socket()
@@ -1682,7 +1722,7 @@ pub(super) async fn bind_operator(path: &Path, gid: u32) -> Result<(UnixListener
                     "refusing to replace an untrusted operator socket",
                 ));
             }
-            match tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
+            match tokio::time::timeout(Duration::from_secs(3), probe_listener(path)).await {
                 Ok(Err(error))
                     if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)]
                         .contains(&error.raw_os_error()) =>

@@ -143,15 +143,19 @@ fn lease_error(error: std::io::Error) -> Error {
 }
 
 impl WriterLease {
-    /// Acquires the online writer lease of the canonical `home` without
-    /// blocking. Another holder (a live broker writer or an offline tool)
-    /// yields `Error::Conflict`. The lease lasts until the returned fence (or
-    /// the writer that consumed it) is dropped; the kernel releases it if the
+    /// Acquires the online writer lease of the canonical `home`, waiting only
+    /// the bounded predecessor-settle time for a terminated broker's lock.
+    /// Another live holder (a broker writer or an offline tool) yields
+    /// `Error::Conflict`. The lease lasts until the returned fence (or the
+    /// writer that consumed it) is dropped; the kernel releases it if the
     /// process dies.
     pub fn acquire_online(home: &Path) -> Result<OnlineWriterFence> {
         let home = canonical_home(home)?;
-        let file =
-            sqlite_access::WriterLease::acquire(&home.join("writer.lock")).map_err(lease_error)?;
+        let file = sqlite_access::WriterLease::acquire_settled(
+            &home.join("writer.lock"),
+            sqlite_access::lease::PREDECESSOR_SETTLE,
+        )
+        .map_err(lease_error)?;
         Ok(OnlineWriterFence { _lock: file, home })
     }
 
