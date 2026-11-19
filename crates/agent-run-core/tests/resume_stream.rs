@@ -197,8 +197,10 @@ async fn foreign_session_frames_are_rejected_before_consumption() {
     for (resume, frame, foreign_before_init) in [
         (true, partial.clone(), true),
         (true, partial.clone(), false),
+        (false, partial.clone(), true),
         (false, partial, false),
         (false, unidentified_partial, false),
+        (false, rate_limit("rejected"), true),
         (true, rate_limit("rejected"), false),
         (true, rate_limit("allowed"), false),
     ] {
@@ -247,6 +249,8 @@ async fn foreign_session_frames_are_rejected_before_consumption() {
 
         let expected = if resume {
             "runtime resumed a different native session"
+        } else if foreign_before_init {
+            "explicit run has not established its native session"
         } else {
             "explicit run changed its native session"
         };
@@ -270,6 +274,44 @@ async fn foreign_session_frames_are_rejected_before_consumption() {
             .unwrap();
         assert_eq!(result_frames, 0, "must stop before the subsequent result");
     }
+}
+
+/// An ordinary fresh run accepts a legacy partial without a session ID.
+#[tokio::test]
+async fn fresh_launch_accepts_unidentified_partial_after_init() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let (id, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
+    let stream = [
+        json!({"type":"system","subtype":"init","session_id":"saved"}),
+        json!({"type":"stream_event","event":{"type":"content_block_delta",
+            "delta":{"type":"text_delta","text":"legacy partial"}}}),
+        json!({"type":"result","subtype":"success","is_error":false,
+            "session_id":"saved","result":"legacy partial","usage":{}}),
+    ]
+    .map(|frame| frame.to_string())
+    .join("\n");
+    let mut process = Process::spawn(&fake_engine(&home.path, &stream)).unwrap();
+    let result = stream::run(&mut process, &mut persist, &record, &record, None)
+        .await
+        .unwrap();
+    process.reap().await;
+    persist.flush().await.unwrap();
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    assert_eq!(result.outcome.runtime_session_id.as_deref(), Some("saved"));
+    assert!(
+        store
+            .transcript(&id, 0, 100)
+            .unwrap()
+            .to_string()
+            .contains("legacy partial")
+    );
 }
 
 /// Mirrors `tests/test_resume_adapters.py::ArgumentsTests::test_dispatch_inherits_authority_and_preserves_caller`

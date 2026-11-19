@@ -1442,31 +1442,7 @@ async fn run_inner(
         } else {
             None
         };
-        // Only initialization and conversation frames may bind an identity.
-        // Partials and quota controls must pass the check before consumption.
-        let can_bind = matches!(
-            (frame_type, subtype),
-            (Some("system"), Some("init")) | (Some("assistant" | "user" | "result"), _)
-        );
-        let frame_session = v["session_id"].as_str().filter(|s| !s.trim().is_empty());
-        let consumed = can_bind
-            || matches!(frame_type, Some("stream_event" | "rate_limit_event"))
-            || v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
-        let rejects = |expected: &str| frame_session.map_or(consumed, |actual| actual != expected);
-        if record.request.explicit_finish && session.as_deref().is_some_and(rejects) {
-            return Err(invalid("explicit run changed its native session"));
-        }
-        if record
-            .resume_of_runtime_session_id
-            .as_deref()
-            .is_some_and(rejects)
-        {
-            return Err(invalid("runtime resumed a different native session"));
-        }
-        if !can_bind && session.as_deref().is_some_and(rejects) {
-            return Err(invalid("native frame changed its session"));
-        }
-        // Validate notification ownership before a frame can rebind a fresh session.
+        // Validate notification ownership before checking or binding the frame session.
         if v.get("type").and_then(Value::as_str) == Some("user")
             && let Err(error) = inputs.replay(&v, session.as_deref())
         {
@@ -1488,6 +1464,43 @@ async fn run_inner(
                 ))
                 .await;
             return Err(error);
+        }
+        // Only initialization and conversation frames may bind an identity.
+        // Partials and quota controls must pass the check before consumption.
+        let can_bind = matches!(
+            (frame_type, subtype),
+            (Some("system"), Some("init")) | (Some("assistant" | "user" | "result"), _)
+        );
+        let frame_session = v["session_id"].as_str().filter(|s| !s.trim().is_empty());
+        let consumed = can_bind
+            || matches!(frame_type, Some("stream_event" | "rate_limit_event"))
+            || v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
+        let rejects = |expected: &str| frame_session.map_or(consumed, |actual| actual != expected);
+        if record.request.explicit_finish
+            && session.is_none()
+            && record.resume_of_runtime_session_id.is_none()
+            && consumed
+            && !(can_bind && frame_session.is_some())
+        {
+            return Err(invalid(
+                "explicit run has not established its native session",
+            ));
+        }
+        if record.request.explicit_finish && session.as_deref().is_some_and(rejects) {
+            return Err(invalid("explicit run changed its native session"));
+        }
+        if record
+            .resume_of_runtime_session_id
+            .as_deref()
+            .is_some_and(rejects)
+        {
+            return Err(invalid("runtime resumed a different native session"));
+        }
+        if !can_bind
+            && let (Some(expected), Some(actual)) = (session.as_deref(), frame_session)
+            && expected != actual
+        {
+            return Err(invalid("native frame changed its session"));
         }
         // Legacy fresh launches may still rebind on authoritative frames.
         if can_bind
