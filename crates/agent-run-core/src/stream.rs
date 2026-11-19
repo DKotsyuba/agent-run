@@ -1496,9 +1496,10 @@ async fn run_inner(
         {
             return Err(invalid("runtime resumed a different native session"));
         }
+        // Ordinary fresh runs can receive legacy partials without session IDs.
         if !can_bind
-            && let (Some(expected), Some(actual)) = (session.as_deref(), frame_session)
-            && expected != actual
+            && (frame_type != Some("stream_event") || frame_session.is_some())
+            && session.as_deref().is_some_and(rejects)
         {
             return Err(invalid("native frame changed its session"));
         }
