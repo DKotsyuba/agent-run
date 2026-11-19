@@ -36,6 +36,8 @@ pub const FINISH_ENV: &str = "AGENT_RUN_WORKER_FINISH";
 /// narrows the worker surface to exactly `finish` and `health_reply`; the
 /// broker's authority checks are unchanged and the marker grants nothing.
 pub const MANAGED_ENV: &str = "AGENT_RUN_WORKER_MANAGED";
+/// Supervisor-selected pooled discovery. The broker independently authorizes calls.
+pub const POOL_CHAT_ENV: &str = "AGENT_RUN_WORKER_POOL_CHAT";
 
 /// The private worker tools of the managed role, in served order.
 pub const MANAGED_TOOLS: [&str; 2] = ["health_reply", "finish"];

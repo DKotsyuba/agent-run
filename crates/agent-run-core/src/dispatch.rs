@@ -867,14 +867,8 @@ async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Resul
     let at = crate::domain::now();
     let home = service.home.clone();
     let probe = proof.clone();
-    let (preflight, pooled) = tokio::task::spawn_blocking(move || {
-        let store = StoreReader::open(&home)?;
-        let preflight = store.worker_catalog_preflight(&probe, at)?;
-        let pooled = matches!(
-            preflight,
-            CatalogPreflight::NeedsWrite | CatalogPreflight::AlreadyRegistered
-        ) && crate::pool_chat::has_seat(store.conn(), &probe.run_id)?;
-        Ok::<_, crate::Error>((preflight, pooled))
+    let preflight = tokio::task::spawn_blocking(move || {
+        StoreReader::open(&home)?.worker_catalog_preflight(&probe, at)
     })
     .await
     .map_err(|_| crate::Error::Runtime("worker catalog proof failed".into()))??;
@@ -895,11 +889,7 @@ async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Resul
                 .await?;
         }
     }
-    let mut receipt = json!({"registered":true});
-    if pooled {
-        receipt["pool_chat"] = json!(true);
-    }
-    Ok(receipt)
+    Ok(json!({"registered":true}))
 }
 
 #[cfg(test)]

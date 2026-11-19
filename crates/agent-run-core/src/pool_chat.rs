@@ -221,6 +221,16 @@ async fn rpc(
     })?
 }
 
+/// Interprets a member response before deciding whether the original send
+/// needs a retry. Missing result fields leave the outcome uncertain.
+async fn member_call(path: &Path, parameters: &Value) -> std::result::Result<Value, RpcError> {
+    let mut result = rpc(path, "member_call_v1", parameters).await?;
+    if !result["content"].is_array() || !result["is_error"].is_boolean() {
+        return Err(RpcError::Uncertain);
+    }
+    Ok(json!({"content":result["content"].take(), "isError":result["is_error"]}))
+}
+
 /// Verifies the exact v1 inventory and forwards Pool's schema objects unchanged.
 fn catalog(mut result: Value) -> std::result::Result<Value, &'static str> {
     let tools = result["tools"]
@@ -248,10 +258,10 @@ impl Service {
                     .map_err(|_| Error::Runtime("Pool catalog cache is unavailable".into()))?;
                 let tx = store.conn().unchecked_transaction()?;
                 if Member::read(&tx, &request, false)?.is_none() {
-                    return Ok(None);
+                    return Err(invalid("worker lineage has no Pool chat seat"));
                 }
                 if let Some(cell) = catalogs.get(&request.attempt_id) {
-                    return Ok(Some(cell.clone()));
+                    return Ok(cell.clone());
                 }
                 // Never evict an active attempt's original catalog, including when
                 // its MCP reconnects. Retired attempts need no explicit teardown.
@@ -262,14 +272,9 @@ impl Service {
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<HashSet<_>>>()?;
                 catalogs.retain(|attempt, _| live.contains(attempt));
-                Ok(Some(
-                    catalogs.entry(request.attempt_id).or_default().clone(),
-                ))
+                Ok(catalogs.entry(request.attempt_id).or_default().clone())
             })
             .await?;
-        let Some(cell) = cell else {
-            return Ok(json!([]));
-        };
         let value = cell
             .get_or_try_init(|| async {
                 let (config, _) = self
@@ -314,7 +319,7 @@ impl Service {
             .ok_or_else(|| Error::Runtime("Agent Pool chat is disabled".into()))?;
         let request_id = uuid::Uuid::new_v4().to_string();
         let params = member.call(&call.tool, call.input, &request_id);
-        let first = rpc(&endpoint.socket, "member_call_v1", &params).await;
+        let first = member_call(&endpoint.socket, &params).await;
         let retry = matches!(first, Err(RpcError::Uncertain));
         let result = if retry {
             // A lost ACK can follow a committed operation. Retry the same
@@ -326,28 +331,24 @@ impl Service {
             {
                 return Err(Error::Runtime(RpcError::Uncertain.message().into()));
             }
-            rpc(&endpoint.socket, "member_call_v1", &params).await
+            member_call(&endpoint.socket, &params).await
         } else {
             first
         };
-        let mut result = match result {
-            Ok(result) => result,
+        match result {
+            Ok(result) => Ok(result),
             Err(RpcError::MemberRefused(kind)) => {
                 let text = if retry {
                     format!("{kind}. {}", RpcError::Uncertain.message())
                 } else {
                     kind.to_owned()
                 };
-                return Ok(json!({"content":[{"type":"text","text":text}],
-                    "structuredContent":{"kind":kind}, "isError":true}));
+                Ok(json!({"content":[{"type":"text","text":text}],
+                    "structuredContent":{"kind":kind}, "isError":true}))
             }
-            Err(_) if retry => return Err(Error::Runtime(RpcError::Uncertain.message().into())),
-            Err(error) => return Err(Error::Runtime(error.message().into())),
-        };
-        if !result["content"].is_array() || !result["is_error"].is_boolean() {
-            return Err(Error::Runtime(RpcError::Uncertain.message().into()));
+            Err(_) if retry => Err(Error::Runtime(RpcError::Uncertain.message().into())),
+            Err(error) => Err(Error::Runtime(error.message().into())),
         }
-        Ok(json!({"content":result["content"].take(), "isError":result["is_error"]}))
     }
 }
 

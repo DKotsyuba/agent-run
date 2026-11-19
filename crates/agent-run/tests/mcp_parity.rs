@@ -1399,6 +1399,10 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
             .env(ENV_NAMES[3], &token)
             .env(agent_run_domain::worker::FINISH_ENV, "1")
             .env(
+                agent_run_domain::worker::POOL_CHAT_ENV,
+                if id == &resume { "1" } else { "0" },
+            )
+            .env(
                 agent_run_domain::worker::RESEARCH_ENV,
                 if research { "1" } else { "0" },
             )
@@ -1476,8 +1480,12 @@ fn pool_chat_worker_relay_preserves_schema_content_and_authenticated_identity() 
                         response["error"] = json!({"code":-32601,"message":"method not found"})
                     }
                     2 => response["result"] = json!({"version":1,"tools":tools}),
-                    3 | 7 => {
-                        // Lose the acknowledgement. The first retry keeps its intent and ID.
+                    3 => {
+                        response["result"] =
+                            json!({"version":1,"content":"malformed","is_error":false})
+                    }
+                    7 => {
+                        // Lose the acknowledgement entirely for this operation.
                         requests.push(request);
                         continue;
                     }
