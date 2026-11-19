@@ -174,6 +174,9 @@ pub struct AdmitProvider {
 /// One pre-minted independent job and its trusted provider inputs.
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchMemberSpec {
+    /// Optional chat seat admitted with this lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_chat: Option<agent_run_domain::pool_chat::PoolChat>,
     /// Stable public identity minted by the broker.
     pub id: AgentId,
     /// Frozen ordinary provider admission facts.

@@ -12,8 +12,8 @@ use agent_run_domain::{
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
 };
@@ -22,7 +22,7 @@ use std::path::Component;
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -48,6 +48,10 @@ pub struct WorkerProxy {
     /// Supervisor-selected managed role: with explicit finish, the surface is
     /// exactly `health_reply` and `finish`.
     managed: bool,
+    /// Pool-owned schemas for this exact attempt, alongside its normal tools.
+    pool_tools: Arc<OnceLock<Vec<Tool>>>,
+    /// The supervisor selected pooled discovery for this attempt.
+    pooled: bool,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -68,6 +72,15 @@ impl WorkerProxy {
     /// Explicit mode adds only finish, with no additional role authority. A
     /// managed role serves only the completion tools.
     fn tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
+        let mut tools = self.base_tools()?;
+        if let Some(pool_tools) = self.pool_tools.get() {
+            tools.extend(pool_tools.iter().cloned());
+        }
+        Ok(tools)
+    }
+
+    /// Loads the embedded profile inventory used by the existing health proof.
+    fn base_tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
         if self.explicit_finish {
             let catalog = if self.managed {
                 agent_run_domain::worker::managed_tools_json()
@@ -94,6 +107,48 @@ impl WorkerProxy {
                 })
             })
             .collect()
+    }
+
+    /// Fetches this attempt's Pool schemas from the authenticated broker.
+    async fn load_pool_tools(&self) -> Result<()> {
+        use agent_run_domain::pool_chat::{CATALOG_METHOD, CatalogRequest};
+        let request = CatalogRequest {
+            run_id: self.run_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            token: self.token.clone(),
+        };
+        let value = self
+            .broker
+            .call(CATALOG_METHOD, serde_json::to_value(request)?)
+            .await?;
+        let tools = serde_json::from_value(value)
+            .map_err(|_| Error::Runtime("invalid Agent Pool tool catalog".into()))?;
+        let _ = self.pool_tools.set(tools);
+        Ok(())
+    }
+
+    /// Forwards arguments verbatim and renders Pool's original MCP content.
+    async fn call_pool(&self, name: &str, input: Value) -> CallToolResult {
+        let call = WorkerToolCall {
+            run_id: self.run_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            token: self.token.clone(),
+            tool: name.to_owned(),
+            input,
+        };
+        let result = async {
+            let result = self
+                .broker
+                .call(
+                    agent_run_domain::worker::TOOL_METHOD,
+                    serde_json::to_value(call)?,
+                )
+                .await?;
+            serde_json::from_value(result)
+                .map_err(|_| Error::Runtime("invalid Agent Pool MCP content".into()))
+        }
+        .await;
+        result.unwrap_or_else(|error| super::mcp_text::failure_result(name, &error, None, None))
     }
 
     /// Registers this actual native catalog once per exact immutable attempt.
@@ -333,6 +388,11 @@ impl ServerHandler for WorkerProxy {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
         self.register_catalog().await;
+        if self.pooled && self.pool_tools.get().is_none() {
+            self.load_pool_tools()
+                .await
+                .map_err(|error| ErrorData::internal_error(error.public().message, None))?;
+        }
         Ok(super::mcp_cache::tools_list_result(&context, self.tools()?))
     }
 
@@ -351,16 +411,18 @@ impl ServerHandler for WorkerProxy {
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
         self.register_catalog().await;
+        let input = Value::Object(request.arguments.unwrap_or_default());
+        if self
+            .pool_tools
+            .get()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.name == request.name))
+        {
+            return Ok(self.call_pool(&request.name, input).await.into());
+        }
         if self.get_tool(&request.name).is_none() {
             return Err(ErrorData::invalid_params("unknown worker tool", None));
         }
-        Ok(self
-            .call(
-                &request.name,
-                Value::Object(request.arguments.unwrap_or_default()),
-            )
-            .await
-            .into())
+        Ok(self.call(&request.name, input).await.into())
     }
 }
 
@@ -536,13 +598,24 @@ pub async fn serve_from_env(context_file: Option<&std::path::Path>) -> Result<()
         research: context.flag(agent_run_domain::worker::RESEARCH_ENV),
         explicit_finish: context.flag(agent_run_domain::worker::FINISH_ENV),
         managed: context.flag(agent_run_domain::worker::MANAGED_ENV),
+        pool_tools: Arc::default(),
+        pooled: context.flag(agent_run_domain::worker::POOL_CHAT_ENV),
     };
     // The managed surface exists only in explicit, non-research mode; any
     // other combination is a supervisor contract error, never a wider catalog.
-    if proxy.managed && (!proxy.explicit_finish || proxy.research) {
+    if proxy.managed && (!proxy.explicit_finish || proxy.research || proxy.pooled) {
         return Err(invalid("invalid managed worker context"));
     }
     proxy.register_catalog().await;
+    if proxy.pooled
+        && let Err(error) = proxy.load_pool_tools().await
+    {
+        // Discovery retries and returns a protocol error if Pool is still unavailable.
+        eprintln!(
+            "Agent Pool worker catalog unavailable: {}",
+            error.public().message
+        );
+    }
     let service = proxy
         .serve((
             super::mcp::BoundedReader::new(),
@@ -600,6 +673,8 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
+            pooled: false,
         };
         let ordinary = proxy.tools().unwrap();
         assert_eq!(ordinary.len(), 1);
@@ -657,6 +732,8 @@ mod tests {
             research: false,
             explicit_finish: true,
             managed: true,
+            pool_tools: Arc::default(),
+            pooled: false,
         };
         proxy.register_catalog().await;
         let calls = broker.0.lock().unwrap();
@@ -729,6 +806,8 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
+            pooled: false,
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -755,6 +834,8 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
+            pooled: false,
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -801,6 +882,81 @@ mod tests {
         assert!(!crate::dispatch::is_tool("notify_orchestrator"));
     }
 
+    /// Launch-selected pooled discovery stays authoritative after two proof timeouts.
+    #[tokio::test]
+    async fn pooled_discovery_survives_both_catalog_proof_timeouts() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        #[derive(Default)]
+        struct DelayedProof {
+            proof_calls: AtomicUsize,
+            pool_calls: AtomicUsize,
+        }
+        impl CliBroker for DelayedProof {
+            /// Withholds proof acknowledgements while answering Pool schema requests.
+            fn call<'a>(&'a self, method: &'a str, _: Value) -> CliFuture<'a> {
+                Box::pin(async move {
+                    if method == agent_run_domain::worker::CATALOG_METHOD {
+                        self.proof_calls.fetch_add(1, Ordering::Relaxed);
+                        return std::future::pending().await;
+                    }
+                    assert_eq!(method, agent_run_domain::pool_chat::CATALOG_METHOD);
+                    self.pool_calls.fetch_add(1, Ordering::Relaxed);
+                    Err(Error::Runtime("Agent Pool fixture unavailable".into()))
+                })
+            }
+        }
+
+        let broker = Arc::new(DelayedProof::default());
+        let proxy = WorkerProxy {
+            broker: broker.clone(),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+            catalog_registered: Arc::default(),
+            research: false,
+            explicit_finish: true,
+            managed: false,
+            pool_tools: Arc::default(),
+            pooled: true,
+        };
+        proxy.register_catalog().await;
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (output_writer, output_reader) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            proxy
+                .serve((input_reader, output_writer))
+                .await
+                .unwrap()
+                .waiting()
+                .await
+        });
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }}});
+        input_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            BufReader::new(output_reader).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert!(reply.get("result").is_none());
+        assert_eq!(reply["error"]["message"], "Agent Pool fixture unavailable");
+        assert_eq!(broker.proof_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(broker.pool_calls.load(Ordering::Relaxed), 1);
+        drop(input_writer);
+        server.await.unwrap().unwrap();
+    }
+
     /// A raw 2026-07-28 `tools/list` (no `initialize`) carries private cache hints,
     /// so Claude children on that protocol keep `notify_orchestrator`; legacy sessions do not.
     #[tokio::test]
@@ -815,6 +971,8 @@ mod tests {
             research: false,
             explicit_finish: false,
             managed: false,
+            pool_tools: Arc::default(),
+            pooled: false,
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

@@ -453,6 +453,18 @@ fn registry_matches_python_golden_field_by_field() {
                 .unwrap()
                 .remove("timeout_seconds");
             if definition.name == "resume" {
+                expected["inputSchema"]["properties"]["pool_chat"] = serde_json::json!({
+                    "type":"object",
+                    "description":"Optional equality assertion of the inherited Agent Pool chat seat.",
+                    "additionalProperties":false,
+                    "required":["version","pool_id","seat_id","pool_store_id"],
+                    "properties":{
+                        "version":{"const":1},
+                        "pool_id":{"type":"string","format":"uuid"},
+                        "seat_id":{"type":"string","format":"uuid"},
+                        "pool_store_id":{"type":"string","pattern":"^store_[0-9a-f]{32}$"}
+                    }
+                });
                 expected["description"] = Value::from(format!(
                     "{} Executions have no wall-clock limit; completion, failure or explicit cancellation ends a run. Native continuations may be resumed repeatedly.",
                     expected["description"].as_str().unwrap()

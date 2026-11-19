@@ -264,6 +264,7 @@ mod tests {
             environment: BTreeMap::from([
                 ("AGENT_RUN_WORKER_TOKEN".into(), "a".repeat(64)),
                 ("AGENT_RUN_WORKER_FINISH".into(), "1".into()),
+                (agent_run_domain::worker::POOL_CHAT_ENV.into(), "1".into()),
                 ("AGENT_RUN_LAUNCH_ID".into(), "launch".into()),
                 ("BRIDGE_NATIVE_OWNER_CHANNEL".into(), "/bridge".into()),
                 ("POOL".into(), "kept".into()),
@@ -305,7 +306,7 @@ mod tests {
         let copy: Value = serde_json::from_slice(&std::fs::read(scoped.path()).unwrap()).unwrap();
         assert_eq!(
             copy["mcpServers"]["agent_run_worker"]["env"],
-            json!({"AGENT_RUN_WORKER_FINISH":"1","AGENT_RUN_WORKER_TOKEN":"a".repeat(64)})
+            json!({"AGENT_RUN_WORKER_FINISH":"1","AGENT_RUN_WORKER_POOL_CHAT":"1","AGENT_RUN_WORKER_TOKEN":"a".repeat(64)})
         );
         assert_eq!(copy["mcpServers"]["pool"]["env"], json!({"POOL":"${POOL}"}));
         let merged = scoped.with_launch(&plan.environment);
@@ -378,7 +379,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(scoped.path()).unwrap()).unwrap();
         assert_eq!(
             context,
-            json!({"AGENT_RUN_WORKER_FINISH":"1","AGENT_RUN_WORKER_TOKEN":"a".repeat(64)})
+            json!({"AGENT_RUN_WORKER_FINISH":"1","AGENT_RUN_WORKER_POOL_CHAT":"1","AGENT_RUN_WORKER_TOKEN":"a".repeat(64)})
         );
         assert_eq!(
             scoped.with_launch(&plan.environment)["AGENT_RUN_WORKER_TOKEN"],

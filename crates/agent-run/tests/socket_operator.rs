@@ -199,6 +199,7 @@ async fn operator_publication_and_private_method_fence() {
         "worker/notify",
         "worker/call",
         "worker/catalog",
+        "worker/pool_chat_catalog",
         "worker/future",
     ] {
         assert_eq!(

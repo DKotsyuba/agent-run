@@ -329,6 +329,12 @@ struct Resume {
     #[serde(default)]
     /// Optional delivery destination override; omission inherits the parent.
     orchestrator: Option<OrchestratorRef>,
+    /// Optional assertion of the inherited chat seat.
+    #[serde(
+        default,
+        deserialize_with = "agent_run_domain::batch::present_pool_chat"
+    )]
+    pool_chat: Option<agent_run_domain::pool_chat::PoolChat>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -475,6 +481,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":message}}),
             )
         }
+        agent_run_domain::pool_chat::CATALOG_METHOD => service.pool_chat_catalog(args(raw)?).await,
         agent_run_domain::worker::CATALOG_METHOD => register_catalog(service, args(raw)?).await,
         agent_run_domain::worker::METHOD => {
             let call: agent_run_domain::worker::WorkerCall = args(raw)?;
@@ -496,6 +503,9 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         agent_run_domain::worker::TOOL_METHOD => {
             let call: agent_run_domain::worker::WorkerToolCall = args(raw)?;
+            if agent_run_domain::pool_chat::TOOLS.contains(&call.tool.as_str()) {
+                return service.pool_chat_call(call).await;
+            }
             let tool = agent_run_domain::worker::WorkerTool::parse(&call.tool)
                 .ok_or_else(|| invalid("unknown worker tool"))?;
             worker_tool_call(service, call, tool).await
@@ -554,6 +564,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     a.request_id,
                     a.display_name,
                     a.orchestrator,
+                    a.pool_chat.as_ref(),
                 )
                 .await
         }
@@ -863,10 +874,10 @@ async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Resul
     .map_err(|_| crate::Error::Runtime("worker catalog proof failed".into()))??;
     match preflight {
         CatalogPreflight::Unauthenticated => {
-            Err(crate::Error::Validation("invalid worker capability".into()))
+            return Err(crate::Error::Validation("invalid worker capability".into()));
         }
-        CatalogPreflight::Conflict => Err(crate::Error::Conflict),
-        CatalogPreflight::AlreadyRegistered => Ok(json!({"registered":true})),
+        CatalogPreflight::Conflict => return Err(crate::Error::Conflict),
+        CatalogPreflight::AlreadyRegistered => {}
         CatalogPreflight::NeedsWrite => {
             service
                 .lane("workers")?
@@ -876,9 +887,9 @@ async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Resul
                     BROKER_BUDGET,
                 )
                 .await?;
-            Ok(json!({"registered":true}))
         }
     }
+    Ok(json!({"registered":true}))
 }
 
 #[cfg(test)]

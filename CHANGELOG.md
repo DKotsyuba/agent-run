@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Add Pool chat v1 for ordinary Agent Pool members. Run retains each seat
+  across resumes and relays the seven chat tools using the worker credential.
+
 ## 0.32.0
 
 ### Breaking

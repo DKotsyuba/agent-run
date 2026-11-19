@@ -198,7 +198,7 @@ fn quota_decision_batch_rolls_back_and_replays_before_guard() {
         .map(|request| identity(request, &authority));
     let batch = StartBatchRequest {
         request_id: "quota-decision-batch".into(),
-        jobs: requests.to_vec(),
+        jobs: requests.iter().cloned().map(Into::into).collect(),
         retain_history: true,
         expected_store_id: None,
         preconditions: None,
@@ -222,6 +222,7 @@ fn quota_decision_batch_rolls_back_and_replays_before_guard() {
             catalog: &catalog,
             jobs: (0..2)
                 .map(|index| BatchMember {
+                    pool_chat: None,
                     id: ids[index].clone(),
                     inputs: AdmissionInputs {
                         request: &requests[index],

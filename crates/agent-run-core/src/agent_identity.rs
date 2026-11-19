@@ -189,10 +189,14 @@ impl crate::service::Service {
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<crate::domain::OrchestratorRef>,
+        pool_chat: Option<&agent_run_domain::pool_chat::PoolChat>,
     ) -> Result<Value> {
         let parent = {
             let store = Store::open(&self.home)?;
             let selected = resolve(&store, agent_id, run_id)?;
+            if let Some(chat) = pool_chat {
+                crate::pool_chat::assert_seat(&store.conn, &selected.root_agent_id, chat)?;
+            }
             let mut replay_request = selected.request.clone();
             replay_request.request_id = request_id.clone();
             if orchestrator.is_some() {

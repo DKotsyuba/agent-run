@@ -200,6 +200,21 @@ or an authorization capability. The receipt outlives ordinary agent history
 retention, so an old ID may no longer have a readable status or answer. Status
 and batch preconditions accept the reference together with its exact sequence.
 
+For Pool chat v1, a job may include
+`"pool_chat":{"version":1,"pool_id":"<uuid>","seat_id":"<uuid>","pool_store_id":"<store_…>"}`.
+Run includes the seat in the batch fingerprint and persists it atomically with
+admission. Resumes inherit the lineage's seat and may assert it using the same
+`pool_chat` object. Run rejects a mismatched assertion. Replay the original job
+in `batch_receipt`. The normal provider
+profile applies. `capabilities.pool_chat_v1` advertises protocol support, and
+new pooled jobs require a configured private Pool socket.
+
+The pooled worker MCP adds `pool_join`, `pool_get`, `pool_post`,
+`pool_send_member`, `pool_notify_owner`, `pool_propose` and `pool_vote`.
+Pool supplies the input schemas and authorizes each call against its current
+roster. Run authenticates the live worker attempt and supplies the Run store,
+lineage, execution sequence and seat from its own records.
+
 The receipt includes the actual `store_id`. Clients that need a database fence
 can record the opt-in capabilities identity with their durable intent and supply
 it as `expected_store_id` on `start_batch`. The expected ID is part of the
@@ -792,7 +807,7 @@ rendered as `RuntimeError`.
   current schemas for that transport.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 42, reached through the paired
+- The current database schema is version 43, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.
 

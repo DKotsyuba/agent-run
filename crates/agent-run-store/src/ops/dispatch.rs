@@ -647,6 +647,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 .iter()
                 .map(|job| crate::batch_admission::BatchMember {
                     id: job.id.clone(),
+                    pool_chat: job.pool_chat.as_ref(),
                     inputs: inputs(&job.inputs),
                 })
                 .collect();
@@ -676,6 +677,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 .iter()
                 .map(|job| crate::batch_admission::BatchMember {
                     id: job.id.clone(),
+                    pool_chat: job.pool_chat.as_ref(),
                     inputs: inputs(&job.inputs),
                 })
                 .collect();

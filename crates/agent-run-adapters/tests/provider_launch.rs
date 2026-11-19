@@ -775,7 +775,10 @@ fn native_provider_keeps_login_and_model_alias() {
         worker["env_vars"].as_array().unwrap(),
         &agent_run_domain::worker::ENV_NAMES
             .into_iter()
-            .chain([agent_run_domain::worker::FINISH_ENV])
+            .chain([
+                agent_run_domain::worker::FINISH_ENV,
+                agent_run_domain::worker::POOL_CHAT_ENV
+            ])
             .map(|name| toml::Value::String(name.into()))
             .collect::<Vec<_>>()
     );
@@ -787,6 +790,7 @@ fn native_provider_keeps_login_and_model_alias() {
         agent_run_domain::worker::FINISH_ENV,
         agent_run_domain::worker::RESEARCH_ENV,
         agent_run_domain::worker::MANAGED_ENV,
+        agent_run_domain::worker::POOL_CHAT_ENV,
     ]) {
         assert!(!plan.launch.environment.contains_key(name));
     }

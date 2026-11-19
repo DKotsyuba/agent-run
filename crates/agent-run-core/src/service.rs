@@ -228,6 +228,8 @@ pub struct Service {
     /// Producer lanes of the resident writer; `None` until the broker attaches
     /// its writer (a service without one cannot mutate durable state).
     writer: Option<BrokerWriter>,
+    /// Pool-owned schemas shared by all MCP clients of an active attempt.
+    pub(crate) pool_catalogs: crate::pool_chat::CatalogCache,
     /// Optional root-coordinated launcher; ordinary per-user services keep `None`.
     system_launcher: Option<Arc<dyn crate::system_launch::SystemLauncher>>,
 }
@@ -420,6 +422,7 @@ impl Service {
             config: Arc::new(RwLock::new(None)),
             writer: None,
             system_launcher: None,
+            pool_catalogs: Default::default(),
         }
     }
 
@@ -921,10 +924,13 @@ impl Service {
         let catalog = config.resolve_catalog(accounts)?;
         let mut prepared = Vec::with_capacity(request.jobs.len());
         for mut job in request.jobs {
-            job.validate()?;
-            let mut job = prepare_provider(&config, &revision, &catalog, job)?;
-            self.bind_system_route(&mut job)?;
-            prepared.push(job);
+            if job.pool_chat.is_some() && config.pool_chat.is_none() {
+                return Err(invalid("pool_chat requires a configured Pool socket"));
+            }
+            job.request.validate()?;
+            let mut prepared_job = prepare_provider(&config, &revision, &catalog, job.request)?;
+            self.bind_system_route(&mut prepared_job)?;
+            prepared.push((prepared_job, job.pool_chat));
         }
         let ids: Vec<_> = prepared.iter().map(|_| AgentId::new()).collect();
         let mut submission = 0;
@@ -933,7 +939,10 @@ impl Service {
             // One external snapshot serves every job in this attempt; never hold
             // a local transaction while awaiting another service.
             let snapshot = decisions.read(config.capacity.quota.as_ref()).await;
-            let requests: Vec<_> = prepared.iter().map(|job| job.request.clone()).collect();
+            let requests: Vec<_> = prepared
+                .iter()
+                .map(|(job, _)| job.request.clone())
+                .collect();
             let rank_catalog = catalog.clone();
             let sets = self
                 .read(move |store| {
@@ -961,9 +970,10 @@ impl Service {
                 })
                 .await?;
             let mut jobs = Vec::with_capacity(prepared.len());
-            for ((id, job), candidates) in ids.iter().zip(&prepared).zip(&sets) {
+            for ((id, (job, pool_chat)), candidates) in ids.iter().zip(&prepared).zip(&sets) {
                 jobs.push(agent_run_store::ops::BatchMemberSpec {
                     id: id.clone(),
+                    pool_chat: pool_chat.clone(),
                     inputs: AdmissionInputs {
                         request: &job.request,
                         effective: &job.effective,
@@ -1138,7 +1148,7 @@ impl Service {
         let internal = managed_batch_key(&route.pool_route, &key.pool_store_id, &key.request_id);
         let mut batch = StartBatchRequest {
             request_id: internal,
-            jobs: normalized,
+            jobs: normalized.into_iter().map(Into::into).collect(),
             retain_history: true,
             expected_store_id: Some(request.expected_store_id.clone()),
             preconditions: (!request.preconditions.is_empty())
@@ -1183,6 +1193,7 @@ impl Service {
             for ((id, job), candidates) in ids.iter().zip(&jobs).zip(&sets) {
                 members.push(agent_run_store::ops::BatchMemberSpec {
                     id: id.clone(),
+                    pool_chat: None,
                     inputs: AdmissionInputs {
                         request: &job.request,
                         effective: &job.effective,
@@ -1280,7 +1291,7 @@ impl Service {
         let callers: Vec<_> = request
             .jobs
             .iter()
-            .filter_map(|job| job.orchestrator.clone())
+            .filter_map(|job| job.request.orchestrator.clone())
             .collect();
         let result = match self.admit_batch(request).await {
             Ok(result) => result,

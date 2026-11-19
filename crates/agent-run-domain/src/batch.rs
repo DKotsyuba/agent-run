@@ -36,8 +36,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectOnly<T> {
 /// Restricts nested provider jobs without changing the legacy scalar DTO.
 fn object_jobs<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> std::result::Result<Vec<ProviderStartRequest>, D::Error> {
-    Vec::<ObjectOnly<ProviderStartRequest>>::deserialize(deserializer)
+) -> std::result::Result<Vec<StartBatchJob>, D::Error> {
+    Vec::<ObjectOnly<StartBatchJob>>::deserialize(deserializer)
         .map(|jobs| jobs.into_iter().map(|job| job.0).collect())
 }
 
@@ -406,6 +406,38 @@ fn present_preconditions<'de, D: serde::Deserializer<'de>>(
     Vec::<BatchPrecondition>::deserialize(deserializer).map(Some)
 }
 
+/// Ordinary provider start plus an optional immutable chat seat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchJob {
+    /// Pool seat metadata. Omission preserves the historical batch fingerprint.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_pool_chat"
+    )]
+    pub pool_chat: Option<crate::pool_chat::PoolChat>,
+    #[serde(flatten)]
+    pub request: ProviderStartRequest,
+}
+
+/// Decodes a present seat object without treating null as omission.
+pub fn present_pool_chat<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::pool_chat::PoolChat>, D::Error> {
+    ObjectOnly::<crate::pool_chat::PoolChat>::deserialize(deserializer).map(|chat| Some(chat.0))
+}
+
+impl From<ProviderStartRequest> for StartBatchJob {
+    /// Wraps an ordinary unpooled provider request.
+    fn from(request: ProviderStartRequest) -> Self {
+        Self {
+            pool_chat: None,
+            request,
+        }
+    }
+}
+
 /// One batch intent. Individual jobs never carry their own idempotency keys.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -413,7 +445,7 @@ pub struct StartBatchRequest {
     /// Permanent key in this Run home's batch namespace.
     pub request_id: String,
     /// Independent ordinary provider requests, in receipt order.
-    pub jobs: Vec<ProviderStartRequest>,
+    pub jobs: Vec<StartBatchJob>,
     /// Keep each new lineage until its associated pin is explicitly released.
     #[serde(default)]
     pub retain_history: bool,
@@ -443,10 +475,13 @@ impl StartBatchRequest {
             }
         }
         for job in &mut self.jobs {
-            if job.request_id.is_some() {
+            if job.request.request_id.is_some() {
                 return Err(invalid("batch jobs must not have request_id"));
             }
-            job.validate_intent()?;
+            job.request.validate_intent()?;
+            if let Some(chat) = &job.pool_chat {
+                chat.validate()?;
+            }
         }
         Ok(())
     }
@@ -620,7 +655,7 @@ object_only_deserialize!(BatchPrecondition {
 object_only_deserialize!(StartBatchRequest {
     request_id: String,
     #[serde(deserialize_with = "object_jobs")]
-    jobs: Vec<ProviderStartRequest>,
+    jobs: Vec<StartBatchJob>,
     #[serde(default)]
     retain_history: bool,
     #[serde(default)]
@@ -833,7 +868,7 @@ mod tests {
     /// Replay identity includes order and binding but does not inspect paths.
     #[test]
     fn intent_is_bounded_ordered_and_path_independent() {
-        let job = |task: &str| {
+        let job = |task: &str| -> ProviderStartRequest {
             serde_json::from_value(json!({
                 "provider":"p", "model":"m", "profile":"code", "task":task,
                 "workdir":"/missing-batch-fixture"
@@ -842,7 +877,7 @@ mod tests {
         };
         let mut request = StartBatchRequest {
             request_id: "key".into(),
-            jobs: vec![job("one"), job("two")],
+            jobs: vec![job("one").into(), job("two").into()],
             retain_history: false,
             expected_store_id: None,
             preconditions: None,
@@ -867,12 +902,48 @@ mod tests {
         let unscoped = request.fingerprint().unwrap();
         request.expected_store_id = Some("store_0123456789abcdef0123456789abcdef".parse().unwrap());
         assert_ne!(request.fingerprint().unwrap(), unscoped);
-        request.jobs[0].request_id = Some("individual".into());
+        request.jobs[0].request.request_id = Some("individual".into());
         assert!(request.validate_intent().is_err());
         request.jobs = Vec::new();
         assert!(request.validate_intent().is_err());
-        request.jobs = vec![job("one"); MAX_BATCH_JOBS + 1];
+        request.jobs = vec![job("one").into(); MAX_BATCH_JOBS + 1];
         assert!(request.validate_intent().is_err());
+    }
+
+    /// Seat identity is part of batch intent and is accepted only in batch jobs.
+    #[test]
+    fn pool_chat_job_is_strict_and_changes_the_fingerprint() {
+        let mut wire = json!({"request_id":"fixture","jobs":[{
+            "provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/fixture"
+        }]});
+        let original: StartBatchRequest = serde_json::from_value(wire.clone()).unwrap();
+        let chat = json!({
+            "version":1,
+            "pool_id":"00000000-0000-4000-8000-000000000001",
+            "seat_id":"00000000-0000-4000-8000-000000000002",
+            "pool_store_id":"store_00000000000000000000000000000003"
+        });
+        wire["jobs"][0]["pool_chat"] = chat.clone();
+        let mut pooled: StartBatchRequest = serde_json::from_value(wire.clone()).unwrap();
+        pooled.validate_intent().unwrap();
+        assert_ne!(
+            pooled.fingerprint().unwrap(),
+            original.fingerprint().unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&pooled).unwrap()["jobs"][0]["pool_chat"],
+            chat
+        );
+        assert!(serde_json::from_value::<ProviderStartRequest>(wire["jobs"][0].clone()).is_err());
+        wire["jobs"][0]["pool_chat"]["version"] = json!(2);
+        assert!(
+            serde_json::from_value::<StartBatchRequest>(wire.clone())
+                .unwrap()
+                .validate_intent()
+                .is_err()
+        );
+        wire["jobs"][0]["pool_chat"] = json!(null);
+        assert!(serde_json::from_value::<StartBatchRequest>(wire).is_err());
     }
 
     /// Public start and lookup cannot alias a private managed enrollment key.
@@ -885,7 +956,7 @@ mod tests {
         .unwrap();
         let request = |id: &str| StartBatchRequest {
             request_id: id.into(),
-            jobs: vec![job.clone()],
+            jobs: vec![job.clone().into()],
             retain_history: true,
             expected_store_id: Some("store_0123456789abcdef0123456789abcdef".parse().unwrap()),
             preconditions: None,

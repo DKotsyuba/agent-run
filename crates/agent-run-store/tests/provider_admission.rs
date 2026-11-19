@@ -108,7 +108,7 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
     let candidates = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
     let mut request = StartBatchRequest {
         request_id: "batch-key".into(),
-        jobs: vec![first.clone(), second.clone()],
+        jobs: vec![first.clone().into(), second.clone().into()],
         retain_history: true,
         expected_store_id: Some(store_id.clone()),
         preconditions: None,
@@ -119,6 +119,7 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
     let jobs = |cap| {
         vec![
             BatchMember {
+                pool_chat: None,
                 id: ids[0].clone(),
                 inputs: AdmissionInputs {
                     request: &first,
@@ -132,6 +133,7 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
                 },
             },
             BatchMember {
+                pool_chat: None,
                 id: ids[1].clone(),
                 inputs: AdmissionInputs {
                     request: &second,
@@ -800,6 +802,7 @@ mod p3 {
         let jobs = || {
             (0..2)
                 .map(|i| BatchMember {
+                    pool_chat: None,
                     id: ids[i].clone(),
                     inputs: AdmissionInputs {
                         request: &requests[i],
@@ -1000,6 +1003,7 @@ mod p3 {
                 preconditions: None,
                 catalog: &catalog,
                 jobs: vec![BatchMember {
+                    pool_chat: None,
                     id: old_id.clone(),
                     inputs: AdmissionInputs {
                         request: &request,
@@ -1055,6 +1059,7 @@ mod p3 {
             preconditions: Some(&start.preconditions),
             catalog: &catalog,
             jobs: vec![BatchMember {
+                pool_chat: None,
                 id: candidate_id.clone(),
                 inputs: AdmissionInputs {
                     request: &next,
@@ -1180,6 +1185,7 @@ mod p3 {
             catalog: &catalog,
             jobs: (0..20)
                 .map(|i| BatchMember {
+                    pool_chat: None,
                     id: ids[i].clone(),
                     inputs: AdmissionInputs {
                         request: &requests[i],
@@ -1277,6 +1283,7 @@ mod p3 {
             preconditions: None,
             catalog: &catalog,
             jobs: vec![BatchMember {
+                pool_chat: None,
                 id: old_id.clone(),
                 inputs: AdmissionInputs {
                     request: &old_request,
@@ -1376,6 +1383,7 @@ mod p3 {
             preconditions: None,
             catalog: &catalog,
             jobs: vec![BatchMember {
+                pool_chat: None,
                 id: new_id.clone(),
                 inputs: AdmissionInputs {
                     request: &new_request,
@@ -1437,6 +1445,7 @@ mod p3 {
                     preconditions: None,
                     catalog: &catalog,
                     jobs: vec![BatchMember {
+                        pool_chat: None,
                         id: AgentId::new(),
                         inputs: AdmissionInputs {
                             request: &request,
@@ -3085,8 +3094,8 @@ fn batch_preconditions_fence_resume_and_preserve_replay() {
     let submit = |store: &mut Store<'_>, request: &StartBatchRequest| {
         let fingerprint = request.fingerprint().unwrap();
         let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
-        let effective = request.jobs[0].storage_projection();
-        let frozen = identity(&request.jobs[0], &authority);
+        let effective = request.jobs[0].request.storage_projection();
+        let frozen = identity(&request.jobs[0].request, &authority);
         store.admit_batch(BatchAdmission {
             request_id: &request.request_id,
             fingerprint: &fingerprint,
@@ -3095,9 +3104,10 @@ fn batch_preconditions_fence_resume_and_preserve_replay() {
             preconditions: request.preconditions.as_deref(),
             catalog: &catalog,
             jobs: vec![BatchMember {
+                pool_chat: request.jobs[0].pool_chat.as_ref(),
                 id: AgentId::new(),
                 inputs: AdmissionInputs {
-                    request: &request.jobs[0],
+                    request: &request.jobs[0].request,
                     effective: &effective,
                     authority: &authority,
                     candidates: &candidate,
@@ -3111,12 +3121,16 @@ fn batch_preconditions_fence_resume_and_preserve_replay() {
     };
     let request = |key: &str| StartBatchRequest {
         request_id: key.into(),
-        jobs: vec![job.clone()],
+        jobs: vec![job.clone().into()],
         retain_history: true,
         expected_store_id: Some(store_id.clone()),
         preconditions: None,
     };
-    let seed_a = submit(&mut store, &request("prior-a"))
+    let mut pooled_seed = request("prior-a");
+    let chat = json!({"version":1,"pool_id":"00000000-0000-4000-8000-000000000001",
+        "seat_id":"00000000-0000-4000-8000-000000000002","pool_store_id":store_id});
+    pooled_seed.jobs[0].pool_chat = Some(serde_json::from_value(chat.clone()).unwrap());
+    let seed_a = submit(&mut store, &pooled_seed)
         .unwrap()
         .receipt
         .jobs
@@ -3255,6 +3269,20 @@ fn batch_preconditions_fence_resume_and_preserve_replay() {
             .unwrap()
     };
     let child_a = resume(&mut other, &a.agent_id, "resume-prior-a");
+    let stored: (u32, String) = store
+        .conn
+        .query_row(
+            "SELECT a.sequence,c.chat_json FROM agents a JOIN lineage_pool_chat c
+           ON c.root_agent_id=a.root_agent_id WHERE a.id=?",
+            [child_a.agent_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, 2);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored.1).unwrap(),
+        chat
+    );
     let after_resume = counts(&store);
     assert!(matches!(
         submit(&mut store, &guarded),
@@ -3337,8 +3365,8 @@ fn batch_precondition_restart_pending_blocks_until_resolved() {
     let submit = |store: &mut Store<'_>, request: &StartBatchRequest| {
         let fingerprint = request.fingerprint().unwrap();
         let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
-        let effective = request.jobs[0].storage_projection();
-        let frozen = identity(&request.jobs[0], &authority);
+        let effective = request.jobs[0].request.storage_projection();
+        let frozen = identity(&request.jobs[0].request, &authority);
         store.admit_batch(BatchAdmission {
             request_id: &request.request_id,
             fingerprint: &fingerprint,
@@ -3347,9 +3375,10 @@ fn batch_precondition_restart_pending_blocks_until_resolved() {
             preconditions: request.preconditions.as_deref(),
             catalog: &catalog,
             jobs: vec![BatchMember {
+                pool_chat: None,
                 id: AgentId::new(),
                 inputs: AdmissionInputs {
-                    request: &request.jobs[0],
+                    request: &request.jobs[0].request,
                     effective: &effective,
                     authority: &authority,
                     candidates: &candidate,
@@ -3363,7 +3392,7 @@ fn batch_precondition_restart_pending_blocks_until_resolved() {
     };
     let request = |key: &str| StartBatchRequest {
         request_id: key.into(),
-        jobs: vec![job.clone()],
+        jobs: vec![job.clone().into()],
         retain_history: true,
         expected_store_id: Some(store_id.clone()),
         preconditions: None,

@@ -1928,6 +1928,12 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             None
         };
         if planned.role.worker_mcp {
+            let pooled =
+                managed_selection.is_none() && crate::pool_chat::has_seat(store.conn(), id)?;
+            planned.launch.environment.insert(
+                agent_run_domain::worker::POOL_CHAT_ENV.into(),
+                if pooled { "1" } else { "0" }.into(),
+            );
             // This attempt-only capability is never part of the sealed home or
             // argv. New attempts receive a new token; the broker checks durable
             // ownership and run liveness for every report.

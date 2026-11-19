@@ -290,6 +290,7 @@ pub fn plan_v1(
         }
     }
     let mut config = ProviderConfig {
+        pool_chat: None,
         schema_version: 2,
         managed_attempt_binding: None,
         core: old.core.clone(),

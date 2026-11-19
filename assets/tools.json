@@ -415,6 +415,18 @@
             }
           ]
         },
+        "pool_chat": {
+          "type": "object",
+          "description": "Optional equality assertion of the inherited Agent Pool chat seat.",
+          "additionalProperties": false,
+          "required": ["version", "pool_id", "seat_id", "pool_store_id"],
+          "properties": {
+            "version": {"const": 1},
+            "pool_id": {"type": "string", "format": "uuid"},
+            "seat_id": {"type": "string", "format": "uuid"},
+            "pool_store_id": {"type": "string", "pattern": "^store_[0-9a-f]{32}$"}
+          }
+        },
         "request_id": {
           "type": [
             "string",
@@ -529,6 +541,18 @@
           "items": {
             "additionalProperties": false,
             "properties": {
+              "pool_chat": {
+                "type": "object",
+                "description": "Immutable Agent Pool chat v1 seat for this lineage.",
+                "additionalProperties": false,
+                "required": ["version", "pool_id", "seat_id", "pool_store_id"],
+                "properties": {
+                  "version": {"const": 1},
+                  "pool_id": {"type": "string", "format": "uuid"},
+                  "seat_id": {"type": "string", "format": "uuid"},
+                  "pool_store_id": {"type": "string", "pattern": "^store_[0-9a-f]{32}$"}
+                }
+              },
               "account": {
                 "type": [
                   "string",
@@ -780,6 +804,18 @@
           "items": {
             "additionalProperties": false,
             "properties": {
+              "pool_chat": {
+                "type": "object",
+                "description": "Immutable Agent Pool chat v1 seat for this lineage.",
+                "additionalProperties": false,
+                "required": ["version", "pool_id", "seat_id", "pool_store_id"],
+                "properties": {
+                  "version": {"const": 1},
+                  "pool_id": {"type": "string", "format": "uuid"},
+                  "seat_id": {"type": "string", "format": "uuid"},
+                  "pool_store_id": {"type": "string", "pattern": "^store_[0-9a-f]{32}$"}
+                }
+              },
               "account": {
                 "type": [
                   "string",
@@ -1222,6 +1258,7 @@
         "schema_version": {
           "const": 1
         },
+        "pool_chat_v1": {"type": "boolean"},
         "product": {
           "const": "agent-run"
         },

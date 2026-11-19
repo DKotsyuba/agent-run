@@ -893,6 +893,9 @@ fn materialize_with_provider(
                 let mut forwarded = s.env_from.clone();
                 if name == agent_run_domain::worker::SERVER_NAME {
                     forwarded.push(agent_run_domain::worker::FINISH_ENV.into());
+                    if !managed {
+                        forwarded.push(agent_run_domain::worker::POOL_CHAT_ENV.into());
+                    }
                 }
                 if managed && name == agent_run_domain::worker::SERVER_NAME {
                     // Select the managed completion-only catalog inside
