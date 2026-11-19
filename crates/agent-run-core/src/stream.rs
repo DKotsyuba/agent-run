@@ -1393,51 +1393,17 @@ async fn run_inner(
                 });
             }
         };
-        // Validate notification ownership before a frame can rebind a fresh session.
-        if v.get("type").and_then(Value::as_str) == Some("user")
-            && let Err(error) = inputs.replay(&v, session.as_deref())
-        {
-            let reason = match &error {
-                crate::Error::Validation(message) => match message.as_str() {
-                    "native user replay has unknown input correlation" => "unknown_input",
-                    "native internal notification contract rejected" => "invalid_notification",
-                    "native internal notification collides with runner input" => "runner_collision",
-                    "native user replay duplicated an input" => "duplicate_input",
-                    _ => "contract",
-                },
-                _ => "contract",
-            };
-            let _ = process
-                .observing(store.event(
-                    &record.id,
-                    "native_user_replay_refused_v1",
-                    &json!({"version":1,"reason":reason}),
-                ))
-                .await;
-            return Err(error);
-        }
-        if let (Some(expected_session), Some(input_id)) =
-            (&record.resume_of_runtime_session_id, &initial_input_id)
-            && is_resume_ack(&v, expected_session, input_id)
-        {
-            process
-                .observing(store.event_durable(
-                    &record.id,
-                    "native_resume_accepted",
-                    &json!({"session":expected_session,"input_id":input_id}),
-                ))
-                .await?;
-            initial_input_id = None;
-        }
-        if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
-            || v.get("type").and_then(Value::as_str) == Some("assistant")
-            || (v.get("type").and_then(Value::as_str) == Some("stream_event")
-                && v.pointer("/event/type").and_then(Value::as_str) == Some("message_start"))
-        {
-            native_idle = false;
-            process
-                .observing(store.worker_turn(&record.id, false, crate::domain::now()))
-                .await?;
+        let frame_type = v["type"].as_str();
+        let subtype = v["subtype"].as_str();
+        // SessionStart hooks can report a provisional session ID even on resume.
+        if matches!(
+            (frame_type, subtype),
+            (
+                Some("system"),
+                Some("hook_started" | "hook_progress" | "hook_response")
+            )
+        ) {
+            continue;
         }
         // Capture every observed result before identity/shape validation can reject it.
         let result_scope = if v.get("type").and_then(Value::as_str) == Some("result") {
@@ -1476,36 +1442,85 @@ async fn run_inner(
         } else {
             None
         };
-        // SessionStart hook frames can carry a provisional ID, even on resume.
-        // Only initialization and conversation frames attest session identity.
-        if matches!(
-            (v["type"].as_str(), v["subtype"].as_str()),
+        // Only initialization and conversation frames may bind an identity.
+        // Partials and quota controls must pass the check before consumption.
+        let can_bind = matches!(
+            (frame_type, subtype),
             (Some("system"), Some("init")) | (Some("assistant" | "user" | "result"), _)
-        ) && let Some(s) = v
-            .get("session_id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
+        );
+        let frame_session = v["session_id"].as_str().filter(|s| !s.trim().is_empty());
+        let consumed = can_bind
+            || matches!(frame_type, Some("stream_event" | "rate_limit_event"))
+            || v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
+        let rejects = |expected: &str| frame_session.map_or(consumed, |actual| actual != expected);
+        if record.request.explicit_finish && session.as_deref().is_some_and(rejects) {
+            return Err(invalid("explicit run changed its native session"));
+        }
+        if record
+            .resume_of_runtime_session_id
+            .as_deref()
+            .is_some_and(rejects)
         {
-            if record.request.explicit_finish
-                && session.as_deref().is_some_and(|expected| expected != s)
-            {
-                return Err(invalid("explicit run changed its native session"));
-            }
-            if record
-                .resume_of_runtime_session_id
-                .as_deref()
-                .is_some_and(|expected| expected != s)
-            {
-                return Err(invalid("runtime resumed a different native session"));
-            }
-            // Legacy fresh launches can rebind after initialization. Explicit
-            // and resumed runs keep one identity across every idle/wake boundary.
-            if session.as_deref() != Some(s) {
-                process
-                    .observing(store.runtime_session(&record.id, s))
-                    .await?;
-                session = Some(s.into());
-            }
+            return Err(invalid("runtime resumed a different native session"));
+        }
+        if !can_bind && session.as_deref().is_some_and(rejects) {
+            return Err(invalid("native frame changed its session"));
+        }
+        // Validate notification ownership before a frame can rebind a fresh session.
+        if v.get("type").and_then(Value::as_str) == Some("user")
+            && let Err(error) = inputs.replay(&v, session.as_deref())
+        {
+            let reason = match &error {
+                crate::Error::Validation(message) => match message.as_str() {
+                    "native user replay has unknown input correlation" => "unknown_input",
+                    "native internal notification contract rejected" => "invalid_notification",
+                    "native internal notification collides with runner input" => "runner_collision",
+                    "native user replay duplicated an input" => "duplicate_input",
+                    _ => "contract",
+                },
+                _ => "contract",
+            };
+            let _ = process
+                .observing(store.event(
+                    &record.id,
+                    "native_user_replay_refused_v1",
+                    &json!({"version":1,"reason":reason}),
+                ))
+                .await;
+            return Err(error);
+        }
+        // Legacy fresh launches may still rebind on authoritative frames.
+        if can_bind
+            && let Some(s) = frame_session
+            && session.as_deref() != Some(s)
+        {
+            process
+                .observing(store.runtime_session(&record.id, s))
+                .await?;
+            session = Some(s.into());
+        }
+        if let (Some(expected_session), Some(input_id)) =
+            (&record.resume_of_runtime_session_id, &initial_input_id)
+            && is_resume_ack(&v, expected_session, input_id)
+        {
+            process
+                .observing(store.event_durable(
+                    &record.id,
+                    "native_resume_accepted",
+                    &json!({"session":expected_session,"input_id":input_id}),
+                ))
+                .await?;
+            initial_input_id = None;
+        }
+        if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+            || frame_type == Some("assistant")
+            || (frame_type == Some("stream_event")
+                && v.pointer("/event/type").and_then(Value::as_str) == Some("message_start"))
+        {
+            native_idle = false;
+            process
+                .observing(store.worker_turn(&record.id, false, crate::domain::now()))
+                .await?;
         }
         if record.request.profile == "research" && v["type"] == "system" && v["subtype"] == "init" {
             let _ = process

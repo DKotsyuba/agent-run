@@ -177,6 +177,101 @@ async fn session_start_hooks_do_not_supply_resume_identity() {
     }
 }
 
+/// Rejects partial tool data and quota controls from outside the owned session.
+#[tokio::test]
+async fn foreign_session_frames_are_rejected_before_consumption() {
+    let partial = json!({"type":"stream_event","session_id":"foreign","event":{
+        "type":"content_block_start","content_block":{
+            "type":"tool_use","id":"foreign-tool","name":"mcp__agent_run_worker__finish"
+        }
+    }});
+    let mut unidentified_partial = partial.clone();
+    unidentified_partial
+        .as_object_mut()
+        .unwrap()
+        .remove("session_id");
+    let rate_limit = |status| {
+        json!({"type":"rate_limit_event","session_id":"foreign",
+        "rate_limit_info":{"status":status,"rateLimitType":"five_hour"}})
+    };
+    for (resume, frame, foreign_before_init) in [
+        (true, partial.clone(), true),
+        (true, partial.clone(), false),
+        (false, partial, false),
+        (false, unidentified_partial, false),
+        (true, rate_limit("rejected"), false),
+        (true, rate_limit("allowed"), false),
+    ] {
+        let home = common::Home::new();
+        let mut store = home.store();
+        let mut request = home.request();
+        request.explicit_finish = !resume;
+        let (id, _) = store
+            .admit(&request, &home.config, &json!({}), None)
+            .unwrap();
+        if resume {
+            store
+                .conn
+                .execute(
+                    "UPDATE agents SET resume_of_runtime_session_id='saved' WHERE id=?",
+                    [id.as_str()],
+                )
+                .unwrap();
+        }
+        let record = store.get(&id).unwrap();
+        let prep = common::writer::prepare_supervisor(&mut store, &id);
+        let harness = common::writer::Harness::start(&home.path);
+        let mut persist = harness.supervisor(&home.path, prep, &id).await;
+        let mut frames = vec![
+            json!({"type":"system","subtype":"init","session_id":"saved"}),
+            frame,
+            json!({"type":"result","subtype":"error_during_execution","is_error":true,
+                "session_id":"saved","usage":{}}),
+        ];
+        if foreign_before_init {
+            frames.swap(0, 1);
+        } else if frames[1]["rate_limit_info"]["status"] == "allowed" {
+            let mut owned_rejection = rate_limit("rejected");
+            owned_rejection["session_id"] = json!("saved");
+            frames.insert(1, owned_rejection);
+        }
+        let stream = frames
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut process = Process::spawn(&fake_engine(&home.path, &stream)).unwrap();
+        let result = stream::run(&mut process, &mut persist, &record, &record, None).await;
+        process.reap().await;
+        persist.flush().await.unwrap();
+
+        let expected = if resume {
+            "runtime resumed a different native session"
+        } else {
+            "explicit run changed its native session"
+        };
+        assert!(
+            matches!(result, Err(agent_run_core::Error::Validation(message)) if message == expected)
+        );
+        assert!(
+            !store
+                .transcript(&id, 0, 100)
+                .unwrap()
+                .to_string()
+                .contains("foreign-tool")
+        );
+        let result_frames: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_result_frame_v1'",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(result_frames, 0, "must stop before the subsequent result");
+    }
+}
+
 /// Mirrors `tests/test_resume_adapters.py::ArgumentsTests::test_dispatch_inherits_authority_and_preserves_caller`
 ///
 /// Resume inherits the parent's authority rather than accepting a new grant, so
