@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.33.1
+
 - Resume Claude Code sessions when SessionStart hooks emit provisional session
   IDs before initialization. Conversation frames still enforce the saved session
   identity. (#43)
