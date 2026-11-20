@@ -117,8 +117,12 @@ fn abandon_cleans_up_the_gated_child() {
 #[test]
 fn unreleased_capability_times_out_with_verified_cleanup() {
     let temp = tempfile::tempdir().unwrap();
+    // The group signal window must cover loaded CI runners (macOS release
+    // verification saw the 200 ms kill window expire before the group was gone).
     let timeouts = Timeouts {
         ready: Duration::from_millis(800),
+        grace: Duration::from_millis(500),
+        kill: Duration::from_secs(3),
         ..quick()
     };
     let started = spawn(
