@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.33.2
+
 - Wait up to three seconds for a terminating predecessor's startup locks
   (API, operator and writer sockets, service lock) so an automatic restart
   after an abrupt broker exit no longer fails with "API socket is already in
