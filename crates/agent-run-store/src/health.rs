@@ -21,6 +21,15 @@ pub const REPLY_GRACE: f64 = 120.0;
 /// Indexed event kind carrying the latest closed, typed state of one attempt.
 const STATE: &str = "worker_ping_state_v1";
 
+/// Batched retention can remove command rows before a terminal attempt's health
+/// event. Only that missing receipt is optional in the public projection.
+fn retained_probe<T>(lookup: Result<T>, terminal: bool) -> Result<Option<T>> {
+    match lookup {
+        Err(Error::Sql(rusqlite::Error::QueryReturnedNoRows)) if terminal => Ok(None),
+        result => result.map(Some),
+    }
+}
+
 /// One durable control or model request, never replayed with a different identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -504,6 +513,7 @@ impl Store<'_> {
     }
 
     /// Projects health using the selected execution and its frozen policy.
+    /// Removed probe receipts appear as null for terminal executions.
     pub fn health_view_for_record(&self, row: &crate::Record) -> Result<Option<Value>> {
         let run = &row.id;
         let attempt: Option<String> = self
@@ -531,11 +541,30 @@ impl Store<'_> {
             .map_or_else(Vec::new, |a| a.sources.clone());
         let observed_at = state.activity.as_ref().map(|a| a.observed_at);
         let more = pending.saturating_sub(sources.len() as u64);
-        let control=state.control.as_ref()
-.map(|probe|self.health_command(probe.command).map(|(status,result,at)|json!({"state":status,"checked_at":at,"native_alive":result.and_then(|r|r["native_alive"].as_bool())}))).transpose()?;
-        let model=state.model.as_ref().map(|probe|self.conn.query_row("SELECT json_extract(payload_json,'$.health_ping') FROM commands WHERE id=?",[probe.command],|r|r.get::<_,String>(0)).map(|id|json!({"ping_id":id,"requested_at":probe.at,"observation_closed":probe.closed,"reply":probe.reply}))).transpose()?;
+        let terminal = row.status.terminal();
+        let control = match &state.control {
+            Some(probe) => retained_probe(self.health_command(probe.command), terminal)?.map(
+                |(status, result, at)| {
+                    json!({"state":status,"checked_at":at,"native_alive":result.and_then(|r|r["native_alive"].as_bool())})
+                },
+            ),
+            None => None,
+        };
+        let model = match &state.model {
+            Some(probe) => {
+                let ping_id = self.conn.query_row(
+                    "SELECT json_extract(payload_json,'$.health_ping') FROM commands WHERE id=?",
+                    [probe.command],
+                    |r| r.get::<_, String>(0),
+                );
+                retained_probe(ping_id.map_err(Error::from), terminal)?.map(|id| {
+                    json!({"ping_id":id,"requested_at":probe.at,"observation_closed":probe.closed,"reply":probe.reply})
+                })
+            }
+            None => None,
+        };
         Ok(Some(
-            json!({"policy":state.policy,"state":if row.status.terminal(){"terminal"}else if state.reason.is_some(){"needs_attention"}else if model.is_some(){"checking"}else if idle&&pending>0{"waiting"}else{"observing"},"reason":state.reason,"waiting_for":if idle&&pending>0{Some("native_tool")}else{None},"activity_observed_at":observed_at,"pending_native_tools":pending,"waiting_sources":sources,"waiting_sources_more":more,"control":control,"model":model}),
+            json!({"policy":state.policy,"state":if terminal{"terminal"}else if state.reason.is_some(){"needs_attention"}else if model.is_some(){"checking"}else if idle&&pending>0{"waiting"}else{"observing"},"reason":state.reason,"waiting_for":if idle&&pending>0{Some("native_tool")}else{None},"activity_observed_at":observed_at,"pending_native_tools":pending,"waiting_sources":sources,"waiting_sources_more":more,"control":control,"model":model}),
         ))
     }
 

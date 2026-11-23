@@ -1141,6 +1141,82 @@ async fn list_page_matches_exact_views_for_one_hundred_executions() {
     }
 }
 
+/// Batched retention can remove a terminal run's probe command before its health event.
+#[tokio::test]
+async fn list_keeps_terminal_run_with_pruned_control_probe() {
+    let home = common::Home::new();
+    let neighbor = admit(&home, home.request(), json!({}));
+    let run = admit(
+        &home,
+        agent_run_domain::domain::StartRequest {
+            explicit_finish: true,
+            ..home.request()
+        },
+        json!({}),
+    );
+    let mut store = home.store();
+    let attempt = store.create_attempt(&run, "cancelled", &json!({})).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET created_at=201 WHERE id=?",
+            [neighbor.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='cancelled',created_at=100,finished_at=200 WHERE id=?",
+            [run.as_str()],
+        )
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO commands(agent_id,kind,payload_json,state,created_at,completed_at,result_json)
+         VALUES(?,'ping','{}','completed',160,161,'{\"native_alive\":true}')",
+        [run.as_str()],
+    ).unwrap();
+    let command = store.conn.last_insert_rowid();
+    store.conn.execute(
+        "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,160,'worker_ping_state_v1',?)",
+        rusqlite::params![run.as_str(), attempt, json!({
+            "policy": "observe",
+            "checked_at": 160,
+            "progress": 0,
+            "control": {"command": command, "at": 160, "reply": null},
+            "model": null,
+            "reason": null
+        }).to_string()],
+    ).unwrap();
+    assert_eq!(
+        store.health_view(&run).unwrap().unwrap()["control"]["native_alive"],
+        true
+    );
+    store
+        .conn
+        .execute("DELETE FROM commands WHERE id=?", [command])
+        .unwrap();
+
+    let service = Service::new(home.path.clone());
+    let page = service
+        .list_public(Query {
+            offset: 1,
+            limit: 1,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["complete"], true);
+    assert_eq!(page["items"][0]["agent_id"], run.as_str());
+    assert_eq!(page["items"][0]["status"], "cancelled");
+    assert_eq!(page["items"][0]["health"]["state"], "terminal");
+    assert!(page["items"][0]["health"]["control"].is_null());
+
+    let mixed = service.list_public(Query::default()).await.unwrap();
+    assert_eq!(mixed["items"][0]["agent_id"], neighbor.as_str());
+    assert_eq!(mixed["items"][1]["agent_id"], run.as_str());
+}
+
 /// Delivery work must not grow with unrelated event history (SQLite VM budget).
 #[test]
 fn delivery_projection_has_bounded_unrelated_event_work() {
