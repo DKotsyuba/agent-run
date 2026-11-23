@@ -1,7 +1,7 @@
 //! Provider-free regression for lost application-level wakes and bounded ping recovery.
 use agent_run_domain::{
     Error,
-    domain::AgentId,
+    domain::{AgentId, Outcome},
     health::{PingPolicy, PingReply, ReplyState},
 };
 use agent_run_store::Store;
@@ -131,6 +131,50 @@ fn observe_detects_unexplained_idle_without_paid_turns() {
     );
     assert_eq!(store.get(&run).unwrap().status.as_str(), "running");
     assert!(store.worker_finish_intent(&run, false).unwrap().is_none());
+}
+
+/// Missing historical probe rows are optional only after execution ends.
+#[test]
+fn terminal_health_omits_pruned_probes_and_checks_retained_receipts() {
+    let (_home, mut store, run) = running(PingPolicy::Recover);
+    stalled(&mut store, &run);
+    let (model_command, _, reply) = model(&mut store, &run);
+    control(&mut store, &run, 462.0);
+    let control_command: i64 = store
+        .conn
+        .query_row("SELECT MAX(id) FROM commands WHERE kind='ping'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        store.health_view(&run).unwrap().unwrap()["model"]["ping_id"],
+        reply.ping_id
+    );
+    store
+        .conn
+        .execute("DELETE FROM commands WHERE id=?", [model_command])
+        .unwrap();
+    assert!(matches!(
+        store.health_view(&run),
+        Err(Error::Sql(rusqlite::Error::QueryReturnedNoRows))
+    ));
+
+    store
+        .finish(&run, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+    let view = store.health_view(&run).unwrap().unwrap();
+    assert_eq!(view["state"], "terminal");
+    assert!(view["model"].is_null());
+    assert_eq!(view["control"]["native_alive"], true);
+
+    store
+        .conn
+        .execute(
+            "UPDATE commands SET result_json='{' WHERE id=?",
+            [control_command],
+        )
+        .unwrap();
+    assert!(matches!(store.health_view(&run), Err(Error::Json(_))));
 }
 
 /// An explicit pause/historical off mode has no monitor or synthetic model input.
