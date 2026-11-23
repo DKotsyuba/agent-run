@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Keep terminal agents visible in `list_agents` when the health-probe command
+  referenced by their last ping state was removed by retention; previously the
+  whole page failed with `StorageError`. Missing active-run receipts and
+  malformed receipts still surface errors.
+
 ## 0.33.2
 
 - Wait up to three seconds for a terminating predecessor's startup locks
