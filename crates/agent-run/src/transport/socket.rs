@@ -1430,18 +1430,28 @@ where
 {
     use agent_run_core::predecessor::SETTLE_POLL;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    tokio::time::timeout_at(deadline, async {
+    // A listener that kept accepting until the deadline is live: remember the last
+    // accepted connection so a final attempt racing the deadline cannot turn a live
+    // broker into a timeout (seen on loaded macOS runners).
+    let mut accepted: Option<UnixStream> = None;
+    let outcome = tokio::time::timeout_at(deadline, async {
         loop {
             match connect().await {
-                Ok(_) if tokio::time::Instant::now() + SETTLE_POLL < deadline => {
+                Ok(stream) if tokio::time::Instant::now() + SETTLE_POLL < deadline => {
+                    accepted = Some(stream);
                     tokio::time::sleep(SETTLE_POLL).await;
                 }
                 result => return result,
             }
         }
     })
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket probe timed out"))?
+    .await;
+    match outcome {
+        Ok(result) => result,
+        Err(_) => accepted.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "socket probe timed out")
+        }),
+    }
 }
 
 /// Binds one private same-user broker socket under its exclusive startup lock.
@@ -3275,6 +3285,13 @@ mod tests {
         let path = home.path().join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let original = std::fs::symlink_metadata(&path).unwrap();
+        // Serve the socket like a live broker: an unpolled listener can leave the
+        // probe's connect pending on loaded macOS runners until its deadline.
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
         let result = bind_private(&path).await;
         assert!(
             matches!(result, Err(crate::Error::Validation(message)) if message == "another broker is listening")
@@ -3285,7 +3302,7 @@ mod tests {
             (original.dev(), original.ino())
         );
         let _client = UnixStream::connect(path).await.unwrap();
-        listener.accept().await.unwrap();
+        acceptor.abort();
     }
 
     /// A dropped listener leaves a stale inode that a new broker can reclaim.
