@@ -899,7 +899,11 @@ pub(crate) async fn serve_one(
         Ok(()) if grant.run_route.component_store_id != store => {
             Err(DispatchFailure::from(Error::StoreIdentityMismatch))
         }
-        Ok(()) => dispatch_with_peers(service, grant, peers, &request.method, request.params).await,
+        Ok(()) => {
+            // Peer verification matched this pin against the kernel credentials.
+            let service = service.clone().with_peer_uid(admitted_pin.uid);
+            dispatch_with_peers(&service, grant, peers, &request.method, request.params).await
+        }
         Err(_) => Err(DispatchFailure::from(peer_not_authorized())),
     };
     let reply = match response {

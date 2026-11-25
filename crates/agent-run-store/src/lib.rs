@@ -347,16 +347,41 @@ pub(crate) fn touch_session_reference(
     Ok(())
 }
 
-/// Finds or creates a session inside a caller-owned transaction.
+/// Attach a verified owner to the session once. A missing UID leaves existing evidence intact.
+fn record_session_owner(conn: &Connection, session: &str, owner_uid: Option<u32>) -> Result<()> {
+    if let Some(uid) = owner_uid {
+        let changed = conn.execute(
+            "UPDATE orchestrator_sessions SET owner_uid=?1 WHERE id=?2 AND (owner_uid IS NULL OR owner_uid=?1)",
+            params![uid, session],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+    }
+    Ok(())
+}
+
+/// Finds or creates a session without new owner evidence.
 /// New rows use canonical transports; exact existing legacy alias rows remain immutable.
 pub(crate) fn session_for_reference(
     tx: &rusqlite::Connection,
     reference: &domain::OrchestratorRef,
     at: f64,
 ) -> Result<String> {
+    owned_session_for_reference(tx, reference, at, None)
+}
+
+/// Finds or creates a session and records the verified owner inside the caller's transaction.
+pub(crate) fn owned_session_for_reference(
+    tx: &Connection,
+    reference: &domain::OrchestratorRef,
+    at: f64,
+    owner_uid: Option<u32>,
+) -> Result<String> {
     reference.validate()?;
     let transport = reference.canonical_transport()?;
     if let Some(session) = session_id_for_reference(tx, reference)? {
+        record_session_owner(tx, &session, owner_uid)?;
         tx.execute(
             "UPDATE orchestrator_sessions SET external_turn_id=?,last_seen_at=? WHERE id=?",
             params![reference.external_turn_id, at, session],
@@ -365,8 +390,8 @@ pub(crate) fn session_for_reference(
     }
     let candidate = format!("os-{}", uuid::Uuid::new_v4().simple());
     tx.execute(
-        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?)",
-        params![candidate, transport, reference.external_session_id, reference.external_turn_id, at, at],
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at,owner_uid) VALUES(?,?,?,?,?,?,?)",
+        params![candidate, transport, reference.external_session_id, reference.external_turn_id, at, at, owner_uid],
     )?;
     Ok(candidate)
 }
@@ -635,6 +660,17 @@ impl Store<'_> {
         reference: &domain::OrchestratorRef,
         at: f64,
     ) -> Result<String> {
+        self.bind_orchestrator_with_owner(id, reference, at, None)
+    }
+
+    /// Binds an execution and records its kernel-attested owner within the binding transaction.
+    pub(crate) fn bind_orchestrator_with_owner(
+        &mut self,
+        id: &AgentId,
+        reference: &domain::OrchestratorRef,
+        at: f64,
+        owner_uid: Option<u32>,
+    ) -> Result<String> {
         reference.validate()?;
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("binding time must be finite and nonnegative"));
@@ -652,13 +688,14 @@ impl Store<'_> {
             if !session_matches_reference(&tx, &current, reference)? {
                 return Err(invalid("agent orchestration binding is immutable"));
             }
+            record_session_owner(&tx, &current, owner_uid)?;
             touch_session_reference(&tx, &current, reference, at)?;
             crate::service_restart::bind_captured_agent(&tx, id, &current, reference)?;
             delivery::ensure_bound_terminal_notice(&tx, id, &current, at)?;
             tx.commit()?;
             return Ok(current);
         }
-        let session_id = session_for_reference(&tx, reference, at)?;
+        let session_id = owned_session_for_reference(&tx, reference, at, owner_uid)?;
         tx.execute(
             "UPDATE agents SET orchestrator_session_id=? WHERE id=?",
             params![session_id, id.as_str()],

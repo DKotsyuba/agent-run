@@ -34,11 +34,9 @@ pub(super) fn intent(claim: &Claim, config: &BridgeDelivery) -> Result<BridgeInt
         }
         (before.owner.clone(), address)
     } else {
-        let (host, namespace) = match claim.transport.as_str() {
-            "codex_queue" => ("codex", config.codex_store.as_deref()),
-            "claude_uds" => ("claude-code", config.claude_store.as_deref()),
-            _ => return Err(invalid("unsupported Bridge destination transport")),
-        };
+        let (host, namespace) = config
+            .destination(&claim.transport, claim.owner_uid)
+            .ok_or_else(|| invalid("unsupported Bridge destination transport"))?;
         let namespace =
             namespace.ok_or_else(|| invalid("Bridge destination namespace is not configured"))?;
         let encode = |value: &str| value.replace('%', "%25").replace('/', "%2F");
@@ -367,7 +365,7 @@ mod tests {
         let token = directory.join("token");
         std::fs::write(&token, "synthetic-private-producer-credential").unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let config = BridgeDelivery {
+        let mut config = BridgeDelivery {
             registration_socket: directory.join("a.sock"),
             core_socket: directory.join("c.sock"),
             token_file: token,
@@ -375,9 +373,17 @@ mod tests {
             host_id: "host/part".into(),
             codex_store: Some("store%name".into()),
             claude_store: Some("claude-main".into()),
+            stores: Default::default(),
             opencode_store: None,
             opencode_plugin: None,
         };
+        config.stores.insert(
+            "1000".into(),
+            agent_run_config::config::BridgeOwnerStores {
+                claude_code: Some("claude-pluto".into()),
+                codex: Some("codex-pluto".into()),
+            },
+        );
         for (payload, kind, marker) in [
             (
                 NoticePayload::Completion(super::super::Notice::legacy(
@@ -401,6 +407,7 @@ mod tests {
             ),
         ] {
             let mut claim = Claim {
+                owner_uid: None,
                 delivery_id: "ntf_same".into(),
                 lease_owner: "owned".into(),
                 attempt: 1,
@@ -425,6 +432,18 @@ mod tests {
                 claude.address,
                 "host%2Fpart/claude-code/claude-main/session%2Fpart"
             );
+            claim.owner_uid = Some(999);
+            assert_eq!(intent(&claim, &config).unwrap().address, claude.address);
+            claim.owner_uid = Some(1000);
+            assert_eq!(
+                intent(&claim, &config).unwrap().address,
+                "host%2Fpart/claude-code/claude-pluto/session%2Fpart"
+            );
+            claim.transport = "codex_queue".into();
+            assert_eq!(
+                intent(&claim, &config).unwrap().address,
+                "host%2Fpart/codex/codex-pluto/session%2Fpart"
+            );
             assert_eq!(frozen.event_id, claude.event_id);
             assert_eq!(frozen.request_id, claude.request_id);
         }
@@ -448,6 +467,7 @@ mod tests {
             host_id: "local".into(),
             codex_store: Some("codex-main".into()),
             claude_store: None,
+            stores: Default::default(),
             opencode_store: None,
             opencode_plugin: None,
         };

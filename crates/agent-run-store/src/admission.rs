@@ -93,10 +93,12 @@ pub fn admit_with_config_revision(
         identity,
         parent,
         None,
+        None,
     )
 }
 
-/// Admit a legacy continuation for one captured service-restart member.
+/// Admit a legacy start or continuation with optional restart and verified UID evidence.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn admit_with_restart(
     store: &mut Store,
     request: &StartRequest,
@@ -105,6 +107,7 @@ pub(crate) fn admit_with_restart(
     identity: &Value,
     parent: Option<&Record>,
     restart_id: Option<i64>,
+    owner_uid: Option<u32>,
 ) -> Result<(AgentId, bool)> {
     agent_run_domain::domain::nonblank("config_revision", config_revision)?;
     let mut checked = request.clone();
@@ -158,7 +161,7 @@ pub(crate) fn admit_with_restart(
     if let Some(identity) = parent.and_then(|record| record.identity.as_ref()) {
         crate::runtime_storage::refuse_prepared_resume_home(&tx, identity)?;
     }
-    let session = upsert_session(&tx, &checked, accepted_at)?;
+    let session = upsert_session(&tx, &checked, accepted_at, owner_uid)?;
     let id = AgentId::new();
     let summary = checked
         .task
@@ -328,11 +331,12 @@ pub(crate) fn upsert_session(
     tx: &rusqlite::Connection,
     request: &StartRequest,
     accepted_at: f64,
+    owner_uid: Option<u32>,
 ) -> Result<Option<String>> {
     request
         .orchestrator
         .as_ref()
-        .map(|reference| crate::session_for_reference(tx, reference, accepted_at))
+        .map(|reference| crate::owned_session_for_reference(tx, reference, accepted_at, owner_uid))
         .transpose()
 }
 

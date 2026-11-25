@@ -457,9 +457,14 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"agent-run: restart wait recorded; retry after the restart notice."}}),
                 );
             }
-            let bound =
-                crate::hooks::bind::run_hook(&service.home, &hook.payload, &hook.transport, None)
-                    .await?;
+            let bound = crate::hooks::bind::run_hook_with_service(
+                &service.home,
+                &hook.payload,
+                &hook.transport,
+                None,
+                Some(service),
+            )
+            .await?;
             let configured = agent_run_config::provider_config::ProviderConfig::load(&service.home)
                 .map(|(config, _)| config.delivery.bridge.is_some())
                 .or_else(|_| {

@@ -90,6 +90,12 @@ The `PostToolUse` hook on `mcp__agent[-_]run__start` binds a session using
 `claude_uds`. A missing or wrong `--transport` on that hook is the usual
 cause of "the agent ran but never delivered a result back."
 
+On a shared broker, check `bridge_stores` in `agent-run doctor`. The
+`[delivery.bridge.stores]` table maps each orchestrator's Unix UID to its
+`claude-code` and `codex` stores. Bindings without a matching owner and harness
+use `claude_store` or `codex_store`. A notice whose destination has already
+been frozen retains its original address.
+
 ## Delivery attempt evidence
 
 When Bridge delivery retries or fails, inspect

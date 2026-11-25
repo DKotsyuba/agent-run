@@ -712,7 +712,7 @@ fn retention_keeps_service_recovery_and_account_quota_latches() {
     store
         .conn
         .execute(
-            "INSERT INTO orchestrator_sessions VALUES ('unused','fixture','unused',NULL,?,?)",
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES ('unused','fixture','unused',NULL,?,?)",
             params![old, old],
         )
         .unwrap();

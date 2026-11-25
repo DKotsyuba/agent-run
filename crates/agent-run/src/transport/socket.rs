@@ -961,7 +961,7 @@ fn runtime_retention_config(service: &Service, params: &Value) -> Result<Value> 
 
 /// Validates the kernel peer before reading requests or replying to overload.
 /// Operator membership is enforced by pathname DAC, including supplementary groups.
-fn authenticate_socket(stream: &UnixStream, access: SocketAccess) -> Result<()> {
+fn authenticate_socket(stream: &UnixStream, access: SocketAccess) -> Result<u32> {
     let credentials = stream.peer_cred()?;
     match access {
         SocketAccess::Private => {
@@ -976,7 +976,7 @@ fn authenticate_socket(stream: &UnixStream, access: SocketAccess) -> Result<()> 
             }
         }
     }
-    Ok(())
+    Ok(credentials.uid())
 }
 
 /// Uses the normal protocol envelope while fencing private methods before dispatch.
@@ -1116,7 +1116,7 @@ async fn connection(
     options: ServeOptions,
     access: SocketAccess,
 ) -> Result<()> {
-    authenticate_socket(&stream, access)?;
+    let service = service.with_peer_uid(authenticate_socket(&stream, access)?);
     let (input, mut output) = stream.into_split();
     let mut input = BufReader::new(input);
     loop {

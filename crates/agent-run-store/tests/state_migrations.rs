@@ -42,6 +42,32 @@ fn build_fixture(path: &Path, version: i64) -> Connection {
     conn
 }
 
+/// Historical sessions migrate with no fabricated owner evidence.
+#[test]
+fn v43_migration_leaves_existing_orchestrator_owner_unknown() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 43);
+    conn.execute(
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at)
+         VALUES('legacy-owner','claude_uds','historical-chat',1,1)",
+        [],
+    ).unwrap();
+    drop(conn);
+
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+    let owner: Option<u32> = store
+        .conn
+        .query_row(
+            "SELECT owner_uid FROM orchestrator_sessions WHERE id='legacy-owner'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, None);
+    assert_eq!(store.health().unwrap()["schema_version"], VERSION);
+}
+
 fn insert_v1_agents(conn: &Connection) {
     for (index, id) in V1_AGENTS.iter().enumerate() {
         conn.execute(

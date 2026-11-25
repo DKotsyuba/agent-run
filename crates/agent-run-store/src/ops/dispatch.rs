@@ -68,6 +68,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::WorkerTurn
             | K::ObserveWorkerFinishReceipt
             | K::BindOrchestrator
+            | K::BindOrchestratorPeer
             | K::RecordContextComponents
             | K::RecordContextReceipt
             | K::RegisterAccount
@@ -258,6 +259,7 @@ pub(crate) fn local_facts(op: &LocalOp) -> Facts {
     use LocalOp as L;
     let exec = |id: &AgentId| (Some(id.clone()), None, None);
     match op {
+        L::BindOrchestratorPeer(op) => exec(&op.binding.execution),
         L::RecordSupervisorLaunch(op) => exec(&op.execution),
         L::RecordStartupOwner(op) => exec(&op.execution),
         L::BeginSupervisorHandoff(op) => exec(&op.execution),
@@ -285,7 +287,11 @@ pub(crate) fn local_facts(op: &LocalOp) -> Facts {
 }
 
 /// Executes a remote payload inside the open transaction.
-pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
+pub(crate) fn run_remote(
+    store: &mut Store,
+    op: RemoteOp,
+    authority: &WriteAuthority,
+) -> Result<Value> {
     use RemoteOp as R;
     match op {
         R::ClaimStartup(op) => out(store.claim_startup(
@@ -464,7 +470,11 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
             out(store.observe_worker_finish_receipt(&op.execution)?)
         }
         R::BindOrchestrator(op) => {
-            out(store.bind_orchestrator(&op.execution, &op.reference, op.at)?)
+            let uid = match authority {
+                WriteAuthority::Cli { uid, .. } => Some(*uid),
+                _ => None,
+            };
+            out(store.bind_orchestrator_with_owner(&op.execution, &op.reference, op.at, uid)?)
         }
         R::RecordContextComponents(op) => {
             out(store.record_context_components_for_ref(&op.reference, &op.components, op.at)?)
@@ -544,13 +554,22 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
 pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
     use LocalOp as L;
     match op {
+        L::BindOrchestratorPeer(op) => out(store.bind_orchestrator_with_owner(
+            &op.binding.execution,
+            &op.binding.reference,
+            op.binding.at,
+            Some(op.owner_uid),
+        )?),
         L::BeginServiceRestart(op) => out(store.begin_service_restart(&op.request_id, op.at)?),
         L::AdvanceServiceRestart(op) => {
             out(store.advance_service_restart(op.restart_id, &op.boot_id, op.now_ns)?)
         }
-        L::RememberServiceRestartCaller(op) => {
-            out(store.remember_service_restart_caller(op.restart_id, &op.reference)?)
-        }
+        L::RememberServiceRestartCaller(op) => out(store
+            .remember_service_restart_caller_with_owner(
+                op.restart_id,
+                &op.reference,
+                op.owner_uid,
+            )?),
         L::RecoverServiceRestart(op) => out(match op.failed_restart {
             Some(id) => store.recover_service_restart_after_failure(id)?,
             None => store.recover_service_restart()?,
@@ -621,6 +640,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 &op.identity,
                 parent.as_ref(),
                 op.restart_id,
+                op.owner_uid,
             )?;
             out(AdmitStartOutput {
                 agent_id,
@@ -628,18 +648,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             })
         }
         L::AdmitProvider(op) => {
-            let spec = &op.inputs;
-            out(store.admit_provider(
-                &spec.request,
-                &spec.effective,
-                &op.catalog,
-                &spec.authority,
-                &spec.candidates,
-                &spec.identity,
-                spec.global_cap,
-                spec.harness_cap,
-                spec.pinned.as_ref(),
-            )?)
+            out(store.admit_provider_lineage(&op.catalog, &inputs(&op.inputs), None)?)
         }
         L::AdmitBatch(op) => {
             let jobs = op
@@ -774,26 +783,16 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             &op.inspected,
             op.enabled,
         )?),
-        L::AdmitProviderResume(op) => {
-            let spec = &op.inputs;
-            out(store.admit_provider_resume(
-                &spec.request,
-                &spec.effective,
-                &op.catalog,
-                &spec.authority,
-                &spec.candidates,
-                &spec.identity,
-                spec.global_cap,
-                spec.harness_cap,
-                spec.pinned.as_ref(),
-                crate::provider_admission::ProviderResume {
-                    parent: &op.parent,
-                    prefer: &op.prefer,
-                    preflight_digest: op.preflight_digest.as_deref(),
-                    restart_id: op.restart_id,
-                },
-            )?)
-        }
+        L::AdmitProviderResume(op) => out(store.admit_provider_lineage(
+            &op.catalog,
+            &inputs(&op.inputs),
+            Some(crate::provider_admission::ProviderResume {
+                parent: &op.parent,
+                prefer: &op.prefer,
+                preflight_digest: op.preflight_digest.as_deref(),
+                restart_id: op.restart_id,
+            }),
+        )?),
         L::ExpireUnboundDeliveries(op) => {
             out(store.expire_unbound_batch(op.at, Some(EXPIRY_BATCH))?)
         }
@@ -826,6 +825,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
 /// Borrowed admission inputs of an owned specification.
 fn inputs(spec: &AdmissionSpec) -> crate::provider_admission::AdmissionInputs<'_> {
     crate::provider_admission::AdmissionInputs {
+        owner_uid: spec.owner_uid,
         request: &spec.request,
         effective: &spec.effective,
         authority: &spec.authority,

@@ -109,6 +109,7 @@ fn admission_commits_and_replays_by_request() {
     request.request_id = Some("replay-key".into());
     let admit = || {
         LocalOp::from(AdmitStart {
+            owner_uid: None,
             request: request.clone(),
             config: f.home.config.clone(),
             config_revision: "cfg".into(),

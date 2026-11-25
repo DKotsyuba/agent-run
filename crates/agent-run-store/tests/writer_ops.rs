@@ -48,18 +48,18 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has 116 active rows with stable, unique wire ids and
+/// The inventory has 117 active rows with stable, unique wire ids and
 /// unique snake-case names, and row 79 is internal-only. Removed rows keep
 /// their ids reserved: none decodes and none is reused.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 116);
+    assert_eq!(all.len(), 117);
     let reserved = agent_run_store::ops::RESERVED_WIRE_IDS;
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(
             kind.wire_id() as usize,
-            (1..=131)
+            (1..=132)
                 .filter(|id| !reserved.contains(&(*id as u16)))
                 .nth(index)
                 .unwrap()
@@ -79,7 +79,11 @@ fn inventory_is_closed_with_stable_unique_ids() {
         OpKindRef::from_wire_id(131),
         Some(OpKindRef::AdmitManagedEnrollment)
     );
-    assert_eq!(OpKindRef::from_wire_id(132), None);
+    assert_eq!(
+        OpKindRef::from_wire_id(132),
+        Some(OpKindRef::BindOrchestratorPeer)
+    );
+    assert_eq!(OpKindRef::from_wire_id(133), None);
     for retired in [4, 5, 6, 7, 47, 48, 49, 50, 51, 54, 55, 58, 95, 103, 104] {
         assert!(reserved.contains(&retired));
         assert_eq!(OpKindRef::from_wire_id(retired), None);
@@ -89,7 +93,7 @@ fn inventory_is_closed_with_stable_unique_ids() {
         );
     }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 116);
+    assert_eq!(names.len(), 117);
     for removed in [
         "admit_pool",
         "replace_pool_member",
@@ -140,6 +144,7 @@ fn authority_matrix_confines_roles() {
     assert!(OpKindRef::EnqueueCommand.permits(&cli));
     assert!(!OpKindRef::AdmitStart.permits(&cli));
     for kind in [
+        OpKindRef::BindOrchestratorPeer,
         OpKindRef::BeginServiceRestart,
         OpKindRef::RecoverServiceRestart,
         OpKindRef::ClaimServiceRestart,

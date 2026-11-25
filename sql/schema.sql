@@ -7,6 +7,7 @@ CREATE TABLE orchestrator_sessions (
   external_turn_id TEXT,
   created_at REAL NOT NULL,
   last_seen_at REAL NOT NULL,
+  owner_uid INTEGER CHECK (owner_uid BETWEEN 0 AND 4294967295),
   UNIQUE (transport, external_session_id)
 );
 
@@ -1227,4 +1228,4 @@ WHEN EXISTS (
 BEGIN
   DELETE FROM lineage_pool_chat WHERE root_agent_id=COALESCE(NULLIF(OLD.root_agent_id,''),OLD.id);
 END;
-PRAGMA user_version = 43;
+PRAGMA user_version = 44;

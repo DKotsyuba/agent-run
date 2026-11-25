@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Route Bridge completion notices to the store configured for the orchestrator's
+  verified Unix UID. Existing bindings without a UID use the configured fallback
+  store, and doctor reports the per-UID mapping.
+
 ## 0.33.3
 
 - Treat a listener that kept accepting until the probe deadline as a live

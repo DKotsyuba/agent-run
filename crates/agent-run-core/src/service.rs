@@ -223,6 +223,8 @@ impl LaunchIdentity {
 pub struct Service {
     /// Private agent-run home containing configuration and durable state.
     pub home: PathBuf,
+    /// Kernel UID of this API connection, absent for in-process calls.
+    pub(crate) peer_uid: Option<u32>,
     /// Last valid configuration keyed by its exact on-disk SHA-256 revision.
     config: Arc<RwLock<Option<CachedConfig>>>,
     /// Producer lanes of the resident writer; `None` until the broker attaches
@@ -385,6 +387,7 @@ impl Service {
         self.lane("service-restart")?
             .local(
                 agent_run_store::ops::RememberServiceRestartCaller {
+                    owner_uid: self.peer_uid,
                     restart_id,
                     reference,
                 },
@@ -422,8 +425,15 @@ impl Service {
             config: Arc::new(RwLock::new(None)),
             writer: None,
             system_launcher: None,
+            peer_uid: None,
             pool_catalogs: Default::default(),
         }
+    }
+
+    /// Scope a broker facade to the UID verified on one API connection.
+    pub fn with_peer_uid(mut self, uid: u32) -> Self {
+        self.peer_uid = Some(uid);
+        self
     }
 
     /// Attaches the resident writer every mutation of this service goes through.
@@ -793,6 +803,7 @@ impl Service {
                     agent_run_store::ops::AdmitProvider {
                         catalog: catalog.clone(),
                         inputs: agent_run_store::ops::AdmissionSpec {
+                            owner_uid: self.peer_uid,
                             request: request.clone(),
                             effective: effective.clone(),
                             authority: authority.clone(),
@@ -975,6 +986,7 @@ impl Service {
                     id: id.clone(),
                     pool_chat: pool_chat.clone(),
                     inputs: AdmissionInputs {
+                        owner_uid: self.peer_uid,
                         request: &job.request,
                         effective: &job.effective,
                         authority: &job.authority,
@@ -1195,6 +1207,7 @@ impl Service {
                     id: id.clone(),
                     pool_chat: None,
                     inputs: AdmissionInputs {
+                        owner_uid: self.peer_uid,
                         request: &job.request,
                         effective: &job.effective,
                         authority: &job.authority,
@@ -1532,6 +1545,7 @@ impl Service {
             .lane("admission")?
             .local(
                 agent_run_store::ops::AdmitStart {
+                    owner_uid: self.peer_uid,
                     request: request.clone(),
                     config: config.clone(),
                     config_revision: config_revision.to_owned(),
@@ -1740,8 +1754,11 @@ impl Service {
         if display_name.is_some() {
             request.display_name = display_name;
         }
+        let mut service = self.clone();
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
+        } else {
+            service.peer_uid = None;
         }
         request.validate()?;
         let config_revision: String = Store::open(&self.home)?.conn.query_row(
@@ -1754,7 +1771,7 @@ impl Service {
         } else {
             "pending:materialization"
         };
-        match self
+        match service
             .admit(
                 request,
                 &current,
@@ -1838,6 +1855,7 @@ impl Service {
         if display_name.is_some() {
             request.display_name = display_name;
         }
+        let owner_uid = orchestrator.as_ref().and(self.peer_uid);
         let allow_legacy_replay = orchestrator.is_none();
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
@@ -2100,6 +2118,7 @@ impl Service {
                         preflight_digest: preflight_digest.clone(),
                         restart_id,
                         inputs: agent_run_store::ops::AdmissionSpec {
+                            owner_uid,
                             request: request.clone(),
                             effective: effective.clone(),
                             authority: child_authority.clone(),

@@ -704,15 +704,18 @@ impl Store<'_> {
         pinned: Option<&AccountId>,
     ) -> Result<ProviderAdmission> {
         self.admit_provider_lineage(
-            request,
-            effective,
             catalog,
-            authority,
-            candidates,
-            identity,
-            global_cap,
-            harness_cap,
-            pinned,
+            &AdmissionInputs {
+                owner_uid: None,
+                request,
+                effective,
+                authority,
+                candidates,
+                identity,
+                global_cap,
+                harness_cap,
+                pinned,
+            },
             None,
         )
     }
@@ -739,35 +742,36 @@ impl Store<'_> {
         resume: ProviderResume<'_>,
     ) -> Result<ProviderAdmission> {
         self.admit_provider_lineage(
-            request,
-            effective,
             catalog,
-            authority,
-            candidates,
-            identity,
-            global_cap,
-            harness_cap,
-            pinned,
+            &AdmissionInputs {
+                owner_uid: None,
+                request,
+                effective,
+                authority,
+                candidates,
+                identity,
+                global_cap,
+                harness_cap,
+                pinned,
+            },
             Some(resume),
         )
     }
 
     /// Shared body of [`Self::admit_provider`] and
     /// [`Self::admit_provider_resume`]; `resume` is `None` for a new root run.
-    #[allow(clippy::too_many_arguments)]
-    fn admit_provider_lineage(
+    pub(crate) fn admit_provider_lineage(
         &mut self,
-        request: &ProviderStartRequest,
-        effective: &StartRequest,
         catalog: &ProviderCatalog,
-        authority: &ResolvedLaunchAuthority,
-        candidates: &QuotaCandidateSet,
-        identity: &Value,
-        global_cap: usize,
-        harness_cap: Option<usize>,
-        pinned: Option<&AccountId>,
+        inputs: &AdmissionInputs<'_>,
         resume: Option<ProviderResume<'_>>,
     ) -> Result<ProviderAdmission> {
+        let AdmissionInputs {
+            request,
+            effective,
+            candidates,
+            ..
+        } = *inputs;
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let session = admission::replay_session(&tx, effective)?;
         if (effective.orchestrator.is_none() || session.is_some())
@@ -829,21 +833,11 @@ impl Store<'_> {
             }
             None => None,
         };
-        let inputs = AdmissionInputs {
-            request,
-            effective,
-            authority,
-            candidates,
-            identity,
-            global_cap,
-            harness_cap,
-            pinned,
-        };
         let admission = admit_in_tx(
             &tx,
             catalog,
             AgentId::new(),
-            &inputs,
+            inputs,
             resume.zip(lineage.as_ref()),
         )?;
         if let Some(restart) = resume.and_then(|resume| resume.restart_id) {
@@ -864,6 +858,8 @@ impl Store<'_> {
 
 /// Borrowed, trusted inputs of one provider admission.
 pub struct AdmissionInputs<'a> {
+    /// Verified UID for an explicitly supplied orchestrator.
+    pub owner_uid: Option<u32>,
     /// Strict provider request exactly as frozen into the identity.
     pub request: &'a ProviderStartRequest,
     /// Effective storage request derived from it.
@@ -942,6 +938,7 @@ pub(crate) fn admit_in_tx(
     lineage: Option<(ProviderResume<'_>, &lineage::ResumeLineage)>,
 ) -> Result<ProviderAdmission> {
     let AdmissionInputs {
+        owner_uid,
         request,
         effective,
         authority,
@@ -1021,7 +1018,7 @@ pub(crate) fn admit_in_tx(
     )?;
     let at = now();
     candidates.check_quota_decision(at)?;
-    let session = admission::upsert_session(tx, effective, at)?;
+    let session = admission::upsert_session(tx, effective, at, owner_uid)?;
     let attempt_id = format!("att_{}", uuid::Uuid::new_v4().simple());
     let summary: String = request
         .task

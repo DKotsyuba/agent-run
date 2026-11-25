@@ -46,17 +46,40 @@ pub async fn bind(
     reference: OrchestratorRef,
     at: f64,
 ) -> Result<BindResult> {
+    bind_with_service(home, agent_id, reference, at, None).await
+}
+
+/// Bind through the resident writer, using API peer evidence when present.
+async fn bind_with_service(
+    home: &std::path::Path,
+    agent_id: AgentId,
+    reference: OrchestratorRef,
+    at: f64,
+    service: Option<&crate::service::Service>,
+) -> Result<BindResult> {
     let root = Store::open(home)?.get(&agent_id)?.root_agent_id;
-    let session_id = crate::persist::operator_producer(home)
-        .call(
-            agent_run_store::ops::BindOrchestrator {
-                execution: agent_id.clone(),
-                reference,
-                at,
-            },
-            crate::broker_writer::BROKER_BUDGET,
-        )
-        .await?;
+    let binding = agent_run_store::ops::BindOrchestrator {
+        execution: agent_id.clone(),
+        reference,
+        at,
+    };
+    let budget = crate::broker_writer::BROKER_BUDGET;
+    let session_id = match service.and_then(|service| service.peer_uid.map(|uid| (service, uid))) {
+        Some((service, owner_uid)) => {
+            service
+                .lane("hooks")?
+                .local(
+                    agent_run_store::ops::BindOrchestratorPeer { binding, owner_uid },
+                    budget,
+                )
+                .await?
+        }
+        None => {
+            crate::persist::operator_producer(home)
+                .call(binding, budget)
+                .await?
+        }
+    };
     Ok(BindResult {
         agent_id: root,
         run_id: agent_id,
@@ -75,6 +98,17 @@ pub async fn run_hook(
     payload: &Value,
     transport: &str,
     at: Option<f64>,
+) -> Result<BindResult> {
+    run_hook_with_service(home, payload, transport, at, None).await
+}
+
+/// Normalize one hook payload and route the binding through its verified API connection.
+pub(crate) async fn run_hook_with_service(
+    home: &std::path::Path,
+    payload: &Value,
+    transport: &str,
+    at: Option<f64>,
+    service: Option<&crate::service::Service>,
 ) -> Result<BindResult> {
     let agent_hint = payload
         .get("agent_id")
@@ -96,11 +130,12 @@ pub async fn run_hook(
         }
         None => parsed,
     };
-    bind(
+    bind_with_service(
         home,
         execution,
         normalized.reference,
         at.unwrap_or_else(now),
+        service,
     )
     .await
     .map_err(|error| loud(&agent_id, &error))

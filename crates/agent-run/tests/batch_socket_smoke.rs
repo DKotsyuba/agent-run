@@ -836,6 +836,10 @@ async fn supervised_cli_batch_bearer_stays_out_of_transcript_and_mcp() {
 
     let mut mcp_request = request;
     mcp_request["request_id"] = json!("mcp-retained-canary");
+    mcp_request["jobs"][0]["orchestrator"] = json!({
+        "transport": "codex_queue",
+        "external_session_id": "mcp-owner-session"
+    });
     let mcp = mcp_call(&broker.home, "start_batch", &mcp_request).await;
     assert_eq!(mcp["result"]["isError"], false);
     assert_eq!(
@@ -844,6 +848,14 @@ async fn supervised_cli_batch_bearer_stays_out_of_transcript_and_mcp() {
     );
     assert_eq!(mcp["result"]["structuredContent"]["replayed"], false);
     assert!(!mcp.to_string().contains("release_token"));
+    let store = agent_run_store::Store::open(&broker.home).unwrap();
+    let owner: Option<u32> = store.conn.query_row(
+        "SELECT owner_uid FROM orchestrator_sessions WHERE transport='codex_queue' AND external_session_id='mcp-owner-session'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(owner, Some(std::fs::metadata(&broker.home).unwrap().uid()));
 }
 
 /// The local owner can recover a public legacy pin offline, with an exact
