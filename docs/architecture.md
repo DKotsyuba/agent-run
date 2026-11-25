@@ -213,7 +213,35 @@ authority. MCP runs directly; Agent Run has no native message frontend, Claude
 inbox sender, relay inventory/probe or fallback process.
 
 The first lease always selects Bridge, even without deployment configuration.
-Existing authenticated binding and explicit host/store mapping provide the address.
+Run uses the orchestrator UID reported by the Unix socket for start, batch
+start, explicit resume, and hook binding. MCP over stdio reaches the broker
+through the MCP process's socket connection, so the broker sees that process's
+UID. Direct CLI binding uses the writer socket's peer UID. Private managed
+admission uses the authenticated Pool peer's UID for an explicit orchestrator
+reference. The binding records the first verified UID and refuses a conflicting
+UID for the same session.
+
+For shared brokers, configure each owner's Bridge stores in `config.toml`.
+
+```toml
+[delivery.bridge]
+registration_socket = "/path/to/bridge/registration.sock"
+core_socket = "/path/to/bridge/core.sock"
+token_file = "/path/to/protected/delivery-token"
+host_id = "dobi"
+claude_store = "claude-agent-claude"
+codex_store = "codex-agent-codex"
+
+[delivery.bridge.stores]
+1000 = { claude-code = "claude-pluto", codex = "codex-pluto" }
+1001 = { claude-code = "claude-agent-codex", codex = "codex-agent-codex" }
+1002 = { claude-code = "claude-agent-claude", codex = "codex-agent-claude" }
+```
+
+Run selects the store for the bound UID and harness. A missing UID (including
+migrated bindings), an unmapped UID, or an unmapped harness uses the corresponding
+fallback store. `agent-run doctor` reports the validated configuration in
+`bridge_stores`. The mapping applies when a notice's destination is first frozen.
 Unconfigured notices retain their domain outcome and retry at least 60 seconds apart
 without exhausting the attempt allowance. Previously attempted native rows never
 gain Bridge ownership or new event IDs. Accepted historical facts remain readable;

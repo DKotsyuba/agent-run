@@ -243,6 +243,7 @@ inventory! {
     129 PrepareManagedEnrollment "prepare_managed_enrollment" L C n;
     130 AbortManagedEnrollment "abort_managed_enrollment" L C n;
     131 AdmitManagedEnrollment "admit_managed_enrollment" L N n;
+    132 BindOrchestratorPeer "bind_orchestrator_peer" L N n;
 }
 
 /// Wire ids of removed inventory rows. They are never reused: a frame naming
@@ -372,6 +373,7 @@ op! {
     RegisterAccount => ();
     DisableAccount => ();
     BindOrchestrator => String;
+    BindOrchestratorPeer => String;
     RecordContextComponents => (String, Vec<String>);
     RecordContextReceipt => (String, bool);
     PruneHistoryBatch => Value;
@@ -482,6 +484,7 @@ op_enum! {
     /// authority; all others require `Broker`.
     #[derive(Clone, Serialize)]
     pub enum LocalOp {
+        BindOrchestratorPeer,
         BeginServiceRestart,
         AdvanceServiceRestart,
         RememberServiceRestartCaller,

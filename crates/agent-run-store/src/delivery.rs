@@ -491,10 +491,10 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(None);
         };
-        let (transport, session): (String, String) = tx.query_row(
-            "SELECT transport,external_session_id FROM orchestrator_sessions WHERE id=?",
+        let (transport, session, owner_uid): (String, String, Option<u32>) = tx.query_row(
+            "SELECT transport,external_session_id,owner_uid FROM orchestrator_sessions WHERE id=?",
             [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let transport =
             agent_run_domain::domain::OrchestratorRef::canonical_transport_name(&transport)
@@ -578,6 +578,7 @@ impl Store<'_> {
                 "attempt": attempt,
                 "transport": transport,
                 "session": session,
+                "owner_uid": owner_uid,
                 "payload": payload,
                 "bridge_owned": bridge.is_some(),
                 "bridge_intent": bridge_intent,

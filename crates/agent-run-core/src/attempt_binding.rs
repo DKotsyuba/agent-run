@@ -1910,7 +1910,12 @@ mod tests {
             ],
         );
         std::fs::write(root.join("config.toml"), config(true, "pool_get")).unwrap();
-        let good = request("good");
+        let service = service.with_peer_uid(1000);
+        let mut good = request("good");
+        good["jobs"][0]["spec"]["orchestrator"] = json!({
+            "transport": "claude_uds",
+            "external_session_id": "managed-owner",
+        });
         let (first, second) = tokio::join!(
             crate::attempt_wire::dispatch(
                 &service,
@@ -2010,6 +2015,12 @@ mod tests {
                 .unwrap(),
             1
         );
+        let owner: Option<u32> = stored.conn.query_row(
+            "SELECT owner_uid FROM orchestrator_sessions WHERE transport='claude_uds' AND external_session_id='managed-owner'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(owner, Some(1000));
         drop(stored);
         // Managed pins require the existing authenticated route.
         let pin = first["jobs"][0]["pin_id"].clone();

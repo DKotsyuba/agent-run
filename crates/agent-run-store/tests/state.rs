@@ -20,7 +20,7 @@ use std::{
 /// receipt, producer and authority tables, schema31 Bridge intention ownership,
 /// schema33 binding cooldowns, schema35 restart state, schema36 batch receipts
 /// and history pins, schema37 lineage holds and schema38 launch journal,
-/// schema43 Pool chat lineage metadata, plus WAL and private modes.
+/// schema43 Pool chat lineage metadata and schema44 orchestrator owner UIDs, plus WAL and private modes.
 #[test]
 fn schema_initialization_and_reopen() {
     let h = common::Home::new();

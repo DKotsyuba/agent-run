@@ -632,7 +632,7 @@ impl StoreWriter<'_> {
             kind,
             (execution, attempt, generation),
             checks,
-            |store| crate::ops::dispatch::run_remote(store, op),
+            |store| crate::ops::dispatch::run_remote(store, op, authority),
         )
     }
 
@@ -736,7 +736,7 @@ impl StoreWriter<'_> {
             kind,
             (execution, attempt, generation),
             checks,
-            |store| crate::ops::dispatch::run_remote(store, op),
+            |store| crate::ops::dispatch::run_remote(store, op, authority),
         )
     }
 

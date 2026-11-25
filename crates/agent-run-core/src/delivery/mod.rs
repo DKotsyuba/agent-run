@@ -331,6 +331,8 @@ struct Claim {
     transport: String,
     /// Bound native session ID; never inferred from cwd or process identity.
     session: String,
+    /// Kernel-attested UID persisted by the binding, if available.
+    owner_uid: Option<u32>,
     /// Frozen domain notice facts selected under the lease.
     payload: Payload,
     /// Retry policy captured before the lease was taken, so a config change
@@ -470,6 +472,7 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             .ok_or_else(|| invalid("invalid claimed attempt"))?,
         transport: required(&claimed, "transport")?,
         session: required(&claimed, "session")?,
+        owner_uid: serde_json::from_value(claimed["owner_uid"].clone())?,
         payload,
         policy,
         bridge_intent: claimed["bridge_intent"]

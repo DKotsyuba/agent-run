@@ -50,6 +50,9 @@ pub struct AdvanceServiceRestart {
 /// Remember the caller of a start refused during a service restart.
 #[derive(Clone, Serialize)]
 pub struct RememberServiceRestartCaller {
+    /// Verified orchestrator UID, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
     /// Exact restart that blocked the request.
     pub restart_id: i64,
     /// Existing host session identity used for later delivery.
@@ -99,6 +102,9 @@ pub struct RefreshServiceRestart {
 /// Owned provider admission inputs (the owned form of `AdmissionInputs`).
 #[derive(Debug, Clone, Serialize)]
 pub struct AdmissionSpec {
+    /// Verified orchestrator UID, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
     /// Strict provider request exactly as frozen into the identity.
     pub request: ProviderStartRequest,
     /// Effective storage request derived from it.
@@ -123,6 +129,7 @@ impl From<crate::provider_admission::AdmissionInputs<'_>> for AdmissionSpec {
     /// authorization, capacity and replay predicates remain writer-rechecked.
     fn from(inputs: crate::provider_admission::AdmissionInputs<'_>) -> Self {
         Self {
+            owner_uid: inputs.owner_uid,
             request: inputs.request.clone(),
             effective: inputs.effective.clone(),
             authority: inputs.authority.clone(),
@@ -138,6 +145,9 @@ impl From<crate::provider_admission::AdmissionInputs<'_>> for AdmissionSpec {
 /// 1 — admit one legacy start request (broker; replay by `request_id`).
 #[derive(Debug, Clone, Serialize)]
 pub struct AdmitStart {
+    /// Verified orchestrator UID, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
     /// Validated start request.
     pub request: StartRequest,
     /// Frozen configuration snapshot used for capacity checks.
@@ -1599,6 +1609,15 @@ pub struct BindOrchestrator {
     pub reference: OrchestratorRef,
     /// Time.
     pub at: f64,
+}
+
+/// Bind through the broker using the API connection's kernel peer credentials.
+#[derive(Debug, Clone, Serialize)]
+pub struct BindOrchestratorPeer {
+    /// The same execution and reference as the direct writer bind.
+    pub binding: BindOrchestrator,
+    /// UID collected from the authenticated API socket.
+    pub owner_uid: u32,
 }
 
 /// 83 — record context components for a session.

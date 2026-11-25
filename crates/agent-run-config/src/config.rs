@@ -207,16 +207,57 @@ pub struct BridgeDelivery {
     pub observation_token_file: Option<PathBuf>,
     /// Trusted Bridge host component, never inferred from a caller or working directory.
     pub host_id: String,
-    /// Explicit Codex store namespace; absent means Codex destinations are unsupported.
+    /// Fallback Codex namespace when the binding has no matching UID entry.
     pub codex_store: Option<String>,
-    /// Explicit Claude Code store namespace; absent means Claude destinations are unsupported.
+    /// Fallback Claude Code namespace when the binding has no matching UID entry.
     pub claude_store: Option<String>,
+    /// Store overrides keyed by the canonical decimal Unix UID of the orchestrator.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stores: BTreeMap<String, BridgeOwnerStores>,
     /// Explicit OpenCode namespace; absence never guesses a return destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_store: Option<String>,
     /// Operator-selected first-party native-context ABI 2 component, sealed into each eligible home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_plugin: Option<OpenCodeBridgePlugin>,
+}
+
+/// Per-harness destinations for one orchestrator UID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeOwnerStores {
+    /// Claude Code store namespace.
+    #[serde(rename = "claude-code", skip_serializing_if = "Option::is_none")]
+    pub claude_code: Option<String>,
+    /// Codex store namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<String>,
+}
+
+impl BridgeDelivery {
+    /// Resolve one supported delivery transport to its Bridge harness and store.
+    pub fn destination(
+        &self,
+        transport: &str,
+        uid: Option<u32>,
+    ) -> Option<(&'static str, Option<&str>)> {
+        let stores = uid.and_then(|uid| self.stores.get(&uid.to_string()));
+        match transport {
+            "claude_uds" => Some((
+                "claude-code",
+                stores
+                    .and_then(|stores| stores.claude_code.as_deref())
+                    .or(self.claude_store.as_deref()),
+            )),
+            "codex_queue" => Some((
+                "codex",
+                stores
+                    .and_then(|stores| stores.codex.as_deref())
+                    .or(self.codex_store.as_deref()),
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// First-party OpenCode lifecycle and protected MCP assets, independent of arbitrary runtime plugins.
@@ -250,6 +291,12 @@ impl BridgeDelivery {
             || self.codex_store.is_none()
                 && self.claude_store.is_none()
                 && self.opencode_store.is_none()
+                && self.stores.is_empty()
+            || self.stores.iter().any(|(uid, stores)| {
+                uid.parse::<u32>()
+                    .map_or(true, |parsed| parsed.to_string() != *uid)
+                    || stores.claude_code.is_none() && stores.codex.is_none()
+            })
             || self.opencode_plugin.as_ref().is_some_and(|component| {
                 !component.package.is_absolute() || !component.hook_command.is_absolute()
             })
@@ -257,6 +304,11 @@ impl BridgeDelivery {
                 .chain(self.codex_store.iter())
                 .chain(self.claude_store.iter())
                 .chain(self.opencode_store.iter())
+                .chain(
+                    self.stores
+                        .values()
+                        .flat_map(|stores| stores.claude_code.iter().chain(&stores.codex)),
+                )
                 .any(|part| {
                     part.trim().is_empty() || part.len() > 256 || part.chars().any(char::is_control)
                 })
@@ -904,4 +956,62 @@ pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) 
         value(v)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bridge_store_tests {
+    use super::BridgeDelivery;
+
+    /// Accept the operator's TOML shape and apply existing namespace validation to overrides.
+    #[test]
+    fn bridge_store_overrides_parse_and_validate() {
+        let prefix = "
+registration_socket = '/bridge/registration.sock'
+core_socket = '/bridge/core.sock'
+token_file = '/protected/delivery-token'
+host_id = 'dobi'
+";
+        let bridge: BridgeDelivery = toml::from_str(&format!(
+            "{prefix}[stores]\n1000 = {{ claude-code = 'claude-pluto', codex = 'codex-pluto' }}"
+        ))
+        .unwrap();
+        bridge.validate().unwrap();
+        assert_eq!(
+            bridge.destination("claude_uds", Some(1000)),
+            Some(("claude-code", Some("claude-pluto")))
+        );
+        assert_eq!(
+            bridge.destination("codex_queue", Some(1000)),
+            Some(("codex", Some("codex-pluto")))
+        );
+        assert_eq!(
+            bridge.destination("claude_uds", None),
+            Some(("claude-code", None))
+        );
+
+        for entry in [
+            "1000 = { claude-code = ' ' }",
+            r#"1000 = { claude-code = "bad\tstore" }"#,
+            "1000 = {}",
+            "01000 = { codex = 'valid' }",
+            "4294967296 = { codex = 'valid' }",
+            "1000 = { claude = 'valid' }",
+        ] {
+            let parsed = toml::from_str::<BridgeDelivery>(&format!("{prefix}[stores]\n{entry}"));
+            assert!(
+                !parsed.is_ok_and(|bridge| bridge.validate().is_ok()),
+                "{entry}"
+            );
+        }
+        let oversized = format!(
+            "{prefix}[stores]\n1000 = {{ codex = '{}' }}",
+            "a".repeat(257)
+        );
+        assert!(
+            toml::from_str::<BridgeDelivery>(&oversized)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
 }

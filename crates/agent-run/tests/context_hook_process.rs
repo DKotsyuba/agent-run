@@ -504,6 +504,14 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
         let home = home().await;
         let id = terminal(home.path());
         let receiver = bridge::start(home.path(), false);
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata(home.path()).unwrap().uid();
+        let config_path = home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            config_path,
+            format!("{config}\n[delivery.bridge.stores]\n{uid} = {{ claude-code = 'claude-hook-owner', codex = 'codex-hook-owner' }}\n"),
+        ).unwrap();
         let context = hook(home.path(), "context", transport, prompt()).await;
         assert_eq!(context.status.code(), Some(0));
         // No active agent and no capacity block: nothing to inject.
@@ -539,6 +547,14 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
             let address = NativeAddress::parse(address).unwrap();
             assert_eq!(address.harness, HarnessName::from(host));
             assert_eq!(address.session, "context-probe");
+            assert_eq!(
+                address.store,
+                if host == Host::ClaudeCode {
+                    "claude-hook-owner"
+                } else {
+                    "codex-hook-owner"
+                }
+            );
         }
         assert_eq!(
             agent_run_core::delivery::dispatch_with_batch(home.path(), 10)
@@ -549,6 +565,60 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
         );
         broker.stop().await;
     }
+}
+
+/// A real API connection pins the kernel UID even when the raw hook claims another owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_hook_bind_records_kernel_peer_uid() {
+    use agent_run::transport::socket::{self, BrokerClient};
+
+    let home = home().await;
+    let id = terminal(home.path());
+    let path = home.path().to_owned();
+    let server = tokio::spawn(async move { socket::serve(&path).await });
+    let client = BrokerClient::new(home.path().join("api.sock"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client.call("ping", None).await.is_ok() {
+                break;
+            }
+            assert!(!server.is_finished(), "fixture broker exited before ping");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let uid = std::fs::metadata(home.path())
+        .map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid()
+        })
+        .unwrap();
+    client
+        .call(
+            "_hook_bind",
+            Some(json!({
+                "transport": "claude_uds",
+                "payload": {
+                    "hook_event_name": "PostToolUse", "session_id": "context-probe",
+                    "tool_response": {"agent_id": id}, "owner_uid": uid.wrapping_add(1),
+                    "store": "untrusted-store"
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let owner: Option<u32> = store.conn.query_row(
+        "SELECT owner_uid FROM orchestrator_sessions WHERE transport='claude_uds' AND external_session_id='context-probe'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(owner, Some(uid));
+    drop(store);
+    server.abort();
+    let _ = server.await;
 }
 
 /// Owner-authorized native control using an explicit protected Bridge config and

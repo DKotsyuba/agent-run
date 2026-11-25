@@ -168,6 +168,7 @@ fn admission(home: &common::Home, ordinal: u64) -> agent_run_store::ops::LocalEn
             ns: now + 60_000_000_000,
         },
         agent_run_store::ops::LocalOp::from(agent_run_store::ops::AdmitStart {
+            owner_uid: None,
             request,
             config: home.config.clone(),
             config_revision: "fixture".into(),

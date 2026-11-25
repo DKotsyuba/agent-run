@@ -140,6 +140,9 @@ pub struct Diagnostics {
     pub target: TargetInfo,
     /// Configuration read/parse observation.
     pub config: Check,
+    /// Validated Bridge store overrides and fallback namespaces, without endpoint or credential paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_stores: Option<serde_json::Value>,
     /// Executing sealed release; source builds remain not_checked.
     pub executing_release: ReleaseSummary,
     /// Current installed release, when its pointer exists.
@@ -175,6 +178,7 @@ impl Default for Report {
                     "not read",
                     "run local doctor",
                 ),
+                bridge_stores: None,
                 executing_release: unobserved_release("executing_release"),
                 current_release: unobserved_release("current_release"),
                 resident_compatibility: check(
@@ -587,6 +591,13 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         "configuration parsed without changing it",
         "none",
     );
+    report.diagnostics.bridge_stores = config.delivery.bridge.as_ref().map(|bridge| {
+        serde_json::json!({
+            "stores": bridge.stores,
+            "claude_store": bridge.claude_store,
+            "codex_store": bridge.codex_store,
+        })
+    });
     report.diagnostics.tools = diagnostic_tools(&config, provider_config.as_ref());
     configuration(
         &config,
@@ -2609,6 +2620,44 @@ readiness={command="/bin/true"}
             ["auth_environment_missing"]
         );
         assert_eq!(findings[0].severity, "warning");
+    }
+
+    /// Doctor reports the validated routes without probing Bridge or disclosing credential paths.
+    #[test]
+    fn doctor_reports_validated_bridge_store_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let config = "
+schema_version = 1
+[delivery.bridge]
+registration_socket = '/bridge/register.sock'
+core_socket = '/bridge/core.sock'
+token_file = '/private/protected-token'
+host_id = 'dobi'
+claude_store = 'claude-agent-claude'
+[delivery.bridge.stores]
+";
+        let dependencies = Dependencies::new(Some(home.path().join("missing-canary")), Vec::new);
+        fs::write(
+            &path,
+            format!("{config}1000 = {{ claude-code = 'claude-pluto' }}"),
+        )
+        .unwrap();
+        let report = run_with(home.path(), &dependencies).unwrap();
+        assert_eq!(report.diagnostics.config.status, CheckStatus::Ok);
+        assert_eq!(
+            report.diagnostics.bridge_stores.unwrap(),
+            serde_json::json!({
+                "stores": {"1000":{"claude-code":"claude-pluto"}},
+                "claude_store": "claude-agent-claude",
+                "codex_store": null
+            })
+        );
+
+        fs::write(path, format!("{config}1000 = {{ claude-code = ' ' }}")).unwrap();
+        let report = run_with(home.path(), &dependencies).unwrap();
+        assert_eq!(report.diagnostics.config.status, CheckStatus::Failed);
+        assert!(report.diagnostics.bridge_stores.is_none());
     }
 
     /// Legacy quota rows never create current findings; unrelated checks stay read-only.

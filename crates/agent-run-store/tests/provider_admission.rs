@@ -122,6 +122,7 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
                 pool_chat: None,
                 id: ids[0].clone(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &first,
                     effective: &first_effective,
                     authority: &authority,
@@ -136,6 +137,7 @@ fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
                 pool_chat: None,
                 id: ids[1].clone(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &second,
                     effective: &second_effective,
                     authority: &authority,
@@ -805,6 +807,7 @@ mod p3 {
                     pool_chat: None,
                     id: ids[i].clone(),
                     inputs: AdmissionInputs {
+                        owner_uid: None,
                         request: &requests[i],
                         effective: &effective[i],
                         authority: &authority,
@@ -1006,6 +1009,7 @@ mod p3 {
                     pool_chat: None,
                     id: old_id.clone(),
                     inputs: AdmissionInputs {
+                        owner_uid: None,
                         request: &request,
                         effective: &effective,
                         authority: &authority,
@@ -1062,6 +1066,7 @@ mod p3 {
                 pool_chat: None,
                 id: candidate_id.clone(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &next,
                     effective: &next_effective,
                     authority: &authority,
@@ -1188,6 +1193,7 @@ mod p3 {
                     pool_chat: None,
                     id: ids[i].clone(),
                     inputs: AdmissionInputs {
+                        owner_uid: None,
                         request: &requests[i],
                         effective: &effective[i],
                         authority: &authority,
@@ -1286,6 +1292,7 @@ mod p3 {
                 pool_chat: None,
                 id: old_id.clone(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &old_request,
                     effective: &old_effective,
                     authority: &authority,
@@ -1386,6 +1393,7 @@ mod p3 {
                 pool_chat: None,
                 id: new_id.clone(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &new_request,
                     effective: &new_effective,
                     authority: &authority,
@@ -1448,6 +1456,7 @@ mod p3 {
                         pool_chat: None,
                         id: AgentId::new(),
                         inputs: AdmissionInputs {
+                            owner_uid: None,
                             request: &request,
                             effective: &effective,
                             authority: &authority,
@@ -3107,6 +3116,7 @@ fn batch_preconditions_fence_resume_and_preserve_replay() {
                 pool_chat: request.jobs[0].pool_chat.as_ref(),
                 id: AgentId::new(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &request.jobs[0].request,
                     effective: &effective,
                     authority: &authority,
@@ -3378,6 +3388,7 @@ fn batch_precondition_restart_pending_blocks_until_resolved() {
                 pool_chat: None,
                 id: AgentId::new(),
                 inputs: AdmissionInputs {
+                    owner_uid: None,
                     request: &request.jobs[0].request,
                     effective: &effective,
                     authority: &authority,

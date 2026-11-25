@@ -225,6 +225,7 @@ fn quota_decision_batch_rolls_back_and_replays_before_guard() {
                     pool_chat: None,
                     id: ids[index].clone(),
                     inputs: AdmissionInputs {
+                        owner_uid: None,
                         request: &requests[index],
                         effective: &effective[index],
                         authority: &authority,

@@ -291,6 +291,16 @@ impl Store<'_> {
         restart_id: i64,
         reference: &OrchestratorRef,
     ) -> Result<()> {
+        self.remember_service_restart_caller_with_owner(restart_id, reference, None)
+    }
+
+    /// Save peer evidence before a restart notice can be queued for this caller.
+    pub(crate) fn remember_service_restart_caller_with_owner(
+        &mut self,
+        restart_id: i64,
+        reference: &OrchestratorRef,
+        owner_uid: Option<u32>,
+    ) -> Result<()> {
         reference.validate()?;
         let transport = reference.canonical_transport()?;
         let tx = WriteTx::begin(&self.conn)?;
@@ -302,6 +312,14 @@ impl Store<'_> {
             )
             .optional()?;
         let phase = phase.ok_or_else(|| invalid("unknown service restart"))?;
+        if owner_uid.is_some() {
+            crate::owned_session_for_reference(
+                &tx,
+                reference,
+                agent_run_domain::domain::now(),
+                owner_uid,
+            )?;
+        }
         tx.execute(
             "INSERT INTO service_restart_recipients(restart_id,transport,external_session_id,tried_start) \
              VALUES(?,?,?,1) ON CONFLICT(restart_id,transport,external_session_id) DO UPDATE SET tried_start=1",
