@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.33.4
+
 - Route Bridge completion notices to the store configured for the orchestrator's
   verified Unix UID. Existing bindings without a UID use the configured fallback
   store, and doctor reports the per-UID mapping.
