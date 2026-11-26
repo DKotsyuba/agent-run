@@ -399,6 +399,8 @@ mod tests {
                     notification_id: "ntf_report".into(),
                     agent_id: agent.clone(),
                     run_id: agent,
+                    name: None,
+                    profile: None,
                     kind: WorkerMessageKind::Risk,
                     message: "review needed".into(),
                 }),

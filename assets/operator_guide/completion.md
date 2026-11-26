@@ -6,7 +6,7 @@ Notice format:
 ```
 agent-run/completion
 
-- ID: {agent_id}
+- Agent: {name} ({profile}) · {agent_id}
 - Status: {status}{failure_block}
 - Runtime/model: {runtime}/{model}:{effort}
 - Notice: [notification {notification_id} v{version}]
@@ -20,6 +20,10 @@ and delivery status. Controls and `answer` select the latest execution once;
 `list_agents` returns one latest view per agent with exact logical pagination.
 `transcript` reads retained history across resumes. Continue pagination with
 the same `agent_id` and cursor; no execution selector is needed.
+
+Notices and views show the supplied display name or a name generated from the
+stable agent ID. The profile is shown in parentheses. Use the ID as the
+selector. Historical completion notices may show only the ID.
 
 A delayed completion describes the event at its creation time; the agent may
 have resumed since then. Check current state before acting on an old worker
@@ -38,7 +42,7 @@ the same receipt. Invalid or missing receipts cannot bind a newer execution.
 
 Legacy execution selectors remain accepted for existing clients but are hidden
 from discovery and help. Frozen notice payloads retain execution IDs for
-validation; rendered completion and worker notices show only the stable ID.
+validation; rendered completion and worker notices use the stable lineage ID.
 Older exact-ID hook payloads retain their original binding behavior.
 
 Reconnect MCP clients with the broker upgrade so binding and rendering agree.

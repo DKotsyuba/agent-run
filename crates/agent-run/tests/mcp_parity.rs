@@ -1181,8 +1181,8 @@ fn long_rpc_ids_are_rejected_before_tool_dispatch() {
     broker.join().unwrap();
 }
 
-/// The same health reason is readable through the actual CLI, Unix socket and
-/// stdio MCP processes; initialization/discovery never starts a model turn.
+/// Health and generated agent identity reach the CLI, Unix socket and stdio MCP.
+/// Initialization and discovery never start a model turn.
 #[test]
 fn health_attention_survives_cli_socket_and_mcp() {
     let mut harness = Harness::new();
@@ -1229,6 +1229,8 @@ fn health_attention_survives_cli_socket_and_mcp() {
         String::from_utf8_lossy(&cli.stderr)
     );
     let page: Value = serde_json::from_slice(&cli.stdout).unwrap();
+    let name = agent_run_domain::agent_name(id.as_str());
+    assert_eq!(page["items"][0]["name"], name);
     assert_eq!(
         page["items"][0]["health"]["reason"],
         "idle_without_wait_source"
@@ -1247,6 +1249,7 @@ fn health_attention_survives_cli_socket_and_mcp() {
     let mut line = String::new();
     BufReader::new(socket).read_line(&mut line).unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["result"]["items"][0]["name"], name);
     assert_eq!(
         response["result"]["items"][0]["health"]["reason"],
         "idle_without_wait_source"
@@ -1257,6 +1260,7 @@ fn health_attention_survives_cli_socket_and_mcp() {
     mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
     let reply=mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agents","arguments":{"active":true,"limit":20}}})).unwrap();
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&format!("{name} (review) · {id}")), "{text}");
     assert!(
         text.contains("health: needs_attention: idle_without_wait_source"),
         "{text}"

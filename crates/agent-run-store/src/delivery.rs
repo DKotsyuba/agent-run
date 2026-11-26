@@ -4,7 +4,7 @@
 //! verdicts within SQLite transactions owned by the calling [`Store`].
 
 use crate::Store;
-use agent_run_domain::{Result, domain::AgentId, error::invalid};
+use agent_run_domain::{Result, agent_name, domain::AgentId, error::invalid};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
@@ -342,7 +342,7 @@ fn bounded(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty() && value.chars().count() <= 128)
 }
 
-/// Payload facts of one claimed delivery, validated from durable rows.
+/// Projects a claimed delivery from durable facts and resolves its display metadata.
 fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> Result<Value> {
     let restart: Option<(String, Option<String>)> = tx
         .query_row(
@@ -366,11 +366,12 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> 
         return Ok(json!({"kind":"restart","notice":message,"before_intent":before}));
     }
     let agent_id = agent_id.ok_or_else(|| invalid("delivery has no agent or restart notice"))?;
-    let root: String = tx.query_row(
-        "SELECT CASE WHEN root_agent_id='' THEN id ELSE root_agent_id END FROM agents WHERE id=?",
+    let (root, display_name, profile): (String, Option<String>, String) = tx.query_row(
+        "SELECT COALESCE(NULLIF(root_agent_id,''),id),display_name,profile FROM agents WHERE id=?",
         [agent_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
+    let name = display_name.unwrap_or_else(|| agent_name(&root));
     let worker: Option<(String, String)> = tx
         .query_row(
             "SELECT kind,message FROM worker_notifications WHERE delivery_id=?",
@@ -390,6 +391,8 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> 
             notification_id: delivery_id.to_owned(),
             agent_id: root.parse()?,
             run_id: agent_id.parse()?,
+            name: Some(name),
+            profile: Some(profile),
             kind,
             message,
         };
@@ -435,6 +438,8 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> 
             "notification_id": delivery_id,
             "agent_id": root,
             "run_id": run,
+            "name": name,
+            "profile": profile,
             "status": status.as_str(),
             "runtime": bounded(Some(runtime)),
             "model": bounded(Some(model)),

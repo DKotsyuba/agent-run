@@ -32,6 +32,12 @@ pub struct Notice {
     /// Exact execution being reported; absent only in legacy stored payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
+    /// Display name captured for this notice, absent in historical payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Execution profile displayed as the agent's role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// Terminal status being reported.
     pub status: Status,
     /// Runtime selector captured at admission, when still displayable.
@@ -256,6 +262,8 @@ impl Notice {
             notification_id: notification_id.into(),
             agent_id,
             run_id: None,
+            name: None,
+            profile: None,
             status,
             runtime: None,
             model: None,
@@ -298,7 +306,7 @@ impl Notice {
         Ok(())
     }
 
-    /// Render lifecycle text using only the stable public agent identity.
+    /// Renders lifecycle text with the stable ID and optional display metadata.
     pub fn render(&self) -> Result<String> {
         self.validate()?;
         let failure = guidance(self.status, self.failure_kind.as_deref())?
@@ -306,9 +314,20 @@ impl Notice {
                 format!("\n- Failure: {kind} — {reason}\n- Advice: {advice}")
             })
             .unwrap_or_default();
+        let agent = self
+            .name
+            .as_deref()
+            .zip(self.profile.as_deref())
+            .map_or_else(
+                || format!("- ID: {}", self.agent_id),
+                |(name, profile)| {
+                    let label =
+                        agent_run_domain::agent_label(name, profile, self.agent_id.as_str());
+                    format!("- Agent: {label}")
+                },
+            );
         Ok(format!(
-            "agent-run/completion\n\n- ID: {}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
-            self.agent_id,
+            "agent-run/completion\n\n{agent}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
             self.status.as_str(),
             failure,
             escaped(self.runtime.as_deref(), "unknown"),
@@ -744,7 +763,8 @@ mod tests {
         assert_eq!(notice.agent_id.as_str(), root);
         assert_eq!(notice.run_id.as_ref().unwrap().as_str(), child);
         let rendered = notice.render().unwrap();
-        assert!(rendered.contains(&format!("- ID: {root}\n")));
+        let name = agent_run_domain::agent_name(root);
+        assert!(rendered.contains(&format!("- Agent: {name} (review) · {root}\n")));
         assert!(!rendered.contains(child));
         let stored_run: String = store
             .conn

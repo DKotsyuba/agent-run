@@ -75,7 +75,7 @@ pub struct AgentView {
     pub mcp: Vec<McpSelectionView>,
     /// Stable logical agent id, unchanged across resumes.
     pub agent_id: AgentId,
-    /// Optional human display label stored at admission; `null` when unnamed.
+    /// Shown lineage name, using the admitted label or a generated fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Legacy execution identity, absent from current public projections.

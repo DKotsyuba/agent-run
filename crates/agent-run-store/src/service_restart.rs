@@ -665,7 +665,7 @@ fn queue_restart_results(conn: &Connection, restart_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Keep one result per recipient; update it only before any delivery attempt.
+/// Formats each recipient’s outcomes with lineage labels before any delivery attempt.
 fn queue_restart_result(
     conn: &Connection,
     restart_id: i64,
@@ -674,7 +674,7 @@ fn queue_restart_result(
 ) -> Result<()> {
     let entries = {
         let mut statement = conn.prepare(
-            "SELECT COALESCE(NULLIF(a.root_agent_id,''),a.id),r.resume_status,r.resume_error \
+            "SELECT COALESCE(NULLIF(a.root_agent_id,''),a.id),r.resume_status,r.resume_error,a.display_name,a.profile \
              FROM service_restart_agents r JOIN agents a ON a.id=r.agent_id \
              JOIN orchestrator_sessions o ON o.id=r.orchestrator_session_id \
              WHERE r.restart_id=? AND r.cancelled_before_restart=0 AND o.external_session_id=? AND \
@@ -685,14 +685,18 @@ fn queue_restart_result(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut message = AFTER_NOTICE.to_owned();
-    for (agent, status, reason) in entries {
+    for (agent, status, reason, display_name, profile) in entries {
+        let name = display_name.unwrap_or_else(|| agent_run_domain::agent_name(&agent));
+        let label = agent_run_domain::agent_label(&name, &profile, &agent);
         message.push_str(&format!(
-            "\n- {agent}: {}",
+            "\n- Agent: {label}: {}",
             resume_result(&status, reason.as_deref())
         ));
     }
