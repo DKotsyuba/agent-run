@@ -2655,3 +2655,208 @@ fn managed_launch_receives_only_the_pool_hook_beside_a_leader_hook() {
     set_hooks(&mut removed, &[&leader_hook]);
     assert!(launch_build_pins(&frozen, &removed, HarnessId::ClaudeCode).is_err());
 }
+
+/// Exercises the sealed Codex config and the normal launch redactor after the
+/// operator's header file is removed. Historical homes have no exporter.
+#[tokio::test]
+async fn codex_otel_is_sealed_and_redacted_at_launch() {
+    use agent_run_adapters::engine_launch::{LaunchKind, SpawnError};
+    use agent_run_config::provider_config::CodexOtel;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let binary = fake_engine(root);
+    fs::write(
+        &binary,
+        "#!/bin/sh\n/bin/cat \"$CODEX_HOME/config.toml\" >&2\n",
+    )
+    .unwrap();
+    let legacy = config(root, &binary);
+    let mut enabled = legacy.clone();
+    let headers_file = root.join("otel-headers");
+    let secret = r#"synthetic-otel-"secret"="#;
+    fs::write(&headers_file, format!("x-stats-token={secret}\n")).unwrap();
+    fs::set_permissions(&headers_file, fs::Permissions::from_mode(0o600)).unwrap();
+    enabled.harnesses.get_mut(&HarnessId::Codex).unwrap().otel = Some(CodexOtel {
+        endpoint: "http://127.0.0.1:4318/v1/logs".into(),
+        protocol: "json".into(),
+        headers_file: headers_file.clone(),
+    });
+    let catalog = catalog(&legacy);
+    let role = role(root, false);
+    let provider: ProviderId = "codex-plus".parse().unwrap();
+    let account = "acct-native".parse().unwrap();
+    let materialize = |config: &ProviderConfig, home: &Path| {
+        materialize_selected(
+            config, &catalog, &provider, "gpt", &account, &role, root, home, root,
+        )
+        .unwrap()
+        .1
+    };
+    let login = root.join("accounts/codex/work");
+    fs::create_dir_all(&login).unwrap();
+    fs::write(login.join("auth.json"), "{}").unwrap();
+    let old_home = root.join("old-run");
+    let new_home = root.join("new-run");
+    let old_digest = materialize(&legacy, &old_home);
+    let new_digest = materialize(&enabled, &new_home);
+    let read = |home: &Path| -> toml::Value {
+        toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap()
+    };
+    assert!(read(&old_home).get("otel").is_none());
+    assert_ne!(old_digest, new_digest);
+    assert_eq!(
+        serde_json::to_value(&read(&new_home)["otel"]).unwrap(),
+        serde_json::json!({
+            "exporter": {"otlp-http": {
+                "endpoint": "http://127.0.0.1:4318/v1/logs",
+                "protocol": "json",
+                "headers": {"x-stats-token": secret},
+            }},
+            "log_user_prompt": false,
+        })
+    );
+    assert_eq!(
+        fs::metadata(new_home.join("config.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    fs::remove_file(headers_file).unwrap();
+    let launch = |config: &ProviderConfig, home: &Path, digest| {
+        let authority = make_authority(
+            &catalog,
+            &provider,
+            "gpt",
+            &role,
+            root,
+            digest,
+            "acct-native",
+        );
+        plan_selected(
+            config,
+            &catalog,
+            &authority,
+            &account,
+            home,
+            root,
+            &BTreeMap::from([("HOME".into(), root.display().to_string())]),
+            &FakeReader,
+            "fixture",
+            None,
+        )
+    };
+    launch(&legacy, &old_home, old_digest.clone()).unwrap();
+    assert!(launch(&enabled, &old_home, old_digest).is_err());
+    let plan = launch(&enabled, &new_home, new_digest).unwrap();
+    assert!(
+        plan.launch
+            .environment
+            .values()
+            .all(|value| !value.contains(secret))
+    );
+    let mut process = match plan.launch_process(
+        LaunchKind::Rpc,
+        &new_home,
+        &enabled.harnesses[&HarnessId::Codex],
+        None,
+    ) {
+        Ok(process) => process,
+        Err(SpawnError::NotStarted(error)) => panic!("fixture launch refused: {error}"),
+        Err(SpawnError::Started(started)) => {
+            started.cleanup_blocking(std::time::Duration::from_secs(2));
+            panic!("fixture launch wrapping failed");
+        }
+    };
+    assert_eq!(process.reap().await, Some(0));
+    assert_eq!(
+        process.redact(&format!("response {secret}")),
+        "response <redacted>"
+    );
+    let tail = process.diagnostic_tail().unwrap();
+    assert!(tail.contains("\"x-stats-token\" = \"<redacted>\""));
+    assert!(!tail.contains("synthetic-otel"));
+}
+
+/// Cross-UID workers can seal and start even when they cannot open the header file.
+#[tokio::test]
+async fn codex_otel_is_skipped_for_cross_uid_workers() {
+    use agent_run_adapters::{
+        engine_launch::{LaunchKind, SpawnError},
+        provider::materialize_selected_for_route,
+    };
+    use agent_run_config::provider_config::CodexOtel;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mut config = config(root, &fake_engine(root));
+    let harness = config.harnesses.get_mut(&HarnessId::Codex).unwrap();
+    harness.otel = Some(CodexOtel {
+        endpoint: "http://127.0.0.1:4318/v1/logs".into(),
+        protocol: "json".into(),
+        headers_file: root.join("unavailable-to-worker"),
+    });
+    // SAFETY: geteuid has no preconditions. Flipping one bit guarantees a distinct UID.
+    let config_owner_uid = Some(unsafe { libc::geteuid() } ^ 1);
+    let catalog = catalog(&config);
+    let role = role(root, false);
+    let provider: ProviderId = "codex-gateway".parse().unwrap();
+    let account = "acct-openai".parse().unwrap();
+    let home = root.join("run");
+    let (_, digest) = materialize_selected_for_route(
+        &config,
+        &catalog,
+        &provider,
+        "gpt",
+        &account,
+        &role,
+        root,
+        &home,
+        root,
+        config_owner_uid,
+    )
+    .unwrap();
+    let native: toml::Value =
+        toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+    assert!(native.get("otel").is_none());
+
+    let authority = make_authority(
+        &catalog,
+        &provider,
+        "gpt",
+        &role,
+        root,
+        digest,
+        "acct-openai",
+    );
+    let plan = plan_selected(
+        &config,
+        &catalog,
+        &authority,
+        &account,
+        &home,
+        root,
+        &BTreeMap::from([("HOME".into(), root.display().to_string())]),
+        &FakeReader,
+        "fixture",
+        None,
+    )
+    .unwrap();
+    let mut process = match plan.launch_process(
+        LaunchKind::Rpc,
+        &home,
+        &config.harnesses[&HarnessId::Codex],
+        config_owner_uid,
+    ) {
+        Ok(process) => process,
+        Err(SpawnError::NotStarted(error)) => panic!("fixture launch refused: {error}"),
+        Err(SpawnError::Started(started)) => {
+            started.cleanup_blocking(std::time::Duration::from_secs(2));
+            panic!("fixture launch wrapping failed");
+        }
+    };
+    assert_eq!(process.reap().await, Some(0));
+}

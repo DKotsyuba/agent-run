@@ -51,6 +51,17 @@ impl Redactor {
         Self { literals }
     }
 
+    /// Includes nonempty secrets supplied outside the child environment.
+    pub(crate) fn add_literals(&mut self, secrets: &[String]) {
+        if !secrets.is_empty() {
+            self.literals
+                .extend(secrets.iter().filter(|value| !value.is_empty()).cloned());
+            self.literals
+                .sort_by_key(|value| std::cmp::Reverse(value.len()));
+            self.literals.dedup();
+        }
+    }
+
     /// Sanitizes text before it enters a transcript or bounded diagnostic tail.
     pub fn redact(&self, text: &str) -> String {
         let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {

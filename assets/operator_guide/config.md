@@ -77,6 +77,12 @@ Resume reads the current flag; retries keep the admitted effective mode. Running
 processes do not change. Other harnesses reject true; reasoning effort is separate.
 Fast uses subscription limits/credits at higher rates.
 
+Use `harnesses.codex.otel` to send worker logs to a local Agent Stats receiver.
+Set an HTTP loopback endpoint, `json` or `binary`, and an absolute path to a
+service-owned `0600` headers file. Run disables user-prompt logging. The
+private worker config contains the literal headers required by Codex, which
+stay frozen with that home. See the [Codex telemetry configuration](../../docs/provider-config-v2.md#codex-worker-telemetry).
+
 Tune an existing harness without overriding managed permissions:
 
 ```toml

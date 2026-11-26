@@ -110,6 +110,54 @@ pub fn inline_toml_value(value: &toml::Value) -> Result<String> {
     }
 }
 
+/// Renders the owned OTLP/HTTP exporter as a native TOML section. Only the
+/// private worker config receives the validated header values.
+pub(crate) fn otel_section(otel: &agent_run_config::provider_config::CodexOtel) -> Result<String> {
+    let mut headers = Vec::new();
+    for (name, value) in otel.read_headers()? {
+        headers.push(format!(
+            "{} = {}",
+            serde_json::to_string(&name)?,
+            serde_json::to_string(&value)?,
+        ));
+    }
+    Ok(format!(
+        "\n[otel]\nexporter = {{ otlp-http = {{ endpoint = {}, protocol = {}, headers = {{ {} }} }} }}\nlog_user_prompt = false\n",
+        serde_json::to_string(&otel.endpoint)?,
+        serde_json::to_string(&otel.protocol)?,
+        headers.join(", "),
+    ))
+}
+
+/// Reads header values from the already verified worker config for launch
+/// redaction. Failures never include native TOML excerpts.
+pub(crate) fn sealed_otel_secrets(home: &Path) -> Result<Vec<String>> {
+    let bytes = agent_run_platform::fs::Dir::open(home)?
+        .read(Path::new("config.toml"), 16 * 1024 * 1024)?;
+    let malformed = || invalid("sealed Codex OTLP headers are malformed");
+    let text = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+    let doc: toml::Table = toml::from_str(text).map_err(|_| malformed())?;
+    let headers = doc
+        .get("otel")
+        .and_then(|otel| otel.get("exporter"))
+        .and_then(|exporter| exporter.get("otlp-http"))
+        .and_then(|http| http.get("headers"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(malformed)?;
+    let mut secrets = Vec::new();
+    for value in headers.values() {
+        let value = value.as_str().ok_or_else(malformed)?;
+        secrets.push(value.to_owned());
+        let quoted = serde_json::to_string(value)?;
+        // A diagnostic may quote the raw TOML line instead of the decoded value.
+        let escaped = &quoted[1..quoted.len() - 1];
+        if escaped != value {
+            secrets.push(escaped.to_owned());
+        }
+    }
+    Ok(secrets)
+}
+
 /// Reads an administrator-provided Projects policy when one is installed.
 fn system_projects() -> Result<Option<toml::Table>> {
     let text = match std::fs::read_to_string("/etc/codex/requirements.toml") {

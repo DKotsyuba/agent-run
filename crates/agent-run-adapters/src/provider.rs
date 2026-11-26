@@ -1,6 +1,6 @@
 //! Provider-aware materialization and launch planning over the supported native harnesses.
 //!
-//! Admission writes one sealed, credential-free runtime home. A later attempt
+//! Admission seals the native runtime home. A later attempt
 //! verifies those bytes and the frozen role before binding its own account.
 
 use crate::{
@@ -74,6 +74,26 @@ pub struct ProviderLaunchPlan {
     pub runtime: Runtime,
     /// Frozen role grants for existing harness echo and stream checks.
     pub profile: Profile,
+}
+
+impl ProviderLaunchPlan {
+    /// Starts the native process with redaction for both environment credentials
+    /// and, when enabled by the frozen harness, secrets in the verified home.
+    pub fn launch_process(
+        &self,
+        kind: crate::engine_launch::LaunchKind,
+        verified_home: &Path,
+        harness: &agent_run_config::provider_config::HarnessConfig,
+        config_owner_uid: Option<u32>,
+    ) -> std::result::Result<crate::io::Process, crate::engine_launch::SpawnError> {
+        let secrets = if harness.otel.is_some() && same_uid_otel(config_owner_uid) {
+            crate::codex::sealed_otel_secrets(verified_home)
+                .map_err(crate::engine_launch::SpawnError::NotStarted)?
+        } else {
+            Vec::new()
+        };
+        crate::io::Process::launch_with_secrets(&self.launch, kind, &secrets)
+    }
 }
 
 /// Returns one v1-shaped runtime solely to reuse the established asset and
@@ -283,7 +303,8 @@ pub fn credential_reference(
 /// `role` must be the admitted canonical role, `workdir` an existing absolute
 /// directory, and `account` an enabled in-scope registered identity. Returns
 /// the digest to persist in `ResolvedLaunchAuthority.assets_sha256`; no
-/// credential value enters the generated files or returned digest. Claude Code
+/// provider credential value enters the generated files. Configured OTLP
+/// headers are sealed only in the private Codex config. Claude Code
 /// plugin skills are allowed only when the frozen role declares them. The
 /// admitted worker-MCP capability also selects explicit-finish lifecycle assets.
 #[allow(clippy::too_many_arguments)]
@@ -297,6 +318,33 @@ pub fn materialize_selected(
     workdir: &Path,
     home: &Path,
     app_home: &Path,
+) -> Result<(Snapshot, Sha256Digest)> {
+    materialize_selected_for_route(
+        config, catalog, provider, model, account, role, workdir, home, app_home, None,
+    )
+}
+
+/// Checks whether the supervisor shares the UID that loaded the Run config.
+/// Local launches have no separate broker identity.
+fn same_uid_otel(config_owner_uid: Option<u32>) -> bool {
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    config_owner_uid.is_none_or(|uid| uid == unsafe { libc::geteuid() })
+}
+
+/// Seals a provider home, omitting OTLP entirely for a cross-UID route.
+/// `config_owner_uid` identifies the broker that loaded the Run config.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_selected_for_route(
+    config: &ProviderConfig,
+    catalog: &ProviderCatalog,
+    provider: &ProviderId,
+    model: &str,
+    account: &AccountId,
+    role: &ResolvedRolePlan,
+    workdir: &Path,
+    home: &Path,
+    app_home: &Path,
+    config_owner_uid: Option<u32>,
 ) -> Result<(Snapshot, Sha256Digest)> {
     let definition = catalog
         .provider(provider)
@@ -350,6 +398,10 @@ pub fn materialize_selected(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid("v2 config snapshot lacks a digest"))?
         .to_owned();
+    let otel = config.harnesses[&definition.harness]
+        .otel
+        .as_ref()
+        .filter(|_| same_uid_otel(config_owner_uid));
     let config = shared(config, role.worker_mcp)?;
     if role_profile
         .mcp
@@ -376,6 +428,7 @@ pub fn materialize_selected(
         &config_sha256,
         &role.skills,
         managed.as_ref(),
+        otel,
     )?;
     Ok((snapshot, Sha256Digest::from_str(&digest)?))
 }

@@ -500,11 +500,11 @@ pub fn materialize(
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
-        config, runtime, request, profile, home, app_home, None, None, None,
+        config, runtime, request, profile, home, app_home, None, None, None, None,
     )
 }
 
-/// Seals provider-specific native settings and nonsecret launch metadata into
+/// Seals provider-specific native settings (including optional Codex telemetry) and launch metadata into
 /// the same verified runtime index as skills, MCP, hooks, and permissions.
 ///
 /// `admitted_skills` are the frozen role's skill identities and content
@@ -525,6 +525,7 @@ pub fn materialize_provider(
     config_sha256: &str,
     admitted_skills: &[ResolvedSkill],
     managed: Option<&super::managed_role::Selection>,
+    codex_otel: Option<&agent_run_config::provider_config::CodexOtel>,
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
         config,
@@ -536,6 +537,7 @@ pub fn materialize_provider(
         Some((provider, native_model, config_sha256)),
         Some(admitted_skills),
         managed,
+        codex_otel,
     )
 }
 
@@ -673,6 +675,7 @@ fn materialize_with_provider(
     provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
     admitted_skills: Option<&[ResolvedSkill]>,
     managed_selection: Option<&super::managed_role::Selection>,
+    codex_otel: Option<&agent_run_config::provider_config::CodexOtel>,
 ) -> Result<(Snapshot, String)> {
     let managed = managed_selection.is_some();
     crate::validate_role(runtime, profile)?;
@@ -697,6 +700,7 @@ fn materialize_with_provider(
     let kind = runtime.kind()?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     super::claude::validate_runtime(runtime, kind)?;
+    let otel = codex_otel.map(super::codex::otel_section).transpose()?;
     if std::fs::symlink_metadata(home.join("skills"))
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
@@ -1042,6 +1046,9 @@ fn materialize_with_provider(
             let mut config_text = native_lines.join("\n");
             config_text.push_str("\n\n");
             config_text.push_str(&text);
+            if let Some(otel) = otel {
+                config_text.push_str(&otel);
+            }
             p.file("config.toml", config_text.as_bytes(), 0o600)?;
             let source_target = if provider.is_some() {
                 None

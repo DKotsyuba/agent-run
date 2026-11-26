@@ -24,6 +24,37 @@ flag. Effective launch flags never alter raw request/replay hashes.
 Codex receives `-c service_tier=fast -c features.fast_mode=true`. Fast has higher
 subscription usage or credit rates; see [OpenAI Fast mode documentation](https://learn.chatgpt.com/docs/agent-configuration/speed).
 
+### Codex worker telemetry
+
+Set `otel` in the existing `[harnesses.codex]` table to export Codex worker
+logs to the local Agent Stats receiver.
+
+```toml
+[harnesses.codex]
+otel = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "json", headers_file = "/absolute/path/to/stats-headers" }
+```
+
+Use an HTTP URL with a loopback IP in `127.0.0.0/8` or `::1`, and select `json`
+or `binary` to match the receiver. Use a trusted local receiver and keep its IP
+in the proxy bypass list if the worker environment configures an HTTP proxy.
+The header file must be a regular file owned by the service user, mode `0600`,
+at most 4096 bytes. Put one header on each line in `name=value` form, such as
+`x-stats-token` followed by an equals sign and the receiver token. Config
+validation and worker home creation must share a UID. Cross-UID workers start
+with telemetry omitted.
+
+Run disables user-prompt logging in the generated `[otel]` section. The Run
+configuration and its stored snapshots carry the header file path. Codex
+requires literal headers in its exporter settings, so the sealed worker
+`config.toml` contains the values and is readable by processes with access to
+that worker home. Use a receiver-scoped token. Run redacts header values from
+worker output and diagnostics. A new seal reads the current header file.
+Existing sealed homes keep their captured settings and token across retries and
+resumes. Omit `otel` to keep default Codex behavior. Native settings cannot
+override the managed `[otel]` section.
+
+### Provider configuration example
+
 ```toml
 schema_version = 2
 

@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Support opt-in Codex worker log export to a loopback Agent Stats receiver,
+  with protected header files and user-prompt logging disabled.
+
 ## 0.34.1
 
 - Admit native Codex accounts with reported paid credits after their plan
