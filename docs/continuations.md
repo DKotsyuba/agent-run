@@ -19,7 +19,7 @@ The usual `--session-transport`, `--session-id` and `--session-turn-id` options
 bind the **new** run's notification to its caller.
 
 MCP and the socket API expose `resume(agent_id, task,
-request_id?, orchestrator?)`, returning the same stable `agent_id`. The broker
+request_id?, orchestrator?, recover_after_crash?)`, returning the same stable `agent_id`. The broker
 continues the latest terminal execution. Old execution identifiers remain
 accepted as aliases; internal rows are never renumbered. `answer` reads the
 latest result, `transcript` spans retained conversation history, and
@@ -50,6 +50,16 @@ refuses that run instead of recovering an earlier ancestor's context.
 
 Terminal status alone does not prove that the previous process stopped. A live
 or unprovable process group blocks continuation; this includes `lost` runs.
+For an unsealed `lost` Claude Code or Codex run, deliberately opt in with
+`--recover-after-crash` on the CLI or `recover_after_crash: true` in the tool
+arguments. Run refuses when it observes a live recorded process or engine
+group. Detached processes missing from ownership checkpoints may remain
+alive. The new native session copies the recorded history, omits an invalid
+final line, and uses the same provider and account. The original stays intact.
+The first turn asks the worker to inspect background work, affected files and
+the worktree. Use the same request ID for a transport retry. If an admitted
+recovery is lost or its copy fails before spawn, retry the latest execution
+with a fresh request ID to reuse the recovery session ID.
 Native runtimes also reject missing histories or busy/mismatched sessions.
 CLI and MCP retry a lost broker acknowledgement once using the same admission
 key; this cannot create a second native turn. There is no automatic replay of an

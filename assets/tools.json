@@ -427,6 +427,10 @@
             "pool_store_id": {"type": "string", "pattern": "^store_[0-9a-f]{32}$"}
           }
         },
+        "recover_after_crash": {
+          "description": "Explicitly recover an unsealed lost Claude Code or Codex session.",
+          "type": "boolean"
+        },
         "request_id": {
           "type": [
             "string",

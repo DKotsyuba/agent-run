@@ -54,6 +54,7 @@ impl Worker {
                         &request.parent,
                         &self.socket,
                         &request.route_fingerprint,
+                        request.recover_after_crash,
                     )
                 } else {
                     Err(agent_run_core::system_launch::ResumePreflightFailure::AccessDenied)

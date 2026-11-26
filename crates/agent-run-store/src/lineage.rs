@@ -31,6 +31,15 @@ pub(crate) fn resume_parent(
     tx: &rusqlite::Connection,
     parent_id: &AgentId,
 ) -> Result<ResumeLineage> {
+    resume_parent_with_crash_authority(tx, parent_id, false)
+}
+
+/// Resolve a lineage after explicit crash authorization using its separate process check.
+pub(crate) fn resume_parent_with_crash_authority(
+    tx: &rusqlite::Connection,
+    parent_id: &AgentId,
+    recover_after_crash: bool,
+) -> Result<ResumeLineage> {
     crate::lineage_holds::require_unheld(tx, parent_id)?;
     let parent = tx.query_row(
         "SELECT * FROM agents WHERE id=?",
@@ -47,7 +56,7 @@ pub(crate) fn resume_parent(
         Some(pgid) => group_is_gone(pgid),
         None => parent.supervisor_pid.is_none(),
     };
-    if !quiescent {
+    if !recover_after_crash && !quiescent {
         return Err(invalid(format!(
             "agent {parent_id} finished but its runtime process is still alive or unprovable; refusing to attach to a session it may own"
         )));

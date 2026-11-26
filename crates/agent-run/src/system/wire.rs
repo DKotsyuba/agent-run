@@ -28,6 +28,8 @@ pub(super) struct ResumePreflight {
     pub operation: PreflightOperation,
     pub parent: AgentId,
     pub route_fingerprint: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recover_after_crash: bool,
 }
 
 /// The worker accepts no caller-supplied private path or snapshot contents.

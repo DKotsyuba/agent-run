@@ -190,6 +190,7 @@ impl crate::service::Service {
         display_name: Option<String>,
         orchestrator: Option<crate::domain::OrchestratorRef>,
         pool_chat: Option<&agent_run_domain::pool_chat::PoolChat>,
+        recover_after_crash: bool,
     ) -> Result<Value> {
         let parent = {
             let store = Store::open(&self.home)?;
@@ -216,8 +217,16 @@ impl crate::service::Service {
             }
         };
         admission(
-            self.resume(&parent.id, task, request_id, display_name, orchestrator)
-                .await?,
+            self.resume_for(
+                &parent.id,
+                task,
+                request_id,
+                display_name,
+                orchestrator,
+                None,
+                recover_after_crash,
+            )
+            .await?,
         )
     }
 }

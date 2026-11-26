@@ -29,6 +29,13 @@ A delayed completion describes the event at its creation time; the agent may
 have resumed since then. Check current state before acting on an old worker
 report.
 
+After a crash (e.g. `systemctl stop/restart` with active agents; use
+`agent-run restart` instead), resume an unsealed `lost` run with
+`recover_after_crash: true` (`--recover-after-crash`). Run refuses while a
+recorded process is live, then continues a copy of the history in a new
+native session; detached processes may escape the check. Retry an
+interrupted recovery with a fresh request ID.
+
 Reuse `request_id` for identical resume retries. CLI/MCP reuse a generated key
 across their bounded reconnect, but separate invocations need a caller-supplied
 key. Replays return the original admission; changed intent conflicts. The

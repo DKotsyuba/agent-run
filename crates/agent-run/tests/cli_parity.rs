@@ -199,7 +199,10 @@ fn python_cli_spec_command_surface_is_present() {
             ),
             "models" => (&[], &["--provider", "--profile", "--model"]),
             "capacity order" => (&[], &["--model"]),
-            "resume" => (&["--timeout"], &["--run-id", "--name"]),
+            "resume" => (
+                &["--timeout"],
+                &["--run-id", "--name", "--recover-after-crash"],
+            ),
             "transcript" => (
                 &[],
                 &[

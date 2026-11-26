@@ -8,12 +8,11 @@
 //! structurally checked, and recorded as root, relative path, length, SHA-256
 //! and record count. OpenCode seals the private SQLite main/WAL plus settled
 //! session/message semantics; its startup rechecks semantics after checkpoints.
-//! A resume and the supervisor handoff first [`verify`]
-//! that recorded seal against the same file; they never mint a new baseline
-//! from whatever history exists later. Every failure is a typed
-//! `continuation_unavailable` refusal; the history is only read.
+//! Ordinary resume and account-switch handoffs [`verify`] that recorded seal
+//! against the same file. Explicit crash recovery checks the recorded session
+//! and copies it to a fresh session, omitting an invalid final JSONL record.
 //!
-//! Structural checks: every record is one complete line of JSON, the session
+//! Seal checks: every record is one complete line of JSON, the session
 //! is named consistently, and native tool calls follow a chronological
 //! lifecycle — each recognized call has a nonempty unique id, each result
 //! answers exactly one earlier pending call, and no call is left pending.
@@ -26,6 +25,9 @@ use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
 };
+
+/// Run-authored notice attached to the first turn of a crash recovery fork.
+pub(crate) const CRASH_RECOVERY_NOTICE: &str = "Agent Run restored a copy of this session after a crash. The last command may have been interrupted and its outcome is unknown. Detached processes may still be running. Before continuing, check background processes and tasks, files touched by the last command, and the worktree state. Then continue the original task.";
 
 /// Largest native history file read for a proof (64 MiB).
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
@@ -179,11 +181,37 @@ pub fn seal(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySea
     if session.is_empty() || session.contains(['/', '\0']) || session.contains("..") {
         return Err(unavailable("native session id is not a plain identifier"));
     }
+    if harness == HarnessId::OpenCode {
+        let root = root
+            .canonicalize()
+            .map_err(|_| unavailable("native session storage is missing"))?;
+        return seal_sqlite(&root, session);
+    }
+    let (root, relative) = locate_jsonl(harness, root, session)?;
+    let bytes = read(&root, &relative)?;
+    let records = check(harness, &bytes, session)?;
+    Ok(HistorySeal {
+        harness,
+        session: session.to_owned(),
+        root,
+        relative,
+        bytes: bytes.len() as u64,
+        sha256: fs::sha256(&bytes),
+        records,
+        sqlite: None,
+    })
+}
+
+/// Locate one native JSONL for a plain session identifier in the harness's storage tree.
+fn locate_jsonl(harness: HarnessId, root: &Path, session: &str) -> Result<(PathBuf, PathBuf)> {
+    if session.is_empty() || session.contains(['/', '\0']) || session.contains("..") {
+        return Err(unavailable("native session id is not a plain identifier"));
+    }
     let root = root
         .canonicalize()
         .map_err(|_| unavailable("native session storage is missing"))?;
     let matches = match harness {
-        HarnessId::OpenCode => return seal_sqlite(&root, session),
+        HarnessId::OpenCode => return Err(unavailable("OpenCode does not use JSONL history")),
         HarnessId::Codex => find(&root, Path::new("sessions"), 4, &|name| {
             name.starts_with("rollout-") && name.ends_with(&format!("-{session}.jsonl"))
         }),
@@ -198,18 +226,105 @@ pub fn seal(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySea
             "native history for the session is ambiguous"
         }));
     };
-    let bytes = read(&root, relative)?;
-    let records = check(harness, &bytes, session)?;
-    Ok(HistorySeal {
-        harness,
-        session: session.to_owned(),
-        root,
-        relative: relative.clone(),
-        bytes: bytes.len() as u64,
-        sha256: fs::sha256(&bytes),
-        records,
-        sqlite: None,
-    })
+    Ok((root, relative.clone()))
+}
+
+/// Publish a bounded native history copy, or validate the same copy on a pre-spawn retry.
+/// The optional flag reports whether a newly published copy needed tail repair.
+pub(crate) fn fork_crash_history(
+    harness: HarnessId,
+    root: &Path,
+    session: &str,
+    fork: &str,
+) -> Result<(PathBuf, Option<bool>)> {
+    if uuid::Uuid::parse_str(fork).is_err() || fork == session {
+        return Err(unavailable("invalid crash recovery session identifier"));
+    }
+    let (root, source) = locate_jsonl(harness, root, session)?;
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| unavailable("native history filename is not UTF-8"))?;
+    let suffix = format!("{session}.jsonl");
+    let prefix = name
+        .strip_suffix(&suffix)
+        .ok_or_else(|| unavailable("native history filename disagrees with its session"))?;
+    let target = source.with_file_name(format!("{prefix}{fork}.jsonl"));
+    let dir = fs::Dir::open(&root)?;
+    if let Some(existing) = dir.optional(&target, MAX_HISTORY_BYTES)? {
+        check_jsonl(harness, &existing, fork, true)?;
+        return Ok((root.join(target), None));
+    }
+
+    let (bytes, repaired) = checked_crash_jsonl(harness, &root, &source, session)?;
+    let mut copy = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            copy.extend(line);
+            continue;
+        }
+        let mut record: Value = serde_json::from_slice(line)?;
+        let id = match harness {
+            HarnessId::ClaudeCode => record.get_mut("sessionId"),
+            HarnessId::Codex if record["type"] == "session_meta" => {
+                record.pointer_mut("/payload/id")
+            }
+            _ => None,
+        };
+        if let Some(id) = id {
+            *id = Value::String(fork.to_owned());
+            serde_json::to_writer(&mut copy, &record)?;
+            copy.push(b'\n');
+        } else {
+            copy.extend(line);
+        }
+    }
+    check_jsonl(harness, &copy, fork, true)?;
+    let temporary = target.with_extension("recovery-pending");
+    dir.write(&temporary, &copy, 0o600)?;
+    let published = dir.rename_entry_no_replace(&temporary, &target);
+    let _ = dir.remove(&temporary);
+    if !published? {
+        return Err(unavailable("the crash recovery session already exists"));
+    }
+    Ok((root.join(target), Some(repaired)))
+}
+
+/// Check whether recovery can safely repair the recorded session, without writing it.
+pub(crate) fn check_crash_history(harness: HarnessId, root: &Path, session: &str) -> Result<()> {
+    let (root, relative) = locate_jsonl(harness, root, session)?;
+    checked_crash_jsonl(harness, &root, &relative, session)?;
+    Ok(())
+}
+
+/// Validate the snapshot after removing an invalid final record, if present.
+fn checked_crash_jsonl(
+    harness: HarnessId,
+    root: &Path,
+    relative: &Path,
+    session: &str,
+) -> Result<(Vec<u8>, bool)> {
+    let mut bytes = read(root, relative)?;
+    let end = bytes.len() - usize::from(bytes.ends_with(b"\n"));
+    let start = bytes[..end]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |i| i + 1);
+    let tail = &bytes[start..end];
+    let changed = if !tail.iter().all(u8::is_ascii_whitespace)
+        && serde_json::from_slice::<Value>(tail).is_err()
+    {
+        bytes.truncate(start);
+        true
+    } else if end == bytes.len() {
+        // A complete record whose newline was interrupted still belongs to the session.
+        bytes.push(b'\n');
+        true
+    } else {
+        false
+    };
+    check_jsonl(harness, &bytes, session, true)?;
+    Ok((bytes, changed))
 }
 
 /// Re-reads the sealed file (anchored at the recorded root, no links, bounded)
@@ -664,6 +779,16 @@ fn find(root: &Path, start: &Path, depth: usize, wanted: &dyn Fn(&str) -> bool) 
 /// Parses complete JSON lines and applies the harness's structural checks;
 /// returns the record count.
 fn check(harness: HarnessId, bytes: &[u8], session: &str) -> Result<usize> {
+    check_jsonl(harness, bytes, session, false)
+}
+
+/// Check chronology and session ownership, allowing pending calls only in crash recovery.
+fn check_jsonl(
+    harness: HarnessId,
+    bytes: &[u8],
+    session: &str,
+    allow_pending: bool,
+) -> Result<usize> {
     if bytes.last() != Some(&b'\n') {
         return Err(unavailable("native history is truncated"));
     }
@@ -677,8 +802,8 @@ fn check(harness: HarnessId, bytes: &[u8], session: &str) -> Result<usize> {
         );
     }
     match harness {
-        HarnessId::Codex => codex(&records, session)?,
-        HarnessId::ClaudeCode => claude(&records, session)?,
+        HarnessId::Codex => codex(&records, session, allow_pending)?,
+        HarnessId::ClaudeCode => claude(&records, session, allow_pending)?,
         HarnessId::OpenCode => return Err(unavailable("OpenCode does not use JSONL history")),
     }
     Ok(records.len())
@@ -695,7 +820,7 @@ enum Tool<'a> {
 /// Checks tool lifecycles chronologically: ids must be nonempty and unique
 /// per call, every result must answer an earlier still-pending call, and no
 /// call may remain pending at the end.
-fn lifecycle<'a>(tools: impl Iterator<Item = Tool<'a>>) -> Result<()> {
+fn lifecycle<'a>(tools: impl Iterator<Item = Tool<'a>>, allow_pending: bool) -> Result<()> {
     let mut state: BTreeMap<&str, bool> = BTreeMap::new();
     for tool in tools {
         match tool {
@@ -719,7 +844,7 @@ fn lifecycle<'a>(tools: impl Iterator<Item = Tool<'a>>) -> Result<()> {
             }
         }
     }
-    if state.values().any(|pending| *pending) {
+    if !allow_pending && state.values().any(|pending| *pending) {
         return Err(unavailable("native history has an unresolved tool call"));
     }
     Ok(())
@@ -729,7 +854,7 @@ fn lifecycle<'a>(tools: impl Iterator<Item = Tool<'a>>) -> Result<()> {
 /// one must); `function_call`/`custom_tool_call`/`local_shell_call` response
 /// items open lifecycles that `function_call_output`/`custom_tool_call_output`
 /// items close, by `call_id`.
-fn codex(records: &[Value], session: &str) -> Result<()> {
+fn codex(records: &[Value], session: &str, allow_pending: bool) -> Result<()> {
     let metas: Vec<&Value> = records
         .iter()
         .filter(|record| record["type"] == "session_meta")
@@ -752,12 +877,13 @@ fn codex(records: &[Value], session: &str) -> Result<()> {
                     _ => None,
                 }
             }),
+        allow_pending,
     )
 }
 
 /// Claude transcript: every recorded session id must match, real tool calls
 /// must close, and API request snapshots may only repeat known tool events.
-fn claude(records: &[Value], session: &str) -> Result<()> {
+fn claude(records: &[Value], session: &str, allow_pending: bool) -> Result<()> {
     let ids: Vec<&Value> = records
         .iter()
         .filter_map(|record| record.get("sessionId"))
@@ -777,6 +903,7 @@ fn claude(records: &[Value], session: &str) -> Result<()> {
                 "tool_result" => Some(Tool::Result(item["tool_use_id"].as_str())),
                 _ => None,
             }),
+        allow_pending,
     )
 }
 
@@ -933,9 +1060,95 @@ fn prove(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySeal> 
 
 #[cfg(test)]
 mod tests {
+    /// Both JSONL formats preserve an unanswered tool call and remove only an invalid tail.
+    #[test]
+    fn crash_history_fork_preserves_the_original_and_pending_calls() {
+        use HarnessId::{ClaudeCode, Codex};
+
+        let cases = [
+            (
+                ClaudeCode,
+                "projects/fixture/session.jsonl",
+                r#"{"sessionId":"session","type":"assistant","message":{"content":[{"type":"tool_use","id":"pending"}]}}"#,
+                "",
+            ),
+            (
+                Codex,
+                "sessions/rollout-fixture-session.jsonl",
+                r#"{"type":"session_meta","payload":{"id":"session"}}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","call_id":"pending"}}"#,
+            ),
+        ];
+        for (harness, relative, first, second) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let prefix = format!("{first}\n{second}\n");
+            let truncated = format!("{prefix}{{\"type\":");
+            for suffix in ["", "\n"] {
+                let original = format!("{truncated}{suffix}");
+                std::fs::write(&path, &original).unwrap();
+                check_crash_history(harness, temp.path(), "session").unwrap();
+                let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                let fork = uuid::Uuid::new_v4().to_string();
+                let (copy, repaired) =
+                    fork_crash_history(harness, temp.path(), "session", &fork).unwrap();
+                assert_eq!(repaired, Some(true));
+                use std::io::Write as _;
+                writer.write_all(b"late append").unwrap();
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    format!("{original}late append")
+                );
+                let retained = fs::read(&copy).unwrap();
+                assert_eq!(
+                    super::check_jsonl(harness, &retained, &fork, true).unwrap(),
+                    if harness == ClaudeCode { 1 } else { 2 }
+                );
+                assert!(String::from_utf8_lossy(&retained).contains("pending"));
+                let (reused, repaired) =
+                    fork_crash_history(harness, temp.path(), "session", &fork).unwrap();
+                assert_eq!((reused, repaired), (copy.clone(), None));
+                assert_eq!(fs::read(&copy).unwrap(), retained);
+                assert!(seal(harness, temp.path(), &fork).is_err());
+            }
+            // A failed publication leaves the identifier available for the next try.
+            fs::write(&path, &truncated).unwrap();
+            let fork = uuid::Uuid::new_v4().to_string();
+            let prefix = if harness == Codex {
+                "rollout-fixture-"
+            } else {
+                ""
+            };
+            let destination = path.with_file_name(format!("{prefix}{fork}.jsonl"));
+            fs::create_dir(&destination).unwrap();
+            assert!(fork_crash_history(harness, temp.path(), "session", &fork).is_err());
+            fs::remove_dir(&destination).unwrap();
+            assert_eq!(
+                fork_crash_history(harness, temp.path(), "session", &fork)
+                    .unwrap()
+                    .0,
+                destination
+            );
+            let interior_corruption = format!("broken\n{truncated}");
+            std::fs::write(&path, &interior_corruption).unwrap();
+            assert!(
+                fork_crash_history(
+                    harness,
+                    temp.path(),
+                    "session",
+                    &uuid::Uuid::new_v4().to_string()
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), interior_corruption);
+        }
+    }
+
     use super::{
-        HarnessId, HistorySeal, Path, opencode_qualified_versions, opencode_version_qualified,
-        prove, seal, verify, verify_opencode_started,
+        HarnessId, HistorySeal, Path, check_crash_history, fork_crash_history,
+        opencode_qualified_versions, opencode_version_qualified, prove, seal, verify,
+        verify_opencode_started,
     };
     use std::fs;
 

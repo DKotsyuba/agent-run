@@ -84,6 +84,12 @@ paths, then run `systemctl --user enable --now agent-run.service`.
 
 ## Planned service restart
 
+With active agents, restart only through `agent-run restart`.
+`systemctl stop` and `systemctl restart` can kill workers. If that leaves a
+Claude Code or Codex run lost with unsealed native history, use `resume`
+with `recover_after_crash: true` or CLI `--recover-after-crash` after
+checking for surviving background work.
+
 Use `agent-run --home ~/.agent-run restart` for the standard systemd unit on
 Linux or launchd job on macOS. For a Linux user unit, add `--systemd-user`;
 `--target` selects a different systemd unit or launchd service target. A shared

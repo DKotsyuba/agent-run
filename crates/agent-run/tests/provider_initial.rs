@@ -353,6 +353,8 @@ fn resident_broker(home: &Path) -> tokio::process::Child {
         .arg("--home")
         .arg(home)
         .args(["api", "serve"])
+        .env_remove("BRIDGE_NATIVE_OWNER_CHANNEL")
+        .env_remove("BRIDGE_NATIVE_OWNER_DIRECTORY")
         .env("FAKE_TOKEN", "synthetic-token")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2776,6 +2778,313 @@ async fn unbound_provider_resume_replays_after_later_legacy_pool_binding() {
     run_to_end(&home, &child_id).await;
 }
 
+/// A private API broker admits only an explicitly authorized, quiescent crash recovery.
+#[tokio::test]
+async fn crash_resume_forks_ordered_claude_history_and_retries_a_pre_spawn_loss() {
+    use agent_run::transport::socket;
+    let (_temp, home) = ordered_claude_home();
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut start = request(&home);
+    start.orchestrator = None;
+    start.account = None;
+    start.task = "fixture:billing".into();
+    let started = socket::client(&home, "start", serde_json::to_value(start).unwrap())
+        .await
+        .unwrap();
+    let parent: AgentId = serde_json::from_value(started["agent_id"].clone()).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let original = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let row = store.get(&parent).unwrap();
+            if row.status.terminal()
+                && matches!(
+                    agent_run_platform::process::observe(
+                        row.supervisor_pid,
+                        row.supervisor_identity.as_deref(),
+                        row.supervisor_birth_time,
+                    ),
+                    agent_run_platform::process::ProcessState::Dead
+                        | agent_run_platform::process::ProcessState::Reused
+                )
+            {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(original.status, Status::Succeeded);
+    let session = original.runtime_session_id.as_deref().unwrap();
+    let seal = attempt_state(&home, &parent)["native_history"]["seal"].clone();
+    let history =
+        Path::new(seal["root"].as_str().unwrap()).join(seal["relative"].as_str().unwrap());
+    assert_eq!(
+        attempts(&home, &parent).len(),
+        2,
+        "fixture must use the ordered account switch"
+    );
+    assert!(!history.starts_with(home.join("accounts/claude/reserve")));
+    let recorded_root: String = store.conn.query_row(
+        "SELECT json_extract(session_facts_json,'$.store') FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
+        [parent.as_str()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(recorded_root, seal["root"].as_str().unwrap());
+    let auth_root = home.join("accounts/claude/reserve/claude-config");
+    // Recreate the older record that named the second account's auth root.
+    store.conn.execute(
+        "UPDATE attempts SET session_facts_json=json_set(session_facts_json,'$.store',?1) WHERE id=(SELECT id FROM attempts WHERE agent_id=?2 ORDER BY number DESC LIMIT 1)",
+        rusqlite::params![auth_root.to_str().unwrap(), parent.as_str()],
+    ).unwrap();
+    let mut prior = fs::read_to_string(&history).unwrap();
+    prior.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"sessionId":session,
+        "type":"assistant","message":{"content":[{"type":"tool_use","id":"interrupted-call"}]}})
+    ));
+    let original_history = format!("{prior}{{\"partial\":");
+    fs::write(&history, &original_history).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='lost' WHERE id=?",
+            [parent.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET adapter_state_json='{}',cleanup_proof_json=NULL WHERE id=(SELECT id FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1)",
+            [parent.as_str()],
+        )
+        .unwrap();
+    let resume =
+        serde_json::json!({"agent_id":parent,"task":"fixture:after-crash","request_id":"recover"});
+    let refused = socket::client(&home, "resume", resume.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("recover_after_crash=true"),
+        "{refused}"
+    );
+
+    let live = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    store.conn.execute(
+        "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=? WHERE id=?",
+        rusqlite::params![live.pid, live.token, live.birth, parent.as_str()],
+    ).unwrap();
+    let mut recover = resume.clone();
+    recover["recover_after_crash"] = serde_json::json!(true);
+    let refused = socket::client(&home, "resume", recover.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("old attempt processes are still alive"),
+        "{refused}"
+    );
+    store.conn.execute(
+        "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=? WHERE id=?",
+        rusqlite::params![original.supervisor_pid, original.supervisor_identity,
+            original.supervisor_birth_time, parent.as_str()],
+    ).unwrap();
+    fs::write(home.join("fixture-hold-crash-history-copied"), "").unwrap();
+    let admitted = socket::client(&home, "resume", recover.clone())
+        .await
+        .unwrap();
+    assert_eq!(admitted["sequence"], 2, "{admitted}");
+    let child: AgentId = store
+        .conn
+        .query_row(
+            "SELECT id FROM agents WHERE parent_agent_id=?",
+            [parent.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let interrupted = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if home.join("fixture-held-crash-history-copied").exists() {
+                break store.get(&child).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let phase: String = store
+        .conn
+        .query_row(
+            "SELECT phase FROM attempts WHERE agent_id=?",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "prepared");
+    let abandoned_fork = interrupted.resume_of_runtime_session_id.as_deref().unwrap();
+    assert!(
+        history
+            .with_file_name(format!("{abandoned_fork}.jsonl"))
+            .is_file()
+    );
+    let pid = interrupted.supervisor_pid.unwrap();
+    // SAFETY: this is the recorded supervisor at the test-owned pre-spawn barrier.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    fs::remove_file(home.join("fixture-hold-crash-history-copied")).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let released: bool = store.conn.query_row(
+                "SELECT ownership_active=0 AND json_extract(cleanup_proof_json,'$.never_spawned')=1 FROM attempts WHERE agent_id=?",
+                [child.as_str()], |row| row.get::<_, Option<bool>>(0),
+            ).unwrap().unwrap_or(false);
+            if released && store.get(&child).unwrap().status == Status::Lost { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.unwrap();
+    // Obstruct the published name to exercise a failed file operation in a
+    // never-spawned recovery, then restore the verified copy for the next retry.
+    let copy = history.with_file_name(format!("{abandoned_fork}.jsonl"));
+    let backup = copy.with_extension("fixture-backup");
+    fs::rename(&copy, &backup).unwrap();
+    fs::create_dir(&copy).unwrap();
+    recover["request_id"] = serde_json::json!("recover-blocked");
+    let admitted = socket::client(&home, "resume", recover.clone())
+        .await
+        .unwrap();
+    assert_eq!(admitted["sequence"], 3);
+    let child: AgentId = store
+        .conn
+        .query_row(
+            "SELECT id FROM agents WHERE parent_agent_id=?",
+            [child.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let row = store.get(&child).unwrap();
+            if row.status.terminal()
+                && matches!(
+                    agent_run_platform::process::observe(
+                        row.supervisor_pid,
+                        row.supervisor_identity.as_deref(),
+                        row.supervisor_birth_time,
+                    ),
+                    agent_run_platform::process::ProcessState::Dead
+                        | agent_run_platform::process::ProcessState::Reused
+                )
+            {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed.status, Status::Failed);
+    assert_eq!(
+        failed.resume_of_runtime_session_id.as_deref(),
+        Some(abandoned_fork)
+    );
+    assert!(failed.runtime_session_id.is_none());
+    fs::remove_dir(&copy).unwrap();
+    fs::rename(backup, copy).unwrap();
+    recover["request_id"] = serde_json::json!("recover-again");
+    let admitted = socket::client(&home, "resume", recover.clone())
+        .await
+        .unwrap();
+    assert_eq!(admitted["sequence"], 4, "{admitted}");
+    let child: AgentId = store
+        .conn
+        .query_row(
+            "SELECT id FROM agents WHERE parent_agent_id=?",
+            [child.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let resumed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let row = store.get(&child).unwrap();
+            if row.status.terminal() {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        resumed.status,
+        Status::Succeeded,
+        "{:?}",
+        resumed.failure_kind
+    );
+    let fork = resumed.runtime_session_id.as_deref().unwrap();
+    assert_ne!(fork, session);
+    assert_eq!(fork, abandoned_fork);
+    assert_eq!(resumed.resume_of_runtime_session_id.as_deref(), Some(fork));
+    let account = |id: &AgentId| -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT selected_account_id FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(account(&parent), account(&child));
+    assert_eq!(fs::read_to_string(&history).unwrap(), original_history);
+    let transcript = fs::read_to_string(history.with_file_name(format!("{fork}.jsonl"))).unwrap();
+    let records: Vec<serde_json::Value> = transcript
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(records.iter().all(|record| record["sessionId"] == fork));
+    let turn = &records[prior.lines().count()];
+    let task = turn["message"]["content"][0]["text"].as_str().unwrap();
+    assert!(task.starts_with("Agent Run restored a copy of this session after a crash."));
+    assert!(task.contains("its outcome is unknown"));
+    assert!(task.contains("Detached processes may still be running"));
+    assert!(task.ends_with("\n\nfixture:after-crash"));
+    assert!(
+        store
+            .last_event(&child, "native_turn_started")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .last_event(&child, "crash_history_recovered")
+            .unwrap()
+            .unwrap()["reused"],
+        true
+    );
+    assert_eq!(
+        socket::client(&home, "resume", recover).await.unwrap()["created"],
+        false
+    );
+    assert!(socket::client(&home, "resume", resume).await.is_err());
+    drop(store);
+    let pid = broker.id().unwrap();
+    // SAFETY: the PID is the test-owned disposable broker.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
 /// Explicit provider resume: unprovable native history refuses with
 /// `continuation_unavailable` and admits nothing; a proven history admits one
 /// child that keeps the parent's authority, assets, runtime home and native
@@ -3525,6 +3834,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
                 None,
                 pinned,
                 ProviderResume {
+                    recover_after_crash: false,
                     parent: &id,
                     prefer: &work,
                     preflight_digest: None,

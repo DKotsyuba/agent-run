@@ -1620,12 +1620,21 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
-        self.resume_for(id, task, request_id, display_name, orchestrator, None)
-            .await
+        self.resume_for(
+            id,
+            task,
+            request_id,
+            display_name,
+            orchestrator,
+            None,
+            false,
+        )
+        .await
     }
 
-    /// Resume an exact terminal execution, optionally as a captured restart member.
-    async fn resume_for(
+    /// Resume an exact terminal execution under the specified continuation authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resume_for(
         &self,
         id: &AgentId,
         task: String,
@@ -1633,9 +1642,12 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
         restart_id: Option<i64>,
+        recover_after_crash: bool,
     ) -> Result<Value> {
         let parent = Store::open(&self.home)?.get(id)?;
-        if !parent.status.terminal() || parent.runtime_session_id.is_none() {
+        if !parent.status.terminal()
+            || (parent.runtime_session_id.is_none() && !recover_after_crash)
+        {
             return Err(invalid(
                 "resume requires a terminal run with a native session ID",
             ));
@@ -1656,10 +1668,14 @@ impl Service {
                     display_name,
                     orchestrator,
                     restart_id,
+                    recover_after_crash,
                 )
                 .await?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
+        }
+        if recover_after_crash {
+            return Err(invalid("recover_after_crash requires a provider run"));
         }
         // Replay of the original resume intent precedes every mutable read, as
         // for a provider run: an old parent's retry finds its one child even
@@ -1832,11 +1848,20 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
-        self.admit_provider_resume_for(parent, task, request_id, display_name, orchestrator, None)
-            .await
+        self.admit_provider_resume_for(
+            parent,
+            task,
+            request_id,
+            display_name,
+            orchestrator,
+            None,
+            false,
+        )
+        .await
     }
 
-    /// Reuse ordinary provider resume admission for one captured restart member.
+    /// Admit a provider continuation with optional restart or crash authority.
+    #[allow(clippy::too_many_arguments)]
     async fn admit_provider_resume_for(
         &self,
         parent: &Record,
@@ -1845,6 +1870,7 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
         restart_id: Option<i64>,
+        recover_after_crash: bool,
     ) -> Result<Value> {
         let frozen = ProviderLaunchIdentity::read(parent)?;
         let mut request = frozen.provider_request.clone();
@@ -1867,7 +1893,12 @@ impl Service {
         let replay = store.replay_provider_resume(parent, &request, allow_legacy_replay)?;
         if let Some(replay) = replay {
             let row = store.get(&replay.agent_id)?;
-            if row.parent_agent_id.as_ref() != Some(&parent.id) {
+            if row.parent_agent_id.as_ref() != Some(&parent.id)
+                || store
+                    .last_event(&row.id, "crash_recovery_admitted")?
+                    .is_some()
+                    != recover_after_crash
+            {
                 return Err(Error::Conflict);
             }
             return Ok(
@@ -1875,6 +1906,31 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        let adapter_state = store.latest_attempt_state(&parent.id)?;
+        let unsealed = matches!(parent.status, Status::Lost | Status::Failed)
+            && serde_json::from_str::<Value>(&adapter_state)
+                .is_ok_and(|state| state["native_history"].is_null())
+            && frozen.authority.harness != agent_run_domain::catalog::HarnessId::OpenCode;
+        if unsealed && parent.status == Status::Lost && !recover_after_crash {
+            return Err(Error::Unsupported(
+                "continuation_unavailable: the parent attempt recorded no native history seal; retry with recover_after_crash=true".into(),
+            ));
+        }
+        let crash_native = if recover_after_crash {
+            if !unsealed {
+                return Err(invalid(
+                    "recover_after_crash requires an unsealed lost Claude Code or Codex run",
+                ));
+            }
+            let (_, native) =
+                agent_run_store::provider_admission::verify_crash_parent(&store.conn, &parent.id)?;
+            if native.harness != frozen.authority.harness {
+                return Err(Error::ExecutionChanged);
+            }
+            Some(native)
+        } else {
+            None
+        };
         drop(store);
         match (&self.system_launcher, &frozen.system_route) {
             (None, None) => {}
@@ -1911,6 +1967,11 @@ impl Service {
         let session = parent
             .runtime_session_id
             .as_deref()
+            .or_else(|| {
+                crash_native
+                    .as_ref()
+                    .and_then(|native| native.session.as_deref())
+            })
             .ok_or_else(|| invalid("resume requires a native session ID"))?;
         let runtime_home = frozen.runtime_home.clone().ok_or_else(|| {
             Error::Unsupported("continuation_unavailable: parent has no sealed runtime home".into())
@@ -1942,7 +2003,7 @@ impl Service {
                     )?
                 };
                 let actual = launcher
-                    .preflight_resume(parent.id.clone(), route.clone())
+                    .preflight_resume(parent.id.clone(), route.clone(), recover_after_crash)
                     .await?;
                 if actual != expected {
                     return Err(Error::ExecutionChanged);
@@ -1962,13 +2023,13 @@ impl Service {
                 })?;
                 None
             };
-        let (prefer, intent, pinned_id, adapter_state): (String, String, Option<String>, String) =
+        let (prefer, intent, pinned_id): (String, String, Option<String>) =
             Store::open(&self.home)?.conn.query_row(
-                "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id,t.adapter_state_json \
+                "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id \
                  FROM attempts t JOIN agents a ON a.id=t.agent_id \
                  WHERE t.agent_id=? ORDER BY t.number DESC LIMIT 1",
                 [parent.id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
         let prefer: agent_run_domain::catalog::AccountId = prefer.parse()?;
         // The current configuration may only narrow the frozen authority.
@@ -2001,7 +2062,11 @@ impl Service {
         let expected_root = (authority.harness == agent_run_domain::catalog::HarnessId::Codex)
             .then_some(runtime_home.as_path());
         if preflight_digest.is_none() {
-            verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+            if let Some(native) = &crash_native {
+                crate::continuity::check_crash_history(native.harness, &native.store, session)?;
+            } else {
+                verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+            }
         }
         let bound: std::collections::BTreeSet<_> = offered
             .bindings
@@ -2028,6 +2093,14 @@ impl Service {
                     || *account == prefer)
         });
         let frozen_catalog = frozen.provider_config.resolve_catalog(accounts)?;
+        if recover_after_crash
+            && offered.connection_for(&prefer, authority.model.as_str())
+                != frozen_catalog
+                    .provider(&authority.provider)
+                    .and_then(|provider| provider.connection_for(&prefer, authority.model.as_str()))
+        {
+            return Err(Error::ExecutionChanged);
+        }
         let hard: std::collections::BTreeSet<_> = frozen_catalog
             .provider(&authority.provider)
             .map(|definition| {
@@ -2035,7 +2108,12 @@ impl Service {
                     .bindings
                     .iter()
                     .map(|binding| binding.account.clone())
-                    .filter(|account| !child_authority.eligible_accounts.contains(account))
+                    // Recovery's first launch is pinned to the historical account.
+                    // Later in-flight failover still uses the usual seal requirement.
+                    .filter(|account| {
+                        !child_authority.eligible_accounts.contains(account)
+                            || (recover_after_crash && *account != prefer)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2116,6 +2194,7 @@ impl Service {
                         parent: parent.id.clone(),
                         prefer: prefer.clone(),
                         preflight_digest: preflight_digest.clone(),
+                        recover_after_crash,
                         restart_id,
                         inputs: agent_run_store::ops::AdmissionSpec {
                             owner_uid,
@@ -2177,6 +2256,7 @@ impl Service {
                 None,
                 None,
                 Some(restart_id),
+                false,
             )
             .await;
         if let Err(error) = &result
@@ -2966,6 +3046,7 @@ pub fn system_resume_preflight(
     parent: &AgentId,
     worker_socket: &std::path::Path,
     route_fingerprint: &str,
+    recover_after_crash: bool,
 ) -> std::result::Result<String, crate::system_launch::ResumePreflightFailure> {
     use crate::system_launch::ResumePreflightFailure as Failure;
     // Only the closed code crosses the socket; the worker's own log keeps the
@@ -2994,10 +3075,6 @@ pub fn system_resume_preflight(
         .runtime_home
         .as_deref()
         .ok_or(Failure::AssetsUnverifiable)?;
-    let session = row
-        .runtime_session_id
-        .as_deref()
-        .ok_or_else(|| history(&"the parent recorded no native session"))?;
     crate::runtime_storage::verify(
         &store,
         &route.private_home,
@@ -3010,8 +3087,24 @@ pub fn system_resume_preflight(
         .map_err(|_| history(&"the parent attempt state is unreadable"))?;
     let expected_root = (frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex)
         .then_some(runtime_home);
-    verify_recorded_history(&state, &frozen, expected_root, session)
-        .map_err(|error| history(&error))?;
+    if recover_after_crash {
+        let (_, native) =
+            agent_run_store::provider_admission::verify_crash_parent(&store.conn, parent)
+                .map_err(|error| history(&error))?;
+        if native.harness != frozen.authority.harness {
+            return Err(Failure::ParentChanged);
+        }
+        let session = native.session.as_deref().ok_or(Failure::ParentChanged)?;
+        crate::continuity::check_crash_history(native.harness, &native.store, session)
+            .map_err(|error| history(&error))?;
+    } else {
+        let session = row
+            .runtime_session_id
+            .as_deref()
+            .ok_or_else(|| history(&"the parent recorded no native session"))?;
+        verify_recorded_history(&state, &frozen, expected_root, session)
+            .map_err(|error| history(&error))?;
+    }
     if agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
         .map_err(|_| Failure::ParentUnverifiable)?
         != before

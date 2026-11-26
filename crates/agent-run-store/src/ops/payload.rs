@@ -312,6 +312,8 @@ fn serialize_release_signature<S: serde::Serializer>(
 /// 3 — admit one explicit provider resume of a terminal parent.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdmitProviderResume {
+    /// Explicit authorization for recovery after a crash.
+    pub recover_after_crash: bool,
     /// Resolved catalog.
     pub catalog: ProviderCatalog,
     /// Admission inputs.

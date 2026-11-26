@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Allow explicit crash recovery of an unsealed lost Claude Code or Codex
+  session. Recovery forks a cleaned copy on the same account and preserves
+  the original transcript. A pre-spawn retry reuses the recovery copy.
+- Document that active agents require `agent-run restart`. Direct systemd
+  stop or restart can kill workers. Recover eligible lost runs with the
+  explicit crash recovery flag.
 - Show the agent's display name and profile beside its stable ID in notices,
   binding confirmations, and agent views. Generate a lineage-stable name when
   no display name is supplied.

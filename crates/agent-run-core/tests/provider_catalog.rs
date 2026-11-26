@@ -142,6 +142,7 @@ impl agent_run_core::system_launch::SystemLauncher for RoutedFixture {
         &self,
         _parent: agent_run_domain::domain::AgentId,
         _route: agent_run_core::system_launch::SystemRoute,
+        _recover_after_crash: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = agent_run_domain::Result<String>> + Send + 'static>,
     > {

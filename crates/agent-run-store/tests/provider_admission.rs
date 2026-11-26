@@ -2949,6 +2949,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             None,
             None,
             ProviderResume {
+                recover_after_crash: false,
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: None,
@@ -3015,6 +3016,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
         None,
         None,
         ProviderResume {
+            recover_after_crash: false,
             parent: &admitted.agent_id,
             prefer: &"acct-a".parse().unwrap(),
             preflight_digest: Some(&stale),
@@ -3048,6 +3050,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             None,
             None,
             ProviderResume {
+                recover_after_crash: false,
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: Some(&current),
@@ -3068,6 +3071,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             None,
             None,
             ProviderResume {
+                recover_after_crash: false,
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: Some(&stale),
@@ -3270,6 +3274,7 @@ fn batch_preconditions_fence_resume_and_preserve_replay() {
                 None,
                 None,
                 ProviderResume {
+                    recover_after_crash: false,
                     parent,
                     prefer: &account,
                     preflight_digest: None,
@@ -3558,6 +3563,7 @@ fn restart_resume_uses_the_existing_provider_admission() {
             None,
             None,
             ProviderResume {
+                recover_after_crash: false,
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: None,

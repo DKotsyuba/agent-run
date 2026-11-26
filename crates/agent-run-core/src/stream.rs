@@ -1928,7 +1928,7 @@ async fn run_inner(
 }
 
 /// Hashes a single text block only when it matches the admitted task and native
-/// input metadata. The supervisor's exact explicit-resume prefix is permitted;
+/// input metadata. The exact Run recovery and explicit-resume prefixes are permitted;
 /// other task substitutions remain sendable for compatibility but prove nothing.
 fn initial_text_sha256(frame: &Value, record: &Record, logical: &Record) -> Option<String> {
     if frame["type"] != "user" || frame["message"]["role"] != "user" {
@@ -1946,15 +1946,24 @@ fn initial_text_sha256(frame: &Value, record: &Record, logical: &Record) -> Opti
     {
         return None;
     }
+    let task =
+        if logical.parent_agent_id.is_some() && logical.resume_of_runtime_session_id.is_some() {
+            text.strip_prefix(crate::continuity::CRASH_RECOVERY_NOTICE)
+                .and_then(|suffix| suffix.strip_prefix("\n\n"))
+                .unwrap_or(text)
+        } else {
+            text
+        };
     let admitted = &logical.request.task;
     let explicit_resume = logical.request.explicit_finish
         && logical.parent_agent_id.is_some()
         && logical.resume_of_runtime_session_id.is_some()
-        && text
+        && task
             .strip_prefix(agent_run_domain::worker::EXPLICIT_RESUME_BOUNDARY)
             .and_then(|suffix| suffix.strip_prefix("\n\n"))
             == Some(admitted.as_str());
-    (text == admitted || explicit_resume).then(|| crate::fs::sha256(text.as_bytes()))
+    (text == admitted || task == admitted || explicit_resume)
+        .then(|| crate::fs::sha256(text.as_bytes()))
 }
 
 /// Only an execution's first attempt may originate its admitted-task proof.
