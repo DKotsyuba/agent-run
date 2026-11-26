@@ -100,3 +100,21 @@ workspace and cannot gain access from paths in the prompt. The role owns write
 permission; the request's compatibility `write` flag cannot narrow or expand it.
 Respect requests to work personally, available capacity and permission refusals.
 Inspect the returned evidence rather than treating a terminal status as acceptance.
+
+## Provider account cooldowns
+
+```sh
+agent-run --home HOME cooldowns list
+agent-run --home HOME cooldowns clear --provider PROVIDER --account ACCOUNT --reason "quota reset confirmed"
+```
+
+Use `--broker-socket SOCKET` with the standard operator endpoint on a shared
+server. The list shows active cooldowns with observation and expiry times in
+Unix seconds. Clearing records the caller's Unix UID, time and reason in the
+broker database. Use a short reason without credentials. Clearing an absent
+binding reports a no-op.
+
+Run can release a quota-exhaustion cooldown during admission when Agent Quota
+reports fresh usable capacity for the requested model, observed after the
+cooldown began. Once capacity returns, use `resume` with the same agent ID to
+continue with its preserved context.

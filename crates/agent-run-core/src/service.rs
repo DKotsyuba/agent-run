@@ -2424,6 +2424,41 @@ impl Service {
         Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
     }
 
+    /// Reads active cooldowns from the broker's read-only store.
+    pub(crate) async fn cooldowns_list(&self) -> Result<Value> {
+        self.read(|store| Ok(json!(store.list_cooldowns()?))).await
+    }
+
+    /// Clears one binding through the sole writer with the authenticated peer UID.
+    pub(crate) async fn cooldowns_clear(
+        &self,
+        provider: agent_run_domain::ProviderId,
+        account: agent_run_domain::catalog::AccountId,
+        reason: String,
+    ) -> Result<Value> {
+        let uid = self
+            .peer_uid
+            .ok_or_else(|| invalid("operator peer identity unavailable"))?;
+        let cleared = self
+            .lane("retention")?
+            .local(
+                agent_run_store::ops::ClearCooldown {
+                    provider: provider.clone(),
+                    account: account.clone(),
+                    reason,
+                    uid,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        let message = if cleared {
+            "Cooldown cleared."
+        } else {
+            "No cooldown recorded for this binding."
+        };
+        Ok(json!({"provider":provider,"account":account,"cleared":cleared,"message":message}))
+    }
+
     /// Lists operator history pins in one bounded read; never discloses the
     /// batch release credential.
     pub async fn history_pins_list(

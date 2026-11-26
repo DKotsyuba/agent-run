@@ -244,6 +244,7 @@ inventory! {
     130 AbortManagedEnrollment "abort_managed_enrollment" L C n;
     131 AdmitManagedEnrollment "admit_managed_enrollment" L N n;
     132 BindOrchestratorPeer "bind_orchestrator_peer" L N n;
+    133 ClearCooldown "clear_cooldown" L N n;
 }
 
 /// Wire ids of removed inventory rows. They are never reused: a frame naming
@@ -280,6 +281,7 @@ op! {
     PrepareManagedEnrollment => crate::managed_enrollment::Record;
     AbortManagedEnrollment => crate::managed_enrollment::Record;
     AdmitManagedEnrollment => crate::managed_enrollment::Admitted;
+    ClearCooldown => bool;
     ReleaseHistoryPin => Option<agent_run_domain::batch::HistoryPinRelease>;
     AcquireLineageHold => crate::lineage_holds::LineageHoldAcquireResult;
     ReleaseLineageHold => Option<crate::lineage_holds::LineageHoldRelease>;
@@ -499,6 +501,7 @@ op_enum! {
         PrepareManagedEnrollment,
         AbortManagedEnrollment,
         AdmitManagedEnrollment,
+        ClearCooldown,
         ReleaseHistoryPin,
         AcquireLineageHold,
         ReleaseLineageHold,

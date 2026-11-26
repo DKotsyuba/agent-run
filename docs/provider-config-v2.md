@@ -212,6 +212,10 @@ binding for one hour. New automatic executions select the next eligible binding
 immediately. The cooldown survives a broker restart and is separate from quota
 measurements: a billing error does not establish a zero balance. After one hour,
 the normal priority order applies again, subject to any independently known quota.
+Admission can release a quota-exhaustion cooldown earlier if Agent Quota has a
+fresh observation newer than the cooldown that shows usable plan capacity for
+the exact provider, account and model. Run records the observation time in its
+release audit and commits it with admission.
 An explicitly pinned account is never redirected; while it is cooling down the
 request is refused with `binding_cooldown` and the remaining wait in seconds.
 Executions already admitted before the failure are not cancelled or retroactively

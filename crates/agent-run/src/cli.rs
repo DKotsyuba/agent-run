@@ -364,6 +364,11 @@ pub enum Command {
         #[command(subcommand)]
         command: HistoryPinsCommand,
     },
+    /// Inspect or clear provider/account cooldowns through the broker.
+    Cooldowns {
+        #[command(subcommand)]
+        command: CooldownsCommand,
+    },
     Resume(Resume),
     Bind(Bind),
     Cancel {
@@ -555,6 +560,25 @@ pub enum Command {
         /// Repeated configured MCP namespaces eligible for the narrow allow decision.
         #[arg(long = "allow-mcp", required = true)]
         allow_mcp: Vec<String>,
+    },
+}
+
+/// Broker commands for provider/account cooldowns.
+#[derive(Subcommand, Debug)]
+pub enum CooldownsCommand {
+    /// List currently active cooldowns.
+    List,
+    /// Clear one cooldown and audit the operator and reason.
+    Clear {
+        /// Provider ID.
+        #[arg(long)]
+        provider: agent_run_domain::ProviderId,
+        /// Global account ID.
+        #[arg(long)]
+        account: agent_run_domain::catalog::AccountId,
+        /// Reason to retain in the audit record.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -1790,6 +1814,7 @@ fn client_command(command: &Command) -> bool {
             | Command::HistoryPins {
                 command: HistoryPinsCommand::List { .. } | HistoryPinsCommand::Release { .. }
             }
+            | Command::Cooldowns { .. }
             | Command::Restart(_)
             | Command::Resume(_)
             | Command::Capabilities { .. }
@@ -2585,6 +2610,20 @@ async fn run_client_command(
                 return Err(Error::Runtime("invalid initial task response".into()));
             }
             (output)(&result)?;
+        }
+        Command::Cooldowns { command } => {
+            let (method, params) = match command {
+                CooldownsCommand::List => ("cooldowns_list", json!({})),
+                CooldownsCommand::Clear {
+                    provider,
+                    account,
+                    reason,
+                } => (
+                    "cooldowns_clear",
+                    json!({"provider":provider,"account":account,"reason":reason}),
+                ),
+            };
+            (output)(&broker.call(method, params).await?)?;
         }
         Command::HistoryPins { command } => {
             let (method, mut params, expected_store_id) = match command {

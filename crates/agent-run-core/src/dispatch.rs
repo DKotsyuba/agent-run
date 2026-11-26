@@ -418,6 +418,26 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
+        "cooldowns_list" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {}
+            let _: Request = args(raw)?;
+            service.cooldowns_list().await
+        }
+        "cooldowns_clear" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                provider: agent_run_domain::ProviderId,
+                account: agent_run_domain::catalog::AccountId,
+                reason: String,
+            }
+            let request: Request = args(raw)?;
+            service
+                .cooldowns_clear(request.provider, request.account, request.reason)
+                .await
+        }
         "_service_restart_begin" => {
             let request: ServiceRestartBegin = args(raw)?;
             Ok(json!({"restart_id":service.begin_service_restart(&request.request_id).await?}))

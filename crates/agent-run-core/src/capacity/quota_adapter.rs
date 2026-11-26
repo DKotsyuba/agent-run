@@ -270,7 +270,22 @@ pub(super) fn score(
                 }
                 let priority = raw * factor;
                 if priority.is_finite() {
-                    known.push((account.clone(), LaneVerdict::Known { priority }, keys));
+                    let recovery_observed_at = snapshot.and_then(|snapshot| {
+                        model.newest_observed_at.filter(|observed| {
+                            model.evidence == quota_client::Evidence::Fresh
+                                && observed.is_finite()
+                                && *observed >= 0.0
+                                && *observed <= snapshot.evaluated_at
+                        })
+                    });
+                    known.push((
+                        account.clone(),
+                        LaneVerdict::Known {
+                            priority,
+                            recovery_observed_at,
+                        },
+                        keys,
+                    ));
                 } else {
                     other.push((account.clone(), LaneVerdict::Overflow, keys));
                 }
@@ -282,10 +297,13 @@ pub(super) fn score(
         }
     }
     known.sort_by(|a, b| {
-        let LaneVerdict::Known { priority: left } = &a.1 else {
+        let LaneVerdict::Known { priority: left, .. } = &a.1 else {
             unreachable!()
         };
-        let LaneVerdict::Known { priority: right } = &b.1 else {
+        let LaneVerdict::Known {
+            priority: right, ..
+        } = &b.1
+        else {
             unreachable!()
         };
         right.total_cmp(left).then_with(|| a.0.cmp(&b.0))

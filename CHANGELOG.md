@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
+  requested model is usable again. Completion notices advise resuming the same
+  agent after capacity returns.
+- Add broker-backed `cooldowns list` and audited `cooldowns clear` for operators.
+
 ## 0.34.1
 
 - Admit native Codex accounts with reported paid credits after their plan

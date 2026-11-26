@@ -1080,6 +1080,7 @@ fn candidates(revision: i64) -> QuotaCandidateSet {
             ],
             multiplier: PositiveFinite::try_from(1.0).unwrap(),
             quota_known: true,
+            recovery_observed_at: None,
         }],
         capacity_revision: revision,
         quota_decision: None,
@@ -3758,6 +3759,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
                 ],
                 multiplier: PositiveFinite::try_from(1.0).unwrap(),
                 quota_known: true,
+                recovery_observed_at: None,
             })
             .collect(),
         capacity_revision: agent_run_store::fixture::open(&home)
@@ -4158,6 +4160,7 @@ async fn codex_late_temporary_root_refusal_releases_the_attempt() {
             physical_keys: vec![physical_key],
             multiplier: PositiveFinite::try_from(1.0).unwrap(),
             quota_known: true,
+            recovery_observed_at: None,
         }],
         capacity_revision: committed(&home),
         quota_decision: None,

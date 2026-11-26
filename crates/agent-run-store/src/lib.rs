@@ -6,6 +6,8 @@ pub mod admission;
 pub mod attempt_binding;
 /// Permanent, atomic receipts for generic batch admission.
 pub mod batch_admission;
+/// Provider/account cooldown inspection and release audit.
+pub mod cooldowns;
 /// Durable delivery outbox rows, binding, expiry, and evidence verdicts.
 pub mod delivery;
 /// Read-only diagnostic and active-context snapshots.

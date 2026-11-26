@@ -537,6 +537,7 @@ fn candidate(id: &str, rank: u32) -> QuotaCandidate {
         physical_keys: vec![PhysicalQuotaKey::new(&account, "tokens").unwrap()],
         multiplier: PositiveFinite::try_from(1.0).unwrap(),
         quota_known: true,
+        recovery_observed_at: None,
     }
 }
 

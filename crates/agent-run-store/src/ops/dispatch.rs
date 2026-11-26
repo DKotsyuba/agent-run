@@ -99,6 +99,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::PrepareManagedEnrollment
             | K::AbortManagedEnrollment
             | K::AdmitManagedEnrollment
+            | K::ClearCooldown
             | K::ReleaseHistoryPin
             | K::AcquireLineageHold
             | K::ReleaseLineageHold
@@ -705,6 +706,9 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                     jobs,
                 },
             )?)
+        }
+        L::ClearCooldown(op) => {
+            out(store.clear_cooldown(&op.provider, &op.account, &op.reason, op.uid)?)
         }
         L::ReleaseHistoryPin(op) => out(store.release_history_pin_scoped(
             &op.pin_id,

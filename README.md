@@ -240,6 +240,12 @@ can recover legacy pins and pins with no saved token using
 Active pins also retain process-ownership evidence and recovery details for the
 lineage. See the [pin release contract](docs/api.md#agent-pool-migration-for-history-pins).
 
+Inspect active provider/account cooldowns with `agent-run --home HOME cooldowns list`.
+After confirming recovery, an operator can clear a binding with
+`agent-run --home HOME cooldowns clear --provider PROVIDER --account ACCOUNT --reason "quota reset confirmed"`.
+The broker records the operator UID, time and reason. Resume quota-exhausted
+work with the same agent ID once capacity returns.
+
 New schema-2 workers receive a separate built-in MCP: `notify_orchestrator`,
 plus `health_reply` and `finish` in explicit-completion mode (research roles
 add `save_report`). Ordinary work MCPs remain profile-controlled.

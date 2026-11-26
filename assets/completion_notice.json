@@ -17,6 +17,10 @@
     }
   },
   "failure_guidance": {
+    "quota_exhausted": {
+      "reason": "The selected account's provider reported that quota was exhausted.",
+      "advice": "After capacity returns, use resume with the same agent_id to continue with the preserved context."
+    },
     "billing_unavailable": {
       "reason": "The selected account's provider reported a billing problem; its current balance is not established by this notice.",
       "advice": "Check billing for that account and the recorded fallback status before retrying or continuing the task."

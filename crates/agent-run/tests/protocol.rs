@@ -413,3 +413,14 @@ fn unknown_failure_categories_render_with_package_owned_default_guidance() {
         "- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood."
     ));
 }
+
+/// A quota failure directs the operator to continue the same logical agent.
+#[test]
+fn quota_exhausted_notice_explains_same_agent_resume() {
+    let mut n = notice();
+    n.status = Status::Failed;
+    n.failure_kind = Some("quota_exhausted".into());
+    let text = n.render().unwrap();
+    assert!(text.contains("- Failure: quota_exhausted — The selected account's provider reported that quota was exhausted."));
+    assert!(text.contains("- Advice: After capacity returns, use resume with the same agent_id to continue with the preserved context."));
+}

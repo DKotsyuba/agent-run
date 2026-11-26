@@ -1944,3 +1944,43 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         0
     );
 }
+
+/// A pre-existing cooldown remains effective when its independent audit table is added.
+#[test]
+fn v44_cooldown_migration_preserves_binding_and_starts_with_empty_audit() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 44);
+    conn.execute(
+        "INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at)
+         VALUES ('acct-test','anthropic','env:TEST_TOKEN','enabled',1,1)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO binding_cooldowns VALUES ('Claude','acct-test','quota_exhausted',1,3601,'synthetic')",
+        [],
+    ).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = open_ro(&path);
+    assert_eq!(
+        agent_run_store::provider_admission::binding_cooldown(
+            &conn,
+            &"Claude".parse().unwrap(),
+            &"acct-test".parse().unwrap(),
+            2.0,
+        )
+        .unwrap(),
+        Some((
+            agent_run_domain::catalog::BindingCooldownReason::QuotaExhausted,
+            3599
+        )),
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM binding_cooldown_releases", [], |r| {
+            r.get::<_, u32>(0)
+        })
+        .unwrap(),
+        0
+    );
+}

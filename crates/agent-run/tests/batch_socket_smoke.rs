@@ -65,6 +65,11 @@ struct Broker {
 impl Broker {
     /// Initializes one synthetic account and waits until the owned socket answers.
     async fn start() -> Self {
+        Self::start_seeded(|_| {}).await
+    }
+
+    /// Inserts supplied fixture state before the broker takes sole writer ownership.
+    async fn start_seeded(seed: impl FnOnce(&Path)) -> Self {
         let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
             .unwrap_or_else(|| std::env::temp_dir().into_os_string());
         let temp = tempfile::Builder::new()
@@ -92,6 +97,7 @@ impl Broker {
         )
         .await;
         assert!(status.success(), "register: {error}");
+        seed(&home);
         let child = command(&home)
             .args(["api", "serve"])
             .env("FAKE_TOKEN", "synthetic-token")
@@ -1739,4 +1745,79 @@ async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
     let still = socket.call("initial_task", Some(current)).await.unwrap();
     assert_eq!(still["state"], "available");
     assert!(still.get("pin_id").is_none());
+}
+
+/// Exercises the shipped CLI, Unix broker and sole writer without starting an engine.
+#[tokio::test]
+async fn cooldowns_cli_lists_and_clears_with_authenticated_audit() {
+    let at = agent_run_domain::domain::now();
+    let broker = Broker::start_seeded(|home| {
+        let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+        db.execute(
+            "INSERT INTO binding_cooldowns VALUES ('glm-user','acct-work','billing_unavailable',?1,?2,'synthetic')",
+            rusqlite::params![at, at + 300.0],
+        ).unwrap();
+    }).await;
+    let (status, stdout, stderr) = cli(&broker.home, &["cooldowns", "list"]).await;
+    assert!(status.success(), "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap(),
+        json!([{
+            "provider":"glm-user","account":"acct-work","reason":"billing_unavailable",
+            "observed_at":at,"blocked_until":at+300.0
+        }])
+    );
+    let socket = broker.home.join("api.sock");
+    let params = [
+        "--broker-socket",
+        socket.to_str().unwrap(),
+        "cooldowns",
+        "clear",
+        "--provider",
+        "glm-user",
+        "--account",
+        "acct-work",
+        "--reason",
+        "billing restored",
+    ];
+    for cleared in [true, false] {
+        let (status, stdout, stderr) = cli(&broker.home, &params).await;
+        assert!(status.success(), "{stderr}");
+        let result: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(result["cleared"], cleared);
+        if !cleared {
+            assert_eq!(result["message"], "No cooldown recorded for this binding.");
+        }
+    }
+    let (status, stdout, stderr) = cli(&broker.home, &["cooldowns", "list"]).await;
+    assert!(status.success(), "{stderr}");
+    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), json!([]));
+    let store = read_store(&broker.home);
+    let audit = store
+        .query_row(
+            "SELECT reason,operator_uid,at,evidence_observed_at FROM binding_cooldown_releases",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(audit.0, "billing restored");
+    // SAFETY: geteuid only reads the calling process's identity.
+    assert_eq!(audit.1, unsafe { libc::geteuid() });
+    assert!((at..=agent_run_domain::domain::now()).contains(&audit.2));
+    assert_eq!(audit.3, None);
+    assert_eq!(
+        store
+            .query_row("SELECT count(*) FROM binding_cooldown_releases", [], |r| {
+                r.get::<_, u32>(0)
+            })
+            .unwrap(),
+        1
+    );
 }
