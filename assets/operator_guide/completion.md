@@ -29,14 +29,12 @@ A delayed completion describes the event at its creation time; the agent may
 have resumed since then. Check current state before acting on an old worker
 report.
 
-For an unsealed `lost` Claude Code or Codex run after a crash, use
-`recover_after_crash: true` on `resume` (`--recover-after-crash` on the CLI).
-Run refuses if a recorded process or engine group is still live. Detached
-processes that escaped the last checkpoint may still run. Check background
-work before authorizing recovery. Run continues a copy in a new native
-session on the same provider and account, preserving the original history.
-If recovery is interrupted or its copy fails before spawn, use a fresh
-request ID on the latest run.
+After a crash (e.g. `systemctl stop/restart` with active agents; use
+`agent-run restart` instead), resume an unsealed `lost` run with
+`recover_after_crash: true` (`--recover-after-crash`). Run refuses while a
+recorded process is live, then continues a copy of the history in a new
+native session; detached processes may escape the check. Retry an
+interrupted recovery with a fresh request ID.
 
 Reuse `request_id` for identical resume retries. CLI/MCP reuse a generated key
 across their bounded reconnect, but separate invocations need a caller-supplied
@@ -121,7 +119,3 @@ retaining internal evidence; malformed stored payloads end only their own
 delivery row with `invalid_payload`, allowing later notices to proceed.
 
 Idle monitoring: `agent-run doc idle-ping`.
-
-With active agents, restart only through `agent-run restart`.
-`systemctl stop` and `systemctl restart` can kill workers. After such a
-crash, use `resume` with `recover_after_crash: true` for an eligible lost run.
