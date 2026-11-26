@@ -212,13 +212,23 @@ the latest terminal execution. Storage still records a physical child:
   (or a recorded reason when no seal was possible; the task outcome is
   unchanged). Resume admission and the supervisor handoff verify that seal
   against the file's exact bytes; a missing seal or any change refuses with
-  `Unsupported` (`continuation_unavailable`) and writes nothing. History is
-  never adopted for the first time during resume.
-- In the admission transaction the parent must be terminal, its process
-  group gone and every attempt cleanup-proven.
-- A failed preparation still needs its own recorded `runtime_session_id` to
-  enter public resume. A child carrying only `resume_of_runtime_session_id`
-  is refused; public resume does not recover context from an earlier ancestor.
+  `Unsupported` (`continuation_unavailable`) unless the operator explicitly
+  requests the crash recovery described below.
+- For a `lost` Claude Code or Codex run whose last attempt has no native
+  history seal, set `recover_after_crash: true` on `resume` or pass
+  `--recover-after-crash` on the CLI. Run refuses when it observes a live
+  recorded supervisor, engine group or descendant. A detached process absent
+  from the last ownership checkpoint may escape detection. Check background
+  work before authorizing recovery.
+- The supervisor copies the history from its recorded storage to a new native
+  session on the same provider and account. The copy omits an unparseable final
+  line and retains unanswered tool calls. The source file stays intact. Run
+  records the copy and prefixes the task with a notice about the interrupted
+  command. Automatic account switching still requires a cleanup-bound seal.
+- An ordinary resume requires a terminal, cleanup-proven parent with its own
+  recorded native session. If recovery is interrupted or its copy fails
+  before spawning, retry with a fresh request ID to reuse the recovery
+  session ID.
 
 Automatic in-flight quota failover is not part of resume.
 

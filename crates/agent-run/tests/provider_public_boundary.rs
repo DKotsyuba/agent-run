@@ -1463,6 +1463,16 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let store = agent_run_store::fixture::open(&broker.home).unwrap();
     let discovery = mcp_request(&broker.home, "2026-07-28", "tools/list", json!({})).await;
+    let resume = discovery["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "resume")
+        .unwrap();
+    assert_eq!(
+        resume["inputSchema"]["properties"]["recover_after_crash"]["type"],
+        "boolean"
+    );
     let legacy_discovery = mcp_request(&broker.home, "2025-06-18", "tools/list", json!({})).await;
     assert_eq!(
         legacy_discovery["result"]["tools"],

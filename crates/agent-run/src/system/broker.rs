@@ -49,8 +49,11 @@ impl SystemLauncher for BrokerLauncher {
         &self,
         parent: AgentId,
         route: SystemRoute,
+        recover_after_crash: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>> {
-        Box::pin(async move { super::client::preflight_resume(&parent, &route).await })
+        Box::pin(async move {
+            super::client::preflight_resume(&parent, &route, recover_after_crash).await
+        })
     }
 
     /// Records the launch, requests one supervisor, and releases its capability

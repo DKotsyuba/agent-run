@@ -167,6 +167,7 @@ pub trait SystemLauncher: Send + Sync {
         &self,
         _parent: AgentId,
         _route: SystemRoute,
+        _recover_after_crash: bool,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>> {
         Box::pin(async {
             Err(crate::Error::Unsupported(

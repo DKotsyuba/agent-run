@@ -787,6 +787,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             &op.catalog,
             &inputs(&op.inputs),
             Some(crate::provider_admission::ProviderResume {
+                recover_after_crash: op.recover_after_crash,
                 parent: &op.parent,
                 prefer: &op.prefer,
                 preflight_digest: op.preflight_digest.as_deref(),

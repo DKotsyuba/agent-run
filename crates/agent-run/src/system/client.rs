@@ -23,6 +23,7 @@ use std::{
 pub(super) async fn preflight_resume(
     parent: &AgentId,
     route: &agent_run_core::system_launch::SystemRoute,
+    recover_after_crash: bool,
 ) -> agent_run_domain::Result<String> {
     use agent_run_core::system_launch::ResumePreflightFailure as Failure;
     let metadata = std::fs::symlink_metadata(&route.worker_socket).map_err(preflight_io_error)?;
@@ -44,6 +45,7 @@ pub(super) async fn preflight_resume(
         operation: PreflightOperation::ResumePreflight,
         parent: parent.clone(),
         route_fingerprint: route.fingerprint.as_str().to_owned(),
+        recover_after_crash,
     };
     let reply = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + Duration::from_secs(30);

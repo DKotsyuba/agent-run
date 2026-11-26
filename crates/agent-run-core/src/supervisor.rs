@@ -1830,9 +1830,52 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // A named Claude login uses a different auth directory. For an
         // explicitly ordered provider, resume the previously sealed transcript
         // by path while keeping the native session UUID as the logical identity.
+        let crash_recovery = continuing.is_none()
+            && row.parent_agent_id.is_some()
+            && store.last_event(id, "crash_recovery_admitted")?.is_some();
         let mut recorded_history = None;
         let mut continuation_root = None;
         let mut resume_path = None;
+        if crash_recovery {
+            let parent = row.parent_agent_id.as_ref().expect("crash parent");
+            let (_, native) =
+                agent_run_store::provider_admission::verify_crash_parent(&store.conn, parent)?;
+            if native.harness != identity.authority.harness
+                || (native.harness == HarnessId::Codex
+                    && runtime_home.canonicalize().ok().as_ref() != Some(&native.store))
+            {
+                return Err(Error::ExecutionChanged);
+            }
+            let fork =
+                resume_session.ok_or_else(|| invalid("crash recovery requires a fork session"))?;
+            let original = native
+                .session
+                .as_deref()
+                .ok_or_else(|| invalid("crash recovery requires a native session"))?;
+            let (path, repaired) = crate::continuity::fork_crash_history(
+                native.harness,
+                &native.store,
+                original,
+                fork,
+            )?;
+            if native.harness == HarnessId::ClaudeCode {
+                resume_path = Some(
+                    path.to_str()
+                        .ok_or_else(|| invalid("Claude history path is not UTF-8"))?
+                        .to_owned(),
+                );
+            }
+            continuation_root = Some(native.store);
+            store
+                .event_durable(
+                    id,
+                    "crash_history_recovered",
+                    &json!({"trailing_line_repaired":repaired,"reused":repaired.is_none()}),
+                )
+                .await?;
+            #[cfg(feature = "test-fixtures")]
+            fixture_hold(home, "crash-history-copied").await;
+        }
         if let Some(session) = resume_session {
             let recorded = match (&continuing, &row.parent_agent_id) {
                 (Some((_, state)), _) => state.clone(),
@@ -1841,7 +1884,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     return Err(invalid("a resumed attempt has no recorded history source"));
                 }
             };
-            if ordered_claude {
+            if ordered_claude && !crash_recovery {
                 let seal =
                     crate::service::verify_recorded_history(&recorded, &identity, None, session)?;
                 let path = seal.root.join(&seal.relative);
@@ -1877,6 +1920,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     )
                 });
         let task = resumed_task.as_deref().unwrap_or(task);
+        let recovery_task = crash_recovery
+            .then(|| format!("{}\n\n{task}", crate::continuity::CRASH_RECOVERY_NOTICE));
+        let task = recovery_task.as_deref().unwrap_or(task);
         let mut planned = adapters::provider::plan_selected_with(
             &config,
             &catalog,
@@ -2021,7 +2067,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // selects: a seal for one directory never authorizes a launch whose
         // environment points the harness at another. In-flight switches use
         // this agent's previous attempt; explicit resume uses the parent.
-        if let Some(session) = resume_session {
+        if !crash_recovery && let Some(session) = resume_session {
             let planned_root = history_root(
                 identity.authority.harness,
                 &planned.launch.environment,
@@ -2054,7 +2100,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // A switched attempt re-checks, at the handoff itself, that its
         // selected account is still enabled and the current configuration
         // still permits the frozen execution; otherwise it never spawns.
-        if continuing.is_some() || (ordered_claude && resume_session.is_some()) {
+        if continuing.is_some() || crash_recovery || (ordered_claude && resume_session.is_some()) {
             let policy = current_account_policy(home, id, &identity).await;
             if let Some(blocker) = handoff_blocker(store, &account, policy)? {
                 return finish_blocked_handoff(
@@ -2185,6 +2231,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             };
             store.install_finish_guard(&launch_secrets).await?;
         }
+        if crash_recovery {
+            let parent = row.parent_agent_id.as_ref().expect("crash parent");
+            agent_run_store::provider_admission::verify_crash_parent(&store.conn, parent)?;
+        }
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
         if !store.provider_spawning(id, &attempt_id).await? {
@@ -2209,7 +2259,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             store.provider_spawn_failed(id, &attempt_id).await?;
             return Err(error);
         }
-        if ordered_claude && let Some(session) = resume_session {
+        if ordered_claude
+            && !crash_recovery
+            && let Some(session) = resume_session
+        {
             let recorded = recorded_history
                 .as_deref()
                 .ok_or_else(|| invalid("a resumed attempt has no recorded history source"))?;
@@ -2316,15 +2369,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             process
                 .observing(async {
                     fixture_hold(home, "provider-process").await;
-                    let integration =
-                        history_root(identity.authority.harness, &planned.launch.environment)
-                            .and_then(|root| root.canonicalize().ok())
-                            .map(|store| agent_run_domain::integration::NativeIntegration {
-                                harness: identity.authority.harness,
-                                store,
-                                session: None,
-                            })
-                            .filter(|evidence| evidence.validate().is_ok());
+                    let integration = continuation_root
+                        .clone()
+                        .or_else(|| {
+                            history_root(identity.authority.harness, &planned.launch.environment)
+                        })
+                        .and_then(|root| root.canonicalize().ok())
+                        .map(|store| agent_run_domain::integration::NativeIntegration {
+                            harness: identity.authority.harness,
+                            store,
+                            session: None,
+                        })
+                        .filter(|evidence| evidence.validate().is_ok());
                     store
                         .provider_process(id, &attempt_id, &leader, integration, incarnation)
                         .await

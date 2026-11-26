@@ -733,6 +733,9 @@ pub struct Resume {
     pub task: Option<String>,
     #[arg(long)]
     pub task_file: Option<PathBuf>,
+    /// Recover an unsealed lost Claude Code or Codex session.
+    #[arg(long)]
+    pub recover_after_crash: bool,
     #[arg(long)]
     pub request_id: Option<String>,
     /// Optional replacement display label; omission inherits the previous
@@ -2475,6 +2478,9 @@ async fn run_client_command(
             }
             if let Some(display_name) = a.display_name {
                 arguments["display_name"] = json!(display_name);
+            }
+            if a.recover_after_crash {
+                arguments["recover_after_crash"] = json!(true);
             }
             let result = broker.call("resume", arguments).await?;
             (output)(&admission_output(&result)?)?;

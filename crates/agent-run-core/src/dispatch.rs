@@ -320,6 +320,9 @@ struct Resume {
     run_id: Option<AgentId>,
     /// Nonblank next instruction for the retained native conversation.
     task: String,
+    /// Explicitly recover an unsealed lost native session.
+    #[serde(default)]
+    recover_after_crash: bool,
     #[serde(default)]
     /// Idempotency key in the caller's namespace, reused for transport retries.
     request_id: Option<String>,
@@ -570,6 +573,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     a.display_name,
                     a.orchestrator,
                     a.pool_chat.as_ref(),
+                    a.recover_after_crash,
                 )
                 .await
         }

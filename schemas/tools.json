@@ -437,6 +437,10 @@
           ],
           "type": "object"
         },
+        "recover_after_crash": {
+          "description": "Explicitly recover an unsealed lost Claude Code or Codex session.",
+          "type": "boolean"
+        },
         "request_id": {
           "type": [
             "string",

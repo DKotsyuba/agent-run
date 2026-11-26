@@ -104,6 +104,160 @@ pub struct ProviderResume<'a> {
     pub preflight_digest: Option<&'a str>,
     /// Broker-owned restart permitting this exact captured continuation.
     pub restart_id: Option<i64>,
+    /// Require fresh quiescence proof for a lost, unsealed native session.
+    pub recover_after_crash: bool,
+}
+
+/// Resolve the original crash source, including retries after a proven pre-spawn loss.
+pub fn verify_crash_parent(
+    conn: &rusqlite::Connection,
+    parent: &AgentId,
+) -> Result<(AgentId, agent_run_domain::integration::NativeIntegration)> {
+    let (row, native, never_spawned) = crash_attempt(conn, parent)?;
+    let source = if row.runtime_session_id.is_none() && never_spawned {
+        let event: Option<String> = conn.query_row(
+            "SELECT json_extract(data_json,'$.source') FROM events WHERE agent_id=? AND kind='crash_recovery_admitted' ORDER BY seq DESC LIMIT 1",
+            [parent.as_str()],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        event.map(|source| source.parse::<AgentId>()).transpose()?
+    } else {
+        None
+    };
+    if row.status != Status::Lost && source.is_none() {
+        return Err(Error::Unsupported(
+            "continuation_unavailable: only a lost run or an interrupted pre-spawn recovery can be recovered".into(),
+        ));
+    }
+    let (source, row, native) = if let Some(source) = source {
+        let (row, native, _) = crash_attempt(conn, &source)?;
+        (source, row, native)
+    } else {
+        (parent.clone(), row, native)
+    };
+    let mut native = native
+        .filter(|native| {
+            native.validate().is_ok()
+                && row.runtime_session_id.is_some()
+                && native.session == row.runtime_session_id
+                && matches!(
+                    native.harness,
+                    agent_run_domain::HarnessId::ClaudeCode | agent_run_domain::HarnessId::Codex
+                )
+        })
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "continuation_unavailable: the old attempt's native storage or session is unproven"
+                    .into(),
+            )
+        })?;
+    // Older ordered Claude attempts recorded the auth root even when launch
+    // used a sealed transcript from an earlier attempt or explicit parent.
+    if let Some(identity) = &row.identity
+        && native.harness == agent_run_domain::HarnessId::ClaudeCode
+        && identity["provider_config"]["providers"][row.request.runtime.as_str()]["ordered_accounts"]
+            == true
+    {
+        let prior_root: Option<String> = conn.query_row(
+            "SELECT json_extract(adapter_state_json,'$.native_history.seal.root') FROM attempts \
+             WHERE (agent_id=?1 OR agent_id=?2) \
+             AND json_extract(adapter_state_json,'$.native_history.seal.session')=?3 \
+             AND json_extract(adapter_state_json,'$.native_history.provider')=?4 \
+             AND json_extract(adapter_state_json,'$.native_history.assets_sha256')=?5 \
+             ORDER BY (agent_id=?1) DESC, number DESC LIMIT 1",
+            params![source.as_str(), row.parent_agent_id.as_ref().map(AgentId::as_str),
+                native.session, row.request.runtime, identity["authority"]["assets_sha256"].as_str()],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        if let Some(root) = prior_root {
+            native.store = root.into();
+            native.validate()?;
+        }
+    }
+    Ok((source, native))
+}
+
+/// Refuse a live recorded supervisor, engine group or checkpointed descendant.
+/// Detached processes absent from checkpoints cannot be ruled out.
+fn crash_attempt(
+    conn: &rusqlite::Connection,
+    id: &AgentId,
+) -> Result<(
+    Record,
+    Option<agent_run_domain::integration::NativeIntegration>,
+    bool,
+)> {
+    use agent_run_platform::process::{ProcessState, observe};
+    let unacceptable = |reason| Error::Unsupported(format!("continuation_unavailable: {reason}"));
+    let row = conn.query_row(
+        "SELECT * FROM agents WHERE id=?",
+        [id.as_str()],
+        Record::read,
+    )?;
+    type Evidence = (
+        String,
+        Option<String>,
+        Option<f64>,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+    );
+    let (attempt, token, birth, state, native, proof, inactive): Evidence = conn.query_row(
+        "SELECT id,process_identity,process_birth_time,adapter_state_json,session_facts_json,cleanup_proof_json,ownership_active=0 AND phase='cleanup_complete' \
+         FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
+        [id.as_str()],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
+    )?;
+    let state: Value = serde_json::from_str(&state)?;
+    if !matches!(row.status, Status::Lost | Status::Failed) || !state["native_history"].is_null() {
+        return Err(unacceptable(
+            "crash recovery requires a lost execution without a native history seal",
+        ));
+    }
+    if observe(
+        row.supervisor_pid,
+        row.supervisor_identity.as_deref(),
+        row.supervisor_birth_time,
+    ) == ProcessState::Alive
+        || observe(row.process_group_id, token.as_deref(), birth) == ProcessState::Alive
+        || row
+            .process_group_id
+            .filter(|&group| group > 1)
+            .is_some_and(|group| {
+                // SAFETY: signal 0 only probes a positive recorded process group.
+                let absent = (unsafe { libc::killpg(group, 0) }) == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                !absent
+                    && process::processes().is_ok_and(|processes| {
+                        processes
+                            .iter()
+                            .any(|process| process.group == group && !process.zombie)
+                    })
+            })
+    {
+        return Err(unacceptable("old attempt processes are still alive"));
+    }
+    let mut members = conn.prepare(
+        "SELECT identity_json FROM process_members WHERE owner_kind='attempt' AND owner_id=?",
+    )?;
+    for member in members.query_map([attempt], |r| r.get::<_, String>(0))? {
+        let member: Identity = serde_json::from_str(&member?)?;
+        if observe(Some(member.pid), Some(&member.token), Some(member.birth)) == ProcessState::Alive
+        {
+            return Err(unacceptable(
+                "a recorded descendant of the old attempt is still alive",
+            ));
+        }
+    }
+    let never_spawned = inactive
+        && token.is_none()
+        && proof
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|proof| proof["never_spawned"] == true);
+    let native = native.map(|raw| serde_json::from_str(&raw)).transpose()?;
+    Ok((row, native, never_spawned))
 }
 
 /// Fingerprints the exact parent and last-attempt evidence used by a system
@@ -781,6 +935,16 @@ impl Store<'_> {
             if found.parent_agent_id.as_ref() != resume.map(|resume| resume.parent) {
                 return Err(Error::Conflict);
             }
+            if resume.is_some() {
+                let recovered: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND kind='crash_recovery_admitted')",
+                    [found.id.as_str()],
+                    |r| r.get(0),
+                )?;
+                if recovered != resume.is_some_and(|resume| resume.recover_after_crash) {
+                    return Err(Error::Conflict);
+                }
+            }
             let replay = replayed(&tx, &found, request)?;
             tx.commit()?;
             return Ok(replay);
@@ -796,7 +960,21 @@ impl Store<'_> {
         }
         let lineage = match resume {
             Some(resume) => {
-                let lineage = lineage::resume_parent(&tx, resume.parent)?;
+                if resume.recover_after_crash {
+                    let selected: String = tx.query_row(
+                        "SELECT selected_account_id FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
+                        [resume.parent.as_str()],
+                        |r| r.get(0),
+                    )?;
+                    if selected != resume.prefer.as_str() {
+                        return Err(Error::ExecutionChanged);
+                    }
+                }
+                let lineage = lineage::resume_parent_with_crash_authority(
+                    &tx,
+                    resume.parent,
+                    resume.recover_after_crash,
+                )?;
                 if let Some(expected) = resume.preflight_digest
                     && resume_preflight_digest(&tx, resume.parent)? != expected
                 {
@@ -808,7 +986,7 @@ impl Store<'_> {
                     [resume.parent.as_str()],
                     |row| row.get(0),
                 )?;
-                if uncleaned != 0 {
+                if !resume.recover_after_crash && uncleaned != 0 {
                     return Err(Error::Unsupported(format!(
                         "continuation_unavailable: agent {} has an attempt without cleanup proof",
                         resume.parent
@@ -1016,6 +1194,11 @@ pub(crate) fn admit_in_tx(
         resume.map(|resume| resume.prefer),
         &std::collections::BTreeSet::new(),
     )?;
+    if resume
+        .is_some_and(|resume| resume.recover_after_crash && candidate.account != *resume.prefer)
+    {
+        return Err(Error::ExecutionChanged);
+    }
     let at = now();
     candidates.check_quota_decision(at)?;
     let session = admission::upsert_session(tx, effective, at, owner_uid)?;
@@ -1028,6 +1211,18 @@ pub(crate) fn admit_in_tx(
         .chars()
         .take(160)
         .collect();
+    let recovery = resume
+        .filter(|resume| resume.recover_after_crash)
+        .map(|resume| verify_crash_parent(tx, resume.parent))
+        .transpose()?;
+    let fork = recovery.as_ref().map(|(source, _)| {
+        let (resume, lineage) = lineage.expect("recovery has a parent");
+        if source != resume.parent {
+            lineage.runtime_session_id.clone()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        }
+    });
     let (root, sequence, resumed) = match lineage {
         Some((_, lineage)) => (
             lineage.root_agent_id.clone(),
@@ -1043,7 +1238,7 @@ pub(crate) fn admit_in_tx(
                 request.model, request.profile, request.task, summary,
                 effective.workdir.to_string_lossy(), serde_json::to_string(effective)?,
                 at,
-                resume.map(|resume| resume.parent.as_str()), root.as_str(), sequence, resumed,
+                resume.map(|resume| resume.parent.as_str()), root.as_str(), sequence, fork.as_deref().or(resumed),
                 serde_json::to_string(identity)?,
                 if pinned.is_some() { "pinned" } else { "auto" },
                 pinned.map(AccountId::as_str),
@@ -1105,6 +1300,17 @@ pub(crate) fn admit_in_tx(
             candidates,
         ),
     )?;
+    if let Some((source, _)) = recovery {
+        let resume = resume.expect("recovery has a parent");
+        tx_event(
+            tx,
+            &id,
+            "crash_recovery_admitted",
+            None,
+            None,
+            &json!({"resume_of":resume.parent,"source":source}),
+        )?;
+    }
     Ok(ProviderAdmission {
         agent_id: id,
         attempt_id,

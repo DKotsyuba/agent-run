@@ -453,6 +453,10 @@ fn registry_matches_python_golden_field_by_field() {
                 .unwrap()
                 .remove("timeout_seconds");
             if definition.name == "resume" {
+                expected["inputSchema"]["properties"]["recover_after_crash"] = serde_json::json!({
+                    "description":"Explicitly recover an unsealed lost Claude Code or Codex session.",
+                    "type":"boolean"
+                });
                 expected["inputSchema"]["properties"]["pool_chat"] = serde_json::json!({
                     "type":"object",
                     "description":"Optional equality assertion of the inherited Agent Pool chat seat.",
