@@ -21,6 +21,7 @@ mod legacy_provider;
 pub mod lineage_hold;
 /// Draft strict JSON contracts for the future operator lineage-hold socket.
 pub mod lineage_hold_wire;
+mod names;
 pub mod observation;
 /// Strict managed native-owner v2 outbox and request contracts.
 pub mod owner_v2;
@@ -52,6 +53,7 @@ pub use error::{
     Result,
 };
 pub use fsm::{ACTIVE, TERMINAL, validate_transition};
+pub use names::{agent_label, agent_name};
 pub use provider_start::ProviderStartRequest;
 pub use tools::{
     ArgumentDefault, ArgumentDefinition, ToolDefinition, is_tool, registry, tool, tools_json,

@@ -10,6 +10,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Document that active agents require `agent-run restart`. Direct systemd
   stop or restart can kill workers. Recover eligible lost runs with the
   explicit crash recovery flag.
+- Show the agent's display name and profile beside its stable ID in notices,
+  binding confirmations, and agent views. Generate a lineage-stable name when
+  no display name is supplied.
 
 ## 0.33.4
 

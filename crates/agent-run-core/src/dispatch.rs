@@ -482,7 +482,10 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     } else {
                         "Bridge notification configuration could not be verified"
                     };
-                    format!("agent-run: agent {} is bound; {detail}.", bound.agent_id)
+                    format!(
+                        "agent-run: agent {} is bound; {detail}.",
+                        bound.agent_label()
+                    )
                 }
             };
             Ok(

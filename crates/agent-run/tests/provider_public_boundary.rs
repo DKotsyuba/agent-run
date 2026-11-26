@@ -1198,9 +1198,11 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
             let identity = reply["result"]["structuredContent"].clone();
             assert_eq!(identity.as_object().unwrap().len(), 2);
             let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains(&format!("- Agent: {agent}")), "{text}");
+            assert!(
+                text.contains(&format!("- Agent: 工程師: next (review) · {agent}")),
+                "{text}"
+            );
             assert!(!text.contains("- Run:"), "{text}");
-            assert!(text.contains("Name: 工程師: next"), "{text}");
             identity
         } else {
             let result = client.call("resume", Some(arguments)).await.unwrap();
@@ -1238,7 +1240,10 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     assert_eq!(cli_page["items"][0]["name"], "工程師: next");
     let mcp_list = mcp_tool(&broker.home, "list_agents", json!({})).await;
     let text = mcp_list["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("name: 工程師: next"), "{text}");
+    assert!(
+        text.contains(&format!("- 工程師: next (review) · {agent}:")),
+        "{text}"
+    );
     assert!(text.contains("usage: in 2 out 3"), "{text}");
     let store = agent_run_store::fixture::open(&broker.home).unwrap();
     let native = store

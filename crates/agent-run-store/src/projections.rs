@@ -68,7 +68,7 @@ fn cleanup(value: Option<String>) -> Option<CleanupView> {
 }
 
 impl Store<'_> {
-    /// Builds one current agent view at `observed_at` from committed rows only.
+    /// Builds one current agent view and shown lineage name from committed rows.
     /// Explicit lifecycle supplies idle/closing phase, turn count and idle time;
     /// terminal phases and elapsed/idle observations stay frozen at completion.
     pub fn agent_view_at(&self, id: &AgentId, observed_at: f64) -> Result<AgentView> {
@@ -144,7 +144,7 @@ impl Store<'_> {
             parent_run_id: None,
             run_id: None,
             agent_id: record.id.clone(),
-            name: record.display_name.clone(),
+            name: Some(record.shown_name()),
             runtime: record.request.runtime,
             model: record.request.model,
             profile: record.request.profile,

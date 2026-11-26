@@ -481,6 +481,10 @@ async fn batch_is_atomic_and_replayed_across_live_cli_and_mcp() {
     assert_eq!(status["items"][0]["match"], "verified");
     assert_eq!(status["view"]["agent"]["agent_id"], ids[0].as_str());
     assert_eq!(status["view"]["agent"]["sequence"], 1);
+    assert_eq!(
+        status["view"]["agent"]["name"],
+        agent_run_domain::agent_name(ids[0].as_str())
+    );
     assert_eq!(status["view"]["match"], "verified");
     assert_eq!(status["view"]["status_scope"], "selected_execution_raw");
     assert!(!status.to_string().contains("process_group_id"));

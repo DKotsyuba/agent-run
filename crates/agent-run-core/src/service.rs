@@ -2636,7 +2636,7 @@ impl Service {
         }
     }
     /// Projects the exact execution `row` using committed evidence in `store`.
-    /// Includes the admitted human name, nullable recorded native usage and
+    /// Includes the shown lineage name, nullable recorded native usage and
     /// complete lineage totals, plus lifecycle, delivery and process observations
     /// at the current UTC time. Missing measurements remain null. No state is
     /// written and no process is launched; store/serialization errors propagate.
@@ -2695,7 +2695,7 @@ impl Service {
             .identity
             .as_ref()
             .and_then(|i| i.get("effective_policy"));
-        let mut view = json!({"agent_id":row.id,"name":row.display_name,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
+        let mut view = json!({"agent_id":row.id,"name":row.shown_name(),"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
             "delivery":store.delivery_status_for_record(row)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
             "usage":store.usage_view(&row.id)?,"usage_cumulative":usage,"tool_counts":tools});

@@ -446,8 +446,15 @@ fn restart_queues_personal_results_and_first_caller_notice() {
         "SELECT message FROM service_restart_notices WHERE restart_id=? AND external_session_id='owner' AND stage='after'",
         [restart], |row|row.get(0),
     ).unwrap();
-    assert!(message.contains(agent.as_str()) && message.contains("failed — history_unverifiable"));
-    assert!(message.contains(resumed.as_str()) && message.contains("resumed"));
+    let profile = request.profile;
+    let name = agent_run_domain::agent_name(agent.as_str());
+    let resumed_name = agent_run_domain::agent_name(resumed.as_str());
+    assert!(message.contains(&format!(
+        "- Agent: {name} ({profile}) · {agent}: failed — history_unverifiable"
+    )));
+    assert!(message.contains(&format!(
+        "- Agent: {resumed_name} ({profile}) · {resumed}: resumed"
+    )));
     assert_eq!(store.conn.query_row(
         "SELECT COUNT(*) FROM service_restart_notices WHERE restart_id=? AND external_session_id='owner' AND stage='after'",
         [restart], |row|row.get::<_,i64>(0),

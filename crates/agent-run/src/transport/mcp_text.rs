@@ -209,7 +209,7 @@ struct AgentTextView {
     mcp_more: usize,
     /// Display-safe task label.
     task: String,
-    /// Optional broker-assigned display name.
+    /// Broker-projected display name, empty for older views.
     name: String,
     /// Latest observed public usage summary; absence stays empty.
     usage: String,
@@ -1872,14 +1872,20 @@ mod tests {
                 tool,
                 &json!({"agent_id":"ag-1","sequence":1,"created":true,"agent":agent}),
             );
-            assert!(page.contains("Name: 工程師 / review"), "{page}");
+            assert!(
+                page.contains("- Agent: 工程師 / review (review) · ag-1"),
+                "{page}"
+            );
             assert!(!page.contains("private-execution"), "{page}");
         }
         let page = text(
             "list_agents",
             &json!({"items":[agent],"total":1,"offset":0,"limit":20,"complete":true}),
         );
-        assert!(page.contains("name: 工程師 / review"), "{page}");
+        assert!(
+            page.contains("- 工程師 / review (review) · ag-1:"),
+            "{page}"
+        );
         assert!(page.contains("in 0 out ? cache r0/w? turns ?"), "{page}");
         assert!(
             page.contains("lineage incomplete over 2 execution(s)"),
@@ -2076,16 +2082,22 @@ mod tests {
     /// list_agents keeps the exact total, page size, and continuation.
     #[test]
     fn list_agents_keeps_total_and_continuation() {
+        let mut named = agent_view();
+        named["name"] = json!("Delicate Fox");
         let page = text(
             "list_agents",
             &json!({
-                "items": [agent_view(), agent_view()], "total": 5, "offset": 0,
+                "items": [named, agent_view()], "total": 5, "offset": 0,
                 "limit": 2, "next_offset": 2, "complete": false, "revision": 9,
             }),
         );
         assert!(page.contains("2 of 5 matching (offset 0)"), "{page}");
         assert!(
             page.contains("- ag-1: running (running) — glm-user/glm-5.3 profile review"),
+            "{page}"
+        );
+        assert!(
+            page.contains("- Delicate Fox (review) · ag-1: running (running) — glm-user/glm-5.3"),
             "{page}"
         );
         assert!(page.contains("task: \"fix the parser\""), "{page}");
