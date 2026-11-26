@@ -21,16 +21,27 @@ pub struct BindResult {
     /// Exact durable execution whose receipt was bound, never a moving alias.
     #[serde(skip_serializing)]
     pub run_id: AgentId,
+    /// Shown name for the selected execution.
+    #[serde(skip_serializing)]
+    pub name: String,
+    /// Profile for the selected execution.
+    #[serde(skip_serializing)]
+    pub profile: String,
     /// The opaque durable orchestrator-session primary key.
     pub session_id: String,
 }
 
 impl BindResult {
+    /// Formats the display identity used in both binding confirmations.
+    pub(crate) fn agent_label(&self) -> String {
+        agent_run_domain::agent_label(&self.name, &self.profile, self.agent_id.as_str())
+    }
+
     /// Returns the exact safe confirmation injected into the post-tool host turn.
     pub fn message(&self) -> String {
         format!(
             "agent-run: agent {} is bound; its completion will be delivered to this chat.",
-            self.agent_id
+            self.agent_label()
         )
     }
 }
@@ -57,7 +68,7 @@ async fn bind_with_service(
     at: f64,
     service: Option<&crate::service::Service>,
 ) -> Result<BindResult> {
-    let root = Store::open(home)?.get(&agent_id)?.root_agent_id;
+    let row = Store::open(home)?.get(&agent_id)?;
     let binding = agent_run_store::ops::BindOrchestrator {
         execution: agent_id.clone(),
         reference,
@@ -81,7 +92,9 @@ async fn bind_with_service(
         }
     };
     Ok(BindResult {
-        agent_id: root,
+        name: row.shown_name(),
+        profile: row.request.profile,
+        agent_id: row.root_agent_id,
         run_id: agent_id,
         session_id,
     })

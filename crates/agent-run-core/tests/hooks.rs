@@ -121,7 +121,13 @@ async fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
         .await
         .expect("same target is idempotent");
     assert_eq!(first.session_id, second.session_id);
-    assert!(first.message().contains("is bound"));
+    let name = agent_run_domain::agent_name(agent_id.as_str());
+    let profile = home.request().profile;
+    assert!(
+        first
+            .message()
+            .contains(&format!("{name} ({profile}) · {agent_id} is bound"))
+    );
     let delivery: String = home
         .store()
         .conn

@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Show the agent's display name and profile beside its stable ID in notices,
+  binding confirmations, and agent views. Generate a lineage-stable name when
+  no display name is supplied.
+
 ## 0.33.4
 
 - Route Bridge completion notices to the store configured for the orchestrator's

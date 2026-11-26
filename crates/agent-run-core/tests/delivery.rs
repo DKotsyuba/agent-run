@@ -403,6 +403,21 @@ async fn bridge_delivery_lost_ack_keeps_single_owner_and_frozen_intent() {
     };
     assert_eq!(state(), "outcome_unknown");
     assert_eq!(publications.lock().unwrap().len(), 2);
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
+    let frozen_intent =
+        || -> String {
+            connection.query_row(
+            "SELECT intent_json FROM bridge_delivery_intents WHERE delivery_id='ntf_bridge'",
+            [],
+            |row| row.get(0),
+        ).unwrap()
+        };
+    let frozen = frozen_intent();
+    assert!(frozen.contains("- Agent: Delicate Fox (review) · ag-20260825-120000-0123456789"));
+    connection.execute(
+        "UPDATE agents SET display_name='Changed name' WHERE id='ag-20260825-120000-0123456789'",
+        [],
+    ).unwrap();
     // No visible historical record cannot erase possible committed custody or permit republishing.
     allowed.store(false, Ordering::SeqCst);
     visible.store(false, Ordering::SeqCst);
@@ -461,7 +476,7 @@ async fn bridge_delivery_lost_ack_keeps_single_owner_and_frozen_intent() {
         }
     );
     assert_eq!(dispatch_with_batch(&home.path, 1).await.unwrap().claimed, 0);
-    let connection = fixture_connection(home.path.join("state.db")).unwrap();
+    assert_eq!(frozen_intent(), frozen);
     let receipt: String = connection.query_row("SELECT custody_receipt_json FROM bridge_delivery_intents WHERE delivery_id='ntf_bridge'", [], |row| row.get(0)).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&receipt).unwrap()["acceptance_seq"],
@@ -615,36 +630,6 @@ fn make_due(home: &Path, id: &str) {
         .unwrap();
 }
 
-/// Builds one notice from a frozen rendering fixture input object.
-fn notice_from_case(input: &Value) -> Notice {
-    Notice {
-        run_id: None,
-        notification_id: input["notification_id"].as_str().unwrap().into(),
-        agent_id: input["agent_id"]
-            .as_str()
-            .unwrap()
-            .parse::<AgentId>()
-            .unwrap(),
-        status: serde_json::from_value(input["status"].clone()).unwrap(),
-        runtime: input
-            .get("runtime")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        model: input
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        effort: input
-            .get("effort")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        failure_kind: input
-            .get("failure_kind")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    }
-}
-
 /// Mirrors `tests/test_delivery_base.py::test_every_terminal_status_renders_its_own_line`.
 /// Mirrors `tests/test_delivery_base.py::test_failed_notice_explains_known_and_unknown_failure_categories`.
 /// Mirrors `tests/test_delivery_base.py::test_configured_identifier_punctuation_renders_verbatim`.
@@ -660,13 +645,30 @@ fn notice_rendering_matches_python_golden_cases() {
     .unwrap();
     for case in cases {
         let input = case.get("input").unwrap();
-        let notice = notice_from_case(input);
+        let notice: Notice = serde_json::from_value(input.clone()).unwrap();
         let expected = case["rendered"].as_str().unwrap().replace(
             "Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID.",
             "Inspect progress and transcript; resume explicitly after the native-history, authority and cleanup checks pass. Executions have no time limit.",
         );
         assert_eq!(notice.render().unwrap(), expected, "{}", case["id"]);
     }
+}
+
+/// New payloads display both name and role, while incomplete metadata uses the legacy text.
+#[test]
+fn notice_displays_name_and_role_only_as_a_pair() {
+    let mut notice = notice();
+    let legacy = notice.render().unwrap();
+    notice.name = Some("Parser review".into());
+    assert_eq!(notice.render().unwrap(), legacy);
+    notice.profile = Some("reviewer".into());
+    assert_eq!(
+        notice.render().unwrap(),
+        legacy.replace(
+            "- ID: ag-20260825-120000-0123456789",
+            "- Agent: Parser review (reviewer) · ag-20260825-120000-0123456789"
+        )
+    );
 }
 
 /// Mirrors `tests/test_codex_queue.py::test_attempt_evidence_is_bounded_redacted_and_exactly_classified`.
@@ -802,6 +804,8 @@ fn golden_delivery_database_is_read_from_a_copy() {
 fn notice() -> Notice {
     Notice {
         run_id: None,
+        name: None,
+        profile: None,
         notification_id: "ntf_test".into(),
         agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
         status: Status::Succeeded,
@@ -1018,6 +1022,8 @@ async fn notice_projection_tolerates_rows_without_metadata() {
     );
     let bare = Notice {
         run_id: None,
+        name: None,
+        profile: None,
         notification_id: "ntf_old".into(),
         agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
         status: Status::Succeeded,

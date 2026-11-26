@@ -308,7 +308,7 @@ fn start_tool_description_embeds_the_completion_contract() {
                 .trim_end()
         )
     );
-    for field in ["- ID:", "- Status:", "- Runtime/model:", "- Notice:"] {
+    for field in ["- Agent:", "- Status:", "- Runtime/model:", "- Notice:"] {
         assert!(description.contains(field), "missing {field}");
     }
 }
@@ -340,6 +340,8 @@ async fn huge_wait_is_rejected_without_panicking_or_opening_state() {
 fn notice() -> Notice {
     Notice {
         run_id: None,
+        name: None,
+        profile: None,
         notification_id: "ntf_test".into(),
         agent_id: AgentId::new(),
         status: Status::Succeeded,

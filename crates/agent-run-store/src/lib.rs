@@ -153,6 +153,15 @@ pub struct Record {
     pub display_name: Option<String>,
 }
 
+impl Record {
+    /// Returns the explicit display label or the generated name for this lineage.
+    pub fn shown_name(&self) -> String {
+        self.display_name
+            .clone()
+            .unwrap_or_else(|| agent_run_domain::agent_name(self.root_agent_id.as_str()))
+    }
+}
+
 /// Captures persisted supervisor identity fields for immutable ownership checks.
 type SupervisorOwnership = (
     String,
