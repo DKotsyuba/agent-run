@@ -197,8 +197,9 @@ message boundary when the engine omits ids), so each message renders as one
 continuous row and distinct messages stay distinct. Other commands
 include `steer`, `cancel`, `delivery status`, and `doc`. Quota windows,
 reset times and capacity standing are presented by Agent Quota (for example
-`agent-quota limits`), not by Run; Run keeps only the Quota read its admission
-needs and refuses an exhausted choice with `QuotaExhausted`.
+`agent-quota limits`). Run uses a Quota snapshot for admission. Native Codex
+accounts with reported paid or unlimited credits stay eligible after their plan
+window is exhausted and rank behind accounts with usable window capacity.
 
 ## Use the MCP server
 
@@ -211,8 +212,8 @@ The MCP process is a thin stdio proxy over the resident broker:
 It advertises the orchestrator tools `start`, `start_batch`, `resume`,
 `cancel`, `steer`, `list_agents`, `answer`, `transcript`, `delegation_guide`
 and `doc`. Use `delegation_guide` with optional exact `provider`, `model`, and
-`profile` filters for routing; it carries no quota standing. Service
-integration methods used by Agent Pool and Hub — `status`, `batch_receipt`,
+`profile` filters for routing. The guide flags eligible Codex paid-credit
+fallbacks. Service integration methods used by Agent Pool and Hub — `status`, `batch_receipt`,
 `capabilities`, `transcript_exact`, `initial_task`, `answer_chunk`,
 `agent_integration`, `history_pins_list` and `history_pins_release` — are
 served only by the operator socket and CLI; the socket `tools` method lists

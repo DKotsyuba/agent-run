@@ -429,8 +429,8 @@ transport limits, lineage holds and `initial_task` support.
 
 Quota presentation left Run in 0.32.0: `limits`, `models` and
 `capacity_order` (MCP, CLI and socket) are removed and return unknown-method
-errors. Agent Quota presents quota windows and capacity. Run keeps only the
-Quota read its admission needs.
+errors. Agent Quota presents quota windows and capacity. Run reads snapshots
+for admission and can flag a native Codex paid-credit fallback in the guide.
 
 ### Operator lineage holds (v1)
 
@@ -768,14 +768,15 @@ Notes for the loop:
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
 - Quota windows, reset times and capacity standing come from Agent Quota, not
-  Run. Admission still reads one fresh Quota snapshot per decision and refuses
-  an exhausted choice with `QuotaExhausted`.
+  Run. Admission reads a fresh Quota snapshot per decision. Native Codex
+  accounts with reported paid or unlimited credits remain eligible after their
+  plan window is exhausted, behind accounts with usable window capacity.
 - `delegation_guide` (optional exact `provider`, `model`, `profile` filters;
   schema 2 only) returns one compact plain-text
   routing guide — providers in configured order with each exact model id,
-  admissible profiles, params, restrictions, and configured guidance prose. It
-  carries no quota standing. Its result is a JSON string here and real MCP text content on the MCP
-  transport; the CLI equivalent is `agent-run delegation-guide` with optional
+  admissible profiles, params, restrictions, configured guidance, and any
+  eligible Codex paid-credit fallback. Its result is a JSON string here and text content
+  on the MCP transport. The CLI equivalent is `agent-run delegation-guide` with optional
   `--provider`, `--model`, and `--profile` filters.
   Unknown filters are `ValidationError`; omitted filters keep default guidance.
   Before delegating a task, the orchestrator must call it and read the result

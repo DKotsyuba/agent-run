@@ -1,15 +1,15 @@
 //! Read-only provider catalog behind the delegation guide (schema 2).
 //!
 //! Projection combines one validated immutable config revision with one
-//! committed local read. It never reads or presents quota, probes a harness,
-//! reserves capacity, writes samples or starts agents; Agent Quota owns
-//! capacity presentation. The orchestrator alone chooses provider, model,
+//! committed local read. The guide can also annotate paid-credit fallback from
+//! a supplied Quota snapshot. Agent Quota owns general capacity presentation. The orchestrator alone chooses provider, model,
 //! effort and profile; this view reports configured facts, declared
 //! recommendation prose and canonical role grants — no automatic choice or
 //! score of model ability. No account id, label, or credential reference is
 //! emitted.
 
-use crate::{Result, error::invalid};
+use super::quota_adapter;
+use crate::{Result, error::invalid, quota_client};
 use agent_run_config::{policy, profiles, provider_config::ProviderConfig, role_plan};
 use agent_run_domain::{
     ModelsQuery, ProviderStartRequest,
@@ -17,7 +17,7 @@ use agent_run_domain::{
 };
 use agent_run_store::Store;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 /// Loads the canonical role `name` exactly as provider admission does, using
 /// a catalog-only request for `provider`/`model` (no task is admitted).
@@ -219,14 +219,49 @@ pub fn catalog_at(
     }))
 }
 
-/// Renders the compact account-free delegation guide from [`catalog_at`].
+/// Renders the account-free guide with optional notes for eligible Codex credit fallbacks.
 pub fn delegation_guide_at(
     store: &Store,
     home: &Path,
     config: &ProviderConfig,
     revision: &str,
     query: &ModelsQuery,
+    snapshot: Option<&quota_client::Snapshot>,
 ) -> Result<Value> {
-    let catalog = catalog_at(store, home, config, revision, query)?;
-    Ok(Value::String(crate::delegation_guide::render(&catalog)?))
+    let _read = if store.conn.is_autocommit() {
+        Some(store.conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let mut guide = catalog_at(store, home, config, revision, query)?;
+    if let Some(snapshot) = snapshot {
+        let catalog = resolve(config, store)?;
+        let at = agent_run_domain::domain::now();
+        for provider in guide["providers"].as_array_mut().into_iter().flatten() {
+            let id = provider["provider"].as_str().unwrap_or_default().parse()?;
+            let Some(definition) = catalog.provider(&id) else {
+                continue;
+            };
+            if !quota_adapter::supports_credits(definition.harness, &definition.connection) {
+                continue;
+            }
+            for model in provider["models"].as_array_mut().into_iter().flatten() {
+                let name = model["model"].as_str().unwrap_or_default();
+                let output = quota_adapter::candidates_at(
+                    store,
+                    &catalog,
+                    &id,
+                    name,
+                    None,
+                    &BTreeSet::new(),
+                    Some(snapshot),
+                    at,
+                );
+                if output.is_ok_and(|output| !output.credit_backed.is_empty()) {
+                    model["credit_backed"] = json!(true);
+                }
+            }
+        }
+    }
+    Ok(Value::String(crate::delegation_guide::render(&guide)?))
 }

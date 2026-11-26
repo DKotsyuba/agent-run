@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Admit native Codex accounts with reported paid credits after their plan
+  windows are exhausted. Prefer accounts with window capacity and show the
+  paid-credit fallback in the delegation guide.
+
 ## 0.34.0
 
 - Allow explicit crash recovery of an unsealed lost Claude Code or Codex

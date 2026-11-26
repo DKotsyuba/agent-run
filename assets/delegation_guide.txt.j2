@@ -1,6 +1,6 @@
 agent-run delegation guide
 
-Choose provider, model and profile; the broker selects the account and refuses an exhausted choice with QuotaExhausted.
+Choose provider, model and profile; the broker selects the account and can refuse a choice with QuotaExhausted. Native Codex accounts with paid credits can be used after the plan window is exhausted.
 Providers appear in configured order; guidance comes from configuration. Read current quota and capacity from Agent Quota.
 Read this guide before each delegation; choose a compatible provider with available capacity and a sufficient model/effort.
 Brief one bounded task with role, paths, permissions and checks. Respect a request to work personally.
@@ -26,6 +26,9 @@ provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profil
 {% endif %}
 {% if model.restrictions %}
     restrictions: {{ model.restrictions }}
+{% endif %}
+{% if model.credit_backed %}
+    exhausted window; paid credits available as a fallback
 {% endif %}
 {% for entry in model.guidance %}
   model guidance: {{ entry }}
