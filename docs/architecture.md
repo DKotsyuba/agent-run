@@ -267,14 +267,13 @@ acknowledgement or its evidence.
 ## Capacity and diagnostics
 
 Agent Quota collects observations, computes quota standings and presents
-quota windows and capacity to operators and orchestrators. With schema 2, Run
-keeps only the read its admission needs: each admission decision reads one
-fresh Quota snapshot, combines it with its own local account, cooldown,
-multiplier and reservation snapshot, selects the account, and refuses an
-exhausted choice with `QuotaExhausted`. Run presents no quota: since 0.32.0
-`delegation_guide` is a configuration-only catalog and the UserPromptSubmit
-context carries only active agents. Missing, stale or unavailable quota is
-unknown, not an invented zero; Run may still attempt a launch.
+quota windows and capacity to operators and orchestrators. With schema 2, each
+admission decision reads one fresh Quota snapshot and combines it with local
+account, cooldown, multiplier and reservation state. Native Codex accounts with
+reported paid or unlimited credits rank last when their plan window is
+exhausted. The `delegation_guide` can flag that fallback, and the
+UserPromptSubmit context carries only active agents. Missing, stale or
+unavailable quota is unknown, so Run may still attempt a launch.
 
 `agent-run doctor` checks configuration, binaries, role assets, state,
 schema-2 provider bindings against a read-only account-registry snapshot,

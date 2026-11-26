@@ -14,14 +14,13 @@ delegation guide below.
 ## Schema 2: the provider catalog
 
 MCP discovery exposes one routing read: `delegation_guide`. It reads valid
-config, canonical role files and one committed local snapshot; it never reads,
-collects or presents quota, probes a harness, reserves capacity or starts work.
-Quota windows, reset times and capacity standing are presented by Agent Quota
-(`agent-quota limits` or its MCP); the former Run `limits`, `models` and
-`capacity_order` reads were removed in 0.32.0. Admission still reads one fresh
-Quota snapshot per decision and refuses an exhausted choice with
-`QuotaExhausted`. The caller picks provider, model, effort and profile;
-configured guidance is prose, not an automatic model-suitability decision.
+config, canonical role files and one committed local snapshot. For native
+Codex it can read one Quota snapshot to flag eligible paid-credit fallback.
+Agent Quota presents windows, reset times and capacity standing
+(`agent-quota limits` or its MCP). Admission reads a fresh Quota snapshot per
+decision. Native Codex accounts with reported paid or unlimited credits remain
+eligible after window exhaustion and rank last. The caller picks provider,
+model, effort and profile using the configured guidance.
 
 For each provider (in configured order) the guide shows its harness and
 recommendations and every explicit offering with its default `params`,
@@ -78,8 +77,8 @@ Omitted filters retain the default guide. One local read snapshot renders a
 compact operating header, providers in configured order with
 harness/guidance, and each exact selectable model: admissible canonical
 profiles (`profiles: none` means no role may use it), nonempty default/allowed
-params, restrictions and configured guidance. It carries no quota standing;
-read current capacity from Agent Quota before choosing. Schema 1 is
+params, restrictions, configured guidance and any eligible Codex paid-credit
+fallback. Read current capacity from Agent Quota before choosing. Schema 1 is
 `Unsupported`; an empty catalog is explicit. Text omits skills, MCP arrays,
 hashes, accounts, credentials and endpoints, normalizes recommendation
 whitespace/control characters, and adds no model-ability ranking or facts

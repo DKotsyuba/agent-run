@@ -142,6 +142,40 @@ pub struct Account {
     pub latches: Vec<Latch>,
     pub advice: Vec<Advice>,
     pub advice_key: String,
+    /// Missing or malformed paid-credit metadata is unknown.
+    #[serde(default, deserialize_with = "credit_balance")]
+    pub credit_balance: Option<CreditBalance>,
+}
+
+/// Codex's account-level paid-credit flags and exact reported amount.
+#[derive(Deserialize)]
+pub struct CreditBalance {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    #[serde(deserialize_with = "required_option")]
+    pub balance: Option<String>,
+}
+
+/// Drops malformed optional credit metadata without dropping the quota snapshot.
+fn credit_balance<'de, D>(d: D) -> Result<Option<CreditBalance>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<CreditBalance>(raw)
+        .ok()
+        .filter(|credit| credit.balance.as_deref().is_none_or(valid_credit_amount)))
+}
+
+/// Checks the bounded ASCII decimal syntax used by Agent Quota.
+fn valid_credit_amount(amount: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let unsigned = amount.strip_prefix('-').unwrap_or(amount);
+    amount.len() <= 128
+        && unsigned.split_once('.').map_or_else(
+            || digits(unsigned),
+            |(whole, fractional)| digits(whole) && digits(fractional),
+        )
 }
 
 /// One configured model alias; null fields remain unknown.

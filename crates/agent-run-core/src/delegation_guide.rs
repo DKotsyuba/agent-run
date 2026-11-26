@@ -4,8 +4,8 @@
 //! `assets/delegation_guide.txt.j2`, embedded at build time (never loaded
 //! from the filesystem or hot-reloaded). This module only prepares a small
 //! normalized projection of one committed provider catalog snapshot in
-//! configured order and renders it. It adds no facts, no quota standing (Agent
-//! Quota owns capacity presentation), no ranking of model ability, and no
+//! configured order and renders it with any supplied paid-credit fallback notes.
+//! It adds no ranking of model ability and no
 //! account, credential, endpoint, or hash detail; configured recommendation
 //! prose is whitespace-normalized and never invented.
 
@@ -69,6 +69,7 @@ pub fn render(catalog: &Value) -> Result<String> {
                         "params": params(&model["params"], &model["allowed_params"]),
                         "restrictions": nonempty(&strings(&model["restrictions"]).join(", ")),
                         "guidance": guidance(&model["recommendations"]),
+                        "credit_backed": model["credit_backed"].as_bool().unwrap_or(false),
                     })
                 })
                 .collect();

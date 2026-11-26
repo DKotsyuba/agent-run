@@ -48,11 +48,11 @@ detail — don't parse `failure_text` to decide behavior.
 
 Agent Quota collects independently of model runs and presents quota windows
 and capacity (`agent-quota limits`; `agent-quota doctor` checks service
-availability). Run no longer presents quota: its `limits`, `models` and
-`capacity order` reads were removed in 0.32.0. Admission reads one fresh Quota
-snapshot per decision; unreported or unusable quota is unknown, not zero, so
-Run can still attempt a launch and receive a provider refusal, while a known
-exhausted choice is refused with `QuotaExhausted`.
+availability). Run reads one fresh Quota snapshot per admission decision.
+Unreported or unusable quota is unknown, so Run can still attempt a launch.
+A known exhausted window can result in `QuotaExhausted`. Native Codex
+accounts with reported paid or unlimited credits remain eligible and rank
+last. The delegation guide flags this fallback when available.
 
 ## Optional prompt context
 

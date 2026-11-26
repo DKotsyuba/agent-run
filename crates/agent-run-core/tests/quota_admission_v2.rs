@@ -30,6 +30,10 @@ enum ReplyMode {
     Malformed,
     InvalidSchema,
     Exhausted,
+    CreditBalance {
+        raw: &'static str,
+        window_alternative: bool,
+    },
     FutureClock,
     Oversize,
     Timeout,
@@ -45,7 +49,11 @@ impl ReplyMode {
     /// Returns a synthetic state lifetime, or no response for malformed mode.
     fn lifetime(self) -> Option<f64> {
         match self {
-            Self::Known | Self::InvalidSchema | Self::Exhausted | Self::FutureClock => Some(120.0),
+            Self::Known
+            | Self::InvalidSchema
+            | Self::Exhausted
+            | Self::CreditBalance { .. }
+            | Self::FutureClock => Some(120.0),
             Self::Malformed | Self::Oversize | Self::Timeout => None,
             #[cfg(feature = "test-fixtures")]
             Self::ShortValidity | Self::MixedLatch | Self::MixedLatchLong => Some(1.0),
@@ -107,6 +115,20 @@ impl FakeQuota {
                         } else {
                             known_response(at, until)
                         };
+                        if let ReplyMode::CreditBalance {
+                            raw,
+                            window_alternative,
+                        } = mode
+                        {
+                            let mut exhausted = exhausted_response(at, until);
+                            exhausted["result"]["accounts"][0]["credit_balance"] =
+                                serde_json::from_str(raw).unwrap();
+                            if window_alternative {
+                                exhausted["result"]["accounts"][1] =
+                                    value["result"]["accounts"][1].clone();
+                            }
+                            value = exhausted;
+                        }
                         #[cfg(feature = "test-fixtures")]
                         if matches!(mode, ReplyMode::MixedLatch | ReplyMode::MixedLatchLong) {
                             value = mixed_latch_response(
@@ -487,6 +509,101 @@ async fn quota_admission_v2_exhausted_never_becomes_unknown_before_deadline() {
     assert_eq!(count, 0);
     assert_eq!(fake.requests.lock().unwrap().len(), 1);
     fake.stop().await;
+}
+
+/// Prefers plan windows and admits a pinned exhausted account with paid credits.
+#[tokio::test]
+async fn quota_admission_v2_paid_credits_rank_after_plan_windows() {
+    let fake = FakeQuota::start(ReplyMode::CreditBalance {
+        raw: r#"{"has_credits":true,"unlimited":false,"balance":"42.50"}"#,
+        window_alternative: true,
+    });
+    let home = home(Some(&fake.path), 8);
+    let writer = common::writer::Harness::start(home.path());
+    let service = Service::new(home.path().to_path_buf()).with_writer(writer.broker());
+
+    let guide = service.delegation_guide().await.unwrap();
+    let guide = guide.as_str().unwrap();
+    assert!(guide.contains("exhausted window; paid credits available"));
+    assert!(!guide.contains("acct-a"));
+
+    let auto = service
+        .admit_provider(request(home.path(), "plan-first"))
+        .await
+        .unwrap();
+    assert_eq!(
+        selected(home.path(), auto["agent_id"].as_str().unwrap()),
+        "acct-b"
+    );
+
+    let mut pinned = request(home.path(), "paid-pinned");
+    pinned.account = Some("alpha".parse().unwrap());
+    let paid = service.admit_provider(pinned).await.unwrap();
+    assert_eq!(
+        selected(home.path(), paid["agent_id"].as_str().unwrap()),
+        "acct-a"
+    );
+    fake.stop().await;
+}
+
+/// Checks credit-only admission, known zero, and malformed optional metadata.
+#[tokio::test]
+async fn quota_admission_v2_credit_balance_controls_exhausted_fallback() {
+    for (raw, admits) in [
+        (
+            r#"{"has_credits":true,"unlimited":false,"balance":"42.50"}"#,
+            true,
+        ),
+        (
+            r#"{"has_credits":false,"unlimited":true,"balance":null}"#,
+            true,
+        ),
+        (
+            r#"{"has_credits":false,"unlimited":false,"balance":"0"}"#,
+            false,
+        ),
+        (
+            r#"{"has_credits":"yes","unlimited":false,"balance":"10"}"#,
+            false,
+        ),
+        (
+            r#"{"has_credits":true,"unlimited":false,"balance":10}"#,
+            false,
+        ),
+        (
+            r#"{"has_credits":true,"unlimited":false,"balance":"bad"}"#,
+            false,
+        ),
+    ] {
+        let fake = FakeQuota::start(ReplyMode::CreditBalance {
+            raw,
+            window_alternative: false,
+        });
+        let home = home(Some(&fake.path), 8);
+        let writer = common::writer::Harness::start(home.path());
+        let service = Service::new(home.path().to_path_buf()).with_writer(writer.broker());
+        let result = service
+            .admit_provider(request(home.path(), "credit-fallback"))
+            .await;
+        if admits {
+            let agent = result.unwrap();
+            assert_eq!(
+                selected(home.path(), agent["agent_id"].as_str().unwrap()),
+                "acct-a"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::QuotaAdmission(
+                        agent_run_domain::catalog::QuotaAdmissionError::QuotaExhausted { .. }
+                    ))
+                ),
+                "{raw}: {result:?}"
+            );
+        }
+        fake.stop().await;
+    }
 }
 
 #[tokio::test]

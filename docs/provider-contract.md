@@ -110,8 +110,10 @@ collection jobs require a separate migration.
   must reserve with the attempt. Rank is a producer-assigned ordinal: lower
   groups win, and only equal ranks use active-count then stable global account
   id as admission tie-breaks. Quota supplies each quota class and score; Run
-  applies its local weights and ordering when building the candidate set. Unknown capacity
-  candidates follow known usable capacity; missing data is never invented.
+  applies its local weights and ordering when building the candidate set.
+  Unknown capacity follows known usable capacity. Native Codex accounts with
+  exhausted plan windows and reported paid or unlimited credits rank last.
+  Missing or malformed credit metadata leaves the exhaustion verdict in effect.
 * Transactional admission re-validates Run's local capacity revision in
   `BEGIN IMMEDIATE`, filters by current account status and reservations, and
   persists the chosen account plus the attempt. That revision covers local
@@ -439,11 +441,10 @@ Executable boundary coverage lives beside the contracts:
 `delegation_guide` is the advertised routing read in the shared
 `assets/tools.json` registry and CLI/socket/MCP dispatcher. It uses one
 validated config revision from the service's exact-byte last-valid cache,
-canonical role files and one local committed read. It never reads, collects or
-presents quota, calls a harness, reserves, consumes reset credits, writes
-samples or starts agents. Quota windows and capacity standing are presented by
-Agent Quota; the former `limits`, `models` and `capacity_order` reads were
-removed in 0.32.0.
+canonical role files and one local committed read. For native Codex, it can read
+one bounded Quota snapshot and annotate models with an eligible paid-credit
+fallback. Agent Quota presents quota windows and general capacity standing. The former
+`limits`, `models` and `capacity_order` reads were removed in 0.32.0.
 
 * The guide renders compact account-free routing text, optionally filtered by
   exact provider/model/profile names on CLI, socket and MCP. Providers and
@@ -457,10 +458,9 @@ removed in 0.32.0.
   retain defaults; schema 1 returns `Unsupported`.
 * Admission still ranks eligible accounts from one fresh Quota snapshot with
   Run's configured account and provider multipliers
-  (`capacity::provider_ranking`) and refuses an exhausted choice with
-  `QuotaExhausted`. No account id, label or secret reference is emitted. The
-  orchestrator chooses provider, model, effort and profile; there is no
-  automatic model choice or ability score.
+  (`capacity::provider_ranking`). An exhausted account without eligible paid
+  credits can produce `QuotaExhausted`. The guide omits account identity and
+  credentials. The orchestrator chooses provider, model, effort and profile.
 
 ### Next attempt on one logical agent (store primitive)
 

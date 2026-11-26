@@ -95,6 +95,8 @@ pub(super) enum LaneVerdict {
     },
     /// No fresh known evidence on this lane; a valid fallback, never a zero.
     Unknown,
+    /// The plan window is exhausted, and Codex reports paid credits available.
+    CreditBacked,
     /// An authoritative fresh zero or an active durable latch blocks the
     /// lane for this model; no multiplier can revive it. Carries when the
     /// limiting restriction lifts, when known.
@@ -154,7 +156,7 @@ fn current_eligible(
         .collect()
 }
 
-/// Builds candidates from already obtained quota standings and local state only.
+/// Builds candidates and identifies credit-backed accounts using supplied standings and local state.
 /// The caller may hold one read transaction across multiple calls to share a local revision.
 #[allow(clippy::too_many_arguments)] // Matches the existing scoped producer plus its score source.
 pub(super) fn provider_candidates_prepared_at(
@@ -166,7 +168,7 @@ pub(super) fn provider_candidates_prepared_at(
     hard_ineligible: &BTreeSet<AccountId>,
     at: f64,
     score: impl FnOnce(&BTreeMap<AccountId, f64>, &ProviderModel, f64) -> Result<Vec<LaneStanding>>,
-) -> Result<QuotaCandidateSet> {
+) -> Result<(QuotaCandidateSet, BTreeSet<AccountId>)> {
     provider_candidates_inner(
         store,
         catalog,
@@ -180,7 +182,7 @@ pub(super) fn provider_candidates_prepared_at(
     )
 }
 
-/// Applies local eligibility, cooldown and ranking rules to supplied standings.
+/// Applies eligibility, cooldown and ranking rules and returns the credit-backed accounts.
 #[allow(clippy::too_many_arguments)] // Carries the existing selection contract and two read seams.
 fn provider_candidates_inner<T>(
     store: &Store,
@@ -192,7 +194,7 @@ fn provider_candidates_inner<T>(
     at: f64,
     load: impl FnOnce(&Connection, &BTreeSet<AccountId>) -> Result<(LocalSnapshot, T)>,
     score: impl FnOnce(&T, &BTreeMap<AccountId, f64>, &ProviderModel, f64) -> Result<Vec<LaneStanding>>,
-) -> Result<QuotaCandidateSet> {
+) -> Result<(QuotaCandidateSet, BTreeSet<AccountId>)> {
     if model.trim().is_empty() {
         return Err(invalid("model must be nonblank"));
     }
@@ -291,6 +293,7 @@ fn provider_candidates_inner<T>(
     let mut rank: u32 = 0;
     let mut previous_priority: Option<f64> = None;
     let mut unknown: Vec<(AccountId, f64, BTreeSet<PhysicalQuotaKey>)> = Vec::new();
+    let mut credits = Vec::new();
     let mut exhausted: Vec<(AccountId, Option<f64>)> = Vec::new();
     let mut overflow = false;
     for (account, verdict, keys) in &ordering {
@@ -310,21 +313,29 @@ fn provider_candidates_inner<T>(
                 });
             }
             LaneVerdict::Unknown => unknown.push((account.clone(), factor, keys.clone())),
+            LaneVerdict::CreditBacked => credits.push((account.clone(), factor, keys.clone())),
             LaneVerdict::Exhausted { reset_at, .. } => exhausted.push((account.clone(), *reset_at)),
             LaneVerdict::Overflow => overflow = true,
         }
     }
-    if !unknown.is_empty() {
-        if previous_priority.is_some() {
+    let credit_backed: BTreeSet<_> = credits
+        .iter()
+        .map(|(account, _, _)| account.clone())
+        .collect();
+    for (group, quota_known) in [(unknown, false), (credits, true)] {
+        if group.is_empty() {
+            continue;
+        }
+        if !candidates.is_empty() {
             rank += 1;
         }
-        for (account, factor, keys) in unknown {
+        for (account, factor, keys) in group {
             candidates.push(QuotaCandidate {
                 account,
                 rank,
                 physical_keys: keys.into_iter().collect(),
                 multiplier: factor.try_into()?,
-                quota_known: false,
+                quota_known,
             });
         }
     }
@@ -405,5 +416,5 @@ fn provider_candidates_inner<T>(
         quota_decision: None,
     };
     set.validate()?;
-    Ok(set)
+    Ok((set, credit_backed))
 }

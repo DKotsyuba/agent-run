@@ -2780,9 +2780,8 @@ impl Service {
     }
 
     /// Public `delegation_guide` read: compact account-free routing text over
-    /// one committed catalog snapshot, rendered by
-    /// [`crate::delegation_guide::render`] without any quota read, collection
-    /// or ranking (Agent Quota owns capacity presentation). A schema-1 config
+    /// one committed catalog snapshot and optional paid-credit fallback notes.
+    /// General capacity presentation remains with Agent Quota. A schema-1 config
     /// has no provider catalog, so the whole read is `Unsupported` there.
     pub async fn delegation_guide(&self) -> Result<Value> {
         self.delegation_guide_filtered(agent_run_domain::ModelsQuery::default())
@@ -2801,6 +2800,27 @@ impl Service {
         match active.value {
             CachedConfigValue::Providers(config) => {
                 let home = self.home.clone();
+                let supports_credits = config.providers.iter().any(|(id, provider)| {
+                    query
+                        .provider
+                        .as_deref()
+                        .is_none_or(|wanted| wanted == id.as_str())
+                        && crate::capacity::quota_adapter::supports_credits(
+                            provider.harness,
+                            &provider.connection,
+                        )
+                        && provider.models.iter().any(|model| {
+                            query
+                                .model
+                                .as_deref()
+                                .is_none_or(|wanted| wanted == model.id)
+                        })
+                });
+                let snapshot = if supports_credits {
+                    crate::capacity::quota_adapter::fetch(config.capacity.quota.as_ref()).await
+                } else {
+                    None
+                };
                 self.read(move |store| {
                     crate::capacity::provider_catalog::delegation_guide_at(
                         store,
@@ -2808,6 +2828,7 @@ impl Service {
                         &config,
                         &active.revision,
                         &query,
+                        snapshot.as_ref(),
                     )
                 })
                 .await

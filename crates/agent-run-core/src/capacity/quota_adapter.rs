@@ -6,7 +6,7 @@
 use super::provider_ranking::{self, LaneStanding, LaneVerdict};
 use crate::{Result, error::invalid, quota_client, state::Store};
 use agent_run_domain::{
-    ProviderId,
+    HarnessId, ProviderConnection, ProviderId,
     catalog::{
         AccountId, PhysicalQuotaKey, ProviderCatalog, ProviderModel, QuotaCandidateSet,
         QuotaDecision,
@@ -34,6 +34,8 @@ pub struct CandidateOutput {
     pub candidates: QuotaCandidateSet,
     /// No reference means quota was unavailable and its standings are unknown.
     pub quota_reference: Option<QuotaReference>,
+    /// Eligible accounts whose exhausted plan window is backed by paid credits.
+    pub credit_backed: BTreeSet<AccountId>,
 }
 
 /// Earliest source-class boundary affecting one local decision.
@@ -120,6 +122,11 @@ impl DecisionSnapshots {
     }
 }
 
+/// Paid Codex credits apply only to the native Codex connection.
+pub(crate) fn supports_credits(harness: HarnessId, connection: &ProviderConnection) -> bool {
+    harness == HarnessId::Codex && *connection == ProviderConnection::Native
+}
+
 /// Builds one candidate set from a validated snapshot and current local eligibility.
 ///
 /// `None` means Quota was unavailable; it never means zero or unlimited quota.
@@ -145,7 +152,10 @@ pub fn candidates_at(
     at: f64,
 ) -> Result<CandidateOutput> {
     let mut fence = StateFence::default();
-    let mut candidates = provider_ranking::provider_candidates_prepared_at(
+    let supports_credits = catalog
+        .provider(provider)
+        .is_some_and(|definition| supports_credits(definition.harness, &definition.connection));
+    let (mut candidates, credit_backed) = provider_ranking::provider_candidates_prepared_at(
         store,
         catalog,
         provider,
@@ -161,7 +171,7 @@ pub fn candidates_at(
                 snapshot,
                 clock,
                 &mut fence,
-                Some(32),
+                supports_credits,
             )
         },
     )?;
@@ -182,6 +192,7 @@ pub fn candidates_at(
     Ok(CandidateOutput {
         candidates,
         quota_reference,
+        credit_backed,
     })
 }
 
@@ -193,7 +204,7 @@ pub(super) fn score(
     snapshot: Option<&quota_client::Snapshot>,
     now: f64,
     fence: &mut StateFence,
-    max_pools: Option<usize>,
+    supports_credits: bool,
 ) -> Result<Vec<LaneStanding>> {
     let clock_valid = snapshot.is_some_and(|s| {
         s.evaluated_at.is_finite() && s.evaluated_at >= 0.0 && now >= s.evaluated_at
@@ -201,8 +212,7 @@ pub(super) fn score(
     let mut known = Vec::new();
     let mut other = Vec::new();
     for (account, factor) in accounts {
-        let model = matching_model(snapshot, account, provider, offering);
-        let Some(model) = model else {
+        let Some((view, model)) = matching_model(snapshot, account, provider, offering) else {
             other.push((account.clone(), LaneVerdict::Unknown, BTreeSet::new()));
             continue;
         };
@@ -225,6 +235,16 @@ pub(super) fn score(
             }
         }
         if model.state == quota_client::ModelState::Exhausted && state_valid {
+            if supports_credits
+                && view
+                    .credit_balance
+                    .as_ref()
+                    .is_some_and(|credit| credit.has_credits || credit.unlimited)
+            {
+                let keys = physical_keys(account, &model.pools, Some(32))?;
+                other.push((account.clone(), LaneVerdict::CreditBacked, keys));
+                continue;
+            }
             other.push((
                 account.clone(),
                 LaneVerdict::Exhausted {
@@ -234,7 +254,7 @@ pub(super) fn score(
             ));
             continue;
         }
-        let keys = physical_keys(account, &model.pools, max_pools)?;
+        let keys = physical_keys(account, &model.pools, Some(32))?;
         if !state_valid {
             other.push((account.clone(), LaneVerdict::Unknown, keys));
             continue;
@@ -274,25 +294,24 @@ pub(super) fn score(
     Ok(known)
 }
 
-/// Finds one exact account/provider/model/native binding without alias inference.
-pub(super) fn matching_model<'a>(
+/// Finds the account view and its exact provider/model/native binding without alias inference.
+fn matching_model<'a>(
     snapshot: Option<&'a quota_client::Snapshot>,
     account: &AccountId,
     provider: &ProviderId,
     offering: &ProviderModel,
-) -> Option<&'a quota_client::Model> {
+) -> Option<(&'a quota_client::Account, &'a quota_client::Model)> {
     let native = offering.native_model.as_deref().unwrap_or(&offering.id);
-    snapshot?
+    let view = snapshot?
         .accounts
         .iter()
-        .find(|view| view.account == account.as_str())?
-        .models
-        .iter()
-        .find(|model| {
-            model.provider == provider.as_str()
-                && model.model == offering.id
-                && model.native_model == native
-        })
+        .find(|view| view.account == account.as_str())?;
+    let model = view.models.iter().find(|model| {
+        model.provider == provider.as_str()
+            && model.model == offering.id
+            && model.native_model == native
+    })?;
+    Some((view, model))
 }
 
 /// Converts every reported pool without truncation or inference of missing pools.

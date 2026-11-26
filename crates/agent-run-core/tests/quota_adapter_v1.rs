@@ -742,3 +742,28 @@ fn quota_adapter_v1_batch_calls_share_the_callers_local_read_snapshot() {
             .all(|candidate| candidate.account.as_str() != "acct-b")
     );
 }
+
+/// Credit metadata attached to another harness never revives its exhausted window.
+#[test]
+fn quota_adapter_ignores_codex_credits_on_claude() {
+    let home = home();
+    let store = agent_run_core::state::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store, false);
+    let mut snapshot = snapshot();
+    snapshot.accounts[4].credit_balance = serde_json::from_value(json!({
+        "has_credits":true,"unlimited":false,"balance":"42.50"
+    }))
+    .unwrap();
+    assert!(matches!(
+        candidates(
+            &store,
+            &catalog,
+            Some(&snapshot),
+            Some("epsilon"),
+            &BTreeSet::new()
+        ),
+        Err(Error::QuotaAdmission(
+            QuotaAdmissionError::QuotaExhausted { .. }
+        ))
+    ));
+}
