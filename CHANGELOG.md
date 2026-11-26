@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.34.0
+
 - Allow explicit crash recovery of an unsealed lost Claude Code or Codex
   session. Recovery forks a cleaned copy on the same account and preserves
   the original transcript. A pre-spawn retry reuses the recovery copy.
