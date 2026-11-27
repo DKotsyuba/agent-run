@@ -707,7 +707,15 @@ async fn claude_owner_missing_replay_retires_one_effect() {
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
     let (environment, channel, socket_home) = owner_environment();
     let script = format!(
-        "read initial; printf '%s\\n' '{TURN}'; read wake; printf 'one\\n' >> effect; if read unexpected; then printf 'duplicate\\n' >> effect; fi"
+        r#"read initial; printf '%s\n' '{TURN}'; read wake; printf 'one\n' >> effect
+printf '%s\n' '{{"type":"command_lifecycle","command_uuid":"private-lifecycle-id","state":"private-state","session_id":"s"}}'
+printf '%s\n' '{{"type":"user","isReplay":true,"uuid":"00000000-0000-4000-8000-000000000001","session_id":"s","parent_tool_use_id":null,"origin":{{"kind":"task-notification","producer":"session-task"}},"message":{{"role":"user","content":"private-message"}}}}'
+i=0
+while [ "$i" -lt 12 ]; do
+    printf '%s\n' '{{"type":"command_lifecycle","command_uuid":"private-lifecycle-id","state":"private-state","session_id":"s"}}'
+    i=$((i + 1))
+done
+if read unexpected; then printf 'duplicate\n' >> effect; fi"#
     );
     let mut process = Process::spawn(&LaunchPlan {
         binary: "/bin/sh".into(),
@@ -744,7 +752,12 @@ async fn claude_owner_missing_replay_retires_one_effect() {
             native_start_time: leader.birth.floor() as u64,
             wake_only: true,
         };
-        let mut stream = send(&socket, &call).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let bytes = serde_json::to_vec(&call).unwrap();
+        stream.write_u32_le(bytes.len() as u32).await.unwrap();
+        // The initial socket budget still bounds slow framing and native I/O.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        stream.write_all(&bytes).await.unwrap();
         let mut byte = [0];
         match tokio::time::timeout(Duration::from_secs(33), stream.read(&mut byte)).await {
             Ok(Ok(0)) | Ok(Err(_)) => {}
@@ -773,12 +786,56 @@ async fn claude_owner_missing_replay_retires_one_effect() {
     })
     .await
     .unwrap();
+    assert!(matches!(
+        result,
+        Err(agent_run_domain::Error::NativeOwnerInputUncertain)
+    ));
+    let mut stmt = control.conn.prepare(
+        "SELECT data_json FROM events WHERE agent_id=? AND attempt_id='attempt' AND kind='native_owner_input_v1' ORDER BY seq",
+    ).unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([id.as_str()], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), 10, "{rows:?}");
+    for raw in &rows {
+        assert!(raw.len() < 256);
+        for private in [
+            "manifest",
+            "private-lifecycle-id",
+            "private-state",
+            "00000000-0000-4000-8000-000000000001",
+            "private-message",
+        ] {
+            assert!(!raw.contains(private));
+        }
+    }
+    let observations: Vec<Value> = rows
+        .iter()
+        .map(|row| serde_json::from_str(row).unwrap())
+        .collect();
+    let write = &observations[0];
+    assert_eq!(write["stage"], "wake_written");
+    assert!(write["bytes"].as_u64().unwrap() > "manifest".len() as u64);
+    assert!(write["written_at"].as_f64().unwrap() > 0.);
+    assert!(write["remaining_ms"].as_u64().unwrap() < 29_000);
+    let lifecycle = &observations[1];
+    assert_eq!(lifecycle["stage"], "command_lifecycle");
+    assert_eq!(lifecycle["lifecycle"], "other");
+    let replay = &observations[2];
+    assert_eq!(replay["stage"], "replay");
+    assert_eq!(replay["uuid_match"], false);
+    assert_eq!(replay["session_match"], true);
+    assert!(replay["remaining_ms"].as_u64().unwrap() <= write["remaining_ms"].as_u64().unwrap());
     assert!(
-        result
-            .err()
-            .expect("missing replay must fail closed")
-            .to_string()
-            .contains("acknowledgement is uncertain")
+        observations[3..9]
+            .iter()
+            .all(|row| row["stage"] == "command_lifecycle")
+    );
+    assert_eq!(
+        observations[9],
+        json!({"stage":"deadline_expired","remaining_ms":0})
     );
     assert!(!socket.exists());
     assert_eq!(

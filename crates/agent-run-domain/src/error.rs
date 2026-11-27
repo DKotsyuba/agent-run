@@ -212,6 +212,9 @@ pub enum Error {
     /// A public input contract was violated.
     #[error("{0}")]
     Validation(String),
+    /// A native wake may have taken effect without a verified acknowledgement.
+    #[error("native owner input acknowledgement is uncertain")]
+    NativeOwnerInputUncertain,
     /// The requested agent id was not found.
     #[error("unknown agent: {0}")]
     NotFound(String),
@@ -557,6 +560,7 @@ impl Error {
                 ..
             } => MachineCode::from_wire(code).unwrap_or(MachineCode::RuntimeError),
             Self::Runtime(_)
+            | Self::NativeOwnerInputUncertain
             | Self::WriterFailure(_)
             | Self::OwnershipCheckpoint { .. }
             | Self::Broker { .. } => MachineCode::RuntimeError,

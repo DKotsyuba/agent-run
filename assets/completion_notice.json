@@ -117,6 +117,10 @@
       "reason": "Runtime evidence failed an integrity check.",
       "advice": "After fixing the cause, use resume with the same agent_id when native history and cleanup allow it."
     },
+    "native_owner_input_uncertain": {
+      "reason": "The runtime did not confirm the wake.",
+      "advice": "Check the original Pool/Bridge delivery and native history before resending. If history and cleanup checks pass, resume the same agent_id to reconcile the original message."
+    },
     "runtime_contract_rejected": {
       "reason": "The execution violated the runtime contract.",
       "advice": "After fixing the cause, use resume with the same agent_id when native history and cleanup allow it."
