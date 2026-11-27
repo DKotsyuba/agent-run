@@ -270,6 +270,9 @@ impl BrokerClient {
                 }
                 Err(ClientAttemptError::Transport) => {
                     *connection = None;
+                    if method == "cooldowns_clear" {
+                        return Err(Error::Runtime("cooldown clear outcome unknown".into()));
+                    }
                     if method == "start_batch" {
                         return Err(batch_response_error(method, Error::BrokerUnavailable));
                     }
@@ -482,6 +485,7 @@ const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 /// Interval between content-digest checks for a running broker's configuration.
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_METHODS: &[&str] = &[
+    "cooldowns_clear",
     "start",
     "start_batch",
     "history_pins_release",
@@ -890,6 +894,9 @@ enum SocketAccess {
     SystemGroup,
 }
 
+/// Operator cooldown methods are separate from the public MCP tool table.
+const COOLDOWN_METHODS: &[&str] = &["cooldowns_list", "cooldowns_clear"];
+
 /// Narrow CLI compatibility reads excluded from public tool discovery.
 const CLI_READ_METHODS: &[&str] = &[
     "_cli_answer",
@@ -1042,7 +1049,10 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
     if notification
         && (matches!(
             method,
-            "_lineage_hold_acquire" | "_lineage_hold_release" | "history_pins_release"
+            "_lineage_hold_acquire"
+                | "_lineage_hold_release"
+                | "history_pins_release"
+                | "cooldowns_clear"
         ) || (method == "start_batch"
             && params.get("retain_history") == Some(&Value::Bool(true))))
     {
@@ -1050,6 +1060,7 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
     }
     let known = dispatch::is_tool(method)
         || CLI_READ_METHODS.contains(&method)
+        || COOLDOWN_METHODS.contains(&method)
         || SERVICE_RESTART_METHODS.contains(&method)
         || LINEAGE_HOLD_METHODS.contains(&method)
         || [
@@ -1195,8 +1206,13 @@ async fn connection(
                             .await
                         } else if matches!(
                             method,
-                            "_lineage_hold_acquire" | "_lineage_hold_release"
+                            "_lineage_hold_acquire" | "_lineage_hold_release" | "cooldowns_clear"
                         ) {
+                            let unknown = if method == "cooldowns_clear" {
+                                "cooldown clear outcome unknown"
+                            } else {
+                                "lineage hold outcome unknown"
+                            };
                             let service = service.clone();
                             // An accepted mutation keeps its slot and completes even
                             // if the socket caller stops waiting for its response.
@@ -1206,12 +1222,10 @@ async fn connection(
                             });
                             match tokio::time::timeout(options.request_timeout, task).await {
                                 Ok(Ok(response)) => response,
-                                Ok(Err(_)) => has_id.then(|| {
-                                    err(request_id, -32000, "lineage hold outcome unknown", None)
-                                }),
-                                Err(_) => has_id.then(|| {
-                                    err(request_id, -32002, "lineage hold outcome unknown", None)
-                                }),
+                                Ok(Err(_)) => {
+                                    has_id.then(|| err(request_id, -32000, unknown, None))
+                                }
+                                Err(_) => has_id.then(|| err(request_id, -32002, unknown, None)),
                             }
                         } else if matches!(
                             method,

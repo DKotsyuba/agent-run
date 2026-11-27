@@ -17,6 +17,7 @@ struct FakeQuota {
     path: std::path::PathBuf,
     task: Option<JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Value>>>,
+    observation: Arc<Mutex<Option<f64>>>,
 }
 
 impl FakeQuota {
@@ -32,7 +33,9 @@ impl FakeQuota {
         let path = directory.path().join("quota.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let observed = requests.clone();
+        let request_log = requests.clone();
+        let observation = Arc::new(Mutex::new(None));
+        let source_clock = observation.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut request = Vec::new();
@@ -40,10 +43,12 @@ impl FakeQuota {
                     continue;
                 }
                 if let Ok(value) = serde_json::from_slice(&request) {
-                    observed.lock().unwrap().push(value);
+                    request_log.lock().unwrap().push(value);
                 }
                 let at = agent_run_core::domain::now();
-                let mut bytes = serde_json::to_vec(&response(at, provider, accounts)).unwrap();
+                let observed_at = source_clock.lock().unwrap().unwrap_or(at);
+                let mut bytes =
+                    serde_json::to_vec(&response(at, observed_at, provider, accounts)).unwrap();
                 bytes.push(b'\n');
                 let _ = stream.write_all(&bytes).await;
             }
@@ -53,6 +58,7 @@ impl FakeQuota {
             path,
             task: Some(task),
             requests,
+            observation,
         }
     }
 
@@ -75,7 +81,7 @@ impl Drop for FakeQuota {
 }
 
 /// Produces two current known accounts, each with a separate physical pool.
-fn response(at: f64, provider: &str, account_ids: [&str; 2]) -> Value {
+fn response(at: f64, observed_at: f64, provider: &str, account_ids: [&str; 2]) -> Value {
     let until = at + 300.0;
     let mut base: Value = serde_json::from_str(SNAPSHOT).unwrap();
     let mut accounts = Vec::new();
@@ -87,13 +93,13 @@ fn response(at: f64, provider: &str, account_ids: [&str; 2]) -> Value {
         account["models"][0]["native_model"] = json!("fixture");
         account["models"][0]["state_validity"] = json!({"kind":"until","at":until});
         account["models"][0]["reset_at"] = json!(until + 1000.0);
-        account["models"][0]["newest_observed_at"] = json!(at);
+        account["models"][0]["newest_observed_at"] = json!(observed_at);
         account["windows"][0]["runtime"] = json!(provider);
         account["windows"][0]["models"] = json!(["fixture"]);
-        account["windows"][0]["observed_at"] = json!(at);
+        account["windows"][0]["observed_at"] = json!(observed_at);
         account["windows"][0]["valid_until"] = json!(until);
         account["windows"][0]["last_reset_at"] = json!(until + 1000.0);
-        account["windows"][0]["forecast"]["observed_at"] = json!(at);
+        account["windows"][0]["forecast"]["observed_at"] = json!(observed_at);
         account["windows"][0]["forecast"]["reset_at"] = json!(until + 1000.0);
         account["windows"][0]["evaluation"]["reset_at"] = json!(until + 1000.0);
         account["advice"][0]["reset_at"] = json!(until + 1000.0);
@@ -101,7 +107,7 @@ fn response(at: f64, provider: &str, account_ids: [&str; 2]) -> Value {
     }
     base["result"]["evaluated_at"] = json!(at);
     base["result"]["accounts"] = json!(accounts);
-    base["result"]["coverage"]["last_collection"]["observed_at"] = json!(at);
+    base["result"]["coverage"]["last_collection"]["observed_at"] = json!(observed_at);
     base["result"]["coverage"]["last_collection"]["sources"][0]["account"] = json!(account_ids[0]);
     base["result"]["coverage"]["last_collection"]["sources"][0]["provider"] = json!(provider);
     base
@@ -160,10 +166,11 @@ async fn quota_v2_supervisor_failover_uses_a_fresh_read_without_feedback() {
     quota.stop().await;
 }
 
-/// Ordered-provider cooldown remains local even when Quota still reports both accounts known.
+/// Fresh snapshot reads retain the cooldown until the actual source observation advances.
 #[tokio::test]
-async fn quota_v2_ordered_cooldown_survives_fresh_quota_reads() {
+async fn quota_v2_ordered_cooldown_releases_after_observation_advances() {
     let mut quota = FakeQuota::start("glm-user", ["acct-work", "acct-sub"]);
+    *quota.observation.lock().unwrap() = Some(agent_run_core::domain::now());
     let (_temp, home) = ordered_claude_home();
     configure(&home, &quota.path);
     let service = fixture_service(home.clone()).await;
@@ -186,11 +193,22 @@ async fn quota_v2_ordered_cooldown_survives_fresh_quota_reads() {
     assert_eq!(reason, "quota_exhausted");
     input.task = "fixture:answer".into();
     input.request_id = Some("quota-v2-ordered-next".into());
-    let next = service.admit_provider(input).await.unwrap();
+    let next = service.admit_provider(input.clone()).await.unwrap();
     let next_id: AgentId = serde_json::from_value(next["agent_id"].clone()).unwrap();
     assert_eq!(attempts(&home, &next_id)[0].1, "acct-sub");
+    *quota.observation.lock().unwrap() = None;
+    input.request_id = Some("quota-v2-ordered-recovered".into());
+    let recovered = service.admit_provider(input).await.unwrap();
+    let recovered_id: AgentId = serde_json::from_value(recovered["agent_id"].clone()).unwrap();
+    assert_eq!(attempts(&home, &recovered_id)[0].1, "acct-work");
+    let (reason, cooldown_at, evidence_at): (String, f64, f64) = store.conn.query_row(
+        "SELECT reason,cooldown_observed_at,evidence_observed_at FROM binding_cooldown_releases WHERE provider_id='glm-user' AND account_id='acct-work'",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(reason, "quota_recovered");
+    assert!(evidence_at > cooldown_at);
     let requests = quota.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(
         requests
             .iter()

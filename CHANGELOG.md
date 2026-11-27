@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
+  requested model is usable again. Completion notices advise resuming the same
+  agent after capacity returns.
+- Add broker-backed `cooldowns list` and audited `cooldowns clear` for operators.
 - Support opt-in Codex worker log export to a loopback Agent Stats receiver,
   with protected header files and user-prompt logging disabled.
 

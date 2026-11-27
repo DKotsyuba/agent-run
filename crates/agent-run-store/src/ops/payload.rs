@@ -1781,3 +1781,12 @@ pub struct AcceptHealthReply {
     /// Finite nonnegative observation time in Unix seconds.
     pub at: f64,
 }
+
+/// Broker-only operator release with the kernel-authenticated socket UID.
+#[derive(Clone, Serialize)]
+pub struct ClearCooldown {
+    pub provider: agent_run_domain::ProviderId,
+    pub account: agent_run_domain::catalog::AccountId,
+    pub reason: String,
+    pub uid: u32,
+}

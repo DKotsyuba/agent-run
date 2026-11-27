@@ -814,7 +814,7 @@ rendered as `RuntimeError`.
   current schemas for that transport.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 44, reached through the paired
+- The current database schema is version 45, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.
 

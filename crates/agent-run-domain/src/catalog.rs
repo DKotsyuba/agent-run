@@ -1100,6 +1100,10 @@ pub struct QuotaCandidate {
     /// never a known zero; a computed score must never enter `multiplier`.
     #[serde(default)]
     pub quota_known: bool,
+    /// Observation time of fresh usable plan capacity for this exact model.
+    /// Paid credits and unknown standings do not establish quota recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_observed_at: Option<f64>,
 }
 
 /// A bounded, nonsecret reference to one external quota evaluation.
@@ -1190,6 +1194,18 @@ impl QuotaCandidateSet {
     /// references retain the trusted legacy contract; contradictions invalidate
     /// the snapshot and must not be retried as ordinary finite expiry.
     pub fn check_quota_decision(&self, at: f64) -> Result<()> {
+        if self.candidates.iter().any(|candidate| {
+            candidate.recovery_observed_at.is_some_and(|observed| {
+                !candidate.quota_known
+                    || !observed.is_finite()
+                    || observed < 0.0
+                    || self.quota_decision.as_ref().is_none_or(|decision| {
+                        decision.valid_until.is_none() || observed > decision.evaluated_at
+                    })
+            })
+        }) {
+            return Err(QuotaAdmissionError::QuotaDecisionInvalid.into());
+        }
         if let Some(decision) = &self.quota_decision {
             if !decision.requires_clock_fence
                 && self

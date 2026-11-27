@@ -1242,6 +1242,11 @@ thread_local! {
 }
 
 impl StoreReader {
+    /// Lists active binding cooldowns using the read-only connection.
+    pub fn list_cooldowns(&self) -> Result<Vec<crate::cooldowns::Cooldown>> {
+        self.store.list_cooldowns()
+    }
+
     /// Runs a synchronous read using at most one cached connection on this thread.
     /// Reopens after path replacement or home changes. Every call checks schema
     /// version and busy allowance; only autocommit, query-only connections return

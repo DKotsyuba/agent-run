@@ -1088,7 +1088,7 @@ async fn advisory_context_bounds_sql_work_and_keeps_the_prepared_active_block() 
         CREATE VIEW binding_cooldowns AS WITH RECURSIVE n(x) AS
         (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000)
         SELECT 'alpha' AS provider_id,'acct-alpha' AS account_id,
-        'billing_unavailable' AS reason,2000000000+x AS blocked_until FROM n;",
+        'billing_unavailable' AS reason,2000000000+x AS blocked_until,0 AS observed_at FROM n;",
         )
         .unwrap();
     let writer = common::writer::Harness::start(&home.path);

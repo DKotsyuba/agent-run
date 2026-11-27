@@ -22,7 +22,7 @@ struct LocalSnapshot {
     /// Current enabled status straight from the registry rows.
     enabled: BTreeMap<AccountId, bool>,
     /// Separate provider/account cooldowns, never quota observations.
-    cooldowns: BTreeMap<(String, AccountId), (BindingCooldownReason, f64)>,
+    cooldowns: BTreeMap<(String, AccountId), (BindingCooldownReason, f64, f64)>,
 }
 
 impl LocalSnapshot {
@@ -32,11 +32,11 @@ impl LocalSnapshot {
         provider: &ProviderId,
         account: &AccountId,
         at: f64,
-    ) -> Option<(BindingCooldownReason, f64)> {
+    ) -> Option<(BindingCooldownReason, f64, f64)> {
         self.cooldowns
             .get(&(provider.as_str().to_owned(), account.clone()))
-            .filter(|(_, until)| *until > at)
-            .map(|(reason, until)| (*reason, *until))
+            .filter(|(_, until, _)| *until > at)
+            .copied()
     }
 }
 
@@ -59,22 +59,23 @@ fn read_local_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result
             .optional()?;
         enabled.insert(account.clone(), status.as_deref() == Some("enabled"));
         let mut statement = conn.prepare(
-            "SELECT provider_id,reason,blocked_until FROM binding_cooldowns WHERE account_id=?",
+            "SELECT provider_id,reason,blocked_until,observed_at FROM binding_cooldowns WHERE account_id=?",
         )?;
         for row in statement.query_map([account.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
             ))
         })? {
-            let (provider, reason, until) = row?;
-            if !until.is_finite() || until < 0.0 {
+            let (provider, reason, until, observed) = row?;
+            if !observed.is_finite() || observed < 0.0 || !until.is_finite() || until <= observed {
                 return Err(invalid("binding cooldown is malformed"));
             }
             let reason = serde_json::from_value(serde_json::json!(reason))
                 .map_err(|_| invalid("binding cooldown is malformed"))?;
-            cooldowns.insert((provider, account.clone()), (reason, until));
+            cooldowns.insert((provider, account.clone()), (reason, until, observed));
         }
     }
     Ok(LocalSnapshot {
@@ -92,6 +93,8 @@ pub(super) enum LaneVerdict {
     Known {
         /// The account's ordering priority.
         priority: f64,
+        /// Fresh observation of usable plan capacity for this lane.
+        recovery_observed_at: Option<f64>,
     },
     /// No fresh known evidence on this lane; a valid fallback, never a zero.
     Unknown,
@@ -234,7 +237,7 @@ fn provider_candidates_inner<T>(
         &eligible_accounts(definition, model),
         hard_ineligible,
     );
-    let blocked: BTreeMap<_, _> = usable
+    let mut blocked: BTreeMap<_, _> = usable
         .keys()
         .filter_map(|account| {
             local
@@ -242,9 +245,14 @@ fn provider_candidates_inner<T>(
                 .map(|decision| (account.clone(), decision))
         })
         .collect();
-    usable.retain(|account, _| !blocked.contains_key(account));
+    usable.retain(|account, _| {
+        blocked
+            .get(account)
+            .is_none_or(|(reason, _, _)| *reason == BindingCooldownReason::QuotaExhausted)
+    });
     if let Some(account) = &pinned
-        && let Some((reason, until)) = blocked.get(account)
+        && let Some((reason, until, _)) = blocked.get(account)
+        && !usable.contains_key(account)
     {
         return Err(QuotaAdmissionError::BindingCooldown {
             provider: provider.clone(),
@@ -298,8 +306,18 @@ fn provider_candidates_inner<T>(
     let mut overflow = false;
     for (account, verdict, keys) in &ordering {
         let factor = accounts[account];
+        if let Some((_, _, observed)) = blocked.get(account) {
+            if !matches!(verdict, LaneVerdict::Known { recovery_observed_at: Some(at), .. } if at > observed)
+            {
+                continue;
+            }
+            blocked.remove(account);
+        }
         match verdict {
-            LaneVerdict::Known { priority, .. } => {
+            LaneVerdict::Known {
+                priority,
+                recovery_observed_at,
+            } => {
                 if previous_priority.is_some_and(|previous| *priority != previous) {
                     rank += 1;
                 }
@@ -310,6 +328,7 @@ fn provider_candidates_inner<T>(
                     physical_keys: keys.iter().cloned().collect(),
                     multiplier: factor.try_into()?,
                     quota_known: true,
+                    recovery_observed_at: *recovery_observed_at,
                 });
             }
             LaneVerdict::Unknown => unknown.push((account.clone(), factor, keys.clone())),
@@ -336,10 +355,23 @@ fn provider_candidates_inner<T>(
                 physical_keys: keys.into_iter().collect(),
                 multiplier: factor.try_into()?,
                 quota_known,
+                recovery_observed_at: None,
             });
         }
     }
     if candidates.is_empty() {
+        if let Some(account) = &pinned
+            && let Some((reason, until, _)) = blocked.get(account)
+        {
+            return Err(QuotaAdmissionError::BindingCooldown {
+                provider: provider.clone(),
+                model: model.to_owned(),
+                account: account.clone(),
+                reason: *reason,
+                retry_after_seconds: ((*until - at).ceil() as u64).max(1),
+            }
+            .into());
+        }
         if overflow {
             return Err(invalid(
                 "provider quota priority overflowed a finite number",
@@ -351,7 +383,7 @@ fn provider_candidates_inner<T>(
                 .partial_cmp(&(b.1.is_none(), b.1.unwrap_or(f64::INFINITY), &b.0))
                 .expect("exhaustion resets compare finite against infinity")
         });
-        if let (Some((account, Some(reset))), Some((_, (_, until)))) =
+        if let (Some((account, Some(reset))), Some((_, (_, until, _)))) =
             (soonest_quota, &soonest_block)
             && *reset <= *until
         {
@@ -362,7 +394,7 @@ fn provider_candidates_inner<T>(
             }
             .into());
         }
-        if let Some((account, (reason, until))) = soonest_block {
+        if let Some((account, (reason, until, _))) = soonest_block {
             return Err(QuotaAdmissionError::BindingCooldown {
                 provider: provider.clone(),
                 model: model.to_owned(),

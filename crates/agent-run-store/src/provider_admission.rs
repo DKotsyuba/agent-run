@@ -1345,7 +1345,8 @@ fn quota_decision_metadata(mut metadata: Value, candidates: &QuotaCandidateSet) 
 /// frozen `authority` scope, is not in `exclude` (accounts already tried by
 /// this logical agent), can lease `provider`/`model` from `catalog`, and its
 /// committed registry row is enabled with the catalog's family and storage
-/// reference. `prefer` keeps a resume's still-valid parent account. Next,
+/// reference. An active cooldown blocks the candidate unless fenced quota
+/// evidence releases it within this transaction. `prefer` keeps a resume's still-valid parent account. Next,
 /// ordered providers use frozen binding order; other providers use candidate
 /// rank, active load and account id.
 #[allow(clippy::too_many_arguments)]
@@ -1378,6 +1379,7 @@ fn choose<'a>(
     let mut chosen = None;
     let mut blocked = None;
     let at = now();
+    candidates.check_quota_decision(at)?;
     for candidate in &candidates.candidates {
         if pinned.is_some_and(|account| &candidate.account != account)
             || exclude.contains(&candidate.account)
@@ -1409,13 +1411,22 @@ fn choose<'a>(
         if let Some((reason, retry_after_seconds)) =
             binding_cooldown(tx, provider, &candidate.account, at)?
         {
-            if blocked
-                .as_ref()
-                .is_none_or(|(_, _, seconds)| retry_after_seconds < *seconds)
+            let recovered = if reason == BindingCooldownReason::QuotaExhausted
+                && let Some(observed) = candidate.recovery_observed_at
             {
-                blocked = Some((candidate.account.clone(), reason, retry_after_seconds));
+                crate::cooldowns::recover(tx, provider, &candidate.account, at, observed)?
+            } else {
+                false
+            };
+            if !recovered {
+                if blocked
+                    .as_ref()
+                    .is_none_or(|(_, _, seconds)| retry_after_seconds < *seconds)
+                {
+                    blocked = Some((candidate.account.clone(), reason, retry_after_seconds));
+                }
+                continue;
             }
-            continue;
         }
         let active = Store::active_attempt_counts_in(tx, std::slice::from_ref(&candidate.account))?
             [candidate.account.as_str()];

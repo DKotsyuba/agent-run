@@ -630,6 +630,7 @@ fn quota_candidate_set_preserves_pinned_and_auto_intent() {
         physical_keys: vec![PhysicalQuotaKey::new(&account, "gpt-5.1").unwrap()],
         multiplier: PositiveFinite::try_from(1.0).unwrap(),
         quota_known: true,
+        recovery_observed_at: None,
     };
     let mut set = QuotaCandidateSet {
         provider: provider.clone(),
@@ -679,6 +680,7 @@ fn quota_candidate_rank_groups_are_ordered() {
                 physical_keys: vec![PhysicalQuotaKey::new(account, "shared").unwrap()],
                 multiplier: PositiveFinite::try_from(1.0).unwrap(),
                 quota_known: true,
+                recovery_observed_at: None,
             })
             .collect(),
         capacity_revision: 0,

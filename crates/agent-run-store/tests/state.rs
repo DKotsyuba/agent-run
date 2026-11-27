@@ -20,14 +20,15 @@ use std::{
 /// receipt, producer and authority tables, schema31 Bridge intention ownership,
 /// schema33 binding cooldowns, schema35 restart state, schema36 batch receipts
 /// and history pins, schema37 lineage holds and schema38 launch journal,
-/// schema43 Pool chat lineage metadata and schema44 orchestrator owner UIDs, plus WAL and private modes.
+/// schema43 Pool chat lineage metadata, schema44 orchestrator owner UIDs and
+/// schema45 cooldown release audit, plus WAL and private modes.
 #[test]
 fn schema_initialization_and_reopen() {
     let h = common::Home::new();
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 61);
+    assert_eq!(a["tables"], 62);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     for name in [
@@ -38,6 +39,7 @@ fn schema_initialization_and_reopen() {
         "writer_authority",
         "bridge_delivery_intents",
         "binding_cooldowns",
+        "binding_cooldown_releases",
         "service_restarts",
         "service_restart_agents",
         "service_restart_recipients",

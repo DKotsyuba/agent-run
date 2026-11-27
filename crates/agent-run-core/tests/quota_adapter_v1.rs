@@ -767,3 +767,106 @@ fn quota_adapter_ignores_codex_credits_on_claude() {
         ))
     ));
 }
+
+/// The same admission that reserves the account removes its cooldown and records fresh evidence.
+#[test]
+fn quota_cooldown_releases_only_with_newer_fresh_usable_model_evidence() {
+    use agent_run_core::quota_client::{Evidence, StateValidity};
+
+    let home = home();
+    let mut store = agent_run_core::state::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store, false);
+    let (mut source, at) = current_snapshot();
+    let evidence_at = at - 1.0;
+    let observed_at = at - 3.0;
+    store.conn.execute(
+        "INSERT INTO binding_cooldowns VALUES ('Claude','acct-a','quota_exhausted',?1,?2,'synthetic')",
+        rusqlite::params![observed_at, at + 3600.0],
+    ).unwrap();
+    let excluded = ["acct-b", "acct-c", "acct-d", "acct-e"]
+        .into_iter()
+        .map(|account| account.parse().unwrap())
+        .collect();
+    let rank = |store: &Store, snapshot: Option<&Snapshot>| {
+        candidates_at(store, &catalog, snapshot, None, &excluded, at)
+    };
+    let assert_blocked = |result| {
+        assert!(matches!(
+            result,
+            Err(Error::QuotaAdmission(
+                QuotaAdmissionError::BindingCooldown { .. }
+            ))
+        ));
+    };
+    assert_blocked(rank(&store, None));
+    for (evidence, observed, valid_until) in [
+        (Evidence::Fresh, Some(observed_at - 1.0), at + 60.0),
+        (Evidence::Fresh, Some(observed_at), at + 60.0),
+        (Evidence::Fresh, None, at + 60.0),
+        (Evidence::Fresh, Some(at + 1.0), at + 60.0),
+        (Evidence::Stale, Some(evidence_at), at + 60.0),
+        (Evidence::Fresh, Some(evidence_at), at),
+    ] {
+        let model = &mut source.accounts[0].models[0];
+        model.evidence = evidence;
+        model.newest_observed_at = observed;
+        model.state_validity = StateValidity::Until { at: valid_until };
+        assert_blocked(rank(&store, Some(&source)));
+    }
+    source.accounts[0].models[0].state_validity = StateValidity::Until { at: at + 60.0 };
+    store
+        .conn
+        .execute(
+            "UPDATE binding_cooldowns SET reason='billing_unavailable'",
+            [],
+        )
+        .unwrap();
+    assert_blocked(rank(&store, Some(&source)));
+    store
+        .conn
+        .execute("UPDATE binding_cooldowns SET reason='quota_exhausted'", [])
+        .unwrap();
+    let offered = rank(&store, Some(&source)).unwrap().candidates;
+    let request = request(home.path(), "quota-recovered");
+    let authority = authority(&catalog, home.path());
+    let admit = |store: &mut Store, candidates| {
+        store.admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            candidates,
+            &identity(&request, &authority),
+            4,
+            None,
+            None,
+        )
+    };
+    // The writer checks observation time independently, even if ranking passed earlier.
+    let mut older = offered.clone();
+    older.candidates[0].recovery_observed_at = Some(observed_at);
+    assert!(matches!(
+        admit(&mut store, &older),
+        Err(Error::QuotaAdmission(
+            QuotaAdmissionError::BindingCooldown { .. }
+        ))
+    ));
+    let admitted = admit(&mut store, &offered).unwrap();
+    assert_eq!(admitted.account_id.as_str(), "acct-a");
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM binding_cooldowns", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    let audit = store.conn.query_row(
+        "SELECT reason,operator_uid,evidence_observed_at,cooldown_observed_at FROM binding_cooldown_releases",
+        [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<u32>>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?)),
+    ).unwrap();
+    assert_eq!(
+        audit,
+        ("quota_recovered".into(), None, evidence_at, observed_at)
+    );
+}
