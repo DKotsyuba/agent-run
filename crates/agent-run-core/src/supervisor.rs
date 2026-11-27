@@ -1713,20 +1713,19 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &adapters::provider::profile(&native_role),
             &runtime_home,
         )?;
+        let system_temp = identity
+            .system_route
+            .as_ref()
+            .map(|_| (app_home.to_path_buf(), id.clone()));
         let (scope, facts) = tokio::task::spawn_blocking(move || {
-            let facts = scope.prepare()?;
+            let facts =
+                scope.prepare(system_temp.as_ref().map(|(home, id)| (home.as_path(), id)))?;
             Ok::<_, Error>((scope, facts))
         })
         .await
         .map_err(|_| Error::Runtime("worker launch access check did not complete".into()))??;
         let configured_tmp =
             crate::launch_scope::configured_tmp(&config, identity.authority.harness);
-        let brief = scope.brief(
-            &facts,
-            row.request.explicit_finish,
-            configured_tmp,
-            identity.authority.harness,
-        );
         let agent_dir = home.join("agents").join(id.as_str());
         if identity.system_route.is_some() {
             fs::Dir::open(&agent_dir)?;
@@ -1804,7 +1803,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 },
                 None,
             )?;
-            facts.install_environment(&scope, &mut preliminary.launch.environment, configured_tmp);
+            facts.install_environment(&scope, &mut preliminary.launch.environment, &configured_tmp);
             let codex_grant = if identity.authority.harness == HarnessId::Codex {
                 Some(crate::codex::Grant::new(
                     &preliminary.runtime,
@@ -1973,7 +1972,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             },
             Some(&shared_assets),
         )?;
-        facts.install_environment(&scope, &mut planned.launch.environment, configured_tmp);
+        let temp_environment =
+            facts.install_environment(&scope, &mut planned.launch.environment, &configured_tmp);
+        let brief = scope.brief(
+            &facts,
+            row.request.explicit_finish,
+            &temp_environment,
+            identity.authority.harness,
+        );
         // Update only the live prompt. The sealed role and durable task keep
         // their original bytes for verification, replay and transcript reads.
         match identity.authority.harness {

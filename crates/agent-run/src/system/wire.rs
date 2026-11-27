@@ -10,6 +10,9 @@ use std::{
 };
 
 const MAX_FRAME: usize = 4096;
+// Scope plans can contain multiple bounded absolute path lists. Only the
+// authenticated broker may use this budget and only for a scope request.
+const MAX_SCOPE_FRAME: usize = 256 * 1024;
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -127,8 +130,27 @@ pub(super) fn write_until<T: Serialize>(
     message: &T,
     deadline: Instant,
 ) -> io::Result<()> {
+    write_bounded(stream, message, deadline, MAX_FRAME)
+}
+
+/// Sends just the scope request using its larger, independent budget.
+pub(super) fn write_scope(
+    stream: &mut UnixStream,
+    message: &ScopePreflight,
+    deadline: Instant,
+) -> io::Result<()> {
+    write_bounded(stream, message, deadline, MAX_SCOPE_FRAME)
+}
+
+/// Serialize and bound a message before sending any bytes.
+fn write_bounded<T: Serialize>(
+    stream: &mut UnixStream,
+    message: &T,
+    deadline: Instant,
+    max_frame: usize,
+) -> io::Result<()> {
     let bytes = serde_json::to_vec(message).map_err(io::Error::other)?;
-    if bytes.is_empty() || bytes.len() > MAX_FRAME {
+    if bytes.is_empty() || bytes.len() > max_frame {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid coordinator frame size",
@@ -140,6 +162,7 @@ pub(super) fn write_until<T: Serialize>(
 }
 
 /// Read exactly one bounded JSON frame; malformed input is an error.
+#[cfg(test)]
 pub(super) fn read<T: DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
     read_until(stream, Instant::now() + FRAME_READ_TIMEOUT)
 }
@@ -149,10 +172,35 @@ pub(super) fn read_until<T: DeserializeOwned>(
     stream: &mut UnixStream,
     deadline: Instant,
 ) -> io::Result<T> {
+    let bytes = read_bounded(stream, deadline, MAX_FRAME)?;
+    decode(&bytes)
+}
+
+/// Only requests from the broker UID may consume the scope request budget.
+/// All other messages remain limited to the original frame size.
+pub(super) fn read_request(stream: &mut UnixStream, broker: bool) -> io::Result<Request> {
+    let max_frame = if broker { MAX_SCOPE_FRAME } else { MAX_FRAME };
+    let bytes = read_bounded(stream, Instant::now() + FRAME_READ_TIMEOUT, max_frame)?;
+    let request = decode(&bytes)?;
+    if bytes.len() > MAX_FRAME && !matches!(request, Request::ScopePreflight(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid coordinator frame size",
+        ));
+    }
+    Ok(request)
+}
+
+/// Read one bounded byte frame under the original deadline.
+fn read_bounded(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    max_frame: usize,
+) -> io::Result<Vec<u8>> {
     let mut length = [0_u8; 4];
     read_bytes(stream, &mut length, deadline)?;
     let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > MAX_FRAME {
+    if length == 0 || length > max_frame {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid coordinator frame size",
@@ -160,8 +208,12 @@ pub(super) fn read_until<T: DeserializeOwned>(
     }
     let mut bytes = vec![0_u8; length];
     read_bytes(stream, &mut bytes, deadline)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(bytes)
+}
+
+/// Decode the complete, previously bounded frame.
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Read each partial chunk against the same deadline without changing socket options.
@@ -280,6 +332,36 @@ pub(super) fn lowercase_hex64(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::{io::Write, sync::mpsc, thread};
+
+    /// Oversized frames are reserved for broker scope requests, even if the
+    /// payload parses as an otherwise valid ordinary start.
+    #[test]
+    fn large_scope_budget_keeps_other_requests_at_four_kib() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let start = Start {
+            execution: AgentId::new(),
+            capability_sha256: "a".repeat(MAX_FRAME),
+        };
+        write_bounded(
+            &mut writer,
+            &start,
+            Instant::now() + FRAME_WRITE_TIMEOUT,
+            MAX_SCOPE_FRAME,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_request(&mut reader, true),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer
+            .write_all(&((MAX_FRAME + 1) as u32).to_be_bytes())
+            .unwrap();
+        assert!(matches!(
+            read_request(&mut reader, false),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
 
     /// A complete buffered frame survives peer closure, then the stream reports EOF.
     #[test]

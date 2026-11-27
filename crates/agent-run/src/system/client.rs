@@ -25,10 +25,10 @@ pub(super) async fn preflight_scope(
 ) -> agent_run_domain::Result<Vec<String>> {
     use agent_run_domain::{Error, error::invalid};
     let unavailable = || {
-        Error::Unsupported(format!(
-            "worker access preflight unavailable at {:?}; check the configured worker socket and account",
-            route.worker_socket
-        ))
+        Error::Unsupported(
+            "worker access preflight unavailable; check the configured worker socket and account"
+                .into(),
+        )
     };
     let metadata = std::fs::symlink_metadata(&route.worker_socket).map_err(|_| unavailable())?;
     if !metadata.file_type().is_socket() {
@@ -47,18 +47,18 @@ pub(super) async fn preflight_scope(
     let mut stream = stream.into_std().map_err(|_| unavailable())?;
     let request = wire::ScopePreflight {
         operation: wire::ScopePreflightOperation::ScopePreflight,
-        plan,
+        plan: plan.for_system_probe(),
     };
     let reply = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
-        wire::write_until(&mut stream, &request, deadline)?;
+        wire::write_scope(&mut stream, &request, deadline)?;
         wire::read_until::<Reply>(&mut stream, deadline)
     })
     .await
     .map_err(|_| unavailable())?
     .map_err(|error| {
         if error.kind() == io::ErrorKind::InvalidInput {
-            invalid("worker access preflight exceeds its frame budget; reduce the number or length of scope paths")
+            invalid("requested scope exceeds the worker preflight path budget")
         } else {
             unavailable()
         }

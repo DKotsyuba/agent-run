@@ -238,6 +238,68 @@ fn entry_of(status: &libc::stat) -> Entry {
 
 pub struct Dir(File);
 
+/// Linux POSIX ACL writes are constrained by the group mask in st_mode.
+#[cfg(target_os = "linux")]
+fn no_extended_rename_acl(_: &File) -> bool {
+    true
+}
+
+/// Darwin ACLs can grant delete rights independently of Unix mode bits.
+/// Deny-only ACLs, such as the default home-directory ACL, cannot add rights.
+#[cfg(target_os = "macos")]
+fn no_extended_rename_acl(file: &File) -> bool {
+    // Values from Darwin's sys/acl.h.
+    const ACL_TYPE_EXTENDED: libc::c_uint = 0x100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_DENY: libc::c_uint = 2;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_uint) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            index: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_get_tag_type(entry: *mut libc::c_void, tag: *mut libc::c_uint) -> libc::c_int;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    let mut mount = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: file owns a live descriptor and fstatfs initializes mount on success.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), mount.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: fstatfs succeeded above.
+    if unsafe { mount.assume_init() }.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0 {
+        return false;
+    }
+    // SAFETY: file owns a live descriptor and a non-null result belongs to us.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        return matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOENT | libc::ENOTSUP)
+        );
+    }
+    let mut index = ACL_FIRST_ENTRY;
+    let safe = loop {
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: acl came from the kernel and entry is writable storage.
+        if unsafe { acl_get_entry(acl, index, &mut entry) } != 0 {
+            // Darwin reports the end of a valid ACL as EINVAL.
+            break std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
+        }
+        let mut tag = 0;
+        // SAFETY: the entry borrows the live ACL and tag is writable storage.
+        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 || tag != ACL_EXTENDED_DENY {
+            break false;
+        }
+        index = ACL_NEXT_ENTRY;
+    };
+    // SAFETY: the owned ACL is released once, after the last borrowed entry.
+    unsafe { acl_free(acl) };
+    safe
+}
+
 /// One live bounded scan with its own directory offset, reusable across broker passes.
 pub struct DirScan {
     /// Unique libc directory stream, closed when the scan is dropped.
@@ -349,6 +411,94 @@ impl Dir {
         {
             Self::open(Path::new("/"))?.subdir(relative_path)
         }
+    }
+    /// Opens a physical path whose directory entries can only be replaced by
+    /// root or the effective UID. A trusted sticky ancestor may be shared.
+    pub fn open_protected(path: &Path) -> Result<Self> {
+        let relative_path = path
+            .strip_prefix("/")
+            .map_err(|_| invalid("protected directory must be absolute"))?;
+        let mut directory = Self::open(Path::new("/"))?;
+        directory.check_rename_authority()?;
+        if !relative_path.as_os_str().is_empty() {
+            for part in relative_path.components() {
+                directory = directory.subdir(Path::new(part.as_os_str()))?;
+                directory.check_rename_authority()?;
+            }
+        }
+        Ok(directory)
+    }
+
+    /// Verifies the descriptor owner and authority over entries in this directory.
+    fn check_rename_authority(&self) -> Result<()> {
+        let entry = self.entry(None)?;
+        // SAFETY: geteuid only queries process credentials.
+        let uid = unsafe { libc::geteuid() };
+        if (entry.uid == uid || entry.uid == 0)
+            && (entry.mode & 0o022 == 0 || entry.mode & 0o1000 != 0)
+            && no_extended_rename_acl(&self.0)
+        {
+            return Ok(());
+        }
+        Err(invalid(
+            "directory has an untrusted owner or rename permissions",
+        ))
+    }
+
+    /// Queries the effective account's access to this pinned directory.
+    pub fn has_access(&self, mode: libc::c_int) -> bool {
+        // SAFETY: the directory descriptor and static C string live for the call.
+        unsafe { libc::faccessat(self.0.as_raw_fd(), c".".as_ptr(), mode, libc::AT_EACCESS) == 0 }
+    }
+
+    /// Creates or reopens a worker-owned private child of a protected directory.
+    /// The single entry is created and checked relative to the pinned parent.
+    pub fn private_child(&self, name: &Path) -> Result<Self> {
+        let parts = relative(name)?;
+        let [component] = parts.as_slice() else {
+            return Err(invalid("private directory requires a single component"));
+        };
+        // SAFETY: parent and name are live; mkdirat does not follow the final name.
+        let result = unsafe { libc::mkdirat(self.0.as_raw_fd(), component.as_ptr(), 0o700) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let child = self.subdir(name)?;
+        child.check_rename_authority()?;
+        let entry = child.entry(None)?;
+        // SAFETY: geteuid only queries process credentials.
+        if entry.uid != unsafe { libc::geteuid() } || entry.mode & 0o777 != 0o700 {
+            return Err(invalid(
+                "private directory must be worker-owned with mode 0700",
+            ));
+        }
+        Ok(child)
+    }
+
+    /// Pins a socket inode without following links. Linux can connect through
+    /// the resulting /proc/self/fd path even if the original name is replaced.
+    #[cfg(target_os = "linux")]
+    pub fn pin_socket(&self, name: &Path) -> Result<File> {
+        let (parent, name) = self.parent(name, false)?;
+        // SAFETY: parent/name live for the call; O_PATH never opens the endpoint.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: openat returned a new, owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        use std::os::unix::fs::FileTypeExt as _;
+        if !file.metadata()?.file_type().is_socket() {
+            return Err(invalid("entry is not a socket"));
+        }
+        Ok(file)
     }
     /// Opens a new directory description so independent scans start at offset zero.
     pub fn scan(&self) -> Result<DirScan> {
