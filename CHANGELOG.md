@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.36.0
+
 - Preflight worker directory, Git metadata and Unix socket requirements before
   provider start, resume and batch admission. Describe the effective launch
   scope and provide workspace scratch for direct writable launches and private
