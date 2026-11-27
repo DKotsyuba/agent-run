@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.35.0
+
 - Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
   requested model is usable again. Completion notices advise resuming the same
   agent after capacity returns.
