@@ -1693,6 +1693,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .harnesses
             .get(&identity.authority.harness)
             .ok_or_else(|| invalid("admitted provider harness is unavailable"))?;
+        let config_owner_uid = match (&identity.system_route, &harness.otel) {
+            (Some(route), Some(_)) => {
+                use std::os::unix::fs::MetadataExt as _;
+                Some(std::fs::metadata(&route.state_home)?.uid())
+            }
+            _ => None,
+        };
         let runtime_home = identity
             .runtime_home
             .clone()
@@ -1727,7 +1734,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         )?;
         if identity.runtime_home.is_none() {
             let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
-            let (_, digest) = adapters::provider::materialize_selected(
+            let (_, digest) = adapters::provider::materialize_selected_for_route(
                 &config,
                 &catalog,
                 &identity.authority.provider,
@@ -1737,6 +1744,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 &identity.authority.workdir,
                 &runtime_home,
                 app_home,
+                config_owner_uid,
             )?;
             identity.authority.assets_sha256 = digest.clone();
             identity.snapshot_sha256 = Some(digest.as_str().into());
@@ -2318,25 +2326,26 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 home.join("fixture-hide-started-owner").exists(),
             );
         }
-        let mut process = match Process::launch(&planned.launch, kind) {
-            Ok(process) => process,
-            Err(SpawnError::NotStarted(error @ Error::Io(_))) => {
-                store.provider_spawn_failed(id, &attempt_id).await?;
-                return Err(error);
-            }
-            Err(SpawnError::NotStarted(error)) => return Err(error),
-            Err(SpawnError::Started(started)) => {
-                let system = identity.system_route.is_some();
-                return Err(abandon_started_launch(
-                    store,
-                    id,
-                    &attempt_id,
-                    (&agent_dir, system),
-                    *started,
-                )
-                .await);
-            }
-        };
+        let mut process =
+            match planned.launch_process(kind, &runtime_home, harness, config_owner_uid) {
+                Ok(process) => process,
+                Err(SpawnError::NotStarted(error @ Error::Io(_))) => {
+                    store.provider_spawn_failed(id, &attempt_id).await?;
+                    return Err(error);
+                }
+                Err(SpawnError::NotStarted(error)) => return Err(error),
+                Err(SpawnError::Started(started)) => {
+                    let system = identity.system_route.is_some();
+                    return Err(abandon_started_launch(
+                        store,
+                        id,
+                        &attempt_id,
+                        (&agent_dir, system),
+                        *started,
+                    )
+                    .await);
+                }
+            };
         let switched = continuing.is_some();
         let execution = async {
             // The spawned engine is observed (exit, descendants, escalation)

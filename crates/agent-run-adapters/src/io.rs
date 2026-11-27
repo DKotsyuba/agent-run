@@ -240,11 +240,21 @@ impl Process {
         plan: &LaunchPlan,
         kind: LaunchKind,
     ) -> std::result::Result<Self, crate::engine_launch::SpawnError> {
-        match kind {
-            LaunchKind::Rpc => Self::spawn_with_stdout(plan, false, None, false),
-            LaunchKind::Lease => Self::spawn_with_stdout(plan, true, None, false),
-            LaunchKind::Managed(v2) => Self::spawn_with_stdout(plan, false, v2.map(|v2| *v2), true),
-        }
+        Self::launch_with_secrets(plan, kind, &[])
+    }
+
+    /// Launches with additional literals for redaction without passing them to the child.
+    pub(crate) fn launch_with_secrets(
+        plan: &LaunchPlan,
+        kind: LaunchKind,
+        secrets: &[String],
+    ) -> std::result::Result<Self, crate::engine_launch::SpawnError> {
+        let (lease, v2, managed) = match kind {
+            LaunchKind::Rpc => (false, None, false),
+            LaunchKind::Lease => (true, None, false),
+            LaunchKind::Managed(v2) => (false, v2.map(|v2| *v2), true),
+        };
+        Self::spawn_with_stdout(plan, lease, v2, managed, secrets)
     }
 
     /// Synchronous callers: a started launch is cleaned (bounded) before its
@@ -269,6 +279,7 @@ impl Process {
         lease: bool,
         v2: Option<crate::native_owner_v2::Config>,
         managed: bool,
+        secrets: &[String],
     ) -> std::result::Result<Self, crate::engine_launch::SpawnError> {
         use crate::engine_launch::{SpawnError, StartedLaunch};
         let not_started = |error: Error| SpawnError::NotStarted(error);
@@ -294,7 +305,8 @@ impl Process {
             environment.remove(crate::native_owner_v2::LOCATOR);
             None
         };
-        let redactor = Redactor::from_environment(&environment);
+        let mut redactor = Redactor::from_environment(&environment);
+        redactor.add_literals(secrets);
         let mut command = std::process::Command::new(&plan.binary);
         command
             .args(&plan.args)
