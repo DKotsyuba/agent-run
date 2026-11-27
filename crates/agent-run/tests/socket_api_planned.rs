@@ -523,6 +523,126 @@ async fn python_control_slot_survives_saturated_long_reads() {
     drop(home);
 }
 
+/// A running explicit-finish worker whose finish was already accepted, so an
+/// identical socket `finish` is an authenticated exact replay that needs no
+/// supervisor-installed launch-secret context. Returns the run and token.
+fn finished_worker(home: &tempfile::TempDir) -> (agent_run::domain::AgentId, String) {
+    let id: agent_run::domain::AgentId = "ag-20261127-000000-0123456789".parse().unwrap();
+    let token = "a".repeat(64);
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let request = json!({"runtime":"codex","model":"fixture","profile":"review",
+        "task":"fixture","workdir":home.path(),"explicit_finish":true});
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+             status,created_at,config_revision,root_agent_id,supervisor_pid,supervisor_identity,
+             supervisor_birth_time)
+             VALUES(?1,'codex','fixture','review','fixture','fixture',?2,?3,'running',100,
+                    'fixture',?1,?4,?5,?6)",
+            rusqlite::params![
+                id.as_str(),
+                home.path().to_str(),
+                request.to_string(),
+                me.pid,
+                me.token,
+                me.birth
+            ],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active)
+             VALUES('attempt',?,1,'running','{}',100,1)",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .issue_worker_capability(&id, "attempt", &token, 100.0)
+        .unwrap();
+    store.begin_worker_lifecycle(&id, "attempt", 100.0).unwrap();
+    store
+        .accept_worker_finish(
+            &id,
+            "attempt",
+            &token,
+            &agent_run_domain::worker::FinishRequest {
+                summary: "done".into(),
+                status: agent_run_domain::worker::FinishStatus::Done,
+                ..Default::default()
+            },
+            agent_run_domain::domain::now(),
+            agent_run_domain::worker::FinishGuard::Clean,
+        )
+        .unwrap();
+    (id, token)
+}
+
+/// Opens a connection that parks in `wait` and is held open by the caller.
+async fn park_waiter(path: &Path, agent: &agent_run::domain::AgentId) -> UnixStream {
+    let mut stream = UnixStream::connect(path).await.unwrap();
+    frame::write(
+        &mut stream,
+        &json!({"jsonrpc":"2.0","id":1,"method":"wait",
+            "params":{"agent_id":agent,"timeout_seconds":30.0}}),
+        socket::MAX_FRAME,
+    )
+    .await
+    .unwrap();
+    stream
+}
+
+/// Incident regression: CLI `start --wait` clients parked in `wait` filled
+/// every connection permit, so a worker's `finish` was refused while the
+/// waiters waited for that very worker. Parked waiters now release their
+/// ordinary permits to a separate wait pool, and a worker report is admitted
+/// even when waiters exhaust both that pool and every ordinary permit.
+#[tokio::test]
+async fn parked_waiters_leave_reads_and_worker_finish_admitted() {
+    let (home, path, task) = bounded_broker(socket::ServeOptions {
+        max_connections: 4,
+        max_wait_connections: 6,
+        ..Default::default()
+    })
+    .await;
+    let waiting = admitted(&home);
+    let (worker, token) = finished_worker(&home);
+    let ping = json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}});
+    // Six waiters exceed the four ordinary connections, but all of them park
+    // on the wait pool, so ordinary reads stay admitted.
+    let mut waiters = Vec::new();
+    for _ in 0..6 {
+        waiters.push(park_waiter(&path, &waiting).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(request(&path, ping.clone()).await["result"]["ok"], true);
+    // With the wait pool full, three more waiters keep the three ordinary
+    // permits; only the reserved control slot remains.
+    for _ in 0..3 {
+        waiters.push(park_waiter(&path, &waiting).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let finish = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":3,"method":"worker/call","params":{
+            "run_id":worker,"attempt_id":"attempt","token":token,"tool":"finish",
+            "input":{"summary":"done","status":"done"}}}),
+    )
+    .await;
+    assert_eq!(finish["result"]["duplicate"], true, "finish={finish}");
+    let refused = request(&path, ping).await;
+    assert_eq!(refused["error"]["code"], -32001, "refused={refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        "broker connection limit reached (4); retry shortly; worker calls and control requests are still admitted"
+    );
+    drop(waiters);
+    stop(task).await;
+    drop(home);
+}
+
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_partial_frame_hits_idle_deadline_and_releases_connection`.
 #[tokio::test]
 async fn python_partial_frame_hits_idle_deadline() {

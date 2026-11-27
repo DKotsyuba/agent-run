@@ -488,7 +488,30 @@ impl BrokerClient {
 
 /// Python-compatible upper bound for one newline-delimited JSON RPC message.
 pub const MAX_FRAME: usize = agent_run_domain::observation::SOCKET_MAX_FRAME_BYTES;
-const MAX_CONNECTIONS: usize = 32;
+/// Default ordinary connection handlers, including the reserved control slot.
+///
+/// A handler is one Tokio task with a buffered reader, not an OS thread, and
+/// request work is bounded separately by [`Lanes`]; this ceiling therefore
+/// budgets open descriptors. 128 sockets cover one host running dozens of CLI
+/// clients, worker MCP servers and operator frontends at once. Together with
+/// the wait pool it stays inside half of a 1024 soft open-file limit (the
+/// common Linux service default; the shipped launchd plist raises it to
+/// 65536), and [`fit_wait_connections`] shrinks only the wait pool when the
+/// host limit is lower.
+const MAX_CONNECTIONS: usize = 128;
+/// Default connections that may stay parked in long polls after releasing
+/// their ordinary connection permit (see [`SlotKind::Wait`]).
+const MAX_WAIT_CONNECTIONS: usize = 256;
+/// Socket methods by which a worker reports to the broker: its private tools
+/// (`finish`, `notify_orchestrator`, `health_reply`, Pool chat) and the
+/// legacy notify hook. They are admitted on every connection class so a
+/// worker can always report and finish while ordinary capacity is exhausted;
+/// the broker still authenticates the per-attempt token and applies the
+/// ordinary request lane and per-worker bounds during dispatch.
+const WORKER_REPORT_METHODS: &[&str] = &[
+    agent_run_domain::worker::TOOL_METHOD,
+    agent_run_domain::worker::METHOD,
+];
 const MAX_PENDING_REQUESTS: usize = 64;
 const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 /// Interval between content-digest checks for a running broker's configuration.
@@ -686,8 +709,14 @@ async fn receipt_maintenance(
 /// Bounds one socket server's connections, request queue, and frame deadlines.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
-    /// Maximum simultaneous client handlers, including the reserved control slot.
+    /// Maximum simultaneous ordinary client handlers, including the reserved
+    /// control slot. Connections parked in long polls do not count here.
     pub max_connections: usize,
+    /// Maximum connections parked in long polls (`wait`, `list_agents` with
+    /// `wait_seconds`) after releasing their ordinary permit. Zero keeps long
+    /// polls on ordinary permits. Shrunk at startup to fit the host's soft
+    /// open-file limit.
+    pub max_wait_connections: usize,
     /// Maximum pending requests per ordinary/control lane.
     pub max_pending_requests: usize,
     /// Absolute execution deadline for one request.
@@ -712,10 +741,12 @@ pub struct SystemServeOptions {
 }
 
 impl Default for ServeOptions {
-    /// Returns the production limits matching the Python socket server.
+    /// Returns the production limits: the Python socket server's request
+    /// bounds plus 128 ordinary and 256 wait connections.
     fn default() -> Self {
         Self {
             max_connections: MAX_CONNECTIONS,
+            max_wait_connections: MAX_WAIT_CONNECTIONS,
             max_pending_requests: MAX_PENDING_REQUESTS,
             request_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
@@ -755,6 +786,148 @@ impl Lanes {
         };
         lane.clone().try_acquire_owned().ok()
     }
+}
+
+/// Connection permits by admission class; every handler owns exactly one.
+///
+/// Ordinary connections take `full`. When it is exhausted, one reserved
+/// `control` slot serves a single control or worker frame, and further
+/// sockets park on `wait`. A long poll moves its connection from `full` to
+/// `wait` while parked, so CLI `start --wait` clients and frontends blocked
+/// in `wait` never starve reads, worker reports or control requests.
+#[derive(Clone)]
+struct ConnectionGates {
+    /// Ordinary connections: every method is admitted.
+    full: Arc<Semaphore>,
+    /// The reserved slot used only while `full` is exhausted: one frame.
+    control: Arc<Semaphore>,
+    /// Connections parked in or between long polls.
+    wait: Arc<Semaphore>,
+    /// Configured ordinary connection limit, named in refusals.
+    limit: usize,
+}
+
+/// What one request needs from its connection's permit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Need {
+    /// Control and worker-report methods are admitted on every permit class.
+    Any,
+    /// A long poll prefers the wait pool and frees its ordinary permit.
+    LongPoll,
+    /// Every other method needs an ordinary permit.
+    Ordinary,
+}
+
+impl Need {
+    /// Classifies one parsed request method.
+    fn of(method: &str, long_poll: bool) -> Self {
+        if CONTROL_METHODS.contains(&method) || WORKER_REPORT_METHODS.contains(&method) {
+            Self::Any
+        } else if long_poll {
+            Self::LongPoll
+        } else {
+            Self::Ordinary
+        }
+    }
+}
+
+/// Admission class of the permit a connection currently owns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotKind {
+    /// Ordinary connection: every method, many frames.
+    Full,
+    /// Reserved control slot: one control or worker frame within
+    /// [`CONTROL_FRAME_DEADLINE`], then the connection closes.
+    Control,
+    /// Parked connection: long polls, control and worker frames; an ordinary
+    /// request first has to re-acquire a `full` permit.
+    Wait,
+}
+
+/// The single connection permit a handler currently owns.
+struct Slot {
+    /// Which pool `_permit` belongs to.
+    kind: SlotKind,
+    /// Returned to its pool when replaced or when the handler ends.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionGates {
+    /// Splits `max_connections` into ordinary plus one reserved control slot
+    /// (when there is room for both) and adds the separate wait pool.
+    fn new(max_connections: usize, wait_connections: usize) -> Self {
+        let reserved = usize::from(max_connections > 1);
+        Self {
+            full: Arc::new(Semaphore::new(max_connections - reserved)),
+            control: Arc::new(Semaphore::new(reserved)),
+            wait: Arc::new(Semaphore::new(wait_connections)),
+            limit: max_connections,
+        }
+    }
+
+    /// Takes one permit of `kind` without queueing.
+    fn take(&self, kind: SlotKind) -> Option<Slot> {
+        let pool = match kind {
+            SlotKind::Full => &self.full,
+            SlotKind::Control => &self.control,
+            SlotKind::Wait => &self.wait,
+        };
+        let permit = pool.clone().try_acquire_owned().ok()?;
+        Some(Slot {
+            kind,
+            _permit: permit,
+        })
+    }
+
+    /// Admits a new socket: ordinary, else the control slot, else parked.
+    fn accept(&self) -> Option<Slot> {
+        self.take(SlotKind::Full)
+            .or_else(|| self.take(SlotKind::Control))
+            .or_else(|| self.take(SlotKind::Wait))
+    }
+
+    /// Moves `slot` to a permit that admits `need`, releasing the old one.
+    ///
+    /// Returns false, leaving `slot` unchanged, when no such permit is free.
+    fn admit(&self, slot: &mut Slot, need: Need) -> bool {
+        let replacement = match (need, slot.kind) {
+            (Need::Any, _)
+            | (Need::LongPoll, SlotKind::Wait)
+            | (Need::Ordinary, SlotKind::Full) => return true,
+            // A parked long poll frees its ordinary permit; without a wait
+            // permit an ordinary connection keeps polling on its own permit.
+            (Need::LongPoll, kind) => match self.take(SlotKind::Wait) {
+                Some(wait) => Some(wait),
+                None if kind == SlotKind::Full => return true,
+                None => self.take(SlotKind::Full),
+            },
+            (Need::Ordinary, _) => self.take(SlotKind::Full),
+        };
+        match replacement {
+            Some(replacement) => {
+                *slot = replacement;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `-32001` refusal for an ordinary request without an ordinary permit.
+    fn refusal(&self) -> String {
+        format!(
+            "broker connection limit reached ({}); retry shortly; worker calls and control requests are still admitted",
+            self.limit
+        )
+    }
+}
+
+/// Wait-pool size that fits the host: API sockets (ordinary plus wait) may use
+/// at most half of the soft open-file limit, leaving the rest to the store,
+/// logs, the writer and attempt sockets, and children. Only the wait pool
+/// shrinks; at zero, long polls simply keep their ordinary permit.
+fn fit_wait_connections(max_connections: usize, max_wait: usize, soft_open_files: u64) -> usize {
+    let budget = usize::try_from(soft_open_files / 2).unwrap_or(usize::MAX);
+    max_wait.min(budget.saturating_sub(max_connections))
 }
 
 /// Owns one batch control slot and records an interrupted task without payloads.
@@ -1146,11 +1319,17 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
 /// Runs one connection with framed parsing, lane admission, and ordered writes.
 /// Oversized successful answers shed inline content before the frame cap is
 /// enforced; all other reply and lifecycle/deadline behavior is preserved.
+///
+/// The connection owns exactly one permit in `slot`, re-admitted per request
+/// by [`ConnectionGates::admit`]: long polls park on the wait pool, ordinary
+/// requests need an ordinary permit, and control or worker-report methods
+/// are admitted on any permit.
 async fn connection(
     stream: UnixStream,
     service: Service,
     lanes: Lanes,
-    control_only: bool,
+    gates: ConnectionGates,
+    mut slot: Slot,
     options: ServeOptions,
     access: SocketAccess,
 ) -> Result<()> {
@@ -1158,7 +1337,7 @@ async fn connection(
     let (input, mut output) = stream.into_split();
     let mut input = BufReader::new(input);
     loop {
-        let deadline = if control_only {
+        let deadline = if slot.kind == SlotKind::Control {
             CONTROL_FRAME_DEADLINE
         } else {
             options.idle_timeout
@@ -1192,125 +1371,109 @@ async fn connection(
                 let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                 answer_response = method == "answer";
                 batch_response = method == "start_batch";
-                if control_only && !CONTROL_METHODS.contains(&method) {
+                let long_poll = method == "wait"
+                    || (method == "list_agents"
+                        && value
+                            .get("params")
+                            .and_then(|params| params.get("wait_seconds"))
+                            .and_then(Value::as_f64)
+                            .is_some_and(|seconds| seconds > 0.0));
+                if !gates.admit(&mut slot, Need::of(method, long_poll)) {
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
                     if value.get("id").is_some() {
-                        Some(err(
-                            id,
-                            -32001,
-                            "API capacity is reserved for control requests",
-                            None,
-                        ))
+                        Some(err(id, -32001, &gates.refusal(), None))
                     } else {
                         None
                     }
-                } else {
-                    let long_poll = method == "wait"
-                        || (method == "list_agents"
-                            && value
-                                .get("params")
-                                .and_then(|params| params.get("wait_seconds"))
-                                .and_then(Value::as_f64)
-                                .is_some_and(|seconds| seconds > 0.0));
-                    if long_poll {
-                        respond_with_access(&service, value, access).await
-                    } else if let Some(permit) = lanes.try_acquire(method) {
-                        let request_id = value.get("id").cloned().unwrap_or(Value::Null);
-                        let has_id = value.get("id").is_some();
-                        if method == "start_batch" {
-                            let service = service.clone();
-                            // The detached operation retains its control slot even
-                            // when a caller's wait expires or its socket closes.
-                            let task = spawn_controlled(permit, async move {
-                                respond_with_access(&service, value, access).await
-                            });
-                            batch_control_response(
-                                task,
-                                options.request_timeout,
-                                request_id,
-                                has_id,
-                            )
+                } else if long_poll {
+                    respond_with_access(&service, value, access).await
+                } else if let Some(permit) = lanes.try_acquire(method) {
+                    let request_id = value.get("id").cloned().unwrap_or(Value::Null);
+                    let has_id = value.get("id").is_some();
+                    if method == "start_batch" {
+                        let service = service.clone();
+                        // The detached operation retains its control slot even
+                        // when a caller's wait expires or its socket closes.
+                        let task = spawn_controlled(permit, async move {
+                            respond_with_access(&service, value, access).await
+                        });
+                        batch_control_response(task, options.request_timeout, request_id, has_id)
                             .await
-                        } else if matches!(
-                            method,
-                            "_lineage_hold_acquire" | "_lineage_hold_release" | "cooldowns_clear"
-                        ) {
-                            let unknown = if method == "cooldowns_clear" {
-                                "cooldown clear outcome unknown"
-                            } else {
-                                "lineage hold outcome unknown"
-                            };
-                            let service = service.clone();
-                            // An accepted mutation keeps its slot and completes even
-                            // if the socket caller stops waiting for its response.
-                            let task = tokio::spawn(async move {
-                                let _permit = permit;
-                                respond_with_access(&service, value, access).await
-                            });
-                            match tokio::time::timeout(options.request_timeout, task).await {
-                                Ok(Ok(response)) => response,
-                                Ok(Err(_)) => {
-                                    has_id.then(|| err(request_id, -32000, unknown, None))
-                                }
-                                Err(_) => has_id.then(|| err(request_id, -32002, unknown, None)),
-                            }
-                        } else if matches!(
-                            method,
-                            "status"
-                                | "batch_receipt"
-                                | "transcript_exact"
-                                | "initial_task"
-                                | "_lineage_hold_lookup"
-                                | "_lineage_hold_list"
-                        ) {
-                            let service = service.clone();
-                            let failure = if method == "status" {
-                                "status read failed"
-                            } else if method == "transcript_exact" {
-                                "exact transcript read failed"
-                            } else if method == "initial_task" {
-                                "initial task read failed"
-                            } else if method == "batch_receipt" {
-                                "batch receipt read failed"
-                            } else {
-                                "lineage hold read failed"
-                            };
-                            // A timed-out observer leaves its read slot with the
-                            // owned task until its blocking snapshot actually ends.
-                            let task = tokio::spawn(async move {
-                                let _permit = permit;
-                                respond_with_access(&service, value, access).await
-                            });
-                            match tokio::time::timeout(options.request_timeout, task).await {
-                                Ok(Ok(response)) => response,
-                                Ok(Err(_)) => {
-                                    has_id.then(|| err(request_id, -32000, failure, None))
-                                }
-                                Err(_) => has_id.then(|| {
-                                    err(request_id, -32002, "API request deadline exceeded", None)
-                                }),
-                            }
+                    } else if matches!(
+                        method,
+                        "_lineage_hold_acquire" | "_lineage_hold_release" | "cooldowns_clear"
+                    ) {
+                        let unknown = if method == "cooldowns_clear" {
+                            "cooldown clear outcome unknown"
                         } else {
+                            "lineage hold outcome unknown"
+                        };
+                        let service = service.clone();
+                        // An accepted mutation keeps its slot and completes even
+                        // if the socket caller stops waiting for its response.
+                        let task = tokio::spawn(async move {
                             let _permit = permit;
-                            match tokio::time::timeout(
-                                options.request_timeout,
-                                respond_with_access(&service, value, access),
-                            )
-                            .await
-                            {
-                                Ok(response) => response,
-                                Err(_) => has_id.then(|| {
-                                    err(request_id, -32002, "API request deadline exceeded", None)
-                                }),
-                            }
+                            respond_with_access(&service, value, access).await
+                        });
+                        match tokio::time::timeout(options.request_timeout, task).await {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(_)) => has_id.then(|| err(request_id, -32000, unknown, None)),
+                            Err(_) => has_id.then(|| err(request_id, -32002, unknown, None)),
+                        }
+                    } else if matches!(
+                        method,
+                        "status"
+                            | "batch_receipt"
+                            | "transcript_exact"
+                            | "initial_task"
+                            | "_lineage_hold_lookup"
+                            | "_lineage_hold_list"
+                    ) {
+                        let service = service.clone();
+                        let failure = if method == "status" {
+                            "status read failed"
+                        } else if method == "transcript_exact" {
+                            "exact transcript read failed"
+                        } else if method == "initial_task" {
+                            "initial task read failed"
+                        } else if method == "batch_receipt" {
+                            "batch receipt read failed"
+                        } else {
+                            "lineage hold read failed"
+                        };
+                        // A timed-out observer leaves its read slot with the
+                        // owned task until its blocking snapshot actually ends.
+                        let task = tokio::spawn(async move {
+                            let _permit = permit;
+                            respond_with_access(&service, value, access).await
+                        });
+                        match tokio::time::timeout(options.request_timeout, task).await {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(_)) => has_id.then(|| err(request_id, -32000, failure, None)),
+                            Err(_) => has_id.then(|| {
+                                err(request_id, -32002, "API request deadline exceeded", None)
+                            }),
                         }
                     } else {
-                        let id = value.get("id").cloned().unwrap_or(Value::Null);
-                        if value.get("id").is_some() {
-                            Some(err(id, -32001, "API request queue is full", None))
-                        } else {
-                            None
+                        let _permit = permit;
+                        match tokio::time::timeout(
+                            options.request_timeout,
+                            respond_with_access(&service, value, access),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => has_id.then(|| {
+                                err(request_id, -32002, "API request deadline exceeded", None)
+                            }),
                         }
+                    }
+                } else {
+                    let id = value.get("id").cloned().unwrap_or(Value::Null);
+                    if value.get("id").is_some() {
+                        Some(err(id, -32001, "API request queue is full", None))
+                    } else {
+                        None
                     }
                 }
             }
@@ -1325,7 +1488,7 @@ async fn connection(
             .await
             .map_err(|_| crate::error::invalid("socket output timeout"))??;
         }
-        if control_only {
+        if slot.kind == SlotKind::Control {
             return Ok(());
         }
     }
@@ -2335,9 +2498,15 @@ async fn serve_endpoints(
         },
         move || refresher.refresh_config(),
     );
-    let reserved = usize::from(options.max_connections > 1);
-    let gate = Arc::new(Semaphore::new(options.max_connections - reserved));
-    let control_gate = Arc::new(Semaphore::new(reserved));
+    let soft_open_files = agent_run_core::writer_limits::open_file_soft_limit().unwrap_or(u64::MAX);
+    let gates = ConnectionGates::new(
+        options.max_connections,
+        fit_wait_connections(
+            options.max_connections,
+            options.max_wait_connections,
+            soft_open_files,
+        ),
+    );
     let lanes = Lanes::new(options.max_pending_requests);
     let mut handlers = JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -2387,20 +2556,16 @@ async fn serve_endpoints(
                 if authenticate_socket(&stream, access).is_err() {
                     continue;
                 }
-                let (permit, control_only) = match gate.clone().try_acquire_owned() {
-                    Ok(permit) => (permit, false),
-                    Err(_) => match control_gate.clone().try_acquire_owned() {
-                        Ok(permit) => (permit, true),
-                        Err(_) => {
-                            let _ = frame::write(&mut stream, &err(Value::Null, -32001, "API connection limit reached", None), MAX_FRAME).await;
-                            continue;
-                        }
-                    },
+                let Some(slot) = gates.accept() else {
+                    let refusal = format!("broker connection limit reached ({}); retry shortly", gates.limit);
+                    let _ = frame::write(&mut stream, &err(Value::Null, -32001, &refusal, None), MAX_FRAME).await;
+                    continue;
                 };
                 let service=service.clone();
                 let lanes=lanes.clone();
+                let gates=gates.clone();
                 let options = options.clone();
-                handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only,options,access).await; });
+                handlers.spawn(async move { let _=connection(stream,service,lanes,gates,slot,options,access).await; });
             }
             // Reap finished handlers as they end: a JoinSet retains every
             // completed task's output and allocation until joined, so a
@@ -3702,6 +3867,80 @@ mod tests {
         );
     }
 
+    /// A long poll hands its ordinary permit to the wait pool; ordinary
+    /// requests need it back, while control and worker reports never do.
+    #[test]
+    fn long_polls_park_on_the_wait_pool() {
+        let gates = ConnectionGates::new(3, 1);
+        let mut parked = gates.accept().unwrap();
+        let mut ordinary = gates.accept().unwrap();
+        assert_eq!(
+            (parked.kind, ordinary.kind),
+            (SlotKind::Full, SlotKind::Full)
+        );
+        let control = gates.accept().unwrap();
+        assert_eq!(control.kind, SlotKind::Control);
+        let overflow = gates.accept().unwrap();
+        assert_eq!(overflow.kind, SlotKind::Wait);
+        assert!(gates.accept().is_none(), "every pool is exhausted");
+        drop(overflow);
+        // The parked poll releases one ordinary permit for a new socket.
+        assert!(gates.admit(&mut parked, Need::of("wait", true)));
+        assert_eq!(parked.kind, SlotKind::Wait);
+        let reader = gates.accept().unwrap();
+        assert_eq!(reader.kind, SlotKind::Full);
+        // Wait pool full: a further poll keeps its own ordinary permit.
+        assert!(gates.admit(&mut ordinary, Need::of("list_agents", true)));
+        assert_eq!(ordinary.kind, SlotKind::Full);
+        // A parked connection cannot read without an ordinary permit, but
+        // worker reports and control requests are still admitted on it.
+        assert!(!gates.admit(&mut parked, Need::of("status", false)));
+        assert_eq!(parked.kind, SlotKind::Wait);
+        for method in [
+            agent_run_domain::worker::TOOL_METHOD,
+            agent_run_domain::worker::METHOD,
+            "cancel",
+        ] {
+            assert_eq!(Need::of(method, false), Need::Any);
+            assert!(gates.admit(&mut parked, Need::of(method, false)));
+            assert_eq!(parked.kind, SlotKind::Wait);
+        }
+        assert_eq!(
+            Need::of(agent_run_domain::worker::CATALOG_METHOD, false),
+            Need::Ordinary
+        );
+        // A freed ordinary permit lets the parked connection read again.
+        drop((control, reader));
+        assert!(gates.admit(&mut parked, Need::of("status", false)));
+        assert_eq!(parked.kind, SlotKind::Full);
+        assert!(
+            gates
+                .refusal()
+                .starts_with("broker connection limit reached (3); retry shortly")
+        );
+    }
+
+    /// API sockets stay within half of the soft open-file limit by shrinking
+    /// only the wait pool; zero leaves long polls on ordinary permits.
+    #[test]
+    fn wait_pool_fits_the_open_file_limit() {
+        assert_eq!(fit_wait_connections(128, 256, 65_536), 256);
+        assert_eq!(fit_wait_connections(128, 256, 1024), 256);
+        assert_eq!(fit_wait_connections(128, 256, 512), 128);
+        assert_eq!(fit_wait_connections(128, 256, 256), 0);
+        assert_eq!(fit_wait_connections(128, 256, u64::MAX), 256);
+        assert_eq!(fit_wait_connections(1, 0, 1024), 0);
+        const { assert!(MAX_CONNECTIONS + MAX_WAIT_CONNECTIONS <= 1024 / 2) };
+    }
+
+    /// Default connection gates and one ordinary connection permit from them.
+    fn ordinary_slot() -> (ConnectionGates, Slot) {
+        let gates = ConnectionGates::new(MAX_CONNECTIONS, MAX_WAIT_CONNECTIONS);
+        let slot = gates.accept().unwrap();
+        assert_eq!(slot.kind, SlotKind::Full);
+        (gates, slot)
+    }
+
     /// A real framed connection exercises metadata fallback and chunk recovery,
     /// keeps ping exact and closes its handler after EOF without lifecycle work.
     #[tokio::test]
@@ -3713,11 +3952,13 @@ mod tests {
             .revision()
             .unwrap();
         let (client, server) = UnixStream::pair().unwrap();
+        let (gates, slot) = ordinary_slot();
         let serving = tokio::spawn(connection(
             server,
             service.clone(),
             Lanes::new(1),
-            false,
+            gates,
+            slot,
             ServeOptions::default(),
             SocketAccess::Private,
         ));
@@ -3902,11 +4143,13 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (client, server) = UnixStream::pair().unwrap();
         let service = Service::new(PathBuf::from("/nonexistent-required-mcp-fixture"));
+        let (gates, slot) = ordinary_slot();
         let serving = tokio::spawn(connection(
             server,
             service,
             Lanes::new(1),
-            false,
+            gates,
+            slot,
             ServeOptions::default(),
             SocketAccess::Private,
         ));
