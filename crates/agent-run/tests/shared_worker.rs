@@ -29,7 +29,8 @@ fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
     command.env_remove("AGENT_RUN_HOME");
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("AGENT_RUN_") {
+        let key = name.to_string_lossy();
+        if key.starts_with("AGENT_RUN_") || key.starts_with("BRIDGE_NATIVE_OWNER_") {
             command.env_remove(name);
         }
     }
@@ -117,6 +118,7 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
         .unwrap_or_else(std::env::temp_dir);
     let temp = tempfile::Builder::new()
         .prefix("sw-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(base)
         .unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -126,6 +128,9 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     for path in [&state, &user_home, &private] {
         fs::create_dir(path).unwrap();
     }
+    // Mirror the protected account-home ancestry used by a routed deployment,
+    // including when the test runner uses a group-writable umask.
+    fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
     agent_run_store::fixture::initialize(&state).unwrap();
     fs::create_dir(state.join("agents")).unwrap();
@@ -228,8 +233,8 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     .expect("the owning worker should reclaim the orphan");
     assert!(retained.exists(), "configured paths must remain");
 
-    // This path check happens in the account worker before the broker admits
-    // an execution. It cannot run the fixture engine or consume a launch claim.
+    // The endpoint is inside the workdir. The read-only role cannot use a
+    // shell socket, so the worker refuses it without probing the endpoint.
     let missing = root.join("absent.sock");
     let failed = socket::client_at(
         &api,
@@ -243,9 +248,10 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     .await
     .unwrap_err();
     assert!(
-        failed.to_string().contains(missing.to_str().unwrap()),
+        failed.to_string().contains("native shell/network grant"),
         "{failed}"
     );
+    assert!(!failed.to_string().contains(missing.to_str().unwrap()));
 
     // A refused private-history preflight must not consume the parent's one
     // continuation. Restoring the fixture then permits the identical request.
@@ -269,7 +275,19 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     )
     .await
     .unwrap();
-    assert_eq!(finished["status"], "succeeded");
+    if finished["status"] != "succeeded" {
+        let row = agent_run_store::fixture::open(&state)
+            .unwrap()
+            .get(&parent)
+            .unwrap();
+        panic!(
+            "shared worker ended in {:?}: {:?}",
+            row.status, row.failure_text
+        );
+    }
+    let temporary = fs::metadata(private.join(format!(".agent-run-tmp-{parent}"))).unwrap();
+    assert!(temporary.is_dir());
+    assert_eq!(temporary.mode() & 0o777, 0o700);
     let policy = socket::client_at(
         &api,
         broker_uid,

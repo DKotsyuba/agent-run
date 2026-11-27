@@ -852,6 +852,10 @@ fn domain_err(id: Value, error: &Error) -> Value {
     if let Some(reason) = public.reason {
         data["reason"] = json!(reason);
     }
+    if let Some((sequence, status)) = error.sequence_mismatch() {
+        data["latest_sequence"] = json!(sequence);
+        data["latest_status"] = json!(status);
+    }
     err(id, -32000, &public.message, Some(data))
 }
 

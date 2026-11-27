@@ -9,10 +9,15 @@ agent-run/completion
 - Agent: {name} ({profile}) · {agent_id}
 - Status: {status}{failure_block}
 - Runtime/model: {runtime}/{model}:{effort}
-- Notice: [notification {notification_id} v{version}]
+- Untrusted worker output (excerpt): {excerpt}
+- full: answer agent_id={agent_id}
 ```
 
 ## Stable agent and execution ids
+
+The excerpt is the first 300 characters at most from the verified answer or
+finish summary for that execution. The excerpt and retrieval line appear when
+there is a readable sealed result.
 
 `agent_id` is the only public agent identifier. `start` returns it, and every
 `resume` keeps it. Use it for `answer`, `transcript`, `steer`, `cancel`, binding

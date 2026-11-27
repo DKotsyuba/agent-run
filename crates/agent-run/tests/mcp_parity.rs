@@ -606,7 +606,10 @@ fn mcp_broker_unavailable_matches_python_tool_error() {
     assert_eq!(reply["id"], expected[2]["response"]["id"]);
     assert_eq!(reply["result"]["isError"], true, "{reply}");
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("broker is not running"), "{text}");
+    assert!(
+        text.contains("broker is unreachable") && text.contains("Ask the operator"),
+        "{text}"
+    );
     assert!(
         reply["result"].get("structuredContent").is_none(),
         "{reply}"
@@ -776,7 +779,11 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
         .unwrap();
     assert_eq!(receipt["result"]["isError"], false);
     let text = receipt["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("ntf_fixture"));
+    assert!(!text.contains("ntf_fixture"));
+    assert_eq!(
+        receipt["result"]["structuredContent"]["notification_id"],
+        "ntf_fixture"
+    );
     assert!(text.contains("report-2"));
     assert!(text.contains("not approval"));
     assert!(!receipt.to_string().contains(&"a".repeat(64)));
@@ -1034,6 +1041,8 @@ fn resume_missing_broker_and_lost_response_keep_reconciliation_identity() {
                     Err(error) => panic!("fixture accept: {error}"),
                 }
             };
+            // macOS accepted sockets inherit the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -1264,13 +1273,45 @@ fn health_attention_survives_cli_socket_and_mcp() {
     let init = mcp.send(initialize("2025-06-18")).unwrap();
     assert_eq!(init["result"]["serverInfo"]["name"], "agent-run");
     mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
-    let reply=mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agents","arguments":{"active":true,"limit":20}}})).unwrap();
+    let reply=mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agents","arguments":{"active":true,"limit":20,"agent_id":id}}})).unwrap();
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains(&format!("{name} (review) · {id}")), "{text}");
     assert!(
-        text.contains("health: needs_attention: idle_without_wait_source"),
+        text.contains("health: idle without a wait source — steer it or check the transcript"),
         "{text}"
     );
+    let too_many = mcp
+        .send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"list_agents","arguments":{"limit":21}}}))
+        .unwrap();
+    assert_eq!(too_many["result"]["isError"], true);
+    let excluded = mcp
+        .send(json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+        "params":{"name":"list_agents","arguments":{"agent_id":"ag-20261018-000000-0123456788"}}}))
+        .unwrap();
+    assert!(
+        excluded["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("0 of 0 matching")
+    );
+    for (rid, name, arguments, expected) in [
+        (5, "answer", json!({}), "missing field `agent_id`"),
+        (
+            6,
+            "list_agents",
+            json!({"surprise":false}),
+            "unknown field `surprise`",
+        ),
+    ] {
+        let error = mcp
+            .send(json!({"jsonrpc":"2.0","id":rid,"method":"tools/call",
+            "params":{"name":name,"arguments":arguments}}))
+            .unwrap();
+        let text = error["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(expected), "{text}");
+    }
+    mcp.finish();
 }
 
 /// Real worker stdio and Run broker sockets, with a bounded local fake Pool peer.

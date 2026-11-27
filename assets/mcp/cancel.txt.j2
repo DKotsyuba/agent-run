@@ -1,7 +1,7 @@
 agent-run cancel accepted
 
 - Agent: {% if agent.name %}{{ agent.name }} ({{ agent.profile }}) · {% endif %}{{ agent.id }}
-- Status: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %}{% if agent.terminal %} — already terminal; no cancellation was needed{% else %} — cancellation requested, not yet confirmed{% endif %}{{ "" }}
+- Status: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %}{% if agent.terminal %} — already terminal; use resume with the same agent_id to continue; no cancellation was needed{% else %} — cancellation requested, not yet confirmed{% endif %}{{ "" }}
 - Route: {{ agent.runtime }}/{{ agent.model }}{% if not agent.name %} profile {{ agent.profile }}{% endif %}{{ "" }}
 {% if agent.task %}
 - Task: {{ agent.task }}

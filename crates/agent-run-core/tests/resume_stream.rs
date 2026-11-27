@@ -334,7 +334,7 @@ async fn dispatch_inherits_authority_and_preserves_caller() {
     .await
     .expect_err("resume must not accept an authority override");
     assert!(
-        overridden.to_string().contains("argument"),
+        overridden.to_string().contains("unknown field `write`"),
         "an authority override is refused while decoding: {overridden}"
     );
 

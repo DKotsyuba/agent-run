@@ -226,10 +226,7 @@ fn group_client() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("worker UID"), "{error}");
-        assert!(
-            error.to_string().contains(blocked.to_str().unwrap()),
-            "{error}"
-        );
+        assert!(!error.to_string().contains(blocked.to_str().unwrap()));
         if failover {
             request.as_object_mut().unwrap().remove("account");
         }

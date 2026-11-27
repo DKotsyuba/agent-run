@@ -77,6 +77,10 @@ async fn main() {
                 if let Some(reason) = public.reason {
                     object.insert("reason".into(), serde_json::json!(reason));
                 }
+                if let Some((sequence, status)) = error.sequence_mismatch() {
+                    object.insert("latest_sequence".into(), serde_json::json!(sequence));
+                    object.insert("latest_status".into(), serde_json::json!(status));
+                }
                 if object.contains_key("failure_kind") {
                     object.insert("status".into(), "failed".into());
                 }

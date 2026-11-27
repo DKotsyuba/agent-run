@@ -19,11 +19,19 @@ The usual `--session-transport`, `--session-id` and `--session-turn-id` options
 bind the **new** run's notification to its caller.
 
 MCP and the socket API expose `resume(agent_id, task,
-request_id?, orchestrator?, recover_after_crash?)`, returning the same stable `agent_id`. The broker
+request_id?, orchestrator?, recover_after_crash?, expected_sequence?)`, returning the same stable `agent_id`. The broker
 continues the latest terminal execution. Old execution identifiers remain
 accepted as aliases; internal rows are never renumbered. `answer` reads the
 latest result, `transcript` spans retained conversation history, and
 `list_agents` shows each logical agent once.
+
+To continue only a specific latest execution, set the positive integer
+`expected_sequence` (`--expected-sequence N` in the CLI). A stale value refuses
+admission with `sequence_mismatch`, `latest_sequence`, and `latest_status`.
+Concurrent requests still compete for the exact same parent, so a concurrent
+manual resume cannot cause a guarded request to admit against a newer execution.
+On a mismatch, inspect the current execution before deciding whether to resume.
+Omit the fence to retain normal latest-execution selection and keyed replay.
 
 The original provider, harness, model, reasoning effort, generated home, working
 directory, write/network/read-root grants, output schema and fast setting are

@@ -1932,22 +1932,10 @@ async fn run_inner(
                         )
                         .await?;
                     }
-                    let text = (item.get("type").and_then(Value::as_str)
-                        == Some("commandExecution"))
-                    .then(|| command_outputs.complete(process, item, &turn_id))
-                    .flatten()
-                    .or_else(|| {
-                        item.get("aggregatedOutput")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| item.pointer("/result/content").map(Value::to_string))
-                    .or_else(|| {
-                        item.pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_default();
+                    let text = (item["type"] == "commandExecution")
+                        .then(|| command_outputs.complete(process, item, &turn_id))
+                        .flatten()
+                        .unwrap_or_else(|| native_item_output(item));
                     if worker_finish_item(item) {
                         crate::worker_finish::receipt(process, store, record, &text).await?;
                     }
@@ -2611,18 +2599,39 @@ async fn journal_missing_tool_input(
 /// Read a terminal native item's output and apply the process's secret redactor.
 /// Missing output becomes empty text; structured MCP content is kept as JSON.
 fn native_job_text(process: &Process, item: &Value) -> String {
-    let text = item
-        .get("aggregatedOutput")
+    process.redact(&native_item_output(item))
+}
+
+/// Extract native command, MCP, or dynamic tool output before receipt checks.
+fn native_item_output(item: &Value) -> String {
+    item.get("aggregatedOutput")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .or_else(|| item.pointer("/result/content").map(Value::to_string))
+        .or_else(|| {
+            item.pointer("/result/content")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                })
+        })
+        .or_else(|| {
+            item["contentItems"].as_array().and_then(|items| {
+                let text = items
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            })
+        })
         .or_else(|| {
             item.pointer("/error/message")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .unwrap_or_default();
-    process.redact(&text)
+        .unwrap_or_default()
 }
 
 /// Find overlapping native process handles within one exact origin turn.

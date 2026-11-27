@@ -263,16 +263,22 @@ impl AccessPlan {
             } else {
                 self.admits_system_read(path)
             };
-            if admitted
-                && Dir::open_searchable(path).is_ok_and(|dir| {
-                    dir.has_access(if write {
-                        DIRECTORY_WRITE_ACCESS
-                    } else {
-                        DIRECTORY_ACCESS
-                    })
+            if !admitted {
+                return Err(invalid(SCOPE_REFUSAL));
+            }
+            if Dir::open_searchable(path).is_ok_and(|dir| {
+                dir.has_access(if write {
+                    DIRECTORY_WRITE_ACCESS
+                } else {
+                    DIRECTORY_ACCESS
                 })
-            {
+            }) {
                 return Ok(path.to_path_buf());
+            }
+            if kind == "workdir" {
+                return Err(invalid(
+                    "Workdir is unavailable to the worker UID; verify directory access and ancestor traversal.",
+                ));
             }
             return Err(invalid(SCOPE_REFUSAL));
         }
@@ -517,7 +523,7 @@ impl AccessPlan {
         if !self.shell || (self.codex && !self.network) {
             let reason = "Unix socket is blocked by the native shell/network grant; select a role and harness with local IPC access.";
             return Err(invalid(if system {
-                SCOPE_REFUSAL.into()
+                reason.into()
             } else {
                 format!("{path:?}: {reason}")
             }));
@@ -950,6 +956,11 @@ mod tests {
         fs::set_permissions(&readonly, fs::Permissions::from_mode(0o400)).unwrap();
         let error = check.warnings().err().unwrap().to_string();
         assert!(error.contains("read root") && error.contains("traversal"));
+
+        let workdir = plan(&readonly);
+        let error = workdir.system_warnings().unwrap_err().to_string();
+        assert!(error.contains("Workdir is unavailable to the worker UID"));
+        assert!(!error.contains(readonly.to_str().unwrap()));
     }
 
     /// Scope requirements and symlink aliases cannot widen a native grant.
@@ -1159,6 +1170,31 @@ mod tests {
         check.system_warnings().unwrap();
         listener.set_nonblocking(true).unwrap();
         listener.accept().unwrap();
+    }
+
+    /// An endpoint inside the workdir can be blocked by native policy even
+    /// when the worker accepts the ordinary launch with no endpoint required.
+    #[test]
+    fn system_scope_distinguishes_shell_policy_from_outside_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut check = plan(root.path());
+        check.write_workdir = false;
+        check.writable.clear();
+        check.shell = false;
+        check.system_warnings().unwrap();
+
+        let path = check.workdir.join("absent.sock");
+        check.sockets.push(path.clone());
+        let refusal = check.system_warnings().unwrap_err().to_string();
+        assert!(refusal.contains("native shell/network grant"));
+        assert!(!refusal.contains(path.to_str().unwrap()));
+
+        check.sockets = vec![outside.path().join("absent.sock")];
+        assert_eq!(
+            check.system_warnings().unwrap_err().to_string(),
+            SCOPE_REFUSAL
+        );
     }
 
     /// Replacing workspace scratch after admission cannot affect the independent

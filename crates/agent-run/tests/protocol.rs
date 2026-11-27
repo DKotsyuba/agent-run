@@ -298,17 +298,23 @@ fn start_tool_description_embeds_the_completion_contract() {
         .expect("start tool");
     let description = start["description"].as_str().expect("description text");
     assert!(description.starts_with("Start one asynchronous durable agent."));
+    let completion = dispatch::doc("completion").expect("completion contract");
+    let contract = completion
+        .split("\n## Stable agent and execution ids")
+        .next()
+        .unwrap()
+        .trim_end();
     assert!(
-        description.contains(
-            dispatch::doc("completion")
-                .expect("completion contract")
-                .split("\n## Stable agent and execution ids")
-                .next()
-                .unwrap()
-                .trim_end()
-        )
+        description.contains(contract),
+        "missing completion contract: {contract}"
     );
-    for field in ["- Agent:", "- Status:", "- Runtime/model:", "- Notice:"] {
+    for field in [
+        "- Agent:",
+        "- Status:",
+        "- Runtime/model:",
+        "- Untrusted worker output (excerpt):",
+        "- full: answer agent_id=",
+    ] {
         assert!(description.contains(field), "missing {field}");
     }
 }
@@ -410,7 +416,7 @@ fn unknown_failure_categories_render_with_package_owned_default_guidance() {
         "- Failure: codex_futureProviderCode — The agent ended without a recognized failure category."
     ));
     assert!(text.contains(
-        "- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood."
+        "- Advice: Inspect list_agents, transcript, and supervisor logs for this agent_id before choosing a recovery action."
     ));
 }
 

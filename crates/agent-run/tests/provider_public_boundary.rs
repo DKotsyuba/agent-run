@@ -1184,11 +1184,45 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         "{:?}",
         parent.failure_text
     );
+    let refusal = mcp_tool(
+        &broker.home,
+        "resume",
+        json!({
+            "agent_id":agent, "task":"do not admit", "expected_sequence":2,
+        }),
+    )
+    .await;
+    assert_eq!(refusal["result"]["isError"], true, "{refusal}");
+    assert_eq!(
+        refusal["result"]["structuredContent"],
+        json!({
+            "code":"sequence_mismatch","latest_sequence":1,"latest_status":"succeeded",
+        })
+    );
+    let refused_cli = cli(
+        &broker.home,
+        &[
+            "resume",
+            &agent,
+            "--task",
+            "do not admit",
+            "--expected-sequence",
+            "2",
+        ],
+    );
+    assert!(!refused_cli.status.success());
+    let error: Value = serde_json::from_slice(&refused_cli.stderr).unwrap();
+    assert_eq!(error["error"]["type"], "sequence_mismatch");
+    assert_eq!(error["error"]["latest_sequence"], 1);
+    assert_eq!(error["error"]["latest_status"], "succeeded");
     for number in 1..=2 {
         let mut arguments = json!({
             "agent_id":agent, "task":"fixture:answer",
             "request_id":format!("stable-resume-{number}")
         });
+        if number == 1 {
+            arguments["expected_sequence"] = json!(1);
+        }
         if number == 2 {
             arguments["display_name"] = json!("工程師: next");
         }
@@ -1225,7 +1259,12 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         broker.wait_terminal(&run);
         runs.push(run);
     }
-    let list = client.call("list_agents", Some(json!({}))).await.unwrap();
+    let list = client
+        .call("list_agents", Some(json!({"agent_id":agent})))
+        .await
+        .unwrap();
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["sequence"], 3);
     assert_eq!(list["items"][0]["name"], "工程師: next");
     assert_eq!(list["items"][0]["usage"]["input_tokens"], 2);
     for field in ["usage", "usage_cumulative"] {
@@ -1322,13 +1361,20 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
 
     // A bounded hanging fixture keeps the winner active until explicitly cancelled.
     let other = BrokerClient::new(broker.home.join("api.sock"));
-    let first = json!({"agent_id":agent,"task":"fixture:hang","request_id":"stable-race-a"});
-    let second = json!({"agent_id":agent,"task":"fixture:hang","request_id":"stable-race-b"});
+    let first = json!({"agent_id":agent,"task":"fixture:hang","expected_sequence":3,"request_id":"stable-race-a"});
+    let second = json!({"agent_id":agent,"task":"fixture:hang","expected_sequence":3,"request_id":"stable-race-b"});
     let (left, right) = tokio::join!(
         client.call("resume", Some(first)),
         other.call("resume", Some(second))
     );
     assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let loser = left
+        .as_ref()
+        .err()
+        .or_else(|| right.as_ref().err())
+        .unwrap();
+    assert_eq!(loser.public().kind, "sequence_mismatch", "{loser:?}");
+    assert_eq!(loser.sequence_mismatch().unwrap().0, 4);
     let winner = left.or(right).unwrap();
     assert_eq!(winner["agent_id"], agent);
     let active_run = agent_run_core::agent_identity::resolve_sequence(

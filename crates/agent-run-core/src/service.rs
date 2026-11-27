@@ -255,6 +255,8 @@ enum CachedConfigValue {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Query {
+    /// Exact stable agent ID for public pages, or execution ID for internal pages.
+    pub agent_id: Option<AgentId>,
     pub active: bool,
     pub orchestrator: Option<OrchestratorRef>,
     pub offset: usize,
@@ -276,6 +278,7 @@ impl Default for Query {
     fn default() -> Self {
         Self {
             active: false,
+            agent_id: None,
             orchestrator: None,
             offset: 0,
             limit: 100,
@@ -2649,17 +2652,13 @@ impl Service {
                 if tokio::time::Instant::now() < until && !events_advanced && !journal_advanced {
                     Ok(None)
                 } else {
-                    let list = if latest {
-                        Store::list_latest
-                    } else {
-                        Store::list
-                    };
-                    let (rows, total) = list(
-                        store,
+                    let (rows, total) = store.list_selected(
                         query.active,
                         query.offset,
                         query.limit,
                         query.orchestrator.as_ref(),
+                        latest,
+                        query.agent_id.as_ref(),
                     )?;
                     let usage = store.usage_cumulative_page(&rows)?;
                     let tools = store.tool_counts_page(&rows)?;

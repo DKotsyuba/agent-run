@@ -36,8 +36,14 @@ fn args<T: serde::de::DeserializeOwned>(raw: Value) -> Result<T> {
     if !raw.is_object() {
         return Err(invalid("tool arguments must be an object"));
     }
-    serde_json::from_value(raw)
-        .map_err(|_| invalid("unknown, missing, or incorrectly typed tool argument"))
+    serde_json::from_value(raw).map_err(|error| {
+        let message = error.to_string();
+        if message.starts_with("unknown field `") || message.starts_with("missing field `") {
+            invalid(message)
+        } else {
+            invalid("incorrectly typed tool argument; check the tool schema")
+        }
+    })
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,6 +324,8 @@ struct Resume {
     /// Optional exact parent, otherwise the terminal lineage tip.
     #[serde(default)]
     run_id: Option<AgentId>,
+    /// Optional latest-execution fence for conditional admission.
+    expected_sequence: Option<std::num::NonZeroU32>,
     /// Nonblank next instruction for the retained native conversation.
     task: String,
     /// Explicitly recover an unsealed lost native session.
@@ -600,6 +608,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 .resume_public(
                     &a.agent_id,
                     a.run_id.as_ref(),
+                    a.expected_sequence,
                     a.task,
                     a.request_id,
                     a.display_name,

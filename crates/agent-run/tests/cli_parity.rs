@@ -213,6 +213,7 @@ fn python_cli_spec_command_surface_is_present() {
                     "--needs-git-commit",
                     "--socket",
                     "--tmpdir",
+                    "--expected-sequence",
                 ],
             ),
             "transcript" => (

@@ -41,6 +41,15 @@ pub fn now() -> f64 {
         .as_secs_f64()
 }
 
+/// Format a recorded Unix timestamp for agent-facing UTC text.
+pub fn utc_timestamp(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(seconds.floor() as i64, 0)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AgentId(String);

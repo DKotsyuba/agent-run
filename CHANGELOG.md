@@ -5,9 +5,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 ## [Unreleased]
 
 - Preflight worker directory, Git metadata and Unix socket requirements before
-  provider start, resume and batch admission. Give writable workers workspace
-  scratch and a brief describing their effective launch scope.
-
+  provider start, resume and batch admission. Describe the effective launch
+  scope and provide workspace scratch for direct writable launches and private
+  temporary directories for shared workers.
+- Present pending steer receipts, per-job batch admission and completion binding,
+  compact agent pages, and retained transcript results in MCP text.
+- Include a bounded verified result excerpt and specific terminal recovery
+  guidance in completion notices.
+- Add an exact `agent_id` list filter and optional `expected_sequence` resume
+  fence. A stale fence returns `sequence_mismatch` with the current status and sequence.
 - Discover the operator MCP tool list from the broker and report frontend version
   skew with reconnection guidance and `version --check-frontend`.
 - Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the

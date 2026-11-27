@@ -974,7 +974,7 @@ fn tool_input_plan() -> LaunchPlan {
         ),
         event(
             "item/completed",
-            json!({"type":"dynamicToolCall","id":"dynamic","tool":"inspect"}),
+            json!({"type":"dynamicToolCall","id":"dynamic","tool":"inspect","contentItems":[{"type":"inputText","text":"dynamic tool output"}],"success":true}),
         ),
         event(
             "item/started",
@@ -1114,6 +1114,7 @@ async fn codex_tool_input_captures_supported_fields_without_mispairing() {
     assert_eq!(late_change[0], "");
     assert!(late_change[1].contains("src/new.rs") && late_change[1].contains("later change"));
     assert!(contents("tool_call", "dynamic")[0].contains("visible"));
+    assert_eq!(contents("tool_result", "dynamic"), ["dynamic tool output"]);
     let long = contents("tool_call", "long");
     assert_eq!(long.len(), 2);
     assert!(long.iter().all(|fragment| fragment.len() <= 16 * 1024));

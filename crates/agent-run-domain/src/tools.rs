@@ -231,6 +231,7 @@ impl ToolDefinition {
                 MachineCode::StorageError,
             ],
             "resume" => &[
+                MachineCode::SequenceMismatch,
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,
                 MachineCode::StateTransitionError,
@@ -385,7 +386,13 @@ pub fn socket_tools_json() -> Vec<Value> {
         .iter()
         .filter(|definition| definition.legacy_for.is_none())
         .cloned()
-        .map(|definition| serde_json::to_value(definition).expect("tool definition is JSON"))
+        .map(|mut definition| {
+            if definition.name == "list_agents" {
+                definition.input_schema["properties"]["limit"] =
+                    json!({"type":"integer","minimum":1,"maximum":1000,"default":100});
+            }
+            serde_json::to_value(definition).expect("tool definition is JSON")
+        })
         .collect()
 }
 

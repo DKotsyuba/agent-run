@@ -99,7 +99,7 @@ struct ExecutionReceipt {
     request_id: Option<String>,
     /// Exact admission counter for the PostToolUse binding mirror.
     sequence: Option<u32>,
-    /// Exact queued steering command, retained on formatting failure.
+    /// Exact pending steering command, retained on formatting failure.
     command_id: Option<i64>,
 }
 
@@ -143,7 +143,11 @@ impl ExecutionReceipt {
         let mut text = if self.accepted {
             format!(
                 "ACCEPTED {tool} {}\nPresentation: degraded (presentation_failed).\nDo not repeat the mutation to repair this response.\n",
-                self.identity.as_deref().unwrap_or("")
+                if tool == "notify_orchestrator" {
+                    ""
+                } else {
+                    self.identity.as_deref().unwrap_or("")
+                }
             )
         } else if matches!(
             tool,
@@ -151,7 +155,7 @@ impl ExecutionReceipt {
         ) {
             "OUTCOME_UNKNOWN\nPresentation: degraded (presentation_failed).\nReconcile the original request before any retry; do not create replacement work.\n".into()
         } else {
-            "agent-run error RuntimeError: presentation_failed; no page was published. Request a smaller list/transcript limit or narrower model/provider/profile filter; doc topics and answer artifact paths remain available through CLI/API.\n".into()
+            "agent-run error RuntimeError: presentation_failed; no page was published. For list_agents, use a smaller limit or filter by agent_id. For transcript, use a smaller limit. The operator CLI can retrieve larger results.\n".into()
         };
         if !self.accepted
             && let Some(id) = &self.identity
@@ -166,6 +170,9 @@ impl ExecutionReceipt {
         }
         let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
         result.is_error = Some(!self.accepted);
+        if tool == "notify_orchestrator" && self.accepted {
+            result.structured_content = Some(json!({"notification_id": self.identity}));
+        }
         if tool == "start_batch" && !self.accepted {
             result.structured_content = Some(json!({"code":"BatchOutcomeUnknown"}));
         }
@@ -215,7 +222,9 @@ struct AgentTextView {
     usage: String,
     /// Honest lineage coverage summary.
     usage_lineage: String,
-    /// Optional latest-execution tool counts, preserving unknown values.
+    /// Relative age for active runs or UTC completion time for terminal runs.
+    age: Option<String>,
+    /// Optional measured tool counts for the latest execution.
     tool_counts: Option<String>,
     /// Content-free ping state and actionable broker diagnosis.
     health: Option<String>,
@@ -301,8 +310,6 @@ struct MessageTextView {
     first_seq: Option<i64>,
     /// Inclusive final source sequence for a block.
     last_seq: Option<i64>,
-    /// Opaque raw evidence reference, never automatically expanded.
-    raw_ref: Option<String>,
     /// Whether earlier block fragments lie outside this page.
     partial_before: Option<bool>,
     /// Whether later block fragments lie outside this page.
@@ -377,8 +384,6 @@ struct ExcerptTextView<'a> {
 /// Safe worker queue acknowledgement with no capability or message content.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReportTextView {
-    /// Exact queue delivery identity.
-    notification_id: String,
     /// Validated queue lifecycle.
     state: String,
     /// Whether the request replay reused an existing report.
@@ -649,9 +654,7 @@ pub fn success_result_with_request(
     }
 
     if tool == "start_batch" {
-        return batch_result(value, request_id).unwrap_or_else(|_| {
-            ExecutionReceipt::capture(tool, &Value::Null, request_id).fallback(tool)
-        });
+        return batch_result_with_caller(value, request_id, &Value::Null, None);
     }
     if matches!(tool, "capabilities" | "answer_chunk") {
         return observation_result(tool, value).unwrap_or_else(|_| {
@@ -703,6 +706,14 @@ pub fn success_result_with_request(
             "path": displayed["path"], "inline_complete": false,
         }));
         result.content.push(ContentBlock::resource_link(resource));
+    }
+    if tool == "notify_orchestrator"
+        && result.structured_content.is_none()
+        && result.is_error != Some(true)
+    {
+        result.structured_content = Some(
+            json!({"notification_id": value["notification_id"], "state": value["state"], "duplicate": value["duplicate"]}),
+        );
     }
     if matches!(tool, "start" | "resume")
         && let (Some(id), Some(sequence)) = (&receipt.identity, receipt.sequence)
@@ -815,8 +826,25 @@ fn status_result(value: &Value) -> Result<CallToolResult> {
     Ok(result)
 }
 
+/// Render each admitted job and its admission-time relationship to the MCP caller.
+pub(super) fn batch_result_with_caller(
+    value: &Value,
+    request_id: Option<&str>,
+    args: &Value,
+    caller: Option<&crate::domain::OrchestratorRef>,
+) -> CallToolResult {
+    batch_result(value, request_id, args, caller).unwrap_or_else(|_| {
+        ExecutionReceipt::capture("start_batch", &Value::Null, request_id).fallback("start_batch")
+    })
+}
+
 /// Returns the complete validated durable batch receipt in structured content.
-fn batch_result(value: &Value, request_id: Option<&str>) -> Result<CallToolResult> {
+fn batch_result(
+    value: &Value,
+    request_id: Option<&str>,
+    args: &Value,
+    caller: Option<&crate::domain::OrchestratorRef>,
+) -> Result<CallToolResult> {
     let mut batch: agent_run_domain::batch::StartBatchResult =
         serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
     if batch.receipt.validate().is_err()
@@ -824,9 +852,26 @@ fn batch_result(value: &Value, request_id: Option<&str>) -> Result<CallToolResul
     {
         return Err(shape_error());
     }
-    let mut result = CallToolResult::success(vec![ContentBlock::text(
-        "agent-run start_batch: durable admission receipt in structuredContent. Automatic batch hook binding is not provided.",
-    )]);
+    use std::fmt::Write as _;
+    let mut text = String::from("agent-run start_batch accepted\n");
+    for job in &batch.receipt.jobs {
+        let destination: Option<crate::domain::OrchestratorRef> =
+            serde_json::from_value(args["jobs"][job.index]["orchestrator"].clone())
+                .map_err(|_| shape_error())?;
+        let binding = match (destination.as_ref(), caller) {
+            (Some(dest), Some(caller))
+                if dest.external_session_id == caller.external_session_id
+                    && dest.canonical_transport()? == caller.canonical_transport()? =>
+            {
+                "completion bound to caller at admission"
+            }
+            (Some(_), None) => "completion destination set; caller identity unavailable",
+            (Some(_), Some(_)) => "completion bound to a different destination at admission",
+            (None, _) => "completion not bound at admission",
+        };
+        let _ = writeln!(text, "- agent_id={} — {binding}", job.agent_id);
+    }
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     batch.release_token = None;
     result.structured_content = Some(serde_json::to_value(batch)?);
     let mut wire = BoundedWriter {
@@ -942,10 +987,22 @@ pub fn failure_result(
             identity: target_id.filter(|id| reference(id)).map(str::to_owned),
             ..ExecutionReceipt::capture(tool, &Value::Null, request_id)
         };
-        return receipt.fallback(tool);
+        let mut result = receipt.fallback(tool);
+        if error.machine_code() == agent_run_domain::MachineCode::BrokerUnavailable {
+            result.content.push(ContentBlock::text(
+                "Broker unreachable. Check the Agent Run service, then reconcile the original request before retrying.",
+            ));
+        }
+        return result;
     }
     let public = error.public();
-    error_result(public.kind, &public.message)
+    let mut result = error_result(public.kind, &public.message);
+    if let Some((sequence, status)) = error.sequence_mismatch() {
+        result.structured_content = Some(json!({
+            "code": public.kind, "latest_sequence": sequence, "latest_status": status,
+        }));
+    }
+    result
 }
 
 /// Presents one operator result through shared text views or the two additive
@@ -1079,7 +1136,7 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
             required_reference(value, "agent_id")?;
             if value["command_id"].as_i64().is_none_or(|n| n < 1)
                 || value["kind"] != "steer"
-                || value["state"] != "queued"
+                || !matches!(value["state"].as_str(), Some("pending" | "completed"))
             {
                 return Err(shape_error());
             }
@@ -1266,7 +1323,12 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
                 agent_run_domain::integration::Communication::Observed {
                     address,
                     sampled_at_ms,
-                } => format!("observed {} at {sampled_at_ms} ms", exact_display(&address)),
+                } => format!(
+                    "observed {} at {}",
+                    exact_display(&address),
+                    crate::domain::utc_timestamp(sampled_at_ms as f64 / 1000.0)
+                        .ok_or_else(shape_error)?,
+                ),
                 agent_run_domain::integration::Communication::Unknown { reason } => {
                     format!("unknown {}", serde_json::to_value(reason)?)
                 }
@@ -1327,7 +1389,7 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
         "notify_orchestrator" => render_view(
             name,
             &projected::<ReportTextView>(json!({
-                "notification_id": value["notification_id"], "state": value["state"], "duplicate": value["duplicate"]
+                "state": value["state"], "duplicate": value["duplicate"]
             }))?,
             limit,
         ),
@@ -1357,23 +1419,39 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
 fn agent_fields(view: &Value) -> Value {
     let text = |key: &str| view[key].as_str().map(exact_display).unwrap_or_default();
     let status = text("status");
+    let terminal = matches!(
+        status.as_str(),
+        "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
+    );
+    let age = if terminal {
+        view["finished_at"]
+            .as_f64()
+            .and_then(crate::domain::utc_timestamp)
+    } else {
+        view["elapsed_seconds"].as_f64().map(|seconds| {
+            let seconds = seconds as u64;
+            match seconds {
+                0..=59 => format!("{seconds}s"),
+                60..=3599 => format!("{}m", seconds / 60),
+                3600..=86399 => format!("{}h", seconds / 3600),
+                _ => format!("{}d", seconds / 86400),
+            }
+        })
+    };
     json!({
-        "id": view["agent_id"], "status": status,
-        "terminal": matches!(status.as_str(),
-            "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"),
+        "id": view["agent_id"], "status": status, "terminal": terminal, "age": age,
         "runtime": view["runtime"].as_str().map(exact_display), "model": view["model"].as_str().map(exact_display), "profile": view["profile"].as_str().map(exact_display),
         "phase": text("phase"), "effort": text("effort"),
         "name": view["name"].as_str().map(display_label).unwrap_or_default(),
         "usage": usage_line(&view["usage"]),
         "usage_lineage": lineage_line(&view["usage_cumulative"]),
-        "health": view["health"].as_object().map(|health| {
-            let state=health.get("state").and_then(Value::as_str).map(exact_display).unwrap_or_else(||"unknown".into());
-            health.get("reason").and_then(Value::as_str).map(|reason|format!("{state}: {}",exact_display(reason))).unwrap_or(state)
-        }),
-        "tool_counts": view["tool_counts"].as_object().map(|counts| {
-
-            let number = |key: &str| counts.get(key).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
-            format!("{} native calls, {} failed, {} unknown results (latest execution)", number("calls"), number("failed"), number("unknown_results"))
+        "health": health_line(&view["health"]),
+        "tool_counts": view["tool_counts"]["calls"].as_u64().map(|calls| {
+            let mut line = format!("{calls} native calls");
+            if let Some(failed) = view["tool_counts"]["failed"].as_u64() {
+                line.push_str(&format!(", {failed} failed"));
+            }
+            line
         }),
         "mcp": view["mcp"].as_array().into_iter().flatten().take(8).map(|server| json!({
             "name": server["name"].as_str().map(exact_display), "source": server["source"].as_str().map(exact_display),
@@ -1404,42 +1482,67 @@ fn start_context(value: &Value) -> Value {
     fields
 }
 
-/// One compact human usage line from a latest-execution usage object.
-///
-/// Unreported numbers render as `?` so an honest null is never mistaken for
-/// a measured zero; an absent object (no statistics row yet, typically while
-/// the run executes) and an explicitly sourceless row both stay distinct.
+/// Render measured input and output tokens, omitting counts without evidence.
 fn usage_line(usage: &Value) -> String {
-    let Some(object) = usage.as_object() else {
-        return String::new();
-    };
-    if object.get("usage_source").and_then(Value::as_str) == Some("none") {
-        return "no native usage reported".to_owned();
+    if usage["usage_source"] == "none" {
+        return "no native usage reported".into();
     }
-    let number = |key: &str| {
-        object
-            .get(key)
-            .and_then(Value::as_i64)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".to_owned())
+    let parts = [("in", "input_tokens"), ("out", "output_tokens")]
+        .into_iter()
+        .filter_map(|(label, key)| {
+            usage[key]
+                .as_u64()
+                .map(|count| format!("{label} {}", token_count(count)))
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{} tokens", parts.join(" "))
+    }
+}
+
+/// Keep token counts exact below one thousand and compact above it.
+fn token_count(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1000..=999_999 => format!("{}k", (count + 500) / 1000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0).replace(".0M", "M"),
+    }
+}
+
+/// Translate health observations into agent-facing state and recovery guidance.
+fn health_line(health: &Value) -> Option<String> {
+    let state = health["state"].as_str()?;
+    if state == "terminal" {
+        return Some("execution ended — use answer to retrieve the result".into());
+    }
+    let line = match health["reason"].as_str() {
+        Some("idle_without_wait_source" | "idle_without_wait_source_after_ping") => {
+            "idle without a wait source — steer it or check the transcript"
+        }
+        Some("worker_blocked") => {
+            "worker reported a blocker — check the transcript and address the blocker"
+        }
+        Some("control_unresponsive" | "native_control_unavailable") => {
+            "worker control is unavailable — check broker health and the transcript"
+        }
+        Some("model_ping_delivery_unconfirmed" | "model_reply_missing") => {
+            "worker has not acknowledged a health check — check the transcript"
+        }
+        Some(
+            "clock_regression"
+            | "activity_observation_unavailable"
+            | "native_observation_unavailable",
+        ) => "worker activity could not be verified — check the transcript",
+        _ => match state {
+            "waiting" => "waiting for a native tool — check the transcript for progress",
+            "checking" => "checking worker activity — check the transcript for progress",
+            "observing" => "monitoring worker activity",
+            _ => "worker needs attention — check the transcript",
+        },
     };
-    let turns = object
-        .get("num_turns")
-        .and_then(Value::as_i64)
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "?".to_owned());
-    format!(
-        "in {} out {} cache r{}/w{} turns {} ({})",
-        number("input_tokens"),
-        number("output_tokens"),
-        number("cache_read_tokens"),
-        number("cache_write_tokens"),
-        turns,
-        object
-            .get("usage_source")
-            .and_then(Value::as_str)
-            .unwrap_or("?"),
-    )
+    Some(line.into())
 }
 
 /// One compact lineage-aggregate line; empty when no aggregate is attached.
@@ -1457,7 +1560,11 @@ fn lineage_line(cumulative: &Value) -> String {
     let output = object.get("output_tokens").and_then(Value::as_i64);
     match (input, output) {
         (Some(input), Some(output)) => {
-            format!("lineage in {input} out {output} over {executions} execution(s)")
+            format!(
+                "lineage in {} out {} tokens over {executions} execution(s)",
+                token_count(input.max(0) as u64),
+                token_count(output.max(0) as u64)
+            )
         }
         _ => format!("lineage incomplete over {executions} execution(s)"),
     }
@@ -1489,10 +1596,10 @@ fn transcript_context(value: &Value) -> Value {
                 "seq": message["seq"], "role": message["role"],
                 "name": message["name"].as_str().map(label), "content": message["content"],
                 "first_seq": message["first_seq"], "last_seq": message["last_seq"],
-                "raw_ref":message["raw_ref"], "partial_before":message["partial_before"],
+                "partial_before":message["partial_before"],
                 "partial_after":message["partial_after"], "omitted_bytes":message["omitted_bytes"],
                 "content_complete":message["content_complete"],
-                "error":message["error"].as_bool().map(|failed| if failed {"error"} else {"ok"}).unwrap_or("unknown"),
+                "error":message["error"].as_bool().map(|failed| if failed {"error"} else {"ok"}).unwrap_or(""),
                 "error_source":message["error_source"],
             })
         }).collect::<Vec<_>>(),
@@ -1558,6 +1665,30 @@ mod tests {
         let wire = serde_json::to_string(&result).unwrap();
         assert!(!wire.contains("release_token"));
         assert!(!wire.contains(canary.as_str().unwrap()));
+    }
+
+    /// Batch text distinguishes caller binding from omitted delivery destinations.
+    #[test]
+    fn batch_text_shows_every_job_and_its_binding() {
+        let value = json!({"replayed":false,"receipt":{
+            "version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"batch",
+            "jobs":[
+                {"index":0,"agent_id":"ag-20200101-000000-0000000001","sequence":1,"execution_ref":format!("ex1_{}", "a".repeat(64))},
+                {"index":1,"agent_id":"ag-20200101-000000-0000000002","sequence":1,"execution_ref":format!("ex1_{}", "b".repeat(64))}
+            ]
+        }});
+        let destination = json!({"transport":"codex","external_session_id":"opaque-caller"});
+        let caller = serde_json::from_value(destination.clone()).unwrap();
+        let args = json!({"jobs":[{"orchestrator":destination},{}]});
+        let result = super::batch_result_with_caller(&value, Some("batch"), &args, Some(&caller));
+        assert_ne!(result.is_error, Some(true));
+        let wire = serde_json::to_value(&result).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("agent_id=ag-20200101-000000-0000000001 — completion bound to caller")
+        );
+        assert!(text.contains("agent_id=ag-20200101-000000-0000000002 — completion not bound"));
+        assert!(!text.contains("opaque-caller"));
     }
 
     /// Structured batch receipts preserve every identity; malformed or unknown outcomes retain the key.
@@ -1783,7 +1914,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let wire = serde_json::to_value(&result).unwrap();
         let text = wire["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("previous_cursor: 3") && text.contains("opaque-ref"));
+        assert!(text.contains("previous_cursor: 3") && !text.contains("opaque-ref"));
         assert!(text.contains("11904 bytes omitted") && text.contains("CLI/API transcript"));
         assert!(text.len() < 16 * 1024);
     }
@@ -1842,7 +1973,6 @@ mod tests {
             "[3..5]",
             "error: is_error",
             "exact\nbody",
-            "opaque-ref",
             "12 bytes omitted",
             "previous_cursor: 3",
             "before_cursor=3",
@@ -1850,7 +1980,7 @@ mod tests {
         ] {
             assert!(page.contains(fact), "{fact}: {page}");
         }
-        assert!(!page.contains("PRIVATE_CANARY"));
+        assert!(!page.contains("PRIVATE_CANARY") && !page.contains("opaque-ref"));
         for (key, bad) in [
             ("previous_cursor", Value::Null),
             ("direction", json!("sideways")),
@@ -1897,7 +2027,7 @@ mod tests {
             page.contains("- 工程師 / review (review) · ag-1:"),
             "{page}"
         );
-        assert!(page.contains("in 0 out ? cache r0/w? turns ?"), "{page}");
+        assert!(page.contains("in 0 tokens"), "{page}");
         assert!(
             page.contains("lineage incomplete over 2 execution(s)"),
             "{page}"
@@ -2076,12 +2206,23 @@ mod tests {
         assert!(cancel.contains("- Agent: ag-1"), "{cancel}");
         assert!(cancel.contains("requested, not yet confirmed"), "{cancel}");
         assert!(!cancel.contains("succeeded"), "{cancel}");
-        let steer = text(
-            "steer",
-            &json!({"command_id": 7, "agent_id": "ag-1", "kind": "steer", "state": "queued"}),
-        );
+        let home = tempfile::tempdir().unwrap();
+        agent_run_store::fixture::initialize(home.path()).unwrap();
+        let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+        let request = json!({"runtime":"codex","model":"fixture","profile":"review",
+            "task":"fixture only","workdir":home.path()});
+        let id: crate::domain::AgentId = "ag-20261018-000000-0123456789".parse().unwrap();
+        store.conn.execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?1,'codex','fixture','review','fixture only','fixture only',?2,?3,'running',100,'fixture',?1)",
+            rusqlite::params![id.as_str(), home.path().to_str().unwrap(), request.to_string()],
+        ).unwrap();
+        let row = store
+            .enqueue(&id, "steer", &json!({"message":"continue"}))
+            .unwrap();
+        let steer = text("steer", &row);
         assert!(steer.contains("agent-run steer accepted"), "{steer}");
-        assert!(steer.contains("steer #7 (queued)"), "{steer}");
+        assert!(steer.contains("steer #1 (pending)"), "{steer}");
+        assert!(!steer.contains("presentation_failed"), "{steer}");
         assert!(steer.contains("applies to the active run"), "{steer}");
         let mut terminal = agent_view();
         terminal["status"] = json!("cancelled");
@@ -2095,23 +2236,40 @@ mod tests {
     fn list_agents_keeps_total_and_continuation() {
         let mut named = agent_view();
         named["name"] = json!("Delicate Fox");
+        named["elapsed_seconds"] = json!(750);
+        named["usage"] = json!({"input_tokens":8_700_000,"output_tokens":21_400});
+        named["tool_counts"] = json!({"calls":5,"failed":null,"unknown_results":1});
+        let mut finished = agent_view();
+        finished["status"] = json!("succeeded");
+        finished["finished_at"] = json!(0);
+        finished["health"] = json!({"state":"terminal","reason":"idle_without_wait_source"});
         let page = text(
             "list_agents",
             &json!({
-                "items": [named, agent_view()], "total": 5, "offset": 0,
+                "items": [named, finished], "total": 5, "offset": 0,
                 "limit": 2, "next_offset": 2, "complete": false, "revision": 9,
             }),
         );
         assert!(page.contains("2 of 5 matching (offset 0)"), "{page}");
         assert!(
-            page.contains("- ag-1: running (running) — glm-user/glm-5.3 profile review"),
+            page.contains("- ag-1: succeeded (running) — glm-user/glm-5.3 profile review · 1970-01-01T00:00:00Z"),
             "{page}"
         );
         assert!(
             page.contains("- Delicate Fox (review) · ag-1: running (running) — glm-user/glm-5.3"),
             "{page}"
         );
+        assert!(page.contains("execution ended — use answer"), "{page}");
+        assert!(!page.contains("steer it"), "{page}");
         assert!(page.contains("task: \"fix the parser\""), "{page}");
+        assert!(
+            page.contains("· 12m") && page.contains("in 8.7M out 21k tokens"),
+            "{page}"
+        );
+        assert!(
+            page.contains("tools: 5 native calls") && !page.contains("unknown results"),
+            "{page}"
+        );
         assert!(
             page.contains("next offset: 2 — more matching rows remain"),
             "{page}"
@@ -2131,7 +2289,7 @@ mod tests {
         );
         assert!(page.contains("running (idle)"), "{page}");
         assert!(
-            page.contains("health: needs_attention: idle_without_wait_source"),
+            page.contains("health: idle without a wait source — steer it or check the transcript"),
             "{page}"
         );
     }
@@ -2147,10 +2305,20 @@ mod tests {
                 "messages": [
                     {"seq": 1, "role": "user", "content": "please\nfix\tit"},
                     {"seq": 2, "role": "tool_call", "name": "shell", "content": "{\"cmd\":1}"},
+                    {"seq": 3, "role": "tool_result", "name": "shell", "content": "stored output", "raw_ref": "private"},
+
                 ],
             }),
         );
         assert!(page.contains("[1] user: please\nfix\tit"), "{page}");
+        assert!(
+            page.contains("[3] tool_result (\"shell\"): stored output"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("raw_ref") && !page.contains("[unknown]"),
+            "{page}"
+        );
         assert!(
             page.contains("[2] tool_call (\"shell\"): {\"cmd\":1}"),
             "{page}"
