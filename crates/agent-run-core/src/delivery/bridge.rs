@@ -10,9 +10,13 @@ use std::{io::Read, os::unix::fs::MetadataExt, path::Path, time::Duration};
 /// Freeze the notice and the existing binding's explicitly mapped
 /// destination. Unknown transports/namespaces or invalid content refuse before socket I/O;
 /// the protected credential file is read to freeze its deployment association.
-pub(super) fn intent(claim: &Claim, config: &BridgeDelivery) -> Result<BridgeIntent> {
+pub(super) fn intent(
+    claim: &Claim,
+    config: &BridgeDelivery,
+    answer: Option<&str>,
+) -> Result<BridgeIntent> {
     let (kind, message) = match &claim.payload {
-        NoticePayload::Completion(n) => ("agent-run.completion", n.render()?),
+        NoticePayload::Completion(n) => ("agent-run.completion", n.render_with_result(answer)?),
         NoticePayload::Worker(n) => ("agent-run.worker-report", n.render()?),
         NoticePayload::Restart(text) => ("agent-run.maintenance", text.clone()),
     };
@@ -421,7 +425,7 @@ mod tests {
                 bridge_unknown: false,
                 restart_before: None,
             };
-            let frozen = intent(&claim, &config).unwrap();
+            let frozen = intent(&claim, &config, None).unwrap();
             assert_eq!(frozen.kind, kind);
             assert!(frozen.message.contains(marker));
             assert_eq!(
@@ -429,21 +433,24 @@ mod tests {
                 "host%2Fpart/codex/store%25name/session%2Fpart"
             );
             claim.transport = "claude_uds".into();
-            let claude = intent(&claim, &config).unwrap();
+            let claude = intent(&claim, &config, None).unwrap();
             assert_eq!(
                 claude.address,
                 "host%2Fpart/claude-code/claude-main/session%2Fpart"
             );
             claim.owner_uid = Some(999);
-            assert_eq!(intent(&claim, &config).unwrap().address, claude.address);
+            assert_eq!(
+                intent(&claim, &config, None).unwrap().address,
+                claude.address
+            );
             claim.owner_uid = Some(1000);
             assert_eq!(
-                intent(&claim, &config).unwrap().address,
+                intent(&claim, &config, None).unwrap().address,
                 "host%2Fpart/claude-code/claude-pluto/session%2Fpart"
             );
             claim.transport = "codex_queue".into();
             assert_eq!(
-                intent(&claim, &config).unwrap().address,
+                intent(&claim, &config, None).unwrap().address,
                 "host%2Fpart/codex/codex-pluto/session%2Fpart"
             );
             assert_eq!(frozen.event_id, claude.event_id);

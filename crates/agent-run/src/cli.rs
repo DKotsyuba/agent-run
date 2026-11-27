@@ -753,6 +753,9 @@ pub struct Resume {
     /// Pin the terminal parent rather than resolving the latest run.
     #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
+    /// Refuse unless the latest execution has this sequence.
+    #[arg(long)]
+    pub expected_sequence: Option<std::num::NonZeroU32>,
     #[arg(long)]
     pub task: Option<String>,
     #[arg(long)]
@@ -845,6 +848,7 @@ fn agents_query(
 ) -> Result<Query> {
     Ok(Query {
         active: agents.active,
+        agent_id: None,
         offset: agents.offset,
         limit: agents.limit,
         after_revision,
@@ -2503,6 +2507,9 @@ async fn run_client_command(
             }
             if let Some(display_name) = a.display_name {
                 arguments["display_name"] = json!(display_name);
+            }
+            if let Some(sequence) = a.expected_sequence {
+                arguments["expected_sequence"] = json!(sequence);
             }
             if a.recover_after_crash {
                 arguments["recover_after_crash"] = json!(true);

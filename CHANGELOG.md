@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Present pending steer receipts, per-job batch admission and completion binding,
+  compact agent pages, and retained transcript results in MCP text.
+- Include a bounded verified result excerpt and specific terminal recovery
+  guidance in completion notices.
+- Add an exact `agent_id` list filter and optional `expected_sequence` resume
+  fence. A stale fence returns `sequence_mismatch` with the current status and sequence.
+
 - Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
   requested model is usable again. Completion notices advise resuming the same
   agent after capacity returns.

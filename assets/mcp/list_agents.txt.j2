@@ -1,7 +1,7 @@
 agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
 
 {% for agent in agents %}
-- {% if agent.name %}{{ agent.name }} ({{ agent.profile }}) · {% endif %}{{ agent.id }}: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %} — {{ agent.runtime }}/{{ agent.model }}{% if not agent.name %} profile {{ agent.profile }}{% endif %}{{ "" }}
+- {% if agent.name %}{{ agent.name }} ({{ agent.profile }}) · {% endif %}{{ agent.id }}: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %} — {{ agent.runtime }}/{{ agent.model }}{% if not agent.name %} profile {{ agent.profile }}{% endif %}{% if agent.age %} · {{ agent.age }}{% endif %}{{ "" }}
 {% if agent.task %}
   task: {{ agent.task }}
 {% endif %}

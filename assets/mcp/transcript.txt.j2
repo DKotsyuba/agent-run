@@ -1,10 +1,7 @@
 agent-run transcript for {{ agent_id }} ({{ count }} {{ view }} entries, {{ direction }} page)
 
 {% for message in messages %}
-[{{ message.first_seq if message.first_seq else message.seq }}{% if message.last_seq %}..{{ message.last_seq }}{% endif %}] {{ message.role }}{% if message.name %} ({{ message.name }}){% endif %}{% if message.role == "tool_result" %} [{{ message.error }}{% if message.error_source %}: {{ message.error_source }}{% endif %}]{% endif %}: {{ message.content }}{{ "" }}
-{% if message.raw_ref %}
-raw_ref: {{ message.raw_ref }} (opaque)
-{% endif %}
+[{{ message.first_seq if message.first_seq else message.seq }}{% if message.last_seq %}..{{ message.last_seq }}{% endif %}] {{ message.role }}{% if message.name %} ({{ message.name }}){% endif %}{% if message.role == "tool_result" and message.error %} [{{ message.error }}{% if message.error_source %}: {{ message.error_source }}{% endif %}]{% endif %}: {{ message.content }}{{ "" }}
 {% if message.partial_before or message.partial_after %}
 partial block: {% if message.partial_before %}earlier fragments omitted from this page{% endif %}{% if message.partial_before and message.partial_after %}; {% endif %}{% if message.partial_after %}later fragments continue{% endif %}
 {% endif %}

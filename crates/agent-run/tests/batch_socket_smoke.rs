@@ -283,7 +283,7 @@ async fn assert_mcp_refuses(home: &Path, tool: &str, request: &Value) {
     assert!(
         reply["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("unknown tool")),
+            .is_some_and(|message| message.contains("operator CLI")),
         "{tool}: {reply}"
     );
 }

@@ -47,7 +47,8 @@ revisions are recorded independently of host qualification in `family.toml`.
 ## Presentation policy
 
 `start_batch` returns the durable receipt and replay flag in
-`structuredContent` with a fixed text summary. The release credential is
+`structuredContent` with one line per admitted job. Each line names its stable
+agent ID and identifies whether the admission requested binding to this caller. The release credential is
 omitted from MCP responses. The operator socket and CLI expose `capabilities`
 and `answer_chunk`. Answer chunks are capped at 128 KiB before escaping.
 
@@ -97,7 +98,8 @@ refused, except for the explicitly marked single-block transcript preview.
 No partial buffer, shortened critical value or upstream continuation
 for undisplayed rows is published. Narrow delegation guidance with exact
 provider/model/profile filters;
-request smaller list/transcript limits; use CLI/socket for full documents or
+request a smaller list or transcript page, or filter list_agents by stable
+agent ID. Use CLI/socket for full documents or
 answer artifacts. No new detail-reference service is invented.
 
 Semantic execution receipts are captured before presentation. Degradation after

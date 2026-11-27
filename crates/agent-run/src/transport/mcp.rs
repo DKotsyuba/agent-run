@@ -21,9 +21,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Match the Python broker and MCP stdin ceiling before the SDK allocates a frame.
 const MAX_FRAME_BYTES: usize = agent_run_domain::observation::SOCKET_MAX_FRAME_BYTES;
 
-/// Preserve Python's stable, operator-actionable broker-unavailable wording.
+/// Give the caller a recovery step when the broker cannot be reached.
 const BROKER_UNAVAILABLE: &str =
-    "agent-run broker is not running; start it with `agent-run api serve` or its launchd job";
+    "Agent Run broker is unreachable. Ask the operator to check the service, then retry.";
 
 /// Return a blocked-start receipt that the existing post-tool hook can bind.
 /// No agent was admitted; the host supplies the caller's session separately.
@@ -361,9 +361,27 @@ impl ServerHandler for Proxy {
         // Socket-only service methods (status, batch_receipt, capabilities,
         // exact reads, agent_integration, history pins) are unknown here.
         if !dispatch::is_orchestrator_tool(request.name.as_ref()) {
-            return Err(ErrorData::invalid_params("unknown tool", None));
+            let message = if dispatch::tool(request.name.as_ref()).is_some() {
+                "This method is available through the operator CLI only on this surface."
+            } else {
+                "unknown tool"
+            };
+            return Err(ErrorData::invalid_params(message, None));
         }
         let mut arguments = request.arguments.unwrap_or_default();
+        if request.name == "list_agents" {
+            let limit = arguments.entry("limit").or_insert(json!(20));
+            if !limit
+                .as_u64()
+                .is_some_and(|limit| (1..=20).contains(&limit))
+            {
+                return Ok(super::mcp_text::error_result(
+                    "ValidationError",
+                    "limit must be an integer between 1 and 20; request another page with offset",
+                )
+                .into());
+            }
+        }
         // The guide accepts exactly the filters its shared registry schema declares.
         if request.name == "delegation_guide" {
             let declared = dispatch::tool(request.name.as_ref())
@@ -467,6 +485,15 @@ impl ServerHandler for Proxy {
                         &error,
                         request_id.as_deref(),
                         None,
+                    )
+                    .into());
+                }
+                if request.name == "start_batch" {
+                    return Ok(super::mcp_text::batch_result_with_caller(
+                        &value,
+                        request_id.as_deref(),
+                        &arguments,
+                        self.orchestrator.as_ref(),
                     )
                     .into());
                 }
