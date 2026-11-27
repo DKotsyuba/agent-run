@@ -365,10 +365,8 @@ impl Dir {
     }
     /// Opens an absolute directory without following any component.
     ///
-    /// On Linux, intermediate descriptors require directory search permission
-    /// but not directory listing permission. The final directory is opened
-    /// normally, so descriptor-relative reads, writes and synchronization remain
-    /// available there. Other Unix platforms retain existing traversal semantics.
+    /// Intermediate descriptors require search permission only. The final
+    /// directory is opened normally for reads, writes and synchronization.
     pub fn open_searchable(path: &Path) -> Result<Self> {
         let relative_path = path
             .strip_prefix("/")
@@ -376,57 +374,63 @@ impl Dir {
         if relative_path.as_os_str().is_empty() {
             return Self::open(Path::new("/"));
         }
-        #[cfg(target_os = "linux")]
-        {
-            let parts = relative(relative_path)?;
-            let mut parent = Self::open(Path::new("/"))?.0;
-            for (index, name) in parts.iter().enumerate() {
-                let access = if index + 1 == parts.len() {
-                    libc::O_RDONLY
-                } else {
-                    libc::O_PATH
-                };
-                // SAFETY: parent and name remain live; the returned descriptor
-                // is uniquely owned and O_DIRECTORY rejects symlink targets.
-                let fd = unsafe {
-                    libc::openat(
-                        parent.as_raw_fd(),
-                        name.as_ptr(),
-                        access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                // SAFETY: openat returned a new nonnegative descriptor.
-                let child = unsafe { File::from_raw_fd(fd) };
-                if !child.metadata()?.is_dir() {
-                    return Err(invalid("path contains a non-directory"));
-                }
-                parent = child;
-            }
-            Ok(Self(parent))
+        let parts = relative(relative_path)?;
+        let (leaf, ancestors) = parts.split_last().expect("validated nonempty path");
+        let mut directory = Self::search_at(libc::AT_FDCWD, c"/")?;
+        for part in ancestors {
+            directory = Self::search_at(directory.0.as_raw_fd(), part)?;
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Self::open(Path::new("/"))?.subdir(relative_path)
-        }
+        Self::directory_at(directory.0.as_raw_fd(), leaf, libc::O_RDONLY)
     }
     /// Opens a physical path whose directory entries can only be replaced by
     /// root or the effective UID. A trusted sticky ancestor may be shared.
+    /// The returned descriptor supports lookup and metadata, without listing.
     pub fn open_protected(path: &Path) -> Result<Self> {
         let relative_path = path
             .strip_prefix("/")
             .map_err(|_| invalid("protected directory must be absolute"))?;
-        let mut directory = Self::open(Path::new("/"))?;
+        let directory = Self::search_at(libc::AT_FDCWD, c"/")?;
         directory.check_rename_authority()?;
-        if !relative_path.as_os_str().is_empty() {
-            for part in relative_path.components() {
-                directory = directory.subdir(Path::new(part.as_os_str()))?;
-                directory.check_rename_authority()?;
-            }
+        if relative_path.as_os_str().is_empty() {
+            return Ok(directory);
         }
-        Ok(directory)
+        directory.protected_descendant(relative_path)
+    }
+
+    /// Check each component relative to an already verified directory.
+    fn protected_descendant(mut self, path: &Path) -> Result<Self> {
+        for part in relative(path)? {
+            self = Self::search_at(self.0.as_raw_fd(), &part)?;
+            self.check_rename_authority()?;
+        }
+        Ok(self)
+    }
+
+    /// Open a real directory for search and metadata without listing rights.
+    fn search_at(parent: libc::c_int, name: &CStr) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let search = libc::O_PATH;
+        #[cfg(target_os = "macos")]
+        let search = libc::O_SEARCH;
+        Self::directory_at(parent, name, search)
+    }
+
+    /// Open one directory component without following links.
+    fn directory_at(parent: libc::c_int, name: &CStr, access: libc::c_int) -> Result<Self> {
+        // SAFETY: the parent and C name live for openat. On success it returns
+        // an owned descriptor for a real directory.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fd is the new descriptor returned by openat.
+        Ok(Self(unsafe { File::from_raw_fd(fd) }))
     }
 
     /// Verifies the descriptor owner and authority over entries in this directory.
@@ -801,19 +805,7 @@ impl Dir {
     /// Open a real child directory through no-follow descriptors.
     fn open_directory(&self, path: &Path) -> Result<File> {
         let (parent, name) = self.parent(path, false)?;
-        // SAFETY: descriptor/name remain live for this system call.
-        let raw = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: this call owns the fresh descriptor.
-        Ok(unsafe { File::from_raw_fd(raw) })
+        Ok(Self::directory_at(parent.as_raw_fd(), &name, libc::O_RDONLY)?.0)
     }
     fn parent(&self, path: &Path, create: bool) -> Result<(File, CString)> {
         let parts = relative(path)?;
@@ -1410,6 +1402,54 @@ pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>> {
         }
     }
     Ok(serde_json::to_vec(&normalized(value))?)
+}
+
+#[cfg(test)]
+mod protected_tests {
+    use super::*;
+
+    /// Search-only ancestors remain usable, and links and mutable ancestors
+    /// still fail closed. The fixture supplies an already trusted anchor.
+    #[test]
+    fn protected_descent_needs_search_but_not_ancestor_read_access() {
+        let home = tempfile::tempdir().unwrap();
+        let ancestor = home.path().join("search-only");
+        let leaf = ancestor.join("private");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let physical_leaf = leaf.canonicalize().unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let readable = File::open(&ancestor).is_ok();
+        let searchable = Dir::open_searchable(&physical_leaf);
+        let walk = Dir::open(home.path())
+            .unwrap()
+            .protected_descendant(Path::new("search-only/private"));
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid only queries process credentials.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!readable);
+        }
+        searchable.unwrap();
+        let pinned = walk.unwrap();
+        assert!(pinned.has_access(libc::W_OK | libc::X_OK));
+        pinned.private_child(Path::new("run")).unwrap();
+        assert!(leaf.join("run").is_dir());
+
+        std::os::unix::fs::symlink(&ancestor, home.path().join("alias")).unwrap();
+        assert!(
+            Dir::open(home.path())
+                .unwrap()
+                .protected_descendant(Path::new("alias/private"))
+                .is_err()
+        );
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            Dir::open(home.path())
+                .unwrap()
+                .protected_descendant(Path::new("search-only/private"))
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

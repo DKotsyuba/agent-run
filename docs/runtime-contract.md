@@ -211,12 +211,19 @@ Linked metadata outside the workdir stays with its owner. A scratch conflict
 is advisory. Direct read-only roles retain their native temp environment.
 
 Shared-service launches default to a worker-owned `0700` directory at
-`<worker-private-home>/.agent-run-tmp/<run-id>`. The worker opens each
-ancestor without following links and verifies who can rename its entries.
+`<worker-private-home>/.agent-run-tmp-<run-id>`. The worker opens each
+ancestor without following links, needs only search access on ancestors, and
+verifies who can rename their entries.
 An explicit task `tmpdir` must be writable and inside the native grant.
-For a shared worker it becomes the base for the same private per-run structure
-and must pass the same ancestor checks. Temporary data in those per-run
-directories remains with the worker account after exit.
+For a shared worker it becomes the base for the same private per-run leaf
+and must pass the same ancestor checks. Each run creates its own entry directly
+in the base, so workers can share a protected sticky base.
+
+Run leaves these directories with the worker account after exit. Their contents
+come from the native harness and may be arbitrarily large. The terminal path
+avoids recursive cleanup work, and crash recovery lacks a durable cleanup
+record for these paths, including explicit bases. The host can apply retention
+after verifying that no worker for the corresponding run is using the leaf.
 
 An explicit task `tmpdir` overrides all three temp variables. Otherwise each
 trusted developer environment setting overrides only its own variable. The

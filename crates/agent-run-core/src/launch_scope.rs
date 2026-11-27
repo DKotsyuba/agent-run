@@ -154,7 +154,7 @@ impl AccessPlan {
         let mut facts = self.inspect(system_run.is_some())?;
         if let Some((private_home, id)) = system_run {
             let base = self.tmpdir.as_deref().unwrap_or(private_home);
-            let parent = Dir::open_protected(base).map_err(|_| invalid(TEMP_REFUSAL))?;
+            let parent = open_run_temp_base(base)?;
             facts.tmpdir = Some(create_run_temp(base, &parent, id)?);
             // Only launch has the complete grant and its verified temp path.
             facts.socket_root =
@@ -220,7 +220,7 @@ impl AccessPlan {
         let tmpdir = if let Some(tmpdir) = &self.tmpdir {
             let path = self.inspect_directory(tmpdir, "temporary directory", true, system)?;
             if system {
-                Dir::open_protected(&path).map_err(|_| invalid(TEMP_REFUSAL))?;
+                open_run_temp_base(&path)?;
             }
             Some(path)
         } else if system {
@@ -411,12 +411,8 @@ impl AccessPlan {
         }
         if let Some(reference) = head.strip_prefix("ref: ") {
             let reference = Path::new(reference);
-            let refs = common.join("refs");
-            if !in_root(reference, Path::new("refs"))
-                || reference == Path::new("refs")
-                || !writable(&refs)
-            {
-                return refuse("Git refs are not writable by the worker UID");
+            if !in_root(reference, Path::new("refs")) || reference == Path::new("refs") {
+                return refuse("Git HEAD does not name a supported reference");
             }
             let Ok(metadata) = Dir::open_searchable(&common) else {
                 return refuse("Shared Git metadata cannot be opened by the worker UID");
@@ -744,20 +740,27 @@ impl Facts {
 
 /// Create a private temp leaf through a parent with verified rename authority.
 fn create_run_temp(base: &Path, parent: &Dir, id: &AgentId) -> Result<PathBuf> {
-    let name = Path::new(id.as_str());
-    let stem = Path::new(".agent-run-tmp");
-    let expected = base.join(stem).join(name);
+    let name = format!(".agent-run-tmp-{id}");
+    let expected = base.join(&name);
     if expected.to_str().is_none() {
         return Err(invalid(TEMP_REFUSAL));
     }
     let leaf = parent
-        .private_child(stem)
-        .and_then(|directory| directory.private_child(name))
+        .private_child(Path::new(&name))
         .map_err(|_| invalid(TEMP_REFUSAL))?;
     if !leaf.has_access(DIRECTORY_WRITE_ACCESS) {
         return Err(invalid(TEMP_REFUSAL));
     }
     Ok(expected)
+}
+
+/// Admission and launch use the same protection and creation-permission checks.
+fn open_run_temp_base(path: &Path) -> Result<Dir> {
+    let dir = Dir::open_protected(path).map_err(|_| invalid(TEMP_REFUSAL))?;
+    if path.to_str().is_none() || !dir.has_access(libc::W_OK | libc::X_OK) {
+        return Err(invalid(TEMP_REFUSAL));
+    }
+    Ok(dir)
 }
 
 /// List the individual temp defaults explicitly overridden by the harness.
@@ -1202,7 +1205,28 @@ mod tests {
         );
     }
 
-    /// Index, object and loose-ref paths must support the worker's Git writes.
+    /// A shared base needs no common directory owned by a particular worker.
+    #[test]
+    fn system_temp_creates_run_leaves_directly_in_a_shared_sticky_base() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        fs::set_permissions(base, fs::Permissions::from_mode(0o1777)).unwrap();
+        let old_stem = base.join(".agent-run-tmp");
+        fs::create_dir(&old_stem).unwrap();
+        fs::set_permissions(&old_stem, fs::Permissions::from_mode(0o500)).unwrap();
+        let dir = Dir::open(base).unwrap();
+        let first = create_run_temp(base, &dir, &AgentId::new()).unwrap();
+        let second = create_run_temp(base, &dir, &AgentId::new()).unwrap();
+        assert_ne!(first, second);
+        for leaf in [first, second] {
+            assert_eq!(leaf.parent(), Some(base));
+            assert_eq!(fs::metadata(leaf).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(fs::read_dir(old_stem).unwrap().count(), 0);
+    }
+
+    /// Index and objects must be writable, and only the deepest existing ref
+    /// directory needs to accept creation of the next entry.
     #[test]
     fn git_commit_requires_writable_object_and_ref_paths() {
         let root = tempfile::tempdir().unwrap();
@@ -1225,7 +1249,6 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             for (path, reason) in [
                 ("objects", "objects"),
-                ("refs", "Git refs"),
                 ("refs/heads", "HEAD reference directory"),
             ] {
                 let path = git.join(path);
@@ -1234,8 +1257,32 @@ mod tests {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
                 assert!(refusal.contains(reason), "{refusal}");
             }
+            let refs = git.join("refs");
+            fs::set_permissions(&refs, fs::Permissions::from_mode(0o500)).unwrap();
+            // A missing directory under writable refs/heads can be created.
+            fs::write(git.join("HEAD"), "ref: refs/heads/team/topic\n").unwrap();
+            let writable_heads = check.system_warnings();
+            // A missing directory directly under read-only refs cannot.
+            fs::write(git.join("HEAD"), "ref: refs/team/topic\n").unwrap();
+            let readonly_refs = check.system_warnings();
+            fs::set_permissions(&refs, fs::Permissions::from_mode(0o700)).unwrap();
+            writable_heads.unwrap();
+            assert!(
+                readonly_refs
+                    .unwrap_err()
+                    .to_string()
+                    .contains("HEAD reference directory")
+            );
         }
         assert!(check.system_warnings().is_ok());
+        fs::rename(git.join("refs"), git.join("unused-refs")).unwrap();
+        assert!(
+            check
+                .system_warnings()
+                .unwrap_err()
+                .to_string()
+                .contains("HEAD reference directory")
+        );
     }
 
     /// A configured TMP or TEMP only overrides that particular default.
