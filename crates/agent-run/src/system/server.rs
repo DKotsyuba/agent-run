@@ -43,12 +43,31 @@ impl Worker {
     /// Handles one launch. The OS controls socket access. The broker must record
     /// the capability and spawned identity before it releases this child.
     pub fn serve_one(&self, mut stream: UnixStream, peer_uid: u32) -> io::Result<()> {
-        let start = match wire::read(&mut stream)? {
+        let broker = peer_uid == std::fs::metadata(&self.home)?.uid();
+        let start = match wire::read_request(&mut stream, broker)? {
             Request::Start(start) => start,
+            Request::ScopePreflight(request) => {
+                let reply = if !broker {
+                    Reply::ScopeRefused {
+                        reason: "worker access preflight requires the broker UID".into(),
+                    }
+                } else {
+                    match request.plan.system_warnings() {
+                        Ok(warnings) => Reply::ScopeChecked { warnings },
+                        Err(agent_run_domain::Error::Validation(reason)) => {
+                            Reply::ScopeRefused { reason }
+                        }
+                        Err(_) => Reply::ScopeRefused {
+                            reason: "worker access preflight failed; check the worker launcher"
+                                .into(),
+                        },
+                    }
+                };
+                return wire::write(&mut stream, &reply);
+            }
             Request::ResumePreflight(request) => {
                 let wire::PreflightOperation::ResumePreflight = request.operation;
-                let broker_uid = std::fs::metadata(&self.home)?.uid();
-                let verified = if peer_uid == broker_uid {
+                let verified = if broker {
                     agent_run_core::service::system_resume_preflight(
                         &self.home,
                         &request.parent,
@@ -253,6 +272,81 @@ mod tests {
     use super::*;
     use crate::system::PendingLaunch;
     use std::{io::Write, path::PathBuf, thread, time::Instant};
+
+    /// A plain launch with large operator grant lists can complete the real
+    /// broker/worker scope exchange without sending unrelated configured roots.
+    #[tokio::test]
+    async fn scope_preflight_with_large_grant_uses_the_real_worker_socket() {
+        use agent_run_core::{launch_scope::AccessPlan, system_launch::SystemRoute};
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let socket = home.join("w.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        let worker = Worker::new(PathBuf::from("/bin/sh"), home.clone(), socket.clone()).unwrap();
+        let mut writable = vec![home.clone()];
+        writable.extend((0..16000).map(|index| home.join(format!("unrelated-{index}"))));
+        let mut value = serde_json::json!({
+            "workdir": home,
+            "reads": [],
+            "writes": [],
+            "writable": writable,
+            "sockets": [],
+            "tmpdir": null,
+            "write_workdir": true,
+            "needs_git_commit": false,
+            "shell": true,
+            "network": false,
+            "codex": true,
+            "projects": true,
+        });
+        assert!(serde_json::to_vec(&value).unwrap().len() > 256 * 1024);
+        let work = thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                worker.serve_one(stream, uid).unwrap();
+            }
+        });
+        let route = SystemRoute {
+            provider: "codex-user".parse().unwrap(),
+            harness: agent_run_domain::HarnessId::Codex,
+            state_home: home.clone(),
+            private_home: home.clone(),
+            operator_socket: home.join("operator.sock"),
+            writer_socket: home.join("writer.sock"),
+            worker_socket: socket,
+            fingerprint: "a".repeat(64).parse().unwrap(),
+        };
+        let plan: AccessPlan = serde_json::from_value(value.clone()).unwrap();
+        super::super::client::preflight_scope(route.clone(), plan)
+            .await
+            .unwrap();
+        let paths = (0..16)
+            .map(|index| {
+                let path = home
+                    .join(format!("{}-{index}", "p".repeat(230)))
+                    .join("nested");
+                std::fs::create_dir_all(&path).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        value["writes"] = serde_json::json!(paths);
+        let plan: AccessPlan = serde_json::from_value(value.clone()).unwrap();
+        assert!(serde_json::to_vec(&plan).unwrap().len() > 4096);
+        super::super::client::preflight_scope(route.clone(), plan)
+            .await
+            .unwrap();
+        value["writes"] = serde_json::json!([home.join("../outside")]);
+        let plan: AccessPlan = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            super::super::client::preflight_scope(route, plan).await,
+            Err(agent_run_domain::Error::Validation(reason))
+                if reason == "Requested path is outside the authorized worker scope."
+        ));
+        work.join().unwrap();
+    }
 
     /// Short real-process launch and cleanup deadlines for the handshake fixtures.
     fn quick() -> Timeouts {

@@ -628,6 +628,9 @@ pub struct StartBatchResult {
     /// Returned only in the original retained public admission response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_token: Option<PinReleaseToken>,
+    /// Advisory launch-scope findings from newly admitted jobs, keyed by agent.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub warnings: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// A permanent receipt lookup at one database snapshot.
@@ -684,6 +687,8 @@ object_only_deserialize!(StartBatchResult {
     replayed: bool,
     #[serde(default, deserialize_with = "present_release_token")]
     release_token: Option<PinReleaseToken>,
+    #[serde(default)]
+    warnings: std::collections::BTreeMap<String, Vec<String>>,
 });
 object_only_deserialize!(BatchReceiptLookup {
     found: bool,
@@ -715,6 +720,7 @@ impl BatchReceiptLookup {
                 receipt: receipt.clone(),
                 replayed: true,
                 release_token: None,
+                warnings: Default::default(),
             }
             .validate_for_request(&request),
             _ => Err(invalid("invalid batch receipt lookup response")),
@@ -860,6 +866,7 @@ mod tests {
             receipt,
             replayed: false,
             release_token: None,
+            warnings: Default::default(),
         })
         .unwrap();
         assert!(crate::storage::encoded_len(&output) <= crate::storage::MAX_RESULT_BYTES);
@@ -1062,6 +1069,7 @@ mod tests {
             },
             replayed: false,
             release_token: None,
+            warnings: Default::default(),
         };
         receipt.validate_for_request(&request).unwrap();
         let mut wrong = receipt.clone();

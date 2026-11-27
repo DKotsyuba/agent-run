@@ -50,6 +50,10 @@
         "model": {
           "type": "string"
         },
+        "needs_git_commit": {
+          "description": "Require writable Git metadata.",
+          "type": "boolean"
+        },
         "orchestrator": {
           "anyOf": [
             {
@@ -140,7 +144,19 @@
           },
           "type": "object"
         },
+        "sockets": {
+          "description": "Required pathname Unix sockets.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
         "task": {
+          "type": "string"
+        },
+        "tmpdir": {
+          "description": "Existing writable task temporary directory.",
           "type": "string"
         },
         "workdir": {
@@ -148,6 +164,14 @@
         },
         "write": {
           "type": "boolean"
+        },
+        "write_roots": {
+          "description": "Additional directories that must be writable.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
         }
       },
       "required": [
@@ -391,6 +415,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "needs_git_commit": {
+          "description": "Require writable Git metadata.",
+          "type": "boolean"
+        },
         "orchestrator": {
           "anyOf": [
             {
@@ -459,8 +487,28 @@
             "null"
           ]
         },
+        "sockets": {
+          "description": "Required pathname Unix sockets.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
         "task": {
           "type": "string"
+        },
+        "tmpdir": {
+          "description": "Existing writable task temporary directory.",
+          "type": "string"
+        },
+        "write_roots": {
+          "description": "Additional directories that must be writable.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
         }
       },
       "required": [
@@ -609,6 +657,10 @@
               "model": {
                 "type": "string"
               },
+              "needs_git_commit": {
+                "description": "Require writable Git metadata.",
+                "type": "boolean"
+              },
               "orchestrator": {
                 "anyOf": [
                   {
@@ -725,7 +777,19 @@
                 },
                 "type": "object"
               },
+              "sockets": {
+                "description": "Required pathname Unix sockets.",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
               "task": {
+                "type": "string"
+              },
+              "tmpdir": {
+                "description": "Existing writable task temporary directory.",
                 "type": "string"
               },
               "workdir": {
@@ -733,6 +797,14 @@
               },
               "write": {
                 "type": "boolean"
+              },
+              "write_roots": {
+                "description": "Additional directories that must be writable.",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
               }
             },
             "required": [
@@ -896,6 +968,15 @@
         },
         "replayed": {
           "type": "boolean"
+        },
+        "warnings": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
         }
       },
       "required": [

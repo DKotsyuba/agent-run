@@ -651,6 +651,17 @@ impl agent_run_core::system_launch::SystemLauncher for PanickingLauncher {
         Ok(self.route.clone())
     }
 
+    /// The fixture launcher uses the test process's execution UID.
+    fn preflight_scope(
+        &self,
+        _route: agent_run_core::system_launch::SystemRoute,
+        plan: agent_run_core::launch_scope::AccessPlan,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = agent_run_domain::Result<Vec<String>>> + Send>,
+    > {
+        Box::pin(async move { plan.warnings() })
+    }
+
     fn launch(
         &self,
         _: std::path::PathBuf,
@@ -781,6 +792,17 @@ impl agent_run_core::system_launch::SystemLauncher for BlockingLauncher {
         _: agent_run_domain::HarnessId,
     ) -> agent_run_domain::Result<agent_run_core::system_launch::SystemRoute> {
         Ok(self.route.clone())
+    }
+
+    /// The fixture launcher uses the test process's execution UID.
+    fn preflight_scope(
+        &self,
+        _route: agent_run_core::system_launch::SystemRoute,
+        plan: agent_run_core::launch_scope::AccessPlan,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = agent_run_domain::Result<Vec<String>>> + Send>,
+    > {
+        Box::pin(async move { plan.warnings() })
     }
 
     fn launch(

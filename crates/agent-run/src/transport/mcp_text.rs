@@ -1343,11 +1343,22 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
             );
             render_view("doc", &ExcerptTextView { text: &text }, limit)
         }
-        "start" | "resume" => render_view(
-            name,
-            &projected::<AdmissionTextView>(start_context(value))?,
-            limit,
-        ),
+        "start" | "resume" => {
+            let mut text = render_view(
+                name,
+                &projected::<AdmissionTextView>(start_context(value))?,
+                limit,
+            )?;
+            if let Some(warnings) = value["warnings"].as_array() {
+                for warning in warnings.iter().filter_map(Value::as_str) {
+                    let line = format!("Warning: {}\n", exact_display(warning));
+                    if text.len() + line.len() <= limit {
+                        text.push_str(&line);
+                    }
+                }
+            }
+            Ok(text)
+        }
         "cancel" => render_view(
             name,
             &projected::<CancelTextView>(json!({"agent": agent_fields(value)}))?,

@@ -374,11 +374,11 @@ impl StartRequest {
     /// rejected before durable admission.
     pub fn validate(&mut self) -> Result<()> {
         self.validate_intent()?;
-        self.workdir = existing_dir(&self.workdir)?;
+        self.workdir = scope_dir("workdir", &self.workdir)?;
         self.read_roots = self
             .read_roots
             .iter()
-            .map(|p| existing_dir(p))
+            .map(|p| scope_dir("read root", p))
             .collect::<Result<_>>()?;
         let mut seen = BTreeSet::new();
         if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
@@ -448,6 +448,12 @@ pub fn task_text(task: &str) -> Result<()> {
         return Err(invalid("task exceeds 512 KiB"));
     }
     Ok(())
+}
+/// Reports a caller-declared directory which the broker cannot canonicalize.
+fn scope_dir(kind: &str, path: &std::path::Path) -> Result<PathBuf> {
+    existing_dir(path).map_err(|_| invalid(format!(
+        "{kind} {path:?} is unavailable to the broker; use an existing directory and grant directory traversal"
+    )))
 }
 pub fn existing_dir(path: &std::path::Path) -> Result<PathBuf> {
     if !path.is_absolute() {

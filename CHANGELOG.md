@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Preflight worker directory, Git metadata and Unix socket requirements before
+  provider start, resume and batch admission. Describe the effective launch
+  scope and provide workspace scratch for direct writable launches and private
+  temporary directories for shared workers.
 - Report ambiguous native wakes as `native_owner_input_uncertain` with same-agent
   recovery guidance. Record bounded Claude wake diagnostics without input or
   session identifiers.

@@ -760,6 +760,18 @@ pub struct Start {
     pub display_name: Option<String>,
     #[arg(long)]
     pub wait: bool,
+    /// Require this existing directory to be writable within the native grant.
+    #[arg(long = "write-root")]
+    pub write_roots: Vec<PathBuf>,
+    /// Require access to commit using the worktree and shared Git metadata.
+    #[arg(long)]
+    pub needs_git_commit: bool,
+    /// Require a reachable Unix socket.
+    #[arg(long = "socket")]
+    pub sockets: Vec<PathBuf>,
+    /// Use an existing writable directory instead of workspace scratch.
+    #[arg(long)]
+    pub tmpdir: Option<PathBuf>,
     #[command(flatten)]
     pub session: SessionArgs,
 }
@@ -788,6 +800,18 @@ pub struct Resume {
     /// run's label. `--display-name` is an alias.
     #[arg(long = "name", alias = "display-name")]
     pub display_name: Option<String>,
+    /// Require this existing directory to be writable within the native grant.
+    #[arg(long = "write-root")]
+    pub write_roots: Vec<PathBuf>,
+    /// Require access to commit using the worktree and shared Git metadata.
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub needs_git_commit: Option<bool>,
+    /// Require a reachable Unix socket.
+    #[arg(long = "socket")]
+    pub sockets: Vec<PathBuf>,
+    /// Use an existing writable directory instead of workspace scratch.
+    #[arg(long)]
+    pub tmpdir: Option<PathBuf>,
     #[command(flatten)]
     pub session: SessionArgs,
 }
@@ -1268,7 +1292,11 @@ fn admission_output(result: &Value) -> Result<Value> {
     if !agent_id.is_string() || !created.is_boolean() {
         return Err(invalid("broker admission result has invalid fields"));
     }
-    Ok(json!({"agent_id":agent_id,"created":created}))
+    let mut output = json!({"agent_id":agent_id,"created":created});
+    if let Some(warnings) = result.get("warnings") {
+        output["warnings"] = warnings.clone();
+    }
+    Ok(output)
 }
 fn result_code(value: &Value) -> i32 {
     match value.get("status").and_then(Value::as_str) {
@@ -2501,6 +2529,10 @@ async fn run_client_command(
                     "idle_ping": a.idle_ping,
                     "effort": a.effort,
                     "read_roots": read_roots,
+                    "write_roots": a.write_roots.iter().map(|p| absolute(p)).collect::<Result<Vec<_>>>()?,
+                    "needs_git_commit": a.needs_git_commit,
+                    "sockets": a.sockets.iter().map(|p| absolute(p)).collect::<Result<Vec<_>>>()?,
+                    "tmpdir": a.tmpdir.as_deref().map(absolute).transpose()?,
                     "output_schema": schema,
                     "orchestrator": a.session.resolve()?,
                     "request_id": a.request_id,
@@ -2508,7 +2540,7 @@ async fn run_client_command(
                     "display_name": a.display_name,
                 }))
                 .map_err(|_| invalid("invalid provider start arguments"))?;
-            request.validate()?;
+            request.validate_intent()?;
             let result = broker.call("start", serde_json::to_value(request)?).await?;
             if a.wait {
                 let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
@@ -2521,9 +2553,12 @@ async fn run_client_command(
                 } else if let Some(run_id) = result.get("run_id") {
                     wait["run_id"] = run_id.clone();
                 }
-                let result = broker.call("wait", wait).await?;
-                (output)(&result)?;
-                return Ok(result_code(&result));
+                let mut outcome = broker.call("wait", wait).await?;
+                if let Some(warnings) = result.get("warnings") {
+                    outcome["warnings"] = warnings.clone();
+                }
+                (output)(&outcome)?;
+                return Ok(result_code(&outcome));
             }
             (output)(&admission_output(&result)?)?;
         }
@@ -2546,6 +2581,28 @@ async fn run_client_command(
             }
             if a.recover_after_crash {
                 arguments["recover_after_crash"] = json!(true);
+            }
+            if !a.write_roots.is_empty() {
+                arguments["write_roots"] = json!(
+                    a.write_roots
+                        .iter()
+                        .map(|p| absolute(p))
+                        .collect::<Result<Vec<_>>>()?
+                );
+            }
+            if let Some(needs_git_commit) = a.needs_git_commit {
+                arguments["needs_git_commit"] = json!(needs_git_commit);
+            }
+            if !a.sockets.is_empty() {
+                arguments["sockets"] = json!(
+                    a.sockets
+                        .iter()
+                        .map(|p| absolute(p))
+                        .collect::<Result<Vec<_>>>()?
+                );
+            }
+            if let Some(tmpdir) = a.tmpdir {
+                arguments["tmpdir"] = json!(absolute(&tmpdir)?);
             }
             let result = broker.call("resume", arguments).await?;
             (output)(&admission_output(&result)?)?;

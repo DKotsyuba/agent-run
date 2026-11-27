@@ -180,6 +180,7 @@ fn replay(
             receipt,
             replayed: true,
             release_token: None,
+            warnings: Default::default(),
         }),
     ))
 }
@@ -316,6 +317,7 @@ impl Store<'_> {
             },
             replayed: false,
             release_token: None,
+            warnings: Default::default(),
         };
         output
             .receipt

@@ -161,6 +161,20 @@ pub trait SystemLauncher: Send + Sync {
     /// Resolve one configured route, or refuse before durable admission.
     fn route(&self, provider: &ProviderId, harness: HarnessId) -> Result<SystemRoute>;
 
+    /// Check only path access and native grant requirements as the worker UID.
+    fn preflight_scope(
+        &self,
+        _route: SystemRoute,
+        _plan: crate::launch_scope::AccessPlan,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'static>> {
+        Box::pin(async {
+            Err(crate::Error::Unsupported(
+                "system worker access preflight is unavailable; check the configured launcher"
+                    .into(),
+            ))
+        })
+    }
+
     /// Verify a terminal parent's private assets and native history under its
     /// frozen worker route, returning only a digest of the checked store rows.
     fn preflight_resume(

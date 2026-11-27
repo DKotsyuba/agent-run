@@ -18,6 +18,7 @@ use agent_run_config::role_plan;
 use agent_run_domain::{
     ProviderStartRequest, Sha256Digest,
     catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
+    provider_start::ResumeScope,
 };
 use agent_run_store::{provider_admission::AdmissionInputs, writer::StoreReader};
 
@@ -470,6 +471,51 @@ impl Service {
         Ok(())
     }
 
+    /// Compile and probe the frozen native scope under the selected execution UID.
+    async fn check_launch_scope(
+        &self,
+        config: &ProviderConfig,
+        request: &ProviderStartRequest,
+        effective: &StartRequest,
+        authority: &ResolvedLaunchAuthority,
+        route: Option<crate::system_launch::SystemRoute>,
+    ) -> Result<Vec<String>> {
+        let role = role_plan::ResolvedRolePlan::from_payload(&authority.role_payload)?;
+        let app_home = route
+            .as_ref()
+            .map_or(self.home.as_path(), |route| &route.private_home);
+        let plan = crate::launch_scope::AccessPlan::compile(
+            config,
+            authority.harness,
+            request,
+            effective,
+            &adapters::provider::profile(&role),
+            app_home,
+        )?;
+        if let (Some(launcher), Some(route)) = (&self.system_launcher, route) {
+            return launcher.preflight_scope(route, plan).await;
+        }
+        tokio::task::spawn_blocking(move || plan.warnings())
+            .await
+            .map_err(|_| Error::Runtime("worker access preflight did not complete".into()))?
+    }
+
+    /// Reuse the prepared provider route and role for all new starts.
+    async fn check_prepared_scope(
+        &self,
+        config: &ProviderConfig,
+        job: &Prepared,
+    ) -> Result<Vec<String>> {
+        let route = job
+            .identity
+            .get("system_route")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        self.check_launch_scope(config, &job.request, &job.effective, &job.authority, route)
+            .await
+    }
+
     /// Uses only the launcher matching the execution's durable system route.
     async fn launch_provider_supervisor(&self, id: &AgentId, lane: &BrokerLane) -> Result<()> {
         let lookup = id.clone();
@@ -753,6 +799,7 @@ impl Service {
         let catalog = config.resolve_catalog(accounts)?;
         let mut prepared = prepare_provider(&config, &revision, &catalog, request)?;
         self.bind_system_route(&mut prepared)?;
+        let warnings = self.check_prepared_scope(&config, &prepared).await?;
         let Prepared {
             request,
             effective,
@@ -844,10 +891,12 @@ impl Service {
         };
         let store = Store::open(&self.home)?;
         let row = store.get(&admission.agent_id)?;
-        Ok(
-            json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
-            "created":admission.created,"agent":self.view(&store,&row)?}),
-        )
+        let mut result = json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
+            "created":admission.created,"agent":self.view(&store,&row)?});
+        if admission.created && !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
+        }
+        Ok(result)
     }
 
     /// Admits through [`Self::admit_provider`] and hands a newly owned attempt
@@ -937,6 +986,7 @@ impl Service {
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
         let mut prepared = Vec::with_capacity(request.jobs.len());
+        let mut scope_warnings = Vec::with_capacity(request.jobs.len());
         for mut job in request.jobs {
             if job.pool_chat.is_some() && config.pool_chat.is_none() {
                 return Err(invalid("pool_chat requires a configured Pool socket"));
@@ -944,6 +994,7 @@ impl Service {
             job.request.validate()?;
             let mut prepared_job = prepare_provider(&config, &revision, &catalog, job.request)?;
             self.bind_system_route(&mut prepared_job)?;
+            scope_warnings.push(self.check_prepared_scope(&config, &prepared_job).await?);
             prepared.push((prepared_job, job.pool_chat));
         }
         let ids: Vec<_> = prepared.iter().map(|_| AgentId::new()).collect();
@@ -1046,6 +1097,12 @@ impl Service {
                 Ok(mut result) => {
                     if !result.replayed {
                         result.release_token = release_token;
+                        result.warnings = ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .zip(scope_warnings)
+                            .filter(|(_, warnings)| !warnings.is_empty())
+                            .collect();
                     }
                     return Ok(result);
                 }
@@ -1157,6 +1214,7 @@ impl Service {
             }
             role_digests.push(selected.role_digest);
             self.bind_system_route(&mut prepared)?;
+            self.check_prepared_scope(&config, &prepared).await?;
             jobs.push(prepared);
         }
         // Namespace the existing batch replay key by the authenticated Pool route.
@@ -1629,6 +1687,7 @@ impl Service {
             request_id,
             display_name,
             orchestrator,
+            ResumeScope::default(),
             None,
             false,
         )
@@ -1644,6 +1703,7 @@ impl Service {
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
+        scope: ResumeScope,
         restart_id: Option<i64>,
         recover_after_crash: bool,
     ) -> Result<Value> {
@@ -1670,12 +1730,16 @@ impl Service {
                     request_id,
                     display_name,
                     orchestrator,
+                    scope,
                     restart_id,
                     recover_after_crash,
                 )
                 .await?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
+        }
+        if !scope.is_empty() {
+            return Err(invalid("launch scope overrides require a provider run"));
         }
         if recover_after_crash {
             return Err(invalid("recover_after_crash requires a provider run"));
@@ -1857,6 +1921,7 @@ impl Service {
             request_id,
             display_name,
             orchestrator,
+            ResumeScope::default(),
             None,
             false,
         )
@@ -1872,11 +1937,13 @@ impl Service {
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
+        scope: ResumeScope,
         restart_id: Option<i64>,
         recover_after_crash: bool,
     ) -> Result<Value> {
         let frozen = ProviderLaunchIdentity::read(parent)?;
         let mut request = frozen.provider_request.clone();
+        scope.apply(&mut request);
         request.task = task;
         request.request_id = request_id;
         // An omitted label inherits the parent's frozen one; an explicit
@@ -2141,6 +2208,15 @@ impl Service {
                     .harnesses
                     .get(&authority.harness)
                     .is_some_and(|harness| harness.fast_mode));
+        let warnings = self
+            .check_launch_scope(
+                &frozen.provider_config,
+                &request,
+                &effective,
+                authority,
+                frozen.system_route.clone(),
+            )
+            .await?;
         let identity = serde_json::to_value(ProviderLaunchIdentity {
             provider_identity_version: 2,
             replay_request_sha256: agent_run_domain::canonical::sha256_hex(
@@ -2238,10 +2314,12 @@ impl Service {
         };
         let store = Store::open(&self.home)?;
         let row = store.get(&admission.agent_id)?;
-        Ok(
-            json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
-            "created":admission.created,"agent":self.view(&store,&row)?}),
-        )
+        let mut result = json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
+            "created":admission.created,"agent":self.view(&store,&row)?});
+        if admission.created && !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
+        }
+        Ok(result)
     }
 
     /// Continue one captured agent after its restart deadline is recorded.
@@ -2258,6 +2336,7 @@ impl Service {
                 Some(format!("service-restart:{restart_id}:{id}")),
                 None,
                 None,
+                ResumeScope::default(),
                 Some(restart_id),
                 false,
             )

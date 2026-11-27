@@ -44,6 +44,15 @@ impl SystemLauncher for BrokerLauncher {
         self.config.route(&self.home, provider, harness)
     }
 
+    /// Checks access in the account-owned worker before admitting any rows.
+    fn preflight_scope(
+        &self,
+        route: SystemRoute,
+        plan: agent_run_core::launch_scope::AccessPlan,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'static>> {
+        Box::pin(super::client::preflight_scope(route, plan))
+    }
+
     /// Runs the private-file preflight under the selected worker's UID.
     fn preflight_resume(
         &self,

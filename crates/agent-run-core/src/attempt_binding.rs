@@ -2121,6 +2121,14 @@ mod tests {
                 fingerprint: "a".repeat(64).parse().unwrap(),
             })
         }
+        /// This test launcher shares the fixture process's UID.
+        fn preflight_scope(
+            &self,
+            _route: crate::system_launch::SystemRoute,
+            plan: crate::launch_scope::AccessPlan,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send>> {
+            Box::pin(async move { plan.warnings() })
+        }
         fn launch(
             &self,
             _: std::path::PathBuf,

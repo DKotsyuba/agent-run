@@ -18,6 +18,58 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Perform a bounded, authenticated path-only probe under the worker UID.
+pub(super) async fn preflight_scope(
+    route: agent_run_core::system_launch::SystemRoute,
+    plan: agent_run_core::launch_scope::AccessPlan,
+) -> agent_run_domain::Result<Vec<String>> {
+    use agent_run_domain::{Error, error::invalid};
+    let unavailable = || {
+        Error::Unsupported(
+            "worker access preflight unavailable; check the configured worker socket and account"
+                .into(),
+        )
+    };
+    let metadata = std::fs::symlink_metadata(&route.worker_socket).map_err(|_| unavailable())?;
+    if !metadata.file_type().is_socket() {
+        return Err(unavailable());
+    }
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::UnixStream::connect(&route.worker_socket),
+    )
+    .await
+    .map_err(|_| unavailable())?
+    .map_err(|_| unavailable())?;
+    if stream.peer_cred().map_err(|_| unavailable())?.uid() != metadata.uid() {
+        return Err(unavailable());
+    }
+    let mut stream = stream.into_std().map_err(|_| unavailable())?;
+    let request = wire::ScopePreflight {
+        operation: wire::ScopePreflightOperation::ScopePreflight,
+        plan: plan.for_system_probe(),
+    };
+    let reply = tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        wire::write_scope(&mut stream, &request, deadline)?;
+        wire::read_until::<Reply>(&mut stream, deadline)
+    })
+    .await
+    .map_err(|_| unavailable())?
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidInput {
+            invalid("requested scope exceeds the worker preflight path budget")
+        } else {
+            unavailable()
+        }
+    })?;
+    match reply {
+        Reply::ScopeChecked { warnings } => Ok(warnings),
+        Reply::ScopeRefused { reason } => Err(invalid(reason)),
+        _ => Err(unavailable()),
+    }
+}
+
 /// Ask the configured account worker to verify a stored parent without
 /// admitting work. Only its socket owner's kernel UID is accepted as a peer.
 pub(super) async fn preflight_resume(
