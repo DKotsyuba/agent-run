@@ -1041,6 +1041,8 @@ fn resume_missing_broker_and_lost_response_keep_reconciliation_identity() {
                     Err(error) => panic!("fixture accept: {error}"),
                 }
             };
+            // macOS accepted sockets inherit the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
