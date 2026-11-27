@@ -1620,7 +1620,10 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     quota.configure(&broker);
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let store = agent_run_store::fixture::open(&broker.home).unwrap();
+    let broker_info = client.call("_mcp_info", None).await.unwrap();
+    assert_eq!(broker_info["product_version"], env!("CARGO_PKG_VERSION"));
     let discovery = mcp_request(&broker.home, "2026-07-28", "tools/list", json!({})).await;
+    assert_eq!(discovery["result"]["tools"], broker_info["tools"]);
     let resume = discovery["result"]["tools"]
         .as_array()
         .unwrap()
