@@ -291,6 +291,84 @@ pub fn loader_preload_safe() -> bool {
     preload_file_safe(Path::new("/etc/ld.so.preload"))
 }
 
+/// Operator-owned Codex log export settings. Only the credential file path is
+/// serialized into the Run configuration snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexOtel {
+    /// HTTP URL with a loopback IP address.
+    pub endpoint: String,
+    /// Codex OTLP/HTTP wire encoding, either `json` or `binary`.
+    pub protocol: String,
+    /// Absolute path to the service-owned header file.
+    pub headers_file: PathBuf,
+}
+
+impl CodexOtel {
+    /// Validates the exporter and reads up to 4 KiB of HTTP header declarations.
+    /// Errors describe the failed check without exposing header contents.
+    pub fn read_headers(&self) -> Result<BTreeMap<String, String>> {
+        let endpoint = url::Url::parse(&self.endpoint)
+            .map_err(|_| invalid("codex otel endpoint must be an HTTP URL with a loopback IP"))?;
+        let loopback = match endpoint.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        if !loopback
+            || endpoint.scheme() != "http"
+            || !self.endpoint.starts_with("http://")
+            || self
+                .endpoint
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'\\')
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return Err(invalid(
+                "codex otel endpoint must use HTTP and a loopback IP, without credentials, query or fragment",
+            ));
+        }
+        if !matches!(self.protocol.as_str(), "json" | "binary") {
+            return Err(invalid("codex otel protocol must be json or binary"));
+        }
+        let path = &self.headers_file;
+        if !path.is_absolute() {
+            return Err(invalid("codex otel headers_file must be absolute"));
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(invalid("codex otel headers_file must name a file"));
+        };
+        let bytes = fs::Dir::open(parent)
+            .and_then(|directory| directory.read_private(Path::new(name), 4096))
+            .map_err(|_| invalid("codex otel headers_file must be a readable service-owned regular file with mode 0600 and at most 4096 bytes"))?;
+        let malformed = || {
+            invalid("codex otel headers_file must contain distinct HTTP header name=value lines")
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+        let mut headers = BTreeMap::new();
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            let (name, value) = line.split_once('=').ok_or_else(malformed)?;
+            let value = value.trim_matches(' ');
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&byte))
+                || value.is_empty()
+                || !value.bytes().all(|byte| matches!(byte, b' '..=b'~'))
+                || headers
+                    .insert(name.to_ascii_lowercase(), value.to_owned())
+                    .is_some()
+            {
+                return Err(malformed());
+            }
+        }
+        Ok(headers)
+    }
+}
+
 /// Stable native launch settings for one supported harness, independent of
 /// provider aliases, account selection, and canonical role grants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +385,9 @@ pub struct HarnessConfig {
     /// Omitted/false keeps per-request behavior; omitted serialization preserves old snapshot digests.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast_mode: bool,
+    /// Optional local OTLP/HTTP logs exporter owned by Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel: Option<CodexOtel>,
     /// Unowned native settings subject to existing reserved-key checks.
     #[serde(default)]
     pub native_settings: BTreeMap<String, toml::Value>,
@@ -907,6 +988,12 @@ impl ProviderConfig {
             }
             if harness.fast_mode && *id != HarnessId::Codex {
                 return Err(invalid("harness fast_mode is supported only by codex"));
+            }
+            if let Some(otel) = &harness.otel {
+                if *id != HarnessId::Codex {
+                    return Err(invalid("harness otel is supported only by codex"));
+                }
+                otel.read_headers()?;
             }
             if harness.max_active_agents == Some(0) {
                 return Err(invalid("harness max_active_agents must be positive"));

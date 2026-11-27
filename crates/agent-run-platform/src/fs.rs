@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::{OpenOptionsExt, PermissionsExt},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
 };
@@ -762,8 +762,26 @@ impl Dir {
         }
         Ok(f)
     }
+    /// Reads a bounded regular file owned by the effective UID with exact mode 0600.
+    /// Checks the same descriptor used for reading and refuses file symlinks.
+    pub fn read_private(&self, path: &Path, max: usize) -> Result<Vec<u8>> {
+        let file = self.open_file(path)?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o600 {
+            return Err(invalid(
+                "private file must be owned by the service user with mode 0600",
+            ));
+        }
+        Self::read_bounded(file, max)
+    }
+
     pub fn read(&self, path: &Path, max: usize) -> Result<Vec<u8>> {
-        let f = self.open_file(path)?;
+        Self::read_bounded(self.open_file(path)?, max)
+    }
+
+    /// Reads at most the configured limit, even if the file grows during the read.
+    fn read_bounded(f: File, max: usize) -> Result<Vec<u8>> {
         if f.metadata()?.len() > max as u64 {
             return Err(Error::Integrity("artifact exceeds read bound".into()));
         }

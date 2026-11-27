@@ -5,7 +5,7 @@ use agent_run_domain::{
     AccountId, AuthFamily, SecretRef,
     catalog::{AccountRecord, AccountStatus, ProviderConnection},
 };
-use std::{fs, path::Path, str::FromStr};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, str::FromStr};
 
 /// Builds one v2 document with two harnesses and three arbitrary provider ids.
 fn document(home: &Path) -> String {
@@ -577,4 +577,87 @@ fn custom_headers_reject_unsafe_names_values_and_placements() {
         )
         .unwrap();
     }
+}
+
+/// Validates the owned exporter through the live config loader and checks that
+/// errors and serialized Run settings exclude credential contents.
+#[test]
+fn codex_otel_is_operator_owned_and_validated() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let text = document(root);
+    let file = root.join("otel-headers");
+    let secret = "synthetic-otel-secret";
+    fs::write(&file, format!("x-stats-token={secret}==\n")).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let with_otel = |harness: &str, endpoint: &str, protocol: &str, file: &Path| {
+        let section = format!("[harnesses.{harness}]");
+        text.replace(
+            &section,
+            &format!("{section}\notel = {{ endpoint = {endpoint:?}, protocol = {protocol:?}, headers_file = {file:?} }}"),
+        )
+    };
+    let ipv4 = "http://127.42.10.2:4318/v1/logs";
+    let valid = with_otel("codex", ipv4, "json", &file);
+    let config = ProviderConfig::parse(&valid, root).unwrap();
+    assert!(!serde_json::to_string(&config).unwrap().contains(secret));
+    assert_ne!(
+        config.snapshot().unwrap(),
+        ProviderConfig::parse(&text, root)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+    );
+    ProviderConfig::parse(
+        &with_otel("codex", "http://[::1]:4318/v1/logs", "binary", &file),
+        root,
+    )
+    .unwrap();
+
+    for endpoint in [
+        "https://127.0.0.1/v1/logs",
+        "http://localhost/v1/logs",
+        "http://128.0.0.1/v1/logs",
+        "http://[::2]/v1/logs",
+        "http://127.0.0.1@example.com/v1/logs",
+        "http://user@127.0.0.1/v1/logs",
+    ] {
+        assert!(ProviderConfig::parse(&with_otel("codex", endpoint, "json", &file), root).is_err());
+    }
+    for invalid in [
+        with_otel("codex", ipv4, "text", &file),
+        with_otel("claude-code", ipv4, "json", &file),
+        with_otel("codex", ipv4, "json", Path::new("relative")),
+        with_otel("codex", ipv4, "json", root),
+        text.replace(
+            "[harnesses.codex]",
+            "[harnesses.codex]\nnative_settings = { otel = { log_user_prompt = true } }",
+        ),
+        text.replace(
+            "[providers.codex]",
+            "[providers.codex]\notel = { log_user_prompt = true }",
+        ),
+    ] {
+        assert!(ProviderConfig::parse(&invalid, root).is_err());
+    }
+
+    let link = root.join("headers-link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(ProviderConfig::parse(&with_otel("codex", ipv4, "json", &link), root).is_err());
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(ProviderConfig::parse(&valid, root).is_err());
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    for invalid in [
+        secret.to_owned(),
+        format!("a={secret}\nA=duplicate\n"),
+        format!("a={secret}{}", "x".repeat(4096)),
+    ] {
+        fs::write(&file, invalid).unwrap();
+        let error = ProviderConfig::parse(&valid, root).unwrap_err();
+        assert!(error.to_string().contains("headers_file"));
+        assert!(!error.to_string().contains(secret));
+        assert!(!format!("{error:?}").contains(secret));
+    }
+    fs::remove_file(file).unwrap();
+    assert!(ProviderConfig::parse(&valid, root).is_err());
 }
