@@ -241,6 +241,8 @@ fn batch_preconditions_schema_and_receipt_are_consistent() {
     let condition = serde_json::json!({"agent_id":"ag-20260826-120000-0123456789","sequence":1,
         "execution_ref":format!("ex1_{}","a".repeat(64)),"pin_id":"pin_550e8400e29b41d4a716446655440000"});
     let mut input = serde_json::json!({"request_id":"key","jobs":[{"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"}]});
+    input["jobs"][0]["write_roots"] = serde_json::json!(["/workspace/build"]);
+    input["jobs"][0]["sockets"] = serde_json::json!(["/run/worker/project.sock"]);
     assert!(start_schema.is_valid(&input));
     input["preconditions"] = serde_json::json!([condition]);
     assert!(!start_schema.is_valid(&input));
@@ -448,6 +450,11 @@ fn registry_matches_python_golden_field_by_field() {
                 description.into();
         }
         if matches!(definition.name.as_str(), "start" | "resume") {
+            let props = &mut expected["inputSchema"]["properties"];
+            props["write_roots"] = serde_json::json!({"description":"Additional directories that must be writable.","type":"array","items":{"type":"string"},"maxItems":16});
+            props["needs_git_commit"] = serde_json::json!({"description":"Require writable Git metadata.","type":"boolean"});
+            props["sockets"] = serde_json::json!({"description":"Required pathname Unix sockets.","type":"array","items":{"type":"string"},"maxItems":16});
+            props["tmpdir"] = serde_json::json!({"description":"Existing writable task temporary directory.","type":"string"});
             expected["inputSchema"]["properties"]
                 .as_object_mut()
                 .unwrap()

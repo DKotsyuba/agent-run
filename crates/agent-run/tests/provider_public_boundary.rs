@@ -1398,6 +1398,159 @@ async fn static_launch_preflight_refuses_every_public_transport_without_admissio
     }
 }
 
+/// Scope failures stay synchronous across CLI, MCP and socket. A rejected
+/// batch or continuation does not consume any admission or lineage authority.
+#[tokio::test]
+async fn launch_scope_refuses_before_admission_across_transports() {
+    let broker = Broker::start();
+    let workdir = tempfile::tempdir().unwrap();
+    let missing = workdir.path().join("missing.sock");
+    let socket = missing.to_str().unwrap();
+    let request = broker.request("fixture:answer", "scope-check");
+    let mut params = serde_json::to_value(&request).unwrap();
+    params["sockets"] = json!([missing]);
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let cli = cli(
+        &broker.home,
+        &[
+            "start",
+            "--provider",
+            "glm-user",
+            "--model",
+            "fixture",
+            "--profile",
+            "review",
+            "--task",
+            "fixture:answer",
+            "--workdir",
+            broker.home.to_str().unwrap(),
+            "--socket",
+            socket,
+        ],
+    );
+    assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+    assert!(String::from_utf8_lossy(&cli.stderr).contains(socket));
+    let mcp = mcp_tool(&broker.home, "start", params.clone()).await;
+    assert_eq!(mcp["result"]["isError"], true);
+    assert!(
+        mcp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(socket)
+    );
+    let bad_start = client
+        .call("start", Some(params.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(&bad_start, Error::Validation(_)));
+    assert!(bad_start.to_string().contains(socket));
+    let mut first = serde_json::to_value(&request).unwrap();
+    first.as_object_mut().unwrap().remove("request_id");
+    params.as_object_mut().unwrap().remove("request_id");
+    let bad_batch = client
+        .call(
+            "start_batch",
+            Some(json!({
+                "request_id":"scope-batch", "jobs":[first, params],
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(bad_batch.to_string().contains(socket), "{bad_batch}");
+    let store = agent_run_store::fixture::open(&broker.home).unwrap();
+    let count: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    drop(store);
+    let parent = client.start(&request).await.unwrap();
+    let parent = parent.agent_id.as_str();
+    broker.wait_terminal(parent);
+    let result = client.call("resume", Some(json!({
+        "agent_id":parent, "task":"fixture:answer", "request_id":"scope-resume", "sockets":[missing],
+    }))).await.unwrap_err();
+    assert!(result.to_string().contains(socket), "{result}");
+    let resumed = client
+        .call(
+            "resume",
+            Some(json!({
+                "agent_id":parent, "task":"fixture:answer", "request_id":"scope-resume",
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed["created"], true);
+    let resumed_id: String = agent_run_store::fixture::open(&broker.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT id FROM agents WHERE parent_agent_id = ?",
+            [parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    broker.wait_terminal(&resumed_id);
+}
+
+/// The real launcher hands the generated temp environment and facts prefix to
+/// the native child, with task override and a soft scratch-conflict diagnosis.
+#[tokio::test]
+async fn launch_scope_reaches_the_worker_environment_and_brief() {
+    let broker = Broker::start();
+    let workdir = tempfile::tempdir().unwrap();
+    let workdir = workdir.path().canonicalize().unwrap();
+    let profile = broker.home.join("profiles/review.md");
+    let text = std::fs::read_to_string(&profile).unwrap();
+    std::fs::write(&profile, text.replace("write = false", "write = true")).unwrap();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let mut request = broker.request("fixture:launch-facts", "launch-facts");
+    request.write = true;
+    request.workdir = workdir.clone();
+    let result = client.start(&request).await.unwrap();
+    broker.wait_terminal(&result.agent_id);
+    let observation = || {
+        serde_json::from_slice::<Value>(&std::fs::read(workdir.join("launch-facts.json")).unwrap())
+            .unwrap()
+    };
+    let observed = observation();
+    let scratch = workdir.join(".scratch");
+    for key in ["tmpdir", "tmp", "temp"] {
+        assert_eq!(observed[key], json!(scratch));
+    }
+    assert!(
+        observed["brief"]
+            .as_str()
+            .unwrap()
+            .starts_with("## Sandbox facts")
+    );
+    assert!(
+        observed["brief"]
+            .as_str()
+            .unwrap()
+            .contains("Git commit: no")
+    );
+
+    std::fs::remove_dir(&scratch).unwrap();
+    std::os::unix::fs::symlink(&broker.home, &scratch).unwrap();
+    request.request_id = Some("launch-facts-warning".into());
+    let result = client.start(&request).await.unwrap();
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|text| text.contains("repair .scratch"))
+    );
+    broker.wait_terminal(&result.agent_id);
+    let custom = workdir.join("task-tmp");
+    std::fs::create_dir(&custom).unwrap();
+    request.request_id = Some("launch-facts-override".into());
+    request.tmpdir = Some(custom.clone());
+    let result = client.start(&request).await.unwrap();
+    broker.wait_terminal(&result.agent_id);
+    assert_eq!(observation()["tmpdir"], json!(custom));
+}
+
 /// A real broker whose committed capacity revision moves between every
 /// ranking and submission (test-fixtures seam) spends its stale-retry
 /// budget; the contention verdict `selection_busy` keeps its exact class on

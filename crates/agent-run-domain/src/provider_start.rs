@@ -7,6 +7,7 @@ use crate::{
     types::AccountLabel,
 };
 use serde::{Deserialize, Serialize};
+use std::os::unix::ffi::OsStrExt as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -37,6 +38,18 @@ pub struct ProviderStartRequest {
     /// Existing absolute read roots requested in addition to the workdir.
     #[serde(default)]
     pub read_roots: Vec<PathBuf>,
+    /// Extra writable directories required from the existing native grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_roots: Vec<PathBuf>,
+    /// Require permission to update the worktree and shared Git metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_git_commit: bool,
+    /// Pathname Unix sockets required by the worker's shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sockets: Vec<PathBuf>,
+    /// Task-specific temporary directory instead of the workspace scratch default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpdir: Option<PathBuf>,
     /// Optional provider-local pinned account label.
     #[serde(default)]
     pub account: Option<AccountLabel>,
@@ -161,13 +174,49 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
     Ok(unique)
 }
 
+/// Optional replacement launch requirements for a continuation. An absent field
+/// inherits its parent's requirement. Requirements never widen the frozen grant.
+#[derive(Debug, Default)]
+pub struct ResumeScope {
+    pub write_roots: Option<Vec<PathBuf>>,
+    pub needs_git_commit: Option<bool>,
+    pub sockets: Option<Vec<PathBuf>>,
+    pub tmpdir: Option<PathBuf>,
+}
+
+impl ResumeScope {
+    /// True when the caller supplied any scope override.
+    pub fn is_empty(&self) -> bool {
+        self.write_roots.is_none()
+            && self.needs_git_commit.is_none()
+            && self.sockets.is_none()
+            && self.tmpdir.is_none()
+    }
+
+    /// Replace only requirements that the caller supplied.
+    pub fn apply(self, request: &mut ProviderStartRequest) {
+        if let Some(roots) = self.write_roots {
+            request.write_roots = roots;
+        }
+        if let Some(required) = self.needs_git_commit {
+            request.needs_git_commit = required;
+        }
+        if let Some(sockets) = self.sockets {
+            request.sockets = sockets;
+        }
+        if let Some(tmpdir) = self.tmpdir {
+            request.tmpdir = Some(tmpdir);
+        }
+    }
+}
+
 impl ProviderStartRequest {
     /// Validates/canonicalizes MCP assertions, paths, task, effort, namespace, orchestrator transport
     /// and the optional human label; stores canonical paths, labels and transport
     /// in place. Invalid values return `ValidationError` before admission.
     /// Historical runtime selectors remain excluded from public v2 input.
     pub fn validate(&mut self) -> Result<()> {
-        normalize_required_mcp(&mut self.required_mcp)?;
+        self.validate_intent()?;
         let mut projection = self.storage_projection();
         projection.validate()?;
         self.workdir = projection.workdir;
@@ -182,6 +231,9 @@ impl ProviderStartRequest {
     /// A new request still calls `validate` before admission and canonicalizes paths.
     pub fn validate_intent(&mut self) -> Result<()> {
         normalize_required_mcp(&mut self.required_mcp)?;
+        validate_scope_paths("write_roots", &self.write_roots)?;
+        validate_scope_paths("sockets", &self.sockets)?;
+        validate_scope_paths("tmpdir", self.tmpdir.as_slice())?;
         let mut projection = self.storage_projection();
         projection.validate_intent()?;
         self.display_name = projection.display_name;
@@ -230,6 +282,29 @@ impl ProviderStartRequest {
             required_constraints: self.required_constraints.clone(),
         }
     }
+}
+
+/// Bounds the private worker probe and rejects ambiguous pathname spellings.
+fn validate_scope_paths(field: &str, paths: &[PathBuf]) -> Result<()> {
+    use crate::error::invalid;
+    if paths.len() > 16 {
+        return Err(invalid(format!("{field} accepts at most 16 paths")));
+    }
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        if !path.is_absolute()
+            || path.as_os_str().as_bytes().len() > 1024
+            || path
+                .to_str()
+                .is_none_or(|s| s.chars().any(char::is_control))
+        {
+            return Err(invalid(format!("{field} requires bounded absolute paths")));
+        }
+        if !seen.insert(path) {
+            return Err(invalid(format!("{field} must not contain duplicate paths")));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

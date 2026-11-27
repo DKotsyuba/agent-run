@@ -332,6 +332,15 @@ struct Resume {
     #[serde(default)]
     /// Optional delivery destination override; omission inherits the parent.
     orchestrator: Option<OrchestratorRef>,
+    /// Optional replacements for the parent's launch requirements.
+    #[serde(default)]
+    write_roots: Option<Vec<std::path::PathBuf>>,
+    #[serde(default)]
+    needs_git_commit: Option<bool>,
+    #[serde(default)]
+    sockets: Option<Vec<std::path::PathBuf>>,
+    #[serde(default)]
+    tmpdir: Option<std::path::PathBuf>,
     /// Optional assertion of the inherited chat seat.
     #[serde(
         default,
@@ -596,6 +605,12 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     a.display_name,
                     a.orchestrator,
                     a.pool_chat.as_ref(),
+                    agent_run_domain::provider_start::ResumeScope {
+                        write_roots: a.write_roots,
+                        needs_git_commit: a.needs_git_commit,
+                        sockets: a.sockets,
+                        tmpdir: a.tmpdir,
+                    },
                     a.recover_after_crash,
                 )
                 .await

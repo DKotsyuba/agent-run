@@ -45,6 +45,26 @@ impl Worker {
     pub fn serve_one(&self, mut stream: UnixStream, peer_uid: u32) -> io::Result<()> {
         let start = match wire::read(&mut stream)? {
             Request::Start(start) => start,
+            Request::ScopePreflight(request) => {
+                let broker_uid = std::fs::metadata(&self.home)?.uid();
+                let reply = if peer_uid != broker_uid {
+                    Reply::ScopeRefused {
+                        reason: "worker access preflight requires the broker UID".into(),
+                    }
+                } else {
+                    match request.plan.warnings() {
+                        Ok(warnings) => Reply::ScopeChecked { warnings },
+                        Err(agent_run_domain::Error::Validation(reason)) => {
+                            Reply::ScopeRefused { reason }
+                        }
+                        Err(_) => Reply::ScopeRefused {
+                            reason: "worker access preflight failed; check the worker launcher"
+                                .into(),
+                        },
+                    }
+                };
+                return wire::write(&mut stream, &reply);
+            }
             Request::ResumePreflight(request) => {
                 let wire::PreflightOperation::ResumePreflight = request.operation;
                 let broker_uid = std::fs::metadata(&self.home)?.uid();

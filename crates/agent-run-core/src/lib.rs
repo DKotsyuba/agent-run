@@ -27,6 +27,7 @@ pub mod health;
 pub mod hooks;
 pub mod housekeeping;
 mod integration;
+pub mod launch_scope;
 pub mod lifecycle;
 /// Generic writer-backed lineage holds and read-only recovery.
 pub mod lineage_holds;

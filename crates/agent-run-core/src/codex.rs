@@ -419,6 +419,17 @@ impl Grant {
             permission_profile: profile,
         })
     }
+    /// User-addressable writable roots. Generated runtime caches are private
+    /// implementation paths and can differ before and after an execution is allocated.
+    pub(crate) fn scope_writable_roots(&self, runtime: &Runtime, home: &Path) -> Vec<PathBuf> {
+        let caches = caches(home);
+        self.writable_roots
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| runtime.workspace_roots.contains(path) || !caches.contains(path))
+            .collect()
+    }
+
     /// The grant of a thread started with no native environment
     /// (`environments: []`), as the managed role requires. Like research, it
     /// then has no runtime workspace roots: codex-cli 0.167.0 echoes

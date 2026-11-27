@@ -49,6 +49,8 @@ pub struct BrokerStartResult {
     pub created: bool,
     /// The provider attempt the admission owns; absent from legacy brokers.
     pub attempt_id: Option<String>,
+    /// Advisory scope findings attached to a newly created admission.
+    pub warnings: Vec<String>,
 }
 
 /// The split broker stream retained by one [`BrokerClient`] session.
@@ -326,7 +328,14 @@ impl BrokerClient {
             Some(Value::String(id)) => Some(id.clone()),
             Some(_) => return Err(Error::Runtime("broker returned an invalid run_id".into())),
         };
+        let warnings = object
+            .get("warnings")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| Error::Runtime("broker returned invalid start warnings".into()))?
+            .unwrap_or_default();
         Ok(BrokerStartResult {
+            warnings,
             agent_id: agent_id.into(),
             run_id,
             created,

@@ -1704,6 +1704,29 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .runtime_home
             .clone()
             .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
+        let native_role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
+        let scope = crate::launch_scope::AccessPlan::compile(
+            &config,
+            identity.authority.harness,
+            &identity.provider_request,
+            &row.request,
+            &adapters::provider::profile(&native_role),
+            &runtime_home,
+        )?;
+        let (scope, facts) = tokio::task::spawn_blocking(move || {
+            let facts = scope.prepare()?;
+            Ok::<_, Error>((scope, facts))
+        })
+        .await
+        .map_err(|_| Error::Runtime("worker launch access check did not complete".into()))??;
+        let configured_tmp =
+            crate::launch_scope::configured_tmp(&config, identity.authority.harness);
+        let brief = scope.brief(
+            &facts,
+            row.request.explicit_finish,
+            configured_tmp,
+            identity.authority.harness,
+        );
         let agent_dir = home.join("agents").join(id.as_str());
         if identity.system_route.is_some() {
             fs::Dir::open(&agent_dir)?;
@@ -1763,7 +1786,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             // store root and Codex grant are validated, so the next attempt and any resume verify the
             // same original index through the registry.
             let host: BTreeMap<String, String> = std::env::vars().collect();
-            let preliminary = adapters::provider::plan_selected_with(
+            let mut preliminary = adapters::provider::plan_selected_with(
                 &config,
                 &catalog,
                 &identity.authority,
@@ -1781,6 +1804,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 },
                 None,
             )?;
+            facts.install_environment(&scope, &mut preliminary.launch.environment, configured_tmp);
             let codex_grant = if identity.authority.harness == HarnessId::Codex {
                 Some(crate::codex::Grant::new(
                     &preliminary.runtime,
@@ -1949,6 +1973,28 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             },
             Some(&shared_assets),
         )?;
+        facts.install_environment(&scope, &mut planned.launch.environment, configured_tmp);
+        // Update only the live prompt. The sealed role and durable task keep
+        // their original bytes for verification, replay and transcript reads.
+        match identity.authority.harness {
+            HarnessId::Codex => {
+                planned.profile.body.insert_str(0, &format!("{brief}\n"));
+                if let Some(setting) = facts.codex_socket_override() {
+                    planned.launch.args.splice(0..0, ["-c".into(), setting]);
+                }
+            }
+            HarnessId::ClaudeCode => {
+                let prompt = planned
+                    .launch
+                    .args
+                    .iter()
+                    .position(|arg| arg == "--append-system-prompt")
+                    .and_then(|index| planned.launch.args.get_mut(index + 1))
+                    .ok_or_else(|| invalid("Claude launch has no worker prompt"))?;
+                prompt.insert_str(0, &format!("{brief}\n"));
+            }
+            HarnessId::OpenCode => {}
+        }
         let managed_selection = adapters::managed_role::select(
             &managed_config,
             identity.authority.harness,
@@ -2426,7 +2472,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     .await?;
             }
             let mut native_row = row.clone();
-            native_row.request.task = task.to_owned();
+            native_row.request.task = if identity.authority.harness == HarnessId::OpenCode {
+                format!("{brief}\n{task}")
+            } else {
+                task.to_owned()
+            };
             native_row.resume_of_runtime_session_id = resume_session.map(str::to_owned);
             if identity.authority.harness == HarnessId::OpenCode {
                 crate::opencode::run(

@@ -149,6 +149,17 @@ impl agent_run_core::system_launch::SystemLauncher for RoutedFixture {
         Box::pin(async { Err(agent_run_domain::Error::ExecutionChanged) })
     }
 
+    /// The fixture launcher uses the test process's execution UID.
+    fn preflight_scope(
+        &self,
+        _route: agent_run_core::system_launch::SystemRoute,
+        plan: agent_run_core::launch_scope::AccessPlan,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = agent_run_domain::Result<Vec<String>>> + Send>,
+    > {
+        Box::pin(async move { plan.warnings() })
+    }
+
     fn launch(
         &self,
         _home: std::path::PathBuf,

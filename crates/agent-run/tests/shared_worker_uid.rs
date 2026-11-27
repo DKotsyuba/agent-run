@@ -218,6 +218,18 @@ fn group_client() {
         let mut request = serde_json::json!({"provider":provider,"model":model,"profile":"review",
             "explicit_finish":finish,"task":task,"workdir":work,
             "account":"fixture","request_id":"real-uid-fixture"});
+        let blocked = PathBuf::from(std::env::var_os("AR_UID_BROKER_ONLY_WORK").unwrap());
+        let mut denied = request.clone();
+        denied["workdir"] = serde_json::json!(blocked);
+        denied["request_id"] = serde_json::json!("uid-preflight-refusal");
+        let error = socket::client_at(&api, 1000, "start", denied)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("worker UID"), "{error}");
+        assert!(
+            error.to_string().contains(blocked.to_str().unwrap()),
+            "{error}"
+        );
         if failover {
             request.as_object_mut().unwrap().remove("account");
         }
@@ -431,6 +443,7 @@ async fn real_uid_shared_worker() {
     let user = root.join("user");
     let private = user.join(".agent-run");
     let work = root.join("work");
+    let broker_only = root.join("broker-only-work");
     let broker_tmp = root.join("bt");
     let target_tmp = root.join("tt");
     let client_tmp = root.join("ct");
@@ -440,6 +453,7 @@ async fn real_uid_shared_worker() {
         &user,
         &private,
         &work,
+        &broker_only,
         &broker_tmp,
         &target_tmp,
         &client_tmp,
@@ -447,7 +461,7 @@ async fn real_uid_shared_worker() {
     ] {
         fs::create_dir(path).unwrap();
     }
-    for path in [&state, &broker_tmp, &broker_home] {
+    for path in [&state, &broker_only, &broker_tmp, &broker_home] {
         chown(path, Some(1000), Some(GROUP)).unwrap();
     }
     for path in [&user, &private, &target_tmp] {
@@ -461,6 +475,7 @@ async fn real_uid_shared_worker() {
         &target_tmp,
         &client_tmp,
         &broker_home,
+        &broker_only,
     ] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -638,6 +653,7 @@ async fn real_uid_shared_worker() {
         // The fake engine confines its resumed history to its test workdir;
         // this disposable root contains both the work and worker-private home.
         .env("AR_UID_WORK", if failover { root } else { &work })
+        .env("AR_UID_BROKER_ONLY_WORK", &broker_only)
         .env("AR_UID_ID", &id_file);
     if failover {
         client_command

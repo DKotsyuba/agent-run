@@ -68,6 +68,30 @@
         "profile": {
           "type": "string"
         },
+        "write_roots": {
+          "description": "Additional directories that must be writable.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "needs_git_commit": {
+          "description": "Require writable Git metadata.",
+          "type": "boolean"
+        },
+        "sockets": {
+          "description": "Required pathname Unix sockets.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "tmpdir": {
+          "description": "Existing writable task temporary directory.",
+          "type": "string"
+        },
         "read_roots": {
           "items": {
             "type": "string"
@@ -427,6 +451,30 @@
             "pool_store_id": {"type": "string", "pattern": "^store_[0-9a-f]{32}$"}
           }
         },
+        "write_roots": {
+          "description": "Additional directories that must be writable.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "needs_git_commit": {
+          "description": "Require writable Git metadata.",
+          "type": "boolean"
+        },
+        "sockets": {
+          "description": "Required pathname Unix sockets.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "tmpdir": {
+          "description": "Existing writable task temporary directory.",
+          "type": "string"
+        },
         "recover_after_crash": {
           "description": "Explicitly recover an unsealed lost Claude Code or Codex session.",
           "type": "boolean"
@@ -621,6 +669,30 @@
               "profile": {
                 "type": "string"
               },
+              "write_roots": {
+                "description": "Additional directories that must be writable.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "needs_git_commit": {
+                "description": "Require writable Git metadata.",
+                "type": "boolean"
+              },
+              "sockets": {
+                "description": "Required pathname Unix sockets.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "tmpdir": {
+                "description": "Existing writable task temporary directory.",
+                "type": "string"
+              },
               "read_roots": {
                 "items": {
                   "type": "string"
@@ -715,6 +787,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "warnings": {
+          "type": "object",
+          "additionalProperties": {"type": "array", "items": {"type": "string"}}
+        },
         "receipt": {
           "type": "object",
           "additionalProperties": false,
@@ -882,6 +958,30 @@
                 ]
               },
               "profile": {
+                "type": "string"
+              },
+              "write_roots": {
+                "description": "Additional directories that must be writable.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "needs_git_commit": {
+                "description": "Require writable Git metadata.",
+                "type": "boolean"
+              },
+              "sockets": {
+                "description": "Required pathname Unix sockets.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16
+              },
+              "tmpdir": {
+                "description": "Existing writable task temporary directory.",
                 "type": "string"
               },
               "read_roots": {

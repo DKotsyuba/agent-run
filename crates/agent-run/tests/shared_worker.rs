@@ -228,6 +228,25 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     .expect("the owning worker should reclaim the orphan");
     assert!(retained.exists(), "configured paths must remain");
 
+    // This path check happens in the account worker before the broker admits
+    // an execution. It cannot run the fixture engine or consume a launch claim.
+    let missing = root.join("absent.sock");
+    let failed = socket::client_at(
+        &api,
+        broker_uid,
+        "start",
+        serde_json::json!({
+            "provider":"claude", "model":"fixture", "profile":"review", "explicit_finish":false,
+            "task":"fixture:answer", "workdir":root, "sockets":[missing]
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        failed.to_string().contains(missing.to_str().unwrap()),
+        "{failed}"
+    );
+
     // A refused private-history preflight must not consume the parent's one
     // continuation. Restoring the fixture then permits the identical request.
     let parent = socket::client_at(

@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Preflight worker directory, Git metadata and Unix socket requirements before
+  provider start, resume and batch admission. Give writable workers workspace
+  scratch and a brief describing their effective launch scope.
+
 - Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
   requested model is usable again. Completion notices advise resuming the same
   agent after capacity returns.

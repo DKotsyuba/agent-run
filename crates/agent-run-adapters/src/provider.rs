@@ -901,6 +901,11 @@ pub fn plan_selected_with(
     })
 }
 
+/// Directory covered by Claude Code's native edit tools for a writable role.
+pub fn claude_edit_root(write: bool, workdir: &Path) -> Option<&Path> {
+    write.then_some(workdir)
+}
+
 /// Builds Claude's partial-message stream with input replay acknowledgements,
 /// the sealed model, role grants, MCP/plugin assets and exact resume id.
 /// Replay frames let the shared runner correlate coalesced input batches without
@@ -932,8 +937,10 @@ fn claude_args(
     let mut allowed = tools
         .iter()
         .map(|tool| {
-            if matches!(*tool, "Edit" | "Write" | "NotebookEdit") {
-                format!("{tool}({}/**)", sealed.workdir.display())
+            if matches!(*tool, "Edit" | "Write" | "NotebookEdit")
+                && let Some(root) = claude_edit_root(role.write, &sealed.workdir)
+            {
+                format!("{tool}({}/**)", root.display())
             } else {
                 (*tool).to_owned()
             }

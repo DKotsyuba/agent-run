@@ -39,6 +39,9 @@ Evidence: an isolated model-free Rust reproduction of the unchanged replay predi
 - [x] Cover CLI, MCP and socket transports through the shared domain dispatcher. Regression: a writable Codex launch with unsupported external read roots is rejected synchronously before durable asynchronous admission.
 - [x] Exercise shared grant/reference checks, supported fake-engine starts and mutable-state races; ensure CLI/MCP/socket use the common admission path. Arbitrary live credential/model/service availability is not a static guarantee.
 
+Worker filesystem and Unix socket requirements extend this preflight. See
+[Worker launch scope](runtime-contract.md#worker-launch-scope).
+
 ## Investigate Codex transport failure: ag-20261007-200321-d534c55a58
 
 - [x] Revisit this incident with content-free execution-error diagnostics before attributing it to a network failure. The recorded outcome is `runtime_transport_failed`; the original execution error and exit code were not retained.

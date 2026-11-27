@@ -190,6 +190,7 @@ impl crate::service::Service {
         display_name: Option<String>,
         orchestrator: Option<crate::domain::OrchestratorRef>,
         pool_chat: Option<&agent_run_domain::pool_chat::PoolChat>,
+        scope: agent_run_domain::provider_start::ResumeScope,
         recover_after_crash: bool,
     ) -> Result<Value> {
         let parent = {
@@ -223,6 +224,7 @@ impl crate::service::Service {
                 request_id,
                 display_name,
                 orchestrator,
+                scope,
                 None,
                 recover_after_crash,
             )

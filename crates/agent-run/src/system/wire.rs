@@ -39,12 +39,27 @@ pub(super) enum PreflightOperation {
     ResumePreflight,
 }
 
+/// UID-scoped probe from the broker. Launch authorization is a separate frame.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ScopePreflight {
+    pub operation: ScopePreflightOperation,
+    pub plan: agent_run_core::launch_scope::AccessPlan,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ScopePreflightOperation {
+    ScopePreflight,
+}
+
 /// Existing start frames stay wire-compatible with the read-only request.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum Request {
     Start(Start),
     ResumePreflight(ResumePreflight),
+    ScopePreflight(ScopePreflight),
 }
 
 /// The broker permits release only after its startup-owner write is durable.
@@ -63,6 +78,12 @@ pub(super) enum Reply {
         backend: Backend,
     },
     Ready,
+    ScopeChecked {
+        warnings: Vec<String>,
+    },
+    ScopeRefused {
+        reason: String,
+    },
     ResumeVerified {
         digest: String,
     },

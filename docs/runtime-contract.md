@@ -165,3 +165,54 @@ settings. Running sessions are unaffected by configuration edits.
 catalog, and selected MCP definitions outside the start path. It does not gate a
 launch on repeated language-toolchain subprocesses or require a pre-generated
 runtime home.
+
+## Worker launch scope
+
+`start` and each `start_batch` job accept `write_roots`, `needs_git_commit`,
+`sockets` and `tmpdir`. The default is an empty list of extra write roots,
+no required commit, no required sockets, and workspace scratch for writable
+roles. Existing `workdir`, `read_roots`, `write` and role policy still
+determine the workspace and native grants. The extra paths are requirements
+within those grants. Configure approved Codex `workspace_roots` on the broker
+and in a managed Projects policy if the worker needs another writable location.
+Each scope list accepts up to 16 absolute paths. The CLI supports
+`--write-root`, `--needs-git-commit`, `--socket` and `--tmpdir`.
+
+`resume` keeps the frozen workdir and grants. Omitted scope fields inherit
+the parent's values. An explicit empty `write_roots` or `sockets` list, or
+`needs_git_commit: false`, clears that requirement. An explicit `tmpdir`
+replaces the inherited directory. Existing idempotent receipts can be replayed
+after paths disappear.
+
+Before admission the broker checks directory access as the execution UID,
+including supplementary groups and ACLs. In shared-service mode the
+authenticated account-owned launcher runs the filesystem and local socket
+probes. Existing broker validation also needs search access to canonicalize
+the workdir and read roots. Shared-worker probes fit the launcher's bounded
+4 KiB request frame. Pathname sockets must accept an empty connection by that UID and the
+native shell must permit local IPC. Codex's restricted network grant is
+treated as unavailable for requested socket probes. A commit requirement
+checks both linked-worktree Git directories. Codex can protect `.git` and
+its resolved target even within a workspace grant. In that case, commit as
+the orchestrator. The supervisor checks again at launch, since permissions,
+files and listeners can change after admission.
+
+Writable workers get `<workdir>/.scratch` (mkdir mode `0770`, subject to
+the worker umask) and all three of `TMPDIR`, `TMP` and `TEMP` point there
+by default. An explicit task `tmpdir` must be an existing writable directory
+inside the native grant and overrides the developer environment. An explicit
+harness environment setting takes precedence over the default. Run adds
+`/.scratch/` to an existing writable local Git `info/exclude` when possible.
+Linked metadata outside the workdir stays with its owner. Workers should
+stage specific files when a local exclude cannot be added. A scratch
+conflict is advisory, and the worker keeps the native temp environment.
+Read-only roles keep their existing temp environment.
+
+When an eligible short protected directory is available, Run exposes it as
+`AGENT_RUN_TEST_SOCKET_TMP`. It can be provisioned by the host and passed
+in the worker service environment. Linux operator-socket tests require
+non-writable, searchable ancestors without access ACLs, as described in
+[Releasing](releasing.md). If those conditions cannot be met the admission
+can return an advisory warning. New starts and resumes return optional
+`warnings`, and new batches key optional warnings by agent ID. Warnings
+are advisory responses and do not change durable replay receipts.

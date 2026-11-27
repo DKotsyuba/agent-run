@@ -739,6 +739,60 @@ impl Dir {
         let _directory = unsafe { File::from_raw_fd(n) };
         flush(&parent, level)
     }
+    /// Creates the workspace scratch directory with group access, subject to umask.
+    /// Refuses links and never changes an existing entry's permissions.
+    pub fn scratch_directory(&self, path: &Path) -> Result<()> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: the pinned directory and C name stay live for mkdirat.
+        let status = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o770) };
+        if status < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.subdir(path)?;
+        Ok(())
+    }
+
+    /// Best-effort append of the scratch ignore rule to an existing Git exclude.
+    /// Only a regular unlinked file is accepted; cooperating launches serialize
+    /// updates on that descriptor. Existing contents are preserved.
+    pub fn exclude_scratch(&self) -> Result<()> {
+        // SAFETY: a live directory descriptor and static pathname are passed.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                c"exclude".as_ptr(),
+                libc::O_RDWR
+                    | libc::O_APPEND
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: openat returned a newly owned file descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(invalid("Git exclude must be a regular file with one link"));
+        }
+        if file.try_lock().is_err() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        (&mut file).take(65_537).read_to_end(&mut bytes)?;
+        if bytes.len() <= 65_536
+            && !bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == b"/.scratch/")
+        {
+            file.write_all(b"\n/.scratch/\n")?;
+        }
+        Ok(())
+    }
+
     pub fn open_file(&self, path: &Path) -> Result<File> {
         let (parent, name) = self.parent(path, false)?;
         // O_NONBLOCK prevents a substituted FIFO from hanging before the type check.

@@ -368,6 +368,15 @@ fn main() {
     } else {
         task
     };
+    if task == "fixture:launch-facts" {
+        let observed = json!({
+            "tmpdir": std::env::var("TMPDIR").ok(),
+            "tmp": std::env::var("TMP").ok(),
+            "temp": std::env::var("TEMP").ok(),
+            "brief": argument(&args, "--append-system-prompt"),
+        });
+        std::fs::write("launch-facts.json", observed.to_string()).unwrap();
+    }
     let mut result_input = input
         .as_ref()
         .and_then(|input| input.get("uuid"))
