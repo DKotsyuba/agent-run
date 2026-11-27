@@ -729,6 +729,9 @@ fn static_reason(message: &str) -> Option<&str> {
 pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
+        Error::NativeOwnerInputUncertain => {
+            data["reason"] = json!("native_owner_input_uncertain");
+        }
         Error::Validation(message) | Error::Unsupported(message) => {
             if let Some(reason) = static_reason(message) {
                 data["reason"] = json!(reason);
@@ -836,6 +839,7 @@ fn failed_result(error: &Error) -> adapters::EngineResult {
     let metadata = execution_error_metadata(error);
     let mut outcome = Outcome::failure(match error {
         Error::Integrity(_) | Error::AnswerIntegrity(_) => "runtime_integrity_failed",
+        Error::NativeOwnerInputUncertain => "native_owner_input_uncertain",
         Error::Validation(_) => "runtime_contract_rejected",
         Error::Sql(_) | Error::Persistence { .. } => "runtime_storage_failed",
         Error::OwnershipCheckpoint {
@@ -3699,6 +3703,26 @@ mod tests {
             failed_result(&error).outcome.failure_kind.as_deref(),
             Some("runtime_contract_rejected")
         );
+    }
+
+    /// Ambiguous native input gets its recovery notice without being recast as invalid input.
+    #[test]
+    fn uncertain_native_owner_input_has_reconciliation_notice() {
+        let outcome = failed_result(&agent_run_domain::Error::NativeOwnerInputUncertain).outcome;
+        assert_eq!(outcome.status, Status::Failed);
+        assert_eq!(
+            outcome.failure_kind.as_deref(),
+            Some("native_owner_input_uncertain")
+        );
+        let mut notice = crate::delivery::Notice::legacy(
+            "test-notice",
+            "ag-20260925-000000-0000000001".parse().unwrap(),
+            outcome.status,
+        );
+        notice.failure_kind = outcome.failure_kind;
+        let text = notice.render().unwrap();
+        assert!(text.contains("The runtime did not confirm the wake."));
+        assert!(text.contains("Check the original Pool/Bridge delivery and native history before resending. If history and cleanup checks pass, resume the same agent_id to reconcile the original message."));
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.

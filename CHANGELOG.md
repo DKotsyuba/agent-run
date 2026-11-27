@@ -8,6 +8,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   provider start, resume and batch admission. Describe the effective launch
   scope and provide workspace scratch for direct writable launches and private
   temporary directories for shared workers.
+- Report ambiguous native wakes as `native_owner_input_uncertain` with same-agent
+  recovery guidance. Record bounded Claude wake diagnostics without input or
+  session identifiers.
 - Present pending steer receipts, per-job batch admission and completion binding,
   compact agent pages, and retained transcript results in MCP text.
 - Include a bounded verified result excerpt and specific terminal recovery

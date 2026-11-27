@@ -59,6 +59,15 @@ Persist new state/mode/finish data through a numbered migration if needed. Histo
 
 Claude CLI: keep stdin and the owned process open after a turn result unless finish, actual failure or cancellation requires closure. Native result frames describe turns and usage, not the run's final answer. Accept self-started turns only through verified native ownership/session/lifecycle evidence. Notification-looking user text or an unknown external replay is insufficient.
 
+Claude native owner calls share a 30-second budget that starts at socket accept.
+It bounds authentication, request framing, native stdin and the receipt on the
+original socket. Starting a fresh acknowledgement budget after stdin would
+outlive that socket's receipt deadline. Claude wake diagnostics report the
+remaining budget at the write and on a bounded sample of input lifecycle or
+replay frames. An unconfirmed write or acknowledgement ends the execution with
+`native_owner_input_uncertain`. Run never automatically replays the wake.
+Same-agent resume remains subject to native history and cleanup checks.
+
 Codex app-server: retain the process/thread after `turn/completed`. Deliver the next event through the same native thread. Before changing its completion loop, probe whether an outstanding code-mode exec cell survives turn end. Record exact client versions and outcomes. If it does not survive, keep that command awaited within the turn through the supported bounded tool API or provide a qualified supervisor-owned job path; never pretend a discarded cell is still pending.
 
 Both adapters preserve cancellation, quota-switch rules, replay guards, role enforcement and birth-verified cleanup. Closing an execution does not delete conversation history.
