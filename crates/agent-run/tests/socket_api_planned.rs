@@ -571,6 +571,7 @@ fn finished_worker(home: &tempfile::TempDir) -> (agent_run::domain::AgentId, Str
             &agent_run_domain::worker::FinishRequest {
                 summary: "done".into(),
                 status: agent_run_domain::worker::FinishStatus::Done,
+                ..Default::default()
             },
             agent_run_domain::domain::now(),
             agent_run_domain::worker::FinishGuard::Clean,

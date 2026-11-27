@@ -116,8 +116,9 @@ pub fn commit_terminal(
                     "explicit answer requires an observed private finish receipt",
                 ));
             }
-            if proof.sha256 != agent_run_platform::fs::sha256(intent.summary.as_bytes())
-                || proof.bytes != intent.summary.len() as u64
+            let text = intent.answer_text()?;
+            if proof.sha256 != agent_run_platform::fs::sha256(text.as_bytes())
+                || proof.bytes != text.len() as u64
             {
                 return Err(invalid("answer does not match immutable finish summary"));
             }

@@ -156,6 +156,7 @@ sleep 1
                 &FinishRequest {
                     summary: "FINAL".into(),
                     status: FinishStatus::Done,
+                    ..Default::default()
                 },
                 agent_run_domain::domain::now(),
                 agent_run_domain::worker::FinishGuard::Clean,
@@ -222,6 +223,7 @@ async fn acknowledged_finish_recovers_after_supervisor_exit() {
             &FinishRequest {
                 summary: "RECOVERED".into(),
                 status: FinishStatus::Done,
+                ..Default::default()
             },
             101.0,
             agent_run_domain::worker::FinishGuard::Clean,
@@ -345,6 +347,7 @@ read digest < receipt
                 &FinishRequest {
                     summary: summary.into(),
                     status: FinishStatus::Done,
+                    ..Default::default()
                 },
                 agent_run_domain::domain::now(),
                 agent_run_domain::worker::FinishGuard::Clean,
@@ -420,6 +423,7 @@ async fn lost_finish_reply_never_becomes_an_answer() {
     assert_eq!(
         agent_run_core::worker_finish::answer(&process, &store, &id)
             .unwrap()
+            .map(|intent| intent.summary)
             .as_deref(),
         Some(summary)
     );

@@ -149,6 +149,7 @@ async fn codex_finish_observed_after_idle_settles_the_execution() {
                 &FinishRequest {
                     summary: "FINAL".into(),
                     status: FinishStatus::Done,
+                    ..Default::default()
                 },
                 agent_run_domain::domain::now(),
                 agent_run_domain::worker::FinishGuard::Clean,

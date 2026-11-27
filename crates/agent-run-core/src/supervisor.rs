@@ -2763,9 +2763,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
         }
         if row.request.explicit_finish {
-            // Only an observed native receipt publishes the exact summary,
+            // Only an observed native receipt publishes the exact result,
             // for failed runs too; a lost reply leaves the run answerless.
-            result.answer = crate::worker_finish::answer(&process, store, id)?;
+            let intent = crate::worker_finish::answer(&process, store, id)?;
+            if let Some(intent) = &intent {
+                crate::worker_finish::seal_structured(
+                    &agent_dir,
+                    intent,
+                    identity.system_route.is_some(),
+                )?;
+            }
+            result.answer = intent.map(|intent| intent.answer_text()).transpose()?;
         }
         let answer_started = std::time::Instant::now();
         let proof = match result.answer.as_deref() {

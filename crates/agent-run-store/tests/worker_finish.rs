@@ -32,6 +32,7 @@ fn report() -> FinishRequest {
     FinishRequest {
         summary: "Verified final summary".into(),
         status: FinishStatus::Done,
+        ..Default::default()
     }
 }
 
@@ -304,6 +305,7 @@ fn output_schema_is_checked_before_finish_intent() {
         let r = FinishRequest {
             summary: text.into(),
             status: FinishStatus::Done,
+            ..Default::default()
         };
         assert!(
             store
@@ -322,6 +324,7 @@ fn output_schema_is_checked_before_finish_intent() {
     let r = FinishRequest {
         summary: "{ \"ok\" : true }".into(),
         status: FinishStatus::Done,
+        ..Default::default()
     };
     store
         .accept_worker_finish(
@@ -658,4 +661,80 @@ fn finish_guard_verdict_never_changes_operation_identity() {
         assert_eq!(op.guard, guard);
         assert_eq!(serde_json::to_value(op).unwrap(), payload);
     }
+}
+
+/// A structured result persists its canonical JSON as the intent, refuses
+/// evidence outside the workdir and the worker token in any field, and the
+/// terminal transaction accepts only its rendered answer as the sealed proof.
+#[test]
+fn structured_finish_persists_and_seals_its_rendering() {
+    use agent_run_domain::domain::{Outcome, Status};
+    let (home, mut store, run) = running(true);
+    let structured = |evidence: &str, note: &str| {
+        FinishRequest::decode(json!({
+            "status":"partial","summary":"Parser fixed; docs remain.",
+            "changes":[{"path":"src/parser.rs","kind":"modified"}],
+            "checks":[{"command":"cargo test","result":"passed","evidence":evidence,"note":note}],
+            "unverified":[],"next":"finish the docs"
+        }))
+        .unwrap()
+    };
+    let accept = |store: &mut Store<'static>, input: &FinishRequest| {
+        store.accept_worker_finish(
+            &run,
+            "attempt",
+            TOKEN,
+            input,
+            200.0,
+            agent_run_domain::worker::FinishGuard::Clean,
+        )
+    };
+    for refused in [
+        structured("/etc/log.txt", "ok"),
+        structured("logs/test.txt", &format!("leaked {TOKEN}")),
+    ] {
+        assert!(matches!(
+            accept(&mut store, &refused),
+            Err(Error::Validation(_))
+        ));
+    }
+    let input = structured("/tmp/logs/test.txt", "ok");
+    let receipt = accept(&mut store, &input).unwrap();
+    let stored: String = store
+        .conn
+        .query_row(
+            "SELECT finish_json FROM worker_lifecycle WHERE attempt_id='attempt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, input.canonical_payload().unwrap());
+    assert_eq!(
+        receipt.sha256,
+        agent_run_platform::fs::sha256(stored.as_bytes())
+    );
+    store.observe_worker_finish_receipt(&run).unwrap();
+    assert_eq!(
+        store.worker_finish_intent(&run, true).unwrap(),
+        Some(input.clone())
+    );
+    let root = home.path().join("agents").join(run.as_str());
+    agent_run_platform::fs::private_dir(&root).unwrap();
+    let summary_proof =
+        agent_run_platform::verify::seal(&root, std::path::Path::new("answer.md"), &input.summary)
+            .unwrap();
+    let outcome = Outcome::failure(input.status.failure_kind().unwrap());
+    assert!(
+        store
+            .finish(&run, &outcome, Some(&summary_proof), None)
+            .is_err()
+    );
+    let text = input.answer_text().unwrap();
+    assert!(text.ends_with(&format!("sha256 {}\n", receipt.sha256)));
+    let proof =
+        agent_run_platform::verify::seal(&root, std::path::Path::new("answer.md"), &text).unwrap();
+    store.finish(&run, &outcome, Some(&proof), None).unwrap();
+    let row = store.get(&run).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(row.failure_kind.as_deref(), Some("worker_partial"));
 }

@@ -11,8 +11,44 @@ continuation-count allowance.
 ```
 
 `summary` is a nonblank string of at most 64 KiB UTF-8. `status` defaults to
-`done`; `blocked` and `failed` are terminal non-success declarations. Checks
-and unfinished work belong in the summary. Unknown arguments are refused.
+`done`; `partial`, `blocked` and `failed` are terminal non-success
+declarations (`worker_partial`, `worker_blocked`, `worker_failed`). Unknown
+arguments are refused.
+
+Workers should prefer a structured result; a plain summary stays valid and
+keeps its historical payload bytes, digest and answer:
+
+```json
+{"status":"done","summary":"Added structured finish; focused tests pass.",
+ "changes":[{"path":"src/finish.rs","kind":"modified"}],"commits":["0a1b2c3d"],
+ "checks":[{"command":"cargo test -p x","result":"passed","evidence":"logs/test.txt"},
+           {"command":"cargo xtask check","result":"not_run","note":"host-only gate"}],
+ "unverified":["macOS launch"],"next":"commit and push"}
+```
+
+Any field beyond `summary` and `status` makes the call structured. It then
+requires `status`, a `summary` of at most 4 KiB (1–3 sentences), `changes`
+(entries `{path, kind}` with kind `added`, `modified` or `deleted`, or the
+literal `"none"` / `"read_only"`) and/or `commits` (7–64 hex characters),
+`checks` (`{command, result: passed|failed|not_run, note?, evidence?}`),
+`unverified` (may be empty) and `next`. Optional fields are
+`baseline_failures`, `blocked_on` (required when `status` is `blocked`),
+`questions`, `artifacts` and a Markdown `report`. Lists and entries are
+bounded, paths and commands are single lines, check `evidence` must be a
+relative path without `..` or an absolute path under the workdir (checked
+lexically, never opened), and all text shares the 64 KiB budget. The same
+launch-secret screen as a plain summary applies to every field and to the
+rendering. Refusals echo no values.
+
+The broker stores the canonical JSON as the finish intent; its SHA-256 is the
+receipt digest. At sealing, `answer.json` receives exactly those bytes and
+`answer.md` receives a deterministic Markdown rendering (status, summary,
+then Changes, Checks, Baseline failures, Unverified, Blocked on, Questions,
+Artifacts, Next and Report sections) ending with
+`Structured result: answer.json sha256 <digest>`. The run's answer proof
+covers `answer.md`; `answer.json` is trusted only when its bytes match that
+digest. `answer` returns the rendering, and completion notices add a compact
+worker-result line (see `agent-run doc completion`).
 The model supplies no recipient, agent ID, attempt ID, token or path: the
 private MCP proxy binds those credentials from its supervisor context.
 
@@ -24,14 +60,15 @@ of cleanup. Success additionally requires the exact sealed answer and verified
 owned-process cleanup. Later assistant text and native results cannot replace
 the summary. Cancellation retains its existing precedence.
 
-The model puts its complete final report only in `finish.summary`. The finish
+The model puts its complete final report only in `finish` (its summary, or
+its structured fields and optional report). The finish
 call is its final response: after calling it, no assistant acknowledgement,
 repeated summary or closing text is sent. An uncertain receipt permits only
 an identical tool-payload retry, without commentary. Newly resolved roles
 freeze these shared instructions; existing admitted prompts retain their bytes.
 
 If `output_schema` is set, the summary must contain JSON text whose parsed
-value matches that schema. Invalid answers stay retryable without finish intent.
+value matches that schema, and structured fields are refused. Invalid answers stay retryable without finish intent.
 External schema references cannot read files or fetch network resources.
 
 ## Idle and wakes

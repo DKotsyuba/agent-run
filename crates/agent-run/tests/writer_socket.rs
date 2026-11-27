@@ -920,6 +920,7 @@ async fn broker_finish(
             input: agent_run_domain::worker::FinishRequest {
                 summary: summary.into(),
                 status: agent_run_domain::worker::FinishStatus::Done,
+                ..Default::default()
             },
             at: agent_run_core::domain::now(),
             guard: agent_run_domain::worker::FinishGuard::Unavailable,

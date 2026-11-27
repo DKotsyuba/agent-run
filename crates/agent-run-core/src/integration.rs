@@ -584,6 +584,7 @@ mod tests {
                 &agent_run_domain::worker::FinishRequest {
                     summary: "fixture complete".into(),
                     status: agent_run_domain::worker::FinishStatus::Done,
+                    ..Default::default()
                 },
                 crate::domain::now(),
                 agent_run_domain::worker::FinishGuard::Clean,
