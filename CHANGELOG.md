@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Report ambiguous native wakes as `native_owner_input_uncertain` with same-agent
+  recovery guidance. Record bounded Claude wake diagnostics without input or
+  session identifiers.
 - Present pending steer receipts, per-job batch admission and completion binding,
   compact agent pages, and retained transcript results in MCP text.
 - Include a bounded verified result excerpt and specific terminal recovery

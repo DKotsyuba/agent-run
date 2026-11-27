@@ -61,6 +61,7 @@ fn python_test_resume_live_parent_group_is_refused() {
 /// Mirrors Python `tests/test_resume.py::ResumeTests::test_resume_makes_a_new_agent_that_inherits_and_attaches`.
 /// Mirrors Python `tests/test_resume.py::ResumeTests::test_a_fresh_start_is_its_own_chain_root`.
 /// Mirrors Python `tests/test_resume.py::ResumeTests::test_two_processes_racing_one_parent_accept_exactly_one_child`.
+/// A parent with an ambiguous native wake can still admit one continuation.
 #[test]
 fn python_test_resume_lineage_has_one_concurrent_latest_child() {
     let home = common::Home::new();
@@ -74,7 +75,12 @@ fn python_test_resume_lineage_has_one_concurrent_latest_child() {
         .runtime_session(&parent_id, "fixture-session")
         .unwrap();
     parent_store
-        .finish(&parent_id, &Outcome::failure("fixture"), None, None)
+        .finish(
+            &parent_id,
+            &Outcome::failure("native_owner_input_uncertain"),
+            None,
+            None,
+        )
         .unwrap();
     let parent = parent_store.get(&parent_id).unwrap();
     let barrier = Arc::new(Barrier::new(2));

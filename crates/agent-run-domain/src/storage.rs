@@ -631,6 +631,7 @@ impl StorageRejection {
             Error::Sql(_)
             | Error::Io(_)
             | Error::Runtime(_)
+            | Error::NativeOwnerInputUncertain
             | Error::WriterFailure(_)
             | Error::BatchOutcomeUnknown { .. }
             | Error::BrokerUnavailable

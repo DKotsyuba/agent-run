@@ -243,7 +243,7 @@ fn is_resume_ack(frame: &Value, session: &str, input_id: &str) -> bool {
 }
 
 /// A late replay cannot turn a deadline-unknown owner effect into acceptance.
-fn is_owner_v2_ack(
+fn is_owner_ack(
     frame: &Value,
     session: &str,
     input_id: &str,
@@ -1048,29 +1048,35 @@ async fn run_inner(
     let mut native_pending: Option<(agent_run_adapters::native_owner::Call, String)> = None;
     let mut native_pending_v2: Option<(agent_run_adapters::native_owner_v2::Call, String, String)> =
         None;
+    let mut owner_frame_samples = 0;
     let mut native_idle = false;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if native_pending_v2
+        if let Some(deadline) = native_pending_v2
             .as_ref()
-            .is_some_and(|(call, _, _)| tokio::time::Instant::now() >= call.deadline)
+            .map(|(call, _, _)| call.deadline)
+            .or_else(|| native_pending.as_ref().map(|(call, _)| call.deadline))
+            && tokio::time::Instant::now() >= deadline
         {
-            let (call, _, token) = native_pending_v2.take().expect("checked pending input");
-            owner_v2_expire(process, store, call, &token).await;
-            native_owner_v2.take();
-            return Err(invalid("native owner input acknowledgement is uncertain"));
-        }
-        if native_pending
-            .as_ref()
-            .is_some_and(|(call, _)| tokio::time::Instant::now() >= call.deadline)
-        {
-            let (call, _) = native_pending.take().expect("checked pending input");
-            let reply = agent_run_adapters::native_owner::Reply::unknown(&call.request.call_id);
-            native_calls.finish(reply.clone());
-            call.answer(reply);
-            native_owner.take();
-            return Err(invalid("native owner input acknowledgement is uncertain"));
+            if let Some((call, _, token)) = native_pending_v2.take() {
+                owner_v2_expire(process, store, call, &token).await;
+                native_owner_v2.take();
+            }
+            if let Some((call, _)) = native_pending.take() {
+                let reply = agent_run_adapters::native_owner::Reply::unknown(&call.request.call_id);
+                native_calls.finish(reply.clone());
+                call.answer(reply);
+                native_owner.take();
+            }
+            let _ = process
+                .observing(store.event_durable(
+                    &record.id,
+                    "native_owner_input_v1",
+                    &json!({"stage":"deadline_expired","remaining_ms":0}),
+                ))
+                .await;
+            return Err(agent_run_domain::Error::NativeOwnerInputUncertain);
         }
         if record.request.explicit_finish && store.worker_finish_intent(&record.id, true)?.is_some()
         {
@@ -1106,11 +1112,14 @@ async fn run_inner(
                         crate::native_owner::PreparedV2::Invoke(token) => token,
                     };
                     let input_id=uuid::Uuid::new_v4().to_string();
-                    if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
+                    let written=write_owner_input(process,&call.request.text,&input_id,call.deadline).await;
+                    let Some(written)=written else {
                         let reply=crate::native_owner::finish_v2(process,store,&call.request,&token,"unknown",None,None,Some("native_uncertain")).await;
                         call.answer(reply);native_owner_v2.take();
-                        return Err(invalid("native owner input write is uncertain"));
-                    }
+                        return Err(agent_run_domain::Error::NativeOwnerInputUncertain);
+                    };
+                    owner_frame_samples=0;
+                    let _=process.observing(store.event(&record.id,"native_owner_input_v1",&written)).await;
                     inputs.sent(input_id.clone(),false);
                     native_idle=false;
                     match owner_v2_after_write(process,store,&record.id,call,input_id,token).await {
@@ -1126,10 +1135,13 @@ async fn run_inner(
                     let refusal=crate::native_owner::refusal(process,store,logical_record,&call,session.as_deref(),native_idle && native_pending.is_none() && native_pending_v2.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
                     if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
                     let input_id=uuid::Uuid::new_v4().to_string();
-                    if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
+                    let written=write_owner_input(process,&call.request.text,&input_id,call.deadline).await;
+                    let Some(written)=written else {
                         let reply=Reply::unknown(&id);native_calls.finish(reply.clone());call.answer(reply);native_owner.take();
-                        return Err(invalid("native owner input write is uncertain"));
-                    }
+                        return Err(agent_run_domain::Error::NativeOwnerInputUncertain);
+                    };
+                    owner_frame_samples=0;
+                    let _=process.observing(store.event(&record.id,"native_owner_input_v1",&written)).await;
                     inputs.sent(input_id.clone(),false);
                     native_idle=false;
                     process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
@@ -1442,6 +1454,33 @@ async fn run_inner(
         } else {
             None
         };
+        let pending_owner = native_pending_v2
+            .as_ref()
+            .map(|(call, input, _)| {
+                (
+                    call.request.thread_id.as_str(),
+                    input.as_str(),
+                    call.deadline,
+                )
+            })
+            .or_else(|| {
+                native_pending.as_ref().map(|(call, input)| {
+                    (
+                        call.request.thread_id.as_str(),
+                        input.as_str(),
+                        call.deadline,
+                    )
+                })
+            });
+        if let Some((thread, input, deadline)) = pending_owner
+            && (owner_frame_samples < 8 || is_owner_ack(&v, thread, input, deadline))
+            && let Some(observed) = owner_frame_observation(&v, thread, input, deadline)
+        {
+            owner_frame_samples += 1;
+            let _ = process
+                .observing(store.event(&record.id, "native_owner_input_v1", &observed))
+                .await;
+        }
         // Validate notification ownership before checking or binding the frame session.
         if v.get("type").and_then(Value::as_str) == Some("user")
             && let Err(error) = inputs.replay(&v, session.as_deref())
@@ -1744,7 +1783,7 @@ async fn run_inner(
             }
             Some("user") => {
                 if native_pending_v2.as_ref().is_some_and(|(call, input, _)| {
-                    is_owner_v2_ack(&v, &call.request.thread_id, input, call.deadline)
+                    is_owner_ack(&v, &call.request.thread_id, input, call.deadline)
                 }) {
                     let (call, input, token) = native_pending_v2
                         .take()
@@ -1764,15 +1803,11 @@ async fn run_inner(
                     call.answer(reply);
                     if unknown {
                         native_owner_v2.take();
-                        return Err(invalid("native owner input outcome is uncertain"));
+                        return Err(agent_run_domain::Error::NativeOwnerInputUncertain);
                     }
                 }
                 if native_pending.as_ref().is_some_and(|(call, input)| {
-                    tokio::time::Instant::now() < call.deadline
-                        && v.get("isReplay").and_then(Value::as_bool) == Some(true)
-                        && v.get("uuid").and_then(Value::as_str) == Some(input.as_str())
-                        && v.get("session_id").and_then(Value::as_str)
-                            == Some(call.request.thread_id.as_str())
+                    is_owner_ack(&v, &call.request.thread_id, input, call.deadline)
                 }) {
                     let (call, input) = native_pending
                         .take()
@@ -1992,10 +2027,61 @@ fn runtime_result_usage(result: &Value) -> Value {
     json!({"duration_ms":result["duration_ms"],"duration_api_ms":result["duration_api_ms"],"num_turns":result["num_turns"],"ttft_ms":result["ttft_ms"],"total_cost_usd":result["total_cost_usd"],"usage":result["usage"]})
 }
 
-/// Writes one user text message with the caller's fresh correlation `id` before
-/// `deadline`; shared by operator steering and native owner input. The ID is native
-/// framing only, not a public agent identity or a delivery/consumption proof.
-/// `false` after a possible partial write is not proof that nothing was sent.
+/// Records only framing facts for a replay or command lifecycle frame.
+fn owner_frame_observation(
+    frame: &Value,
+    thread: &str,
+    input: &str,
+    deadline: tokio::time::Instant,
+) -> Option<Value> {
+    let (stage, uuid_field, lifecycle) = match frame["type"].as_str() {
+        Some("user") if frame["isReplay"].as_bool() == Some(true) => ("replay", "uuid", None),
+        Some("command_lifecycle") => (
+            "command_lifecycle",
+            "command_uuid",
+            Some(match frame["state"].as_str() {
+                Some("queued") => "queued",
+                Some("started") => "started",
+                Some("completed") => "completed",
+                _ => "other",
+            }),
+        ),
+        _ => return None,
+    };
+    Some(json!({
+        "stage":stage,
+        "uuid_match":frame[uuid_field].as_str() == Some(input),
+        "session_match":frame["session_id"].as_str() == Some(thread),
+        "lifecycle":lifecycle,
+        "remaining_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis(),
+    }))
+}
+
+/// Returns content-free write facts after the newline-delimited wake is flushed.
+async fn write_owner_input(
+    process: &mut Process,
+    text: &str,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Option<Value> {
+    let frame = user_text_frame(text, id);
+    let bytes = serde_json::to_vec(&frame).ok()?.len() + 1;
+    process.send_before(&frame, deadline).await.ok()?;
+    Some(json!({
+        "stage":"wake_written",
+        "bytes":bytes,
+        "written_at":crate::domain::now(),
+        "remaining_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis(),
+    }))
+}
+
+/// Builds the shared Claude input envelope for a fresh native correlation ID.
+fn user_text_frame(text: &str, id: &str) -> Value {
+    json!({"type":"user","uuid":id,"message":{"role":"user","content":[{"type":"text","text":text}]}})
+}
+
+/// Writes one steering message before `deadline`. The fresh `id` correlates
+/// native frames. A partial write can return `false` even if the engine received input.
 async fn send_user_text(
     process: &mut agent_run_adapters::io::Process,
     text: &str,
@@ -2003,10 +2089,7 @@ async fn send_user_text(
     deadline: tokio::time::Instant,
 ) -> bool {
     process
-        .send_before(
-            &json!({"type":"user","uuid":id,"message":{"role":"user","content":[{"type":"text","text":text}]}}),
-            deadline,
-        )
+        .send_before(&user_text_frame(text, id), deadline)
         .await
         .is_ok()
 }
@@ -2631,25 +2714,25 @@ if line:
     fn claude_owner_v2_requires_exact_replay_session_uuid_and_deadline() {
         let now = tokio::time::Instant::now();
         let frame = json!({"type":"user","isReplay":true,"uuid":"input","session_id":"session"});
-        assert!(super::is_owner_v2_ack(
+        assert!(super::is_owner_ack(
             &frame,
             "session",
             "input",
             now + std::time::Duration::from_secs(1)
         ));
-        assert!(!super::is_owner_v2_ack(
+        assert!(!super::is_owner_ack(
             &frame,
             "other",
             "input",
             now + std::time::Duration::from_secs(1)
         ));
-        assert!(!super::is_owner_v2_ack(
+        assert!(!super::is_owner_ack(
             &frame,
             "session",
             "other",
             now + std::time::Duration::from_secs(1)
         ));
-        assert!(!super::is_owner_v2_ack(
+        assert!(!super::is_owner_ack(
             &frame,
             "session",
             "input",
@@ -2657,7 +2740,7 @@ if line:
         ));
         let mut no_replay = frame;
         no_replay["isReplay"] = json!(false);
-        assert!(!super::is_owner_v2_ack(
+        assert!(!super::is_owner_ack(
             &no_replay,
             "session",
             "input",

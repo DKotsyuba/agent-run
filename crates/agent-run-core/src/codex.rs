@@ -1229,7 +1229,7 @@ async fn run_inner(
                 let reply=crate::native_owner::finish_v2(process,store,&call.request,&token,state,protocol,native_id,reason).await;
                 let accepted=reply.state=="accepted";let unknown=reply.state=="unknown";
                 call.answer(reply);
-                if unknown {native_owner_v2.take();return Err(invalid("native owner input outcome is uncertain"));}
+                if unknown {native_owner_v2.take();return Err(agent_run_domain::Error::NativeOwnerInputUncertain);}
                 if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
                 continue;
             }
@@ -1248,7 +1248,7 @@ async fn run_inner(
                 };
                 let accepted=reply.state=="accepted";let unknown=reply.state=="unknown";
                 native_calls.finish(reply.clone());call.answer(reply);
-                if unknown {native_owner.take();return Err(invalid("native owner input outcome is uncertain"));}
+                if unknown {native_owner.take();return Err(agent_run_domain::Error::NativeOwnerInputUncertain);}
                 if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
                 continue;
             }
@@ -2908,7 +2908,7 @@ async fn turn_input(
             *idle = false;
         }
         agent_run_adapters::io::RpcDisposition::Uncertain(_) => {
-            return Err(invalid("native wake outcome is uncertain"));
+            return Err(agent_run_domain::Error::NativeOwnerInputUncertain);
         }
         _ => {}
     }
@@ -3356,7 +3356,7 @@ for status in statuses:
         session.turn_completed("old").unwrap();
         let mut turn = "old".to_string();
         let mut idle = true;
-        assert!(
+        assert!(matches!(
             turn_input(
                 &mut process,
                 &mut session,
@@ -3367,9 +3367,9 @@ for status in statuses:
                 None,
                 tokio::time::Instant::now() - Duration::from_millis(1)
             )
-            .await
-            .is_err()
-        );
+            .await,
+            Err(agent_run_domain::Error::NativeOwnerInputUncertain)
+        ));
         assert!(!temp.path().join("effect").exists());
         let proof = process.owner.cleanup(Duration::from_secs(2)).await.unwrap();
         assert!(proof.confirmed);

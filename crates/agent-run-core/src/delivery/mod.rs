@@ -786,7 +786,7 @@ mod tests {
             codex_usageLimitExceeded continuation_unavailable cut_off empty_result
             ended_without_finish engine_error engine_group_survived engine_transport_eof
             engine_transport_failure engine_vanished finish_secret_refused interrupted
-            malformed_engine_json max_turns no_answer nonzero_exit opencode_native_failed
+            malformed_engine_json max_turns native_owner_input_uncertain no_answer nonzero_exit opencode_native_failed
             preparation_rejected prepare_failed prepare_runtime_failed provider_error
             provider_overloaded quota_exhausted rate_limited restart_resume_failed
             runtime_contract_rejected runtime_failed runtime_integrity_failed
