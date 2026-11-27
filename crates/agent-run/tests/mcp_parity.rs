@@ -1114,13 +1114,19 @@ fn long_rpc_ids_are_rejected_before_tool_dispatch() {
                         }
                     }
                     let call: Value = serde_json::from_slice(&line).unwrap();
-                    assert_eq!(call["method"], "doc");
-                    seen.fetch_add(1, Ordering::SeqCst);
+
                     stream.set_nonblocking(false).unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let response = json!({"jsonrpc":"2.0","id":call["id"],"result":{"text":"guide\n".repeat(1024)}});
+                    let result = if call["method"] == "_mcp_info" {
+                        json!({"product_version":env!("CARGO_PKG_VERSION"),"tools":agent_run::dispatch::tools()})
+                    } else {
+                        assert_eq!(call["method"], "doc");
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        json!({"text":"guide\n".repeat(1024)})
+                    };
+                    let response = json!({"jsonrpc":"2.0","id":call["id"],"result":result});
                     writeln!(stream, "{response}").unwrap();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
