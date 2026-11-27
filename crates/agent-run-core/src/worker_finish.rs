@@ -6,8 +6,10 @@ use crate::{
     state::{Record, Store},
 };
 use agent_run_adapters::{EngineResult, io::Process};
-use agent_run_domain::worker::FinishStatus;
+use agent_run_domain::worker::FinishRequest;
+use agent_run_platform::verify;
 use serde_json::Value;
+use std::path::Path;
 
 /// Observe a native private finish tool's reply only when it contains the
 /// current immutable digest. Unknown or error tool output cannot close a run.
@@ -29,7 +31,7 @@ pub async fn receipt(
     {
         if store
             .worker_finish_intent(&record.id, false)?
-            .is_some_and(|intent| process.contains_secret(&intent.summary))
+            .is_some_and(|intent| intent.screen(|text| process.contains_secret(text)))
         {
             return Err(crate::Error::Validation(
                 "finish summary contains launch secret material".into(),
@@ -43,9 +45,9 @@ pub async fn receipt(
 }
 
 /// Produce a result after the native finish reply, leaving cleanup and answer
-/// sealing to the supervisor. Cancellation wins. Refuse a summary carrying
+/// sealing to the supervisor. Cancellation wins. Refuse a result carrying
 /// launch secret material instead of publishing it; the answer is otherwise
-/// the exact accepted callback bytes.
+/// the exact accepted summary or the rendering of a structured result.
 pub fn result(
     process: &Process,
     store: &Store,
@@ -59,14 +61,13 @@ pub fn result(
     let Some(intent) = store.worker_finish_intent(&record.id, true)? else {
         return Ok(None);
     };
-    let mut outcome = match intent.status {
-        FinishStatus::Done => Outcome::success(session.clone()),
-        FinishStatus::Blocked => Outcome::failure("worker_blocked"),
-        FinishStatus::Failed => Outcome::failure("worker_failed"),
+    let mut outcome = match intent.status.failure_kind() {
+        None => Outcome::success(session.clone()),
+        Some(kind) => Outcome::failure(kind),
     };
     outcome.runtime_session_id = session;
-    let mut answer = Some(intent.summary.clone());
-    if process.contains_secret(&intent.summary) {
+    let mut answer = Some(intent.answer_text()?);
+    if intent.screen(|text| process.contains_secret(text)) {
         outcome = Outcome::failure("finish_secret_refused");
         answer = None;
     }
@@ -82,14 +83,43 @@ pub fn result(
     }))
 }
 
-/// The only public answer an explicit-finish run may seal at finalization:
-/// the exact current-attempt summary, provided its native finish receipt was
-/// observed and it carries no launch secret material. An accepted intent
-/// whose native reply was lost yields `None` whatever the run's outcome, so
-/// an unobserved summary never becomes even a failed run's answer.
-pub fn answer(process: &Process, store: &Store, id: &AgentId) -> Result<Option<String>> {
+/// The only intent whose answer an explicit-finish run may seal at
+/// finalization: the exact current-attempt result, provided its native finish
+/// receipt was observed and it carries no launch secret material. An accepted
+/// intent whose native reply was lost yields `None` whatever the run's
+/// outcome, so an unobserved result never becomes even a failed run's answer.
+pub fn answer(process: &Process, store: &Store, id: &AgentId) -> Result<Option<FinishRequest>> {
     Ok(store
         .worker_finish_intent(id, true)?
-        .map(|intent| intent.summary)
-        .filter(|summary| !process.contains_secret(summary)))
+        .filter(|intent| !intent.screen(|text| process.contains_secret(text))))
+}
+
+/// Publish `answer.json` for a structured intent before its `answer.md` is
+/// sealed. The JSON is the exact canonical finish payload; the rendered
+/// `answer.md` names its digest, so it is verified through that answer's
+/// durable proof. A plain intent writes nothing.
+pub fn seal_structured(root: &Path, intent: &FinishRequest, system: bool) -> Result<()> {
+    if intent.is_structured() {
+        verify::seal_structured(root, &intent.canonical_payload()?, system)?;
+    }
+    Ok(())
+}
+
+/// Read the structured result behind an already verified `answer.md`.
+/// `Ok(None)` for a plain answer; a missing, altered or invalid
+/// `answer.json` is an integrity error.
+pub fn structured_answer(root: &Path, answer: &str) -> Result<Option<FinishRequest>> {
+    let Some(digest) = FinishRequest::structured_digest(answer) else {
+        return Ok(None);
+    };
+    let text = verify::read_structured(root, digest)?;
+    let intent: FinishRequest = serde_json::from_str(&text)
+        .map_err(|_| crate::Error::AnswerIntegrity("structured answer is malformed".into()))?;
+    intent.validate()?;
+    if !intent.is_structured() {
+        return Err(crate::Error::AnswerIntegrity(
+            "structured answer has no structured fields".into(),
+        ));
+    }
+    Ok(Some(intent))
 }

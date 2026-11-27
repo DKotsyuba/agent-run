@@ -310,7 +310,9 @@ impl Notice {
     }
 
     /// Include a bounded excerpt only from an already verified answer artifact.
-    fn render_with_result(&self, answer: Option<&str>) -> Result<String> {
+    /// A verified structured result adds one compact worker-result line after
+    /// the status, and its excerpt is the result's summary.
+    fn render_with_result(&self, answer: Option<&VerifiedAnswer>) -> Result<String> {
         self.validate()?;
         let failure = guidance(self.status, self.failure_kind.as_deref())?
             .map(|(kind, reason, advice)| {
@@ -331,25 +333,32 @@ impl Notice {
                     format!("- Agent: {label}")
                 },
             );
+        let worker_result = answer
+            .and_then(|answer| answer.structured.as_ref())
+            .and_then(agent_run_domain::worker::FinishRequest::notice_line)
+            .map(|line| format!("\n- Worker result: {line}"))
+            .unwrap_or_default();
         let mut text = format!(
-            "agent-run/completion\n\n{agent}\n- Status: {}{}\n- Runtime/model: {}/{}:{}",
+            "agent-run/completion\n\n{agent}\n- Status: {}{worker_result}{}\n- Runtime/model: {}/{}:{}",
             self.status.as_str(),
             failure,
             escaped(self.runtime.as_deref(), "unknown"),
             escaped(self.model.as_deref(), "unknown"),
             escaped(self.effort.as_deref(), "unspecified"),
         );
-        if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
+        let excerpt = answer.map(|answer| {
+            answer
+                .structured
+                .as_ref()
+                .map_or(answer.text.as_str(), |result| result.summary.as_str())
+        });
+        if let Some(answer) = excerpt.filter(|answer| !answer.trim().is_empty()) {
             const LABEL: &str = "\n- Untrusted worker output (excerpt): ";
             let full = format!("\n- full: answer agent_id={}", self.agent_id);
             let limit = 4096usize.saturating_sub(text.len() + LABEL.len() + full.len() + 2) / 6; // Maximum encoded bytes per Unicode scalar, including escaped controls.
             if limit > 0 {
                 let excerpt: String = answer.chars().take(limit.min(300)).collect();
-                let quoted = serde_json::to_string(&excerpt)?
-                    .replace('\u{2028}', "\\u2028")
-                    .replace('\u{2029}', "\\u2029")
-                    .replace('<', "\\u003c")
-                    .replace('>', "\\u003e");
+                let quoted = agent_run_domain::worker::quote(&excerpt);
                 text.push_str(LABEL);
                 text.push_str(&quoted);
                 text.push_str(&full);
@@ -589,9 +598,19 @@ async fn complete(
     Ok(())
 }
 
+/// A verified answer and, when `answer.json` verifies against it, the
+/// structured finish result it renders.
+struct VerifiedAnswer {
+    /// Exact verified `answer.md` text.
+    text: String,
+    /// Structured result whose digest the verified answer names.
+    structured: Option<agent_run_domain::worker::FinishRequest>,
+}
+
 /// Read the exact terminal execution's sealed answer before freezing a publication.
-/// Missing or invalid evidence leaves the notice usable without an excerpt.
-async fn verified_notice_answer(home: &Path, notice: &Notice) -> Option<String> {
+/// Missing or invalid evidence leaves the notice usable without an excerpt; an
+/// unverifiable `answer.json` only drops the structured line.
+async fn verified_notice_answer(home: &Path, notice: &Notice) -> Option<VerifiedAnswer> {
     let home = home.to_owned();
     let id = notice.run_id.as_ref().unwrap_or(&notice.agent_id).clone();
     let root_agent_id = notice.agent_id.clone();
@@ -605,7 +624,11 @@ async fn verified_notice_answer(home: &Path, notice: &Notice) -> Option<String> 
         let (_, answer) =
             agent_run_platform::verify::read(&root, &proof, agent_run_platform::verify::MAX_ANSWER)
                 .ok()?;
-        answer
+        let text = answer?;
+        let structured = crate::worker_finish::structured_answer(&root, &text)
+            .ok()
+            .flatten();
+        Some(VerifiedAnswer { text, structured })
     })
     .await
     .ok()
@@ -630,7 +653,7 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
             Payload::Completion(notice) => verified_notice_answer(home, notice).await,
             _ => None,
         };
-        bridge::intent(&claim, config, answer.as_deref())
+        bridge::intent(&claim, config, answer.as_ref())
     } else {
         Err(invalid("Bridge owner remains unconfigured"))
     };
@@ -935,5 +958,67 @@ mod tests {
             next.is_some(),
             "an inherited descriptor kept the dropped lock"
         );
+    }
+
+    /// A verified structured result adds one compact worker-result line after
+    /// the status and uses its summary as the excerpt; answer.json must match
+    /// the digest the verified answer names, otherwise only the line is lost.
+    #[test]
+    fn structured_result_notice_line_and_answer_json_verification() {
+        let intent = agent_run_domain::worker::FinishRequest::decode(serde_json::json!({
+            "status":"partial","summary":"Parser fixed; docs remain.",
+            "changes":[{"path":"a.rs","kind":"modified"},{"path":"b.rs","kind":"added"},
+                {"path":"c.rs","kind":"deleted"}],
+            "checks":[{"command":"cargo test","result":"passed"},
+                {"command":"cargo xtask check","result":"not_run"}],
+            "unverified":["docs","macOS"],"next":"commit and push"
+        }))
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        crate::worker_finish::seal_structured(root, &intent, false).unwrap();
+        let text = intent.answer_text().unwrap();
+        let structured = crate::worker_finish::structured_answer(root, &text).unwrap();
+        assert_eq!(structured.as_ref(), Some(&intent));
+        assert_eq!(
+            crate::worker_finish::structured_answer(root, &intent.summary).unwrap(),
+            None
+        );
+        let mut notice = super::Notice::legacy(
+            "test-notice",
+            "ag-20260925-000000-0000000001".parse().unwrap(),
+            crate::domain::Status::Failed,
+        );
+        notice.failure_kind = Some("worker_partial".into());
+        let rendered = notice
+            .render_with_result(Some(&super::VerifiedAnswer {
+                text: text.clone(),
+                structured,
+            }))
+            .unwrap();
+        assert!(
+            rendered.contains(
+                "\n- Status: failed\n- Worker result: partial · 3 files · checks 1 passed, 1 not_run · 2 unverified · next: \"commit and push\"\n- Failure: worker_partial — "
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains(
+            "- Untrusted worker output (excerpt): \"Parser fixed; docs remain.\"\n- full: answer"
+        ));
+        let plain = notice
+            .render_with_result(Some(&super::VerifiedAnswer {
+                text: text.clone(),
+                structured: None,
+            }))
+            .unwrap();
+        assert!(!plain.contains("Worker result"));
+        std::fs::write(root.join("answer.json"), "{}").unwrap();
+        assert!(matches!(
+            crate::worker_finish::structured_answer(root, &text),
+            Err(crate::Error::AnswerIntegrity(_))
+        ));
+        std::fs::remove_file(root.join("answer.json")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("answer.json")).unwrap();
+        assert!(crate::worker_finish::structured_answer(root, &text).is_err());
     }
 }

@@ -424,16 +424,9 @@ impl Store<'_> {
                 json!("supervisor exited before native history was sealed");
             self.provider_history(id, &attempt, &history)?;
         }
-        let mut outcome = match intent.status {
-            agent_run_domain::worker::FinishStatus::Done => {
-                agent_run_domain::domain::Outcome::success(row.runtime_session_id.clone())
-            }
-            agent_run_domain::worker::FinishStatus::Blocked => {
-                agent_run_domain::domain::Outcome::failure("worker_blocked")
-            }
-            agent_run_domain::worker::FinishStatus::Failed => {
-                agent_run_domain::domain::Outcome::failure("worker_failed")
-            }
+        let mut outcome = match intent.status.failure_kind() {
+            None => agent_run_domain::domain::Outcome::success(row.runtime_session_id.clone()),
+            Some(kind) => agent_run_domain::domain::Outcome::failure(kind),
         };
         outcome.runtime_session_id = row.runtime_session_id.clone();
         if self.cancel_pending(id)? {

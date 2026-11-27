@@ -107,6 +107,50 @@ fn seal_with_mode(root: &Path, relative: &Path, text: &str, system: bool) -> Res
     write(&parent.join(format!("{name}.proof.json")), &data)?;
     Ok(proof)
 }
+/// Name of the structured finish result published beside `answer.md`.
+pub const STRUCTURED_ANSWER: &str = "answer.json";
+/// Read bound of `answer.json`: 64 KiB of text expands at most sixfold under
+/// ASCII-escaped canonical JSON, plus field names.
+pub const MAX_STRUCTURED_ANSWER: usize = 1024 * 1024;
+
+/// Atomically writes the canonical structured result beside `answer.md`
+/// with the answer's private or group mode. It carries no proof sidecar: the
+/// sealed `answer.md` names its SHA-256, which [`read_structured`] checks.
+pub fn seal_structured(root: &Path, text: &str, system: bool) -> Result<()> {
+    if text.is_empty() || text.len() > MAX_STRUCTURED_ANSWER {
+        return Err(invalid("structured answer must be 1 byte to 1 MiB"));
+    }
+    let mode = if system { 0o660 } else { 0o600 };
+    Dir::open(root)?.write(Path::new(STRUCTURED_ANSWER), text.as_bytes(), mode)
+}
+
+/// Reads `answer.json` through a no-follow regular-file descriptor, bounded
+/// to [`MAX_STRUCTURED_ANSWER`], and returns it only when its SHA-256 equals
+/// `sha256` from an already verified `answer.md`.
+pub fn read_structured(root: &Path, sha256: &str) -> Result<String> {
+    let bytes = match Dir::open(root)?.read(Path::new(STRUCTURED_ANSWER), MAX_STRUCTURED_ANSWER) {
+        Ok(bytes) => bytes,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::AnswerIntegrity(
+                "structured answer artifact is missing".into(),
+            ));
+        }
+        Err(e) if is_path_escape(&e) => {
+            return Err(Error::PathEscape(
+                "structured answer must be a regular file".into(),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if fs::sha256(&bytes) != sha256 {
+        return Err(Error::AnswerIntegrity(
+            "structured answer hash does not match its answer".into(),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| Error::AnswerIntegrity("structured answer is not valid UTF-8".into()))
+}
+
 /// Read one optional no-follow metadata file bounded to
 /// [`MAX_METADATA_BYTES`]. Mirrors `_read_answer_metadata` (`verify.py:188-223`):
 /// `None` for a missing file; a symlinked/special file, an oversized file, or
@@ -320,4 +364,40 @@ pub fn error_only(text: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+/// Structured answer publication and digest-bound reads.
+mod structured_tests {
+    use super::*;
+
+    /// answer.json is written with the requested mode and read back only
+    /// when its bytes match the digest named by the verified answer.
+    #[test]
+    fn structured_answer_round_trips_only_with_its_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let text = r#"{"status":"done","summary":"x"}"#;
+        seal_structured(root, text, false).unwrap();
+        let mode = std::fs::metadata(root.join(STRUCTURED_ANSWER))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            read_structured(root, &fs::sha256(text.as_bytes())).unwrap(),
+            text
+        );
+        assert!(matches!(
+            read_structured(root, &"0".repeat(64)),
+            Err(Error::AnswerIntegrity(_))
+        ));
+        assert!(seal_structured(root, "", false).is_err());
+        std::fs::remove_file(root.join(STRUCTURED_ANSWER)).unwrap();
+        assert!(matches!(
+            read_structured(root, &fs::sha256(text.as_bytes())),
+            Err(Error::AnswerIntegrity(_))
+        ));
+    }
 }

@@ -1,5 +1,5 @@
 //! Delivery-only Bridge SDK adapter; no native caller or execution authority.
-use super::{Claim, Evidence, Payload as NoticePayload};
+use super::{Claim, Evidence, Payload as NoticePayload, VerifiedAnswer};
 use crate::{Result, error::invalid};
 use agent_run_config::config::BridgeDelivery;
 use agent_run_domain::bridge::{BridgeIntent, BridgeOwner};
@@ -13,7 +13,7 @@ use std::{io::Read, os::unix::fs::MetadataExt, path::Path, time::Duration};
 pub(super) fn intent(
     claim: &Claim,
     config: &BridgeDelivery,
-    answer: Option<&str>,
+    answer: Option<&VerifiedAnswer>,
 ) -> Result<BridgeIntent> {
     let (kind, message) = match &claim.payload {
         NoticePayload::Completion(n) => ("agent-run.completion", n.render_with_result(answer)?),

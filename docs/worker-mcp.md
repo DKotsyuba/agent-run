@@ -8,7 +8,13 @@ never advertises or dispatches operator tools such as `start`, `resume`, `cancel
 or `steer`.
 Configured work MCPs remain available according to the frozen role. Restricted research excludes configured work MCPs and adds only `save_report`; see [research permissions](research-permissions.md).
 
-An explicit-completion worker also receives `finish` and `health_reply`. For a
+An explicit-completion worker also receives `finish` and `health_reply`.
+`finish` accepts a plain summary or a structured result (status, summary,
+changes, checks, unverified, next and optional extras); see
+[explicit worker completion](worker-completion.md). The structured form
+is completion catalog v5. The broker still accepts v4 catalogs registered by
+workers launched before the upgrade, including health replies; their plain
+`finish` keeps working. For a
 planned service restart, its system message requests `finish` with `status: "done"`
 and an exact first-line marker followed by a summary for continuation. The broker
 accepts that marker only after the active restart has queued the worker's warning;

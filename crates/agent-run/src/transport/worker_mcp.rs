@@ -212,11 +212,8 @@ impl WorkerProxy {
                 name,
                 agent_run_domain::health::PingReply::validate,
             ),
-            WorkerTool::Finish => validated_input(
-                arguments,
-                name,
-                agent_run_domain::worker::FinishRequest::validate,
-            ),
+            WorkerTool::Finish => agent_run_domain::worker::FinishRequest::decode(arguments)
+                .and_then(|input| Ok(serde_json::to_value(input)?)),
             WorkerTool::Notify => validated_input(arguments, name, NotifyRequest::validate),
             WorkerTool::SaveReport => validated_input(
                 arguments,
@@ -880,6 +877,52 @@ mod tests {
         assert_eq!(calls[0].1["attempt_id"], "attempt");
         assert_eq!(calls[0].1["token"], proxy.token);
         assert!(!crate::dispatch::is_tool("notify_orchestrator"));
+    }
+
+    /// Plain and structured finish arguments reach the broker as the decoded
+    /// strict payload; a structured call without status, or with an unknown
+    /// field, is refused locally without echoing its values.
+    #[tokio::test]
+    async fn finish_forwards_plain_and_structured_results() {
+        let broker = Arc::new(Broker::default());
+        let proxy = WorkerProxy {
+            broker: broker.clone(),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
+            explicit_finish: true,
+            managed: false,
+            pool_tools: Arc::default(),
+            pooled: false,
+        };
+        let structured = json!({"status":"done","summary":"Done.","changes":"none",
+            "checks":[{"command":"cargo test","result":"passed"}],"unverified":[],"next":"none"});
+        let mut missing_status = structured.clone();
+        missing_status.as_object_mut().unwrap().remove("status");
+        let mut unknown = structured.clone();
+        unknown["secret_field"] = json!("hidden-value");
+        for refused in [missing_status, unknown] {
+            let result = proxy.call("finish", refused).await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("hidden-value")
+            );
+        }
+        assert!(broker.0.lock().unwrap().is_empty());
+        proxy.call("finish", json!({"summary":"Plain."})).await;
+        proxy.call("finish", structured.clone()).await;
+        let calls = broker.0.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1["tool"], "finish");
+        assert_eq!(
+            calls[0].1["input"],
+            json!({"summary":"Plain.","status":"done"})
+        );
+        assert_eq!(calls[1].1["input"], structured);
     }
 
     /// Launch-selected pooled discovery stays authoritative after two proof timeouts.

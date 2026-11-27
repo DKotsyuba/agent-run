@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+mod finish_report;
+pub use finish_report::{
+    ChangeKind, CheckResult, FileChange, FinishChanges, FinishCheck, MAX_STRUCTURED_BYTES,
+    MAX_STRUCTURED_SUMMARY, NoChanges, STRUCTURED_FOOTER, quote,
+};
+
 /// Private worker MCP server identity exposed only to launched subagents.
 pub const SERVER_NAME: &str = "agent_run_worker";
 
@@ -15,7 +21,11 @@ pub const CATALOG_METHOD: &str = "worker/catalog";
 /// contract. Its digest pins the exact pool-free surface of this binary.
 pub const WORKER_CATALOG_VERSION: u32 = 1;
 /// Reviewed explicit-completion catalog; ordinary/research catalogs stay v1.
-pub const FINISH_CATALOG_VERSION: u32 = 4;
+/// v5 adds the optional structured finish result; v4 stays recognized.
+pub const FINISH_CATALOG_VERSION: u32 = 5;
+/// Explicit-completion catalog versions that remain health-capable: the
+/// current one and v4, registered by workers launched before the upgrade.
+pub const HEALTH_CATALOG_VERSIONS: [u32; 2] = [4, FINISH_CATALOG_VERSION];
 
 /// Fingerprints the actual embedded private catalog served by this binary.
 /// The digest includes schemas/effect hints, not runtime capability material.
@@ -80,6 +90,8 @@ pub enum FinishStatus {
     /// The assigned task is complete, subject to answer and cleanup verification.
     #[default]
     Done,
+    /// Some of the task is complete; terminal but never successful.
+    Partial,
     /// Progress requires external input; terminal but never successful.
     Blocked,
     /// The worker declares failure; terminal but never successful.
@@ -88,20 +100,58 @@ pub enum FinishStatus {
 
 /// Exact final answer supplied by this attempt, not the last assistant text.
 /// Retries are keyed by the attempt and complete canonical payload; no caller
-/// agent identifier, filesystem path or optional authority is accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// agent identifier or optional authority is accepted. Every structured
+/// field is optional and omitted from JSON when absent, so a plain finish
+/// keeps its historical canonical bytes and receipt digest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinishRequest {
     /// Nonblank final answer, at most 64 KiB UTF-8; only newline/tab controls.
+    /// With structured fields: a 1–3 sentence summary of at most 4 KiB.
     pub summary: String,
-    /// Defaults to done. Blocked/failed retain the answer with non-success.
+    /// Defaults to done for a plain finish; required with structured fields.
+    /// Partial/blocked/failed retain the answer with non-success.
     #[serde(default)]
     pub status: FinishStatus,
+    /// Changed files, or the literal `"none"` / `"read_only"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<FinishChanges>,
+    /// Commit SHAs produced by the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits: Option<Vec<String>>,
+    /// Checks the worker ran or deliberately skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<FinishCheck>>,
+    /// Claims the worker could not verify; may be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified: Option<Vec<String>>,
+    /// What the orchestrator must do next, such as "commit and push" or "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// Checks that also fail on the base branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_failures: Option<Vec<String>>,
+    /// The blocker; required when a structured status is blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<String>,
+    /// Questions for the orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<Vec<String>>,
+    /// Paths of produced artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<String>>,
+    /// Optional free Markdown report within the shared 64 KiB budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 impl FinishRequest {
-    /// Reject blank, oversized or control-bearing answers before persistence.
+    /// Reject blank, oversized or control-bearing answers before persistence;
+    /// a structured result is bounded field by field and in total.
     pub fn validate(&self) -> Result<()> {
+        if self.is_structured() {
+            return self.validate_structured();
+        }
         bounded_text("finish summary", &self.summary, 65536)
     }
 
@@ -110,6 +160,11 @@ impl FinishRequest {
     pub fn validate_schema(&self, schema: Option<&serde_json::Map<String, Value>>) -> Result<()> {
         self.validate()?;
         if let Some(schema) = schema {
+            if self.is_structured() {
+                return Err(Error::Validation(
+                    "structured finish fields are unavailable with output_schema; put the schema JSON in summary".into(),
+                ));
+            }
             let validator = finish_schema(schema)?;
             let instance: Value = serde_json::from_str(&self.summary).map_err(|_| {
                 Error::Validation("finish summary must be JSON for output_schema".into())
@@ -146,10 +201,10 @@ pub struct FinishReceipt {
     pub duplicate: bool,
 }
 
-/// Current explicit-completion catalog: the ordinary (or research) worker
-/// tools followed by `health_reply` and `finish`. Legacy Run pool tools were
-/// removed; catalogs registered by earlier binaries are no longer recognized.
-pub fn finish_tools_json(research: bool) -> Vec<Value> {
+/// Frozen v4 explicit-completion catalog: the ordinary (or research) worker
+/// tools followed by `health_reply` and the plain `finish`. Used only to
+/// verify workers launched before structured finish; never served.
+fn finish_tools_json_v4(research: bool) -> Vec<Value> {
     let mut tools = if research {
         research_tools_json()
     } else {
@@ -177,6 +232,54 @@ pub fn finish_tools_json(research: bool) -> Vec<Value> {
     tools
 }
 
+/// Current v5 explicit-completion catalog: v4 with `finish` accepting the
+/// optional structured result. Legacy Run pool tools were removed.
+pub fn finish_tools_json(research: bool) -> Vec<Value> {
+    let mut tools = finish_tools_json_v4(research);
+    if let Some(finish) = tools.iter_mut().find(|tool| tool["name"] == "finish") {
+        *finish = structured_finish_tool();
+    }
+    tools
+}
+
+/// The v5 `finish` definition. `changes` uses a property-level `anyOf`, the
+/// same construct the operator catalog already serves to native hosts.
+fn structured_finish_tool() -> Value {
+    let line = |max: u32| serde_json::json!({"type":"string","minLength":1,"maxLength":max});
+    let list =
+        |max: u32, item: Value| serde_json::json!({"type":"array","maxItems":max,"items":item});
+    serde_json::json!({
+        "name":"finish",
+        "description":"End your current run with its final verified result. Ending a turn only waits for notifications; it does not finish. Call only when done, partial, blocked or failed. Prefer the structured result: status, a 1–3 sentence summary, changes (files and/or commits, or \"none\"/\"read_only\"), checks, unverified and next; optionally baseline_failures, blocked_on (required when blocked), questions, artifacts and a Markdown report. A plain summary alone is still accepted. All text shares a 64 KiB limit. The result is immutable. Retry exactly the same payload after an uncertain receipt; a different payload conflicts. The receipt acknowledges durable finish intent, not process cleanup or owner approval. Never include credentials.",
+        "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
+        "inputSchema":{"type":"object","additionalProperties":false,"required":["summary"],"properties":{
+            "summary":{"type":"string","minLength":1,"maxLength":65536,"description":"With structured fields: 1–3 sentences (at most 4096 bytes). Alone: the complete final report."},
+            "status":{"type":"string","enum":["done","partial","blocked","failed"],"default":"done","description":"Required with structured fields."},
+            "changes":{"description":"Changed files, or \"none\" / \"read_only\" when nothing changed.","anyOf":[
+                list(1000, serde_json::json!({"type":"object","additionalProperties":false,"required":["path","kind"],"properties":{
+                    "path":line(1024),
+                    "kind":{"type":"string","enum":["added","modified","deleted"]}
+                }})),
+                {"type":"string","enum":["none","read_only"]}
+            ]},
+            "commits":list(200, serde_json::json!({"type":"string","pattern":"^[0-9a-fA-F]{7,64}$"})),
+            "checks":list(200, serde_json::json!({"type":"object","additionalProperties":false,"required":["command","result"],"properties":{
+                "command":line(1024),
+                "result":{"type":"string","enum":["passed","failed","not_run"]},
+                "note":line(2048),
+                "evidence":{"type":"string","minLength":1,"maxLength":1024,"description":"Log or test-report path inside the workdir."}
+            }})),
+            "unverified":list(100, line(2048)),
+            "next":{"type":"string","minLength":1,"maxLength":1024,"description":"What the orchestrator must do, e.g. \"commit and push\", \"install\", \"decide X\" or \"none\"."},
+            "baseline_failures":list(100, line(2048)),
+            "blocked_on":line(4096),
+            "questions":list(50, line(2048)),
+            "artifacts":list(200, line(1024)),
+            "report":line(65536)
+        }}
+    })
+}
+
 /// Fingerprint the real mode/role-bound completion catalog, excluding secrets.
 pub fn finish_catalog_digest(research: bool) -> String {
     crate::canonical::sha256_hex(&serde_json::json!(finish_tools_json(research)), true)
@@ -186,7 +289,17 @@ pub fn finish_catalog_digest(research: bool) -> String {
 /// `health_reply` and `finish` only. A no-shell managed participant reaches
 /// its Pool through the pinned Agent Pool server.
 pub fn managed_tools_json() -> Vec<Value> {
-    finish_tools_json(false)
+    managed_subset(finish_tools_json(false))
+}
+
+/// Fingerprints the managed-role catalog, excluding secrets.
+pub fn managed_catalog_digest() -> String {
+    crate::canonical::sha256_hex(&serde_json::json!(managed_tools_json()), true)
+}
+
+/// Exactly the managed subset of a completion catalog.
+fn managed_subset(catalog: Vec<Value>) -> Vec<Value> {
+    catalog
         .into_iter()
         .filter(|tool| {
             tool["name"]
@@ -196,18 +309,30 @@ pub fn managed_tools_json() -> Vec<Value> {
         .collect()
 }
 
-/// Fingerprints the managed-role catalog, excluding secrets.
-pub fn managed_catalog_digest() -> String {
-    crate::canonical::sha256_hex(&serde_json::json!(managed_tools_json()), true)
+/// Frozen v4 managed catalog served before structured finish. Used only to
+/// verify v4 registrations and native inventories recorded from it.
+pub fn managed_tools_json_v4() -> Vec<Value> {
+    managed_subset(finish_tools_json_v4(false))
+}
+
+/// True for a frozen v4 explicit, explicit-research or managed digest.
+fn known_v4_catalog(digest: &str) -> bool {
+    let hash = |tools: Vec<Value>| crate::canonical::sha256_hex(&serde_json::json!(tools), true);
+    [false, true]
+        .into_iter()
+        .any(|research| hash(finish_tools_json_v4(research)) == digest)
+        || hash(managed_tools_json_v4()) == digest
 }
 
 /// Every catalog a worker of this binary may register: the ordinary and
-/// research catalogs at [`WORKER_CATALOG_VERSION`], and the explicit,
+/// research catalogs at [`WORKER_CATALOG_VERSION`], the explicit,
 /// explicit-research and managed completion catalogs at
-/// [`FINISH_CATALOG_VERSION`] (health-capable). Unknown digests never verify.
+/// [`FINISH_CATALOG_VERSION`], and their frozen v4 forms (all
+/// health-capable). Unknown digests never verify.
 pub fn known_worker_catalog(version: u32, digest: &str) -> bool {
     (version == WORKER_CATALOG_VERSION
         && (digest == worker_catalog_digest() || digest == research_catalog_digest()))
+        || (version == 4 && known_v4_catalog(digest))
         || (version == FINISH_CATALOG_VERSION
             && (digest == finish_catalog_digest(false)
                 || digest == finish_catalog_digest(true)
@@ -665,5 +790,104 @@ mod completion_catalog_tests {
             FINISH_CATALOG_VERSION,
             &"0".repeat(64)
         ));
+    }
+}
+
+#[cfg(test)]
+mod structured_catalog_tests {
+    use super::*;
+
+    /// v5 serves the structured finish schema while the exact v4 explicit,
+    /// research and managed fingerprints of already running workers verify.
+    #[test]
+    fn structured_catalog_keeps_v4_fingerprints() {
+        let hash =
+            |tools: Vec<Value>| crate::canonical::sha256_hex(&serde_json::json!(tools), true);
+        for (tools, pinned) in [
+            (
+                finish_tools_json_v4(false),
+                "97e9d56858614ed667bfbdb6a7180dccc997892e8b54ba94161ef846c33fc1fd",
+            ),
+            (
+                finish_tools_json_v4(true),
+                "97a860af56a486698c8857886f9e223d5a82b5ea3d76f404cc5f2e74dc144d91",
+            ),
+            (
+                managed_tools_json_v4(),
+                "34475a2d07c764d4b9ec12854f1c1005894f35b3587354bd6d00534c82ea869d",
+            ),
+        ] {
+            let digest = hash(tools);
+            assert_eq!(
+                digest, pinned,
+                "previous v4 catalog fingerprint must remain exact"
+            );
+            assert!(known_worker_catalog(4, &digest));
+            assert!(!known_worker_catalog(FINISH_CATALOG_VERSION, &digest));
+        }
+        for digest in [
+            finish_catalog_digest(false),
+            finish_catalog_digest(true),
+            managed_catalog_digest(),
+        ] {
+            assert!(known_worker_catalog(FINISH_CATALOG_VERSION, &digest));
+            assert!(!known_worker_catalog(4, &digest));
+        }
+        let finish = finish_tools_json(false)
+            .into_iter()
+            .find(|tool| tool["name"] == "finish")
+            .unwrap();
+        let properties = &finish["inputSchema"]["properties"];
+        assert_eq!(
+            finish["inputSchema"]["required"],
+            serde_json::json!(["summary"])
+        );
+        assert_eq!(
+            properties["status"]["enum"],
+            serde_json::json!(["done", "partial", "blocked", "failed"])
+        );
+        for field in [
+            "changes",
+            "commits",
+            "checks",
+            "unverified",
+            "next",
+            "baseline_failures",
+            "blocked_on",
+            "questions",
+            "artifacts",
+            "report",
+        ] {
+            assert!(properties.get(field).is_some(), "{field}");
+        }
+        assert_eq!(HEALTH_CATALOG_VERSIONS, [4, FINISH_CATALOG_VERSION]);
+    }
+
+    /// Structured fields are refused when an output schema governs the summary.
+    #[test]
+    fn output_schema_refuses_structured_fields() {
+        let schema = serde_json::json!({"type":"object"});
+        let schema = schema.as_object().unwrap();
+        let plain = FinishRequest {
+            summary: "{}".into(),
+            ..Default::default()
+        };
+        assert!(plain.validate_schema(Some(schema)).is_ok());
+        let structured = FinishRequest {
+            summary: "{}".into(),
+            next: Some("none".into()),
+            changes: Some(FinishChanges::Literal(NoChanges::None)),
+            checks: Some(vec![]),
+            unverified: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(structured.validate().is_ok());
+        assert!(
+            structured
+                .validate_schema(Some(schema))
+                .unwrap_err()
+                .to_string()
+                .contains("output_schema")
+        );
     }
 }

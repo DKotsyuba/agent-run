@@ -840,8 +840,7 @@ async fn worker_tool_call(
             Ok(json!({"accepted":true,"duplicate":duplicate}))
         }
         WorkerTool::Finish => {
-            let input: agent_run_domain::worker::FinishRequest = serde_json::from_value(call.input)
-                .map_err(|_| invalid("invalid finish arguments"))?;
+            let input = agent_run_domain::worker::FinishRequest::decode(call.input)?;
             let receipt = service
                 .lane("workers")?
                 .local_as(

@@ -824,21 +824,15 @@ fn recover_finish(store: &mut Store, expected: &Candidate, at: f64) -> Result<Op
     }
     let root = store.home.join("agents").join(row.id.as_str());
     agent_run_platform::fs::private_dir(&root)?;
+    crate::worker_finish::seal_structured(&root, &intent, false)?;
     let answer = agent_run_platform::verify::seal(
         &root,
         std::path::Path::new("answer.md"),
-        &intent.summary,
+        &intent.answer_text()?,
     )?;
-    let mut outcome = match intent.status {
-        agent_run_domain::worker::FinishStatus::Done => {
-            agent_run_domain::domain::Outcome::success(row.runtime_session_id.clone())
-        }
-        agent_run_domain::worker::FinishStatus::Blocked => {
-            agent_run_domain::domain::Outcome::failure("worker_blocked")
-        }
-        agent_run_domain::worker::FinishStatus::Failed => {
-            agent_run_domain::domain::Outcome::failure("worker_failed")
-        }
+    let mut outcome = match intent.status.failure_kind() {
+        None => agent_run_domain::domain::Outcome::success(row.runtime_session_id.clone()),
+        Some(kind) => agent_run_domain::domain::Outcome::failure(kind),
     };
     outcome.runtime_session_id = row.runtime_session_id.clone();
     if store.cancel_pending(&row.id)? {

@@ -500,14 +500,15 @@ fn codex_0_167_0_inventory_is_exactly_the_enabled_tools() {
         .unwrap()
         .remove("pool_vote");
     assert!(verify_inventory(&missing, &allowed).is_err());
-    // The real managed worker served exactly the domain's completion catalog.
+    // The real managed worker served exactly the domain's completion catalog
+    // of its time: the frozen v4 one, recorded before structured finish.
     let worker = status["data"]
         .as_array()
         .unwrap()
         .iter()
         .find(|server| server["name"] == WORKER)
         .unwrap();
-    let catalog = agent_run_domain::worker::managed_tools_json();
+    let catalog = agent_run_domain::worker::managed_tools_json_v4();
     assert_eq!(worker["tools"].as_object().unwrap().len(), catalog.len());
     for tool in catalog {
         let served = &worker["tools"][tool["name"].as_str().unwrap()];

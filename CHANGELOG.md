@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Accept an optional structured worker `finish` result: `status` (adds
+  `partial`, reported as `worker_partial`), a short summary, changes or
+  commits, checks with optional workdir evidence, unverified items, `next`
+  and optional baseline failures, blocker, questions, artifacts and report.
+  Fields are bounded within the 64 KiB summary limit and screened for launch
+  secrets. A plain summary keeps its historical payload and answer.
+- Seal structured results as `answer.json` beside a rendered `answer.md`
+  that names its digest. Completion notices add a compact worker-result line
+  and use the result summary as the excerpt.
+- Serve worker completion catalog v5 while keeping v4 catalogs of already
+  running workers registrable and health-capable.
+
 ## 0.36.0
 
 - Preflight worker directory, Git metadata and Unix socket requirements before

@@ -634,6 +634,7 @@ fn restart_does_not_resume_a_previously_finished_agent() {
     let finish = FinishRequest {
         summary: "Finished work".into(),
         status: FinishStatus::Done,
+        ..Default::default()
     };
     store
         .accept_worker_finish(&agent, "attempt", &token, &finish, 2.0, FinishGuard::Clean)
@@ -745,6 +746,7 @@ fn restart_does_not_resume_work_finished_normally() {
     let invalid = FinishRequest {
         summary: "not JSON".into(),
         status: FinishStatus::Done,
+        ..Default::default()
     };
     assert!(
         store
@@ -754,6 +756,7 @@ fn restart_does_not_resume_work_finished_normally() {
     let finish = FinishRequest {
         summary: "{\"done\":true}".into(),
         status: FinishStatus::Done,
+        ..Default::default()
     };
     store
         .accept_worker_finish(&agent, "attempt", &token, &finish, 3.0, FinishGuard::Clean)
@@ -1069,6 +1072,7 @@ fn restart_finish_does_not_publish_a_completion() {
     let mut finish = FinishRequest {
         summary: "Work in progress".into(),
         status: FinishStatus::Done,
+        ..Default::default()
     };
     assert!(
         store

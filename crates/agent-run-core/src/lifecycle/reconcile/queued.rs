@@ -246,7 +246,9 @@ fn prepare_finish(home: &Path, expected: &Candidate) -> Result<FinishPreparation
     };
     let root = store.home.join("agents").join(row.id.as_str());
     agent_run_platform::fs::private_dir(&root)?;
-    let answer = agent_run_platform::verify::seal(&root, Path::new("answer.md"), &intent.summary)?;
+    crate::worker_finish::seal_structured(&root, &intent, false)?;
+    let answer =
+        agent_run_platform::verify::seal(&root, Path::new("answer.md"), &intent.answer_text()?)?;
     Ok(FinishPreparation::Ready(
         Box::new(ops::RecoverFinish {
             expected: ownership(expected),

@@ -657,9 +657,10 @@ impl Store<'_> {
         Ok(covered && self.health_catalog_ready(attempt)?)
     }
 
-    /// Only the current explicit health-capable catalog can answer challenges.
+    /// Only a health-capable explicit catalog (current or v4) can answer challenges.
     fn health_catalog_ready(&self, attempt: &str) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT pool_catalog_version=? AND length(pool_catalog_digest)=64 FROM worker_capabilities WHERE attempt_id=?",params![agent_run_domain::worker::FINISH_CATALOG_VERSION,attempt],|r|r.get::<_,Option<bool>>(0))?.unwrap_or(false))
+        let [previous, current] = agent_run_domain::worker::HEALTH_CATALOG_VERSIONS;
+        Ok(self.conn.query_row("SELECT pool_catalog_version IN (?,?) AND length(pool_catalog_digest)=64 FROM worker_capabilities WHERE attempt_id=?",params![previous,current,attempt],|r|r.get::<_,Option<bool>>(0))?.unwrap_or(false))
     }
 
     /// The latest real running boundary precedes these tool facts. Critical

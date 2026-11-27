@@ -74,7 +74,7 @@ impl Store<'_> {
         guard: FinishGuard,
     ) -> Result<FinishReceipt> {
         input.validate()?;
-        if input.summary.contains(token) || !at.is_finite() || at < 0.0 {
+        if input.screen(|text| text.contains(token)) || !at.is_finite() || at < 0.0 {
             return Err(invalid("invalid finish payload"));
         }
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
@@ -120,11 +120,8 @@ impl Store<'_> {
         if restart.is_none() {
             input.validate_schema(request.output_schema.as_ref())?;
         }
-        let payload = String::from_utf8(agent_run_domain::canonical::dumps(
-            &serde_json::to_value(input)?,
-            true,
-        ))
-        .map_err(|_| invalid("finish serialization failed"))?;
+        input.validate_workdir(&request.workdir)?;
+        let payload = input.canonical_payload()?;
         let digest = sha256(payload.as_bytes());
         let existing: Option<(Option<String>, Option<String>)> = tx
             .query_row(

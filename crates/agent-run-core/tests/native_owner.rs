@@ -225,6 +225,7 @@ sleep 1
                 &FinishRequest {
                     summary: "FINAL".into(),
                     status: FinishStatus::Done,
+                    ..Default::default()
                 },
                 agent_run_domain::domain::now(),
                 agent_run_domain::worker::FinishGuard::Clean,
@@ -369,6 +370,7 @@ esac; done"#
                 &FinishRequest {
                     summary: "FINAL".into(),
                     status: FinishStatus::Done,
+                    ..Default::default()
                 },
                 agent_run_domain::domain::now(),
                 agent_run_domain::worker::FinishGuard::Clean,

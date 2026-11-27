@@ -217,7 +217,9 @@ impl WriterHandle {
         let guards = self.finish_guards.lock().unwrap_or_else(|e| e.into_inner());
         match guards.get(&(op.execution.clone(), op.attempt.clone())) {
             None => FinishGuard::Unavailable,
-            Some(guard) if guard.redactor.contains_secret(&op.input.summary) => FinishGuard::Secret,
+            Some(guard) if op.input.screen(|text| guard.redactor.contains_secret(text)) => {
+                FinishGuard::Secret
+            }
             Some(_) => FinishGuard::Clean,
         }
     }
