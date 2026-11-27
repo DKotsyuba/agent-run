@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Discover the operator MCP tool list from the broker and report frontend version
+  skew with reconnection guidance and `version --check-frontend`.
 - Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
   requested model is usable again. Completion notices advise resuming the same
   agent after capacity returns.

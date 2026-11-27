@@ -142,6 +142,11 @@ pub trait CliService: Send + Sync {
 pub trait CliBroker: Send + Sync {
     /// Send one method and JSON object to the resident broker.
     fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a>;
+
+    /// Read optional frontend discovery metadata through the same authenticated endpoint.
+    fn mcp_info(&self) -> CliFuture<'_> {
+        Box::pin(async { Err(crate::Error::BrokerUnavailable) })
+    }
 }
 
 impl CliService for Service {
@@ -234,6 +239,10 @@ impl CliBroker for SocketBroker {
     fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
         Box::pin(transport::socket::client(&self.home, method, params))
     }
+
+    fn mcp_info(&self) -> CliFuture<'_> {
+        Box::pin(transport::mcp::read_broker_info(self))
+    }
 }
 
 /// One-shot broker calls through an explicitly selected operator socket.
@@ -255,6 +264,10 @@ impl CliBroker for OperatorBroker {
             method,
             params,
         ))
+    }
+
+    fn mcp_info(&self) -> CliFuture<'_> {
+        Box::pin(transport::mcp::read_broker_info(self))
     }
 }
 
@@ -314,6 +327,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Init,
+    /// Print the frontend version or compare it with the resident broker.
+    Version {
+        /// Report both versions as JSON. Exit 1 when they differ.
+        #[arg(long)]
+        check_frontend: bool,
+    },
     /// Gracefully restart the service and continue its active agents.
     Restart(Restart),
     /// Read-only local diagnostics; emits one JSON report and exits 0/2/3.
@@ -1765,6 +1784,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let home = fs::home(cli.home.clone())?;
+    if matches!(cli.command, Command::Version { .. }) {
+        return run_with(cli, CliDependencies::production(home)).await;
+    }
     if let Command::LaunchWorker { socket } = &cli.command {
         crate::system::serve_worker(&home, socket).await?;
         return Ok(0);
@@ -1806,6 +1828,7 @@ fn client_command(command: &Command) -> bool {
     matches!(
         command,
         Command::Start(_)
+            | Command::Version { .. }
             | Command::StartBatch { .. }
             | Command::BatchReceipt { .. }
             | Command::Status { .. }
@@ -2388,6 +2411,16 @@ async fn run_client_command(
     home: PathBuf,
 ) -> Result<i32> {
     match command {
+        Command::Version { check_frontend } => {
+            if check_frontend {
+                let report = transport::mcp::BrokerInfo::read(broker.as_ref())
+                    .await?
+                    .version_report();
+                (output)(&report)?;
+                return Ok(i32::from(report["matches"] == false));
+            }
+            (text_output)(concat!("agent-run ", env!("CARGO_PKG_VERSION"), "\n"))?;
+        }
         Command::Restart(args) => return crate::restart::run(broker.as_ref(), &output, args).await,
         Command::Hook { command } => {
             let (bind, transport) = match command {

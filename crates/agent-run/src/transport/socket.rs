@@ -1065,6 +1065,7 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
         || LINEAGE_HOLD_METHODS.contains(&method)
         || [
             "tools",
+            super::mcp::BROKER_INFO_METHOD,
             "ping",
             "wait",
             agent_run_domain::worker::METHOD,
@@ -1088,9 +1089,22 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
             SocketAccess::SystemGroup => true,
         };
     let response = if !known {
-        err(id, -32601, "method not found", None)
+        err(
+            id,
+            -32601,
+            "method not found",
+            Some(json!({"product_version": env!("CARGO_PKG_VERSION")})),
+        )
     } else {
-        let result = if method == "_runtime_retention" {
+        let result = if method == super::mcp::BROKER_INFO_METHOD {
+            if params.as_object().is_some_and(serde_json::Map::is_empty) {
+                Ok(
+                    json!({"product_version": env!("CARGO_PKG_VERSION"), "tools": dispatch::tools()}),
+                )
+            } else {
+                Err(crate::error::invalid("MCP discovery takes no parameters"))
+            }
+        } else if method == "_runtime_retention" {
             runtime_retention_config(service, &params)
         } else if method == "_system_policy" {
             system_policy(service, params)
@@ -2581,16 +2595,22 @@ fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
     if object.get("code").and_then(Value::as_i64) == Some(-32602) && !typed {
         return Error::Validation(message);
     }
-    let (broker_error_code, broker_error_data) = object
+    let (mut broker_error_code, broker_error_data) = object
         .get("data")
         .and_then(Value::as_object)
         .map(|data| {
             (
-                data.get("code").and_then(Value::as_str).map(str::to_owned),
+                data.get("code")
+                    .and_then(Value::as_str)
+                    .filter(|code| *code != super::mcp::METHOD_NOT_FOUND)
+                    .map(str::to_owned),
                 Some(Value::Object(data.clone())),
             )
         })
         .unwrap_or((None, None));
+    if object.get("code").and_then(Value::as_i64) == Some(-32601) {
+        broker_error_code = Some(super::mcp::METHOD_NOT_FOUND.into());
+    }
     Error::Broker {
         message,
         broker_error_code,
