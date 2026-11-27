@@ -99,10 +99,21 @@ fn accept(listener: &UnixListener) -> std::os::unix::net::UnixStream {
 
 /// Serve one connection per response, recording complete JSON-RPC requests.
 fn serve(socket: &Path, responses: Vec<Value>) -> thread::JoinHandle<Vec<Value>> {
+    serve_replies(
+        socket,
+        responses
+            .into_iter()
+            .map(|result| json!({"result":result}))
+            .collect(),
+    )
+}
+
+/// Serve complete result or error payloads while filling in each request ID.
+fn serve_replies(socket: &Path, responses: Vec<Value>) -> thread::JoinHandle<Vec<Value>> {
     let listener = UnixListener::bind(socket).unwrap();
     thread::spawn(move || {
         let mut requests = Vec::new();
-        for result in responses {
+        for mut response in responses {
             let mut stream = accept(&listener);
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -111,12 +122,9 @@ fn serve(socket: &Path, responses: Vec<Value>) -> thread::JoinHandle<Vec<Value>>
             let mut line = String::new();
             input.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
-            writeln!(
-                stream,
-                "{}",
-                json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
-            )
-            .unwrap();
+            response["jsonrpc"] = json!("2.0");
+            response["id"] = request["id"].clone();
+            writeln!(stream, "{response}").unwrap();
             requests.push(request);
         }
         requests
@@ -847,11 +855,16 @@ impl Mcp {
         writeln!(input, "{message}").unwrap();
         input.flush().unwrap();
         message.get("id")?;
+        Some(self.read())
+    }
+
+    /// Read one complete reply or server notification.
+    fn read(&self) -> Value {
         let line = self
             .receive
             .recv_timeout(Duration::from_secs(10))
             .expect("MCP reply deadline");
-        Some(serde_json::from_str(&line).unwrap())
+        serde_json::from_str(&line).unwrap()
     }
 }
 
@@ -873,12 +886,19 @@ fn operator_mcp_initializes_and_forwards_to_broker() {
     let fixture = Fixture::new();
     let server = serve(
         &fixture.socket,
-        vec![json!({"topic":"index","text":"operator fixture"})],
+        vec![
+            json!({"product_version":env!("CARGO_PKG_VERSION"),"tools":agent_run::dispatch::tools()}),
+            json!({"topic":"index","text":"operator fixture"}),
+        ],
     );
     let mut mcp = Mcp::start(&fixture);
     let initialization = mcp.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
         "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}})).unwrap();
     assert_eq!(initialization["result"]["serverInfo"]["name"], "agent-run");
+    assert_eq!(
+        initialization["result"]["capabilities"]["tools"]["listChanged"],
+        false
+    );
     mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
     let reply = mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call", "params":{"name":"doc","arguments":{"topic":"index"}}})).unwrap();
     assert_ne!(reply["result"]["isError"], true, "{reply}");
@@ -890,9 +910,151 @@ fn operator_mcp_initializes_and_forwards_to_broker() {
     );
     drop(mcp);
     let calls = server.join().unwrap();
-    assert_eq!(calls[0]["method"], "doc");
-    assert_eq!(calls[0]["params"], json!({"topic":"index"}));
+    assert_eq!(calls[0]["method"], "_mcp_info");
+    assert_eq!(calls[1]["method"], "doc");
+    assert_eq!(calls[1]["params"], json!({"topic":"index"}));
     fixture.assert_homes_absent();
+}
+
+/// Skew replaces the cached tool list and diagnoses removed tools without dispatching them.
+#[test]
+fn operator_mcp_serves_fresh_tools_and_notifies_once() {
+    let fixture = Fixture::new();
+    let catalog: Vec<_> = agent_run::dispatch::tools()
+        .into_iter()
+        .filter(|tool| tool["name"] != "start")
+        .collect();
+    let server = serve(
+        &fixture.socket,
+        vec![json!({"product_version":"0.0.0-skew-fixture","tools":catalog})],
+    );
+    let mut mcp = Mcp::start(&fixture);
+    let init = mcp.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).unwrap();
+    assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], true);
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    assert_eq!(
+        mcp.read(),
+        json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+    );
+    let list = mcp
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .unwrap();
+    assert_eq!(list["result"]["tools"], json!(catalog));
+
+    for (id, name) in [(3, "start"), (4, "limits")] {
+        let reply = mcp
+            .send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name}}))
+            .unwrap();
+        assert_eq!(reply["id"], id);
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            concat!(
+                "agent-run broker is 0.0.0-skew-fixture, this MCP frontend is ",
+                env!("CARGO_PKG_VERSION"),
+                ": reconnect the agent-run MCP server (Claude Code: /mcp → reconnect; Codex: restart the session)"
+            )
+        );
+    }
+    assert_eq!(server.join().unwrap()[0]["method"], "_mcp_info");
+    fixture.assert_homes_absent();
+}
+
+/// Installers get both versions and a distinct status without opening local state.
+#[test]
+fn operator_version_checks_frontend_against_broker() {
+    let fixture = Fixture::new();
+    let server = serve(
+        &fixture.socket,
+        vec![
+            json!({"product_version":"0.0.0-skew-fixture"}),
+            json!({"product_version":env!("CARGO_PKG_VERSION")}),
+        ],
+    );
+    for (version, code) in [("0.0.0-skew-fixture", 1), (env!("CARGO_PKG_VERSION"), 0)] {
+        let output = fixture
+            .operator(Some(uid()))
+            .args(["version", "--check-frontend"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            json!({"frontend_version":env!("CARGO_PKG_VERSION"),"broker_version":version,"matches":code == 0})
+        );
+    }
+    assert!(
+        server
+            .join()
+            .unwrap()
+            .iter()
+            .all(|call| call["method"] == "_mcp_info")
+    );
+    fixture.assert_homes_absent();
+}
+
+/// Pre-catalog brokers still report their product version through capabilities.
+#[test]
+fn operator_version_falls_back_to_legacy_capabilities() {
+    let fixture = Fixture::new();
+    let server = serve_replies(
+        &fixture.socket,
+        vec![
+            json!({"error":{"code":-32601,"message":"method not found"}}),
+            json!({"result":{"product":"agent-run","version":env!("CARGO_PKG_VERSION")}}),
+        ],
+    );
+    let report = output_json(
+        fixture.operator(Some(uid())),
+        &["version", "--check-frontend"],
+    );
+    assert_eq!(report["matches"], true);
+    let calls = server.join().unwrap();
+    assert_eq!(calls[0]["method"], "_mcp_info");
+    assert_eq!(calls[1]["method"], "capabilities");
+}
+
+/// A broker upgrade inside the cache window still diagnoses the rejected tool.
+#[test]
+fn operator_mcp_rejected_rpc_reports_current_broker_version() {
+    let fixture = Fixture::new();
+    let server = serve_replies(
+        &fixture.socket,
+        vec![
+            json!({"result":{"product_version":env!("CARGO_PKG_VERSION"),"tools":agent_run::dispatch::tools()}}),
+            json!({"error":{"code":-32601,"message":"method not found","data":{"product_version":"0.0.0-skew-fixture"}}}),
+            json!({"result":{"product_version":"0.0.0-skew-fixture","tools":[]}}),
+        ],
+    );
+    let mut mcp = Mcp::start(&fixture);
+    let init = mcp.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).unwrap();
+    assert_eq!(
+        init["result"]["capabilities"]["tools"]["listChanged"],
+        false
+    );
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    // The server sends the list invalidation before returning the rejected call.
+    let first = mcp
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"doc"}}))
+        .unwrap();
+    assert_eq!(first["method"], "notifications/tools/list_changed");
+    let reply = mcp.read();
+    assert_eq!(reply["result"]["isError"], true);
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("agent-run broker is 0.0.0-skew-fixture, this MCP frontend is"));
+    assert!(!text.contains("method not found"));
+    let list = mcp
+        .send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))
+        .unwrap();
+    assert_eq!(list["result"]["tools"], json!([]));
+    let calls = server.join().unwrap();
+    assert_eq!(calls[0]["method"], "_mcp_info");
+    assert_eq!(calls[1]["method"], "doc");
+    assert_eq!(calls[2]["method"], "_mcp_info");
 }
 
 /// The listener's group and path must be paired and cannot replace the private socket.

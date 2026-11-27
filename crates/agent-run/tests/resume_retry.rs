@@ -26,10 +26,10 @@ fn command(home: &Path) -> Command {
 }
 
 /// Lose the first acknowledgement and return the same durable execution on retry.
-/// Every accepted frame must retain the caller's exact resume intent and key.
-async fn lost_reply(listener: UnixListener, supplied: Option<&str>) {
+/// The MCP discovery exchange is separate from the two exact resume attempts.
+async fn lost_reply(listener: UnixListener, supplied: Option<&str>, mcp: bool) {
     let mut original = None;
-    for attempt in 0..2 {
+    for attempt in if mcp { -1..2 } else { 0..2 } {
         let (stream, _) = listener.accept().await.unwrap();
         let (input, mut output) = stream.into_split();
         let request: Value = serde_json::from_slice(
@@ -39,6 +39,19 @@ async fn lost_reply(listener: UnixListener, supplied: Option<&str>) {
                 .unwrap(),
         )
         .unwrap();
+        if attempt == -1 {
+            assert_eq!(request["method"], "_mcp_info");
+            frame::write(
+                &mut output,
+                &json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                    "product_version":env!("CARGO_PKG_VERSION"),"tools":agent_run::dispatch::tools()
+                }}),
+                socket::MAX_FRAME,
+            )
+            .await
+            .unwrap();
+            continue;
+        }
         assert_eq!(request["method"], "resume");
         let key = request["params"]["request_id"].as_str().unwrap();
         assert!(!key.is_empty());
@@ -79,7 +92,7 @@ async fn cli_and_mcp_resume_keep_one_intent_after_lost_acknowledgement() {
                 )
                 .unwrap();
             let listener = UnixListener::bind(home.path().join("api.sock")).unwrap();
-            let server = lost_reply(listener, supplied);
+            let server = lost_reply(listener, supplied, mcp);
             let client = async {
                 let mut command = command(home.path());
                 if mcp {

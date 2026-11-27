@@ -10,7 +10,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   guidance in completion notices.
 - Add an exact `agent_id` list filter and optional `expected_sequence` resume
   fence. A stale fence returns `sequence_mismatch` with the current status and sequence.
-
+- Discover the operator MCP tool list from the broker and report frontend version
+  skew with reconnection guidance and `version --check-frontend`.
 - Release quota-exhaustion cooldowns when fresh Agent Quota evidence shows the
   requested model is usable again. Completion notices advise resuming the same
   agent after capacity returns.

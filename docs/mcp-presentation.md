@@ -137,3 +137,27 @@ invalid/unknown requests, cancellation notifications and EOF. Cancellation
 after durable admission is separately tested with an injected broker. These
 checks do not establish real-engine/host qualification or release acceptance;
 the coherent native gate and exact release/host acceptance remain separate.
+
+## Broker version and tool discovery
+
+The operator MCP frontend queries the broker's product version and MCP catalog
+together at initialization through the authenticated Unix socket. Before
+`tools/list` and `tools/call`, it refreshes the snapshot at most once every 30
+seconds. Discovery uses the broker's catalog when available, then the last known
+snapshot or the compiled catalog. For older brokers that lack `_mcp_info`, the
+frontend reads the version from `capabilities` and uses its compiled catalog.
+
+If the versions differ at initialization, the frontend advertises
+`tools.listChanged: true`. It sends `notifications/tools/list_changed` once per
+session after detecting skew, including upgrades detected after initialization.
+Calls to removed tools return both product versions and reconnection guidance.
+If a rejection proves the broker changed during the cache window, the next list
+request refreshes the catalog immediately.
+Tools introduced by a newer broker may require reconnecting with a matching
+frontend to get their argument handling and result presentation.
+
+Run `agent-run version --check-frontend` against the same socket used by the
+frontend. The JSON includes `frontend_version`, `broker_version` and `matches`.
+Matching versions exit 0, skew exits 1, and an unavailable version returns a
+command error. Pool, Quota and Stats frontends can mirror these behaviors with
+their own product versions, broker catalogs and reconnection guidance.
