@@ -56,6 +56,8 @@ pub enum MachineCode {
     AnswerIntegrityError,
     /// The requested receipt no longer identifies the current execution.
     ExecutionChanged,
+    /// The latest execution does not match a resume precondition.
+    SequenceMismatch,
     /// The current answer digest differs from the caller's required fence.
     AnswerHashMismatch,
     /// The current execution has no recorded sealed answer.
@@ -93,6 +95,7 @@ impl MachineCode {
             Self::BatchOutcomeUnknown => "BatchOutcomeUnknown",
             Self::AnswerIntegrityError => "AnswerIntegrityError",
             Self::ExecutionChanged => "ExecutionChanged",
+            Self::SequenceMismatch => "sequence_mismatch",
             Self::AnswerHashMismatch => "AnswerHashMismatch",
             Self::AnswerUnavailable => "AnswerUnavailable",
             Self::TranscriptExportAborted => "TranscriptExportAborted",
@@ -103,7 +106,7 @@ impl MachineCode {
     }
 
     /// Every public machine code, in declaration order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::SelectionStale,
         Self::SelectionBusy,
         Self::NoEligibleAccount,
@@ -123,6 +126,7 @@ impl MachineCode {
         Self::BatchOutcomeUnknown,
         Self::AnswerIntegrityError,
         Self::ExecutionChanged,
+        Self::SequenceMismatch,
         Self::AnswerHashMismatch,
         Self::AnswerUnavailable,
         Self::TranscriptExportAborted,
@@ -247,6 +251,14 @@ pub enum Error {
     /// Current execution differs from the required sequence receipt.
     #[error("current execution differs from the required sequence")]
     ExecutionChanged,
+    /// The latest execution changed before admission.
+    #[error("latest execution is sequence {latest_sequence} with status {}; inspect list_agents before retrying resume", .latest_status.as_str())]
+    SequenceMismatch {
+        /// Latest observed lineage sequence.
+        latest_sequence: u32,
+        /// Recorded status of that execution.
+        latest_status: crate::domain::Status,
+    },
     /// Current sealed digest differs from the required answer hash.
     #[error("current answer differs from the required sha256")]
     AnswerHashMismatch,
@@ -371,6 +383,26 @@ impl Error {
                 ..
             } if code == MachineCode::PreconditionFailed.as_str() => {
                 serde_json::from_value(data.get("reason")?.clone()).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts the latest known execution from a typed resume refusal.
+    pub fn sequence_mismatch(&self) -> Option<(u32, crate::domain::Status)> {
+        match self {
+            Self::SequenceMismatch {
+                latest_sequence,
+                latest_status,
+            } => Some((*latest_sequence, *latest_status)),
+            Self::Broker {
+                broker_error_code: Some(code),
+                broker_error_data: Some(data),
+                ..
+            } if code == MachineCode::SequenceMismatch.as_str() => {
+                let sequence = u32::try_from(data.get("latest_sequence")?.as_u64()?).ok()?;
+                let status = data.get("latest_status")?.as_str()?.parse().ok()?;
+                (sequence > 0).then_some((sequence, status))
             }
             _ => None,
         }
@@ -516,6 +548,7 @@ impl Error {
             Self::BatchOutcomeUnknown { .. } => MachineCode::BatchOutcomeUnknown,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
             Self::ExecutionChanged => MachineCode::ExecutionChanged,
+            Self::SequenceMismatch { .. } => MachineCode::SequenceMismatch,
             Self::AnswerHashMismatch => MachineCode::AnswerHashMismatch,
             Self::AnswerUnavailable => MachineCode::AnswerUnavailable,
             Self::TranscriptExportAborted(_) => MachineCode::TranscriptExportAborted,

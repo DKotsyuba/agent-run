@@ -180,11 +180,13 @@ impl crate::service::Service {
     /// verifies the request fingerprint, native identity, cleanup and unique
     /// child transaction; none of those guards is bypassed here. A conflicting
     /// request id or a pinned run from another lineage fails without a launch.
+    /// An expected sequence pins the latest parent and refuses stale work.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_public(
         &self,
         agent_id: &AgentId,
         run_id: Option<&AgentId>,
+        expected_sequence: Option<std::num::NonZeroU32>,
         task: String,
         request_id: Option<String>,
         display_name: Option<String>,
@@ -194,7 +196,17 @@ impl crate::service::Service {
     ) -> Result<Value> {
         let parent = {
             let store = Store::open(&self.home)?;
-            let selected = resolve(&store, agent_id, run_id)?;
+            let selected = if let Some(expected) = expected_sequence {
+                let latest = checked_resume_tip(&store, agent_id, expected)?;
+                if run_id.is_some_and(|id| id != &latest.id) {
+                    return Err(invalid(
+                        "run_id must select the latest execution when expected_sequence is supplied",
+                    ));
+                }
+                latest
+            } else {
+                resolve(&store, agent_id, run_id)?
+            };
             if let Some(chat) = pool_chat {
                 crate::pool_chat::assert_seat(&store.conn, &selected.root_agent_id, chat)?;
             }
@@ -203,7 +215,12 @@ impl crate::service::Service {
             if orchestrator.is_some() {
                 replay_request.orchestrator = orchestrator.clone();
             }
-            match store.replay_request(&replay_request)? {
+            let replay = if expected_sequence.is_none() {
+                store.replay_request(&replay_request)?
+            } else {
+                None
+            };
+            match replay {
                 Some(previous) => {
                     let parent_id = previous.parent_agent_id.ok_or(Error::Conflict)?;
                     if previous.root_agent_id != selected.root_agent_id
@@ -216,8 +233,10 @@ impl crate::service::Service {
                 None => selected,
             }
         };
-        admission(
-            self.resume_for(
+        // Both admission paths transact against this exact parent and allow
+        // only one child. A concurrent winner cannot redirect this resume.
+        let outcome = self
+            .resume_for(
                 &parent.id,
                 task,
                 request_id,
@@ -226,7 +245,38 @@ impl crate::service::Service {
                 None,
                 recover_after_crash,
             )
-            .await?,
-        )
+            .await;
+        if let Err(error) = &outcome
+            && let Some(expected) = expected_sequence
+            && matches!(
+                error,
+                Error::Conflict
+                    | Error::Validation(_)
+                    | Error::ExecutionChanged
+                    | Error::Transition(_)
+            )
+            && let Ok(store) = Store::open(&self.home)
+            && let Err(error @ Error::SequenceMismatch { .. }) =
+                checked_resume_tip(&store, &parent.root_agent_id, expected)
+        {
+            return Err(error);
+        }
+        admission(outcome?)
     }
+}
+
+/// Select the exact lineage tip subject to a caller's sequence assertion.
+fn checked_resume_tip(
+    store: &Store,
+    agent_id: &AgentId,
+    expected: std::num::NonZeroU32,
+) -> Result<Record> {
+    let latest = resolve(store, agent_id, None)?;
+    if latest.sequence != expected.get() {
+        return Err(Error::SequenceMismatch {
+            latest_sequence: latest.sequence,
+            latest_status: latest.status,
+        });
+    }
+    Ok(latest)
 }

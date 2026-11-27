@@ -619,6 +619,8 @@ impl StorageRejection {
             Error::ExecutionChanged => (RejectCode::ExecutionChanged, error.to_string()),
             Error::AnswerHashMismatch => (RejectCode::AnswerHashMismatch, error.to_string()),
             Error::AnswerUnavailable => (RejectCode::AnswerUnavailable, error.to_string()),
+            // This refusal is produced by the broker outside the writer.
+            Error::SequenceMismatch { .. } => (RejectCode::Conflict, error.to_string()),
             // Exact export is a read-only API, never an admitted writer operation.
             // Refuse an accidental writer use without persisting transcript data.
             Error::TranscriptExportAborted(_) => (

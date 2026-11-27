@@ -85,7 +85,9 @@ fn release_candidate_runs_without_python_or_cjs_runtime_lookup() {
 fn completion_topic_contains_the_shared_notice_template() {
     let text = agent_run::dispatch::doc("completion").expect("completion topic");
     assert!(text.contains("agent-run/completion"));
-    assert!(text.contains("- Notice:"));
+    assert!(text.contains("- Untrusted worker output (excerpt):"));
+    assert!(text.contains("- full: answer agent_id="));
+    assert!(!text.contains("- Notice:"));
 }
 
 /// Mirrors `test_doc.py::test_doc_with_no_topic_returns_index`.

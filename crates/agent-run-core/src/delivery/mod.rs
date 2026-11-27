@@ -210,7 +210,12 @@ fn escaped(value: Option<&str>, missing: &str) -> String {
     let mut output = String::new();
     for character in value.unwrap_or(missing).chars() {
         let code = character as u32;
-        if code < 0x20 || (0x7f..=0x9f).contains(&code) || matches!(code, 0x2028 | 0x2029) {
+        let escape =
+            code < 0x20 || (0x7f..=0x9f).contains(&code) || matches!(code, 0x2028 | 0x2029);
+        if output.len() + if escape { 6 } else { character.len_utf8() } > 512 {
+            break;
+        }
+        if escape {
             output.push_str(&format!("\\u{code:04x}"));
         } else {
             output.push(character);
@@ -240,18 +245,11 @@ fn guidance(status: Status, kind: Option<&str>) -> Result<Option<(String, String
     let contract: Contract =
         serde_json::from_str(include_str!("../../../../assets/completion_notice.json"))?;
     let display = escaped(kind, "unknown");
-    let pair = if status == Status::TimedOut {
-        contract
-            .status_guidance
-            .get("timed_out")
-            .unwrap_or(&contract.default_failure)
-    } else {
-        contract
-            .failure_guidance
-            .get(kind.unwrap_or("unknown"))
-            .or_else(|| contract.status_guidance.get(status.as_str()))
-            .unwrap_or(&contract.default_failure)
-    };
+    let pair = match kind {
+        Some(kind) => contract.failure_guidance.get(kind),
+        None => contract.status_guidance.get(status.as_str()),
+    }
+    .unwrap_or(&contract.default_failure);
     Ok(Some((display, pair.reason.clone(), pair.advice.clone())))
 }
 
@@ -306,8 +304,13 @@ impl Notice {
         Ok(())
     }
 
-    /// Renders lifecycle text with the stable ID and optional display metadata.
+    /// Renders lifecycle text with the stable agent ID and optional display metadata.
     pub fn render(&self) -> Result<String> {
+        self.render_with_result(None)
+    }
+
+    /// Include a bounded excerpt only from an already verified answer artifact.
+    fn render_with_result(&self, answer: Option<&str>) -> Result<String> {
         self.validate()?;
         let failure = guidance(self.status, self.failure_kind.as_deref())?
             .map(|(kind, reason, advice)| {
@@ -321,20 +324,38 @@ impl Notice {
             .map_or_else(
                 || format!("- ID: {}", self.agent_id),
                 |(name, profile)| {
+                    let name: String = name.chars().take(64).collect();
+                    let profile: String = profile.chars().take(64).collect();
                     let label =
-                        agent_run_domain::agent_label(name, profile, self.agent_id.as_str());
+                        agent_run_domain::agent_label(&name, &profile, self.agent_id.as_str());
                     format!("- Agent: {label}")
                 },
             );
-        Ok(format!(
-            "agent-run/completion\n\n{agent}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
+        let mut text = format!(
+            "agent-run/completion\n\n{agent}\n- Status: {}{}\n- Runtime/model: {}/{}:{}",
             self.status.as_str(),
             failure,
             escaped(self.runtime.as_deref(), "unknown"),
             escaped(self.model.as_deref(), "unknown"),
             escaped(self.effort.as_deref(), "unspecified"),
-            self.notification_id,
-        ))
+        );
+        if let Some(answer) = answer.filter(|answer| !answer.trim().is_empty()) {
+            const LABEL: &str = "\n- Untrusted worker output (excerpt): ";
+            let full = format!("\n- full: answer agent_id={}", self.agent_id);
+            let limit = 4096usize.saturating_sub(text.len() + LABEL.len() + full.len() + 2) / 6; // Maximum encoded bytes per Unicode scalar, including escaped controls.
+            if limit > 0 {
+                let excerpt: String = answer.chars().take(limit.min(300)).collect();
+                let quoted = serde_json::to_string(&excerpt)?
+                    .replace('\u{2028}', "\\u2028")
+                    .replace('\u{2029}', "\\u2029")
+                    .replace('<', "\\u003c")
+                    .replace('>', "\\u003e");
+                text.push_str(LABEL);
+                text.push_str(&quoted);
+                text.push_str(&full);
+            }
+        }
+        Ok(text)
     }
 }
 
@@ -568,6 +589,29 @@ async fn complete(
     Ok(())
 }
 
+/// Read the exact terminal execution's sealed answer before freezing a publication.
+/// Missing or invalid evidence leaves the notice usable without an excerpt.
+async fn verified_notice_answer(home: &Path, notice: &Notice) -> Option<String> {
+    let home = home.to_owned();
+    let id = notice.run_id.as_ref().unwrap_or(&notice.agent_id).clone();
+    let root_agent_id = notice.agent_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let row = Store::open(&home).ok()?.get(&id).ok()?;
+        if !row.status.terminal() || row.root_agent_id != root_agent_id {
+            return None;
+        }
+        let proof = crate::observation::answer_proof(&row).ok()?;
+        let root = home.join("agents").join(id.as_str());
+        let (_, answer) =
+            agent_run_platform::verify::read(&root, &proof, agent_run_platform::verify::MAX_ANSWER)
+                .ok()?;
+        answer
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Claims and attempts one completion delivery, using an ephemeral lease owner identity.
 async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
     let owner = format!(
@@ -582,7 +626,11 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
     let intent = if let Some(intent) = &claim.bridge_intent {
         Ok(intent.clone())
     } else if let Some(config) = &claim.policy.bridge {
-        bridge::intent(&claim, config)
+        let answer = match &claim.payload {
+            Payload::Completion(notice) => verified_notice_answer(home, notice).await,
+            _ => None,
+        };
+        bridge::intent(&claim, config, answer.as_deref())
     } else {
         Err(invalid("Bridge owner remains unconfigured"))
     };
@@ -726,6 +774,43 @@ mod tests {
         assert!(advice.contains("process identity separately"));
     }
 
+    /// Every documented Run classifier gets specific guidance, including for lost outcomes.
+    #[test]
+    fn stored_failure_kinds_have_specific_notice_guidance() {
+        let kinds = "
+            ambiguous_result answer_incomplete answer_present auth_error auth_failed
+            billing_unavailable cancelled cancelled_before_spawn codex_badRequest
+            codex_contextWindowExceeded codex_cyberPolicy codex_internalServerError
+            codex_misalignmentPolicyViolation codex_other codex_rateLimitExceeded codex_sandboxError
+            codex_sessionBudgetExceeded codex_threadRollbackFailed codex_unauthorized
+            codex_usageLimitExceeded continuation_unavailable cut_off empty_result
+            ended_without_finish engine_error engine_group_survived engine_transport_eof
+            engine_transport_failure engine_vanished finish_secret_refused interrupted
+            malformed_engine_json max_turns no_answer nonzero_exit opencode_native_failed
+            preparation_rejected prepare_failed prepare_runtime_failed provider_error
+            provider_overloaded quota_exhausted rate_limited restart_resume_failed
+            runtime_contract_rejected runtime_failed runtime_integrity_failed
+            runtime_ownership_checkpoint_failed runtime_ownership_observation_failed
+            runtime_protocol_failed runtime_storage_failed runtime_transport_failed
+            snapshot_integrity_failed start_submit_failed supervision_failed
+            supervisor_bootstrap_failed supervisor_dead supervisor_executable_missing
+            supervisor_failed supervisor_identity_mismatch supervisor_spawn_failed
+            supervisor_start_failed uncertain_input uncorrelated_result unowned_starting
+            worker_blocked worker_failed
+        ";
+        for kind in kinds.split_whitespace() {
+            let mut notice = super::Notice::legacy(
+                "test-notice",
+                "ag-20260925-000000-0000000001".parse().unwrap(),
+                crate::domain::Status::Failed,
+            );
+            notice.failure_kind = Some(kind.into());
+            let text = notice.render().unwrap();
+            assert!(text.contains(&format!("Failure: {kind} — ")), "{text}");
+            assert!(!text.contains("without a recognized"), "{text}");
+        }
+    }
+
     /// A resumed notice exposes stable identity without moving its delivery lease.
     #[tokio::test]
     async fn resumed_notice_keeps_exact_run_and_stable_agent() {
@@ -735,13 +820,35 @@ mod tests {
         std::fs::write(home.path().join("config.toml"), "schema_version = 2\n").unwrap();
         let root = "ag-20260925-000000-0000000001";
         let child = "ag-20260925-000000-0000000002";
+        let request = serde_json::json!({"runtime":"mock","model":"fixture","profile":"review","task":"task","workdir":home.path()});
         for id in [root, child] {
             store.conn.execute(
                 "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) \
-                 VALUES(?1,'mock','fixture','review','task','task','/tmp','{}','succeeded',?2,'fixture',?3)",
-                params![id, now(), root],
+                 VALUES(?1,'mock','fixture','review','task','task','/tmp',?4,'succeeded',?2,'fixture',?3)",
+                params![id, now(), root, request.to_string()],
             ).unwrap();
         }
+        let answer_root = home.path().join("agents").join(child);
+        agent_run_platform::fs::private_dir(&answer_root).unwrap();
+        let prefix = format!("{}\n", "💡".repeat(299));
+        let proof = agent_run_platform::verify::seal(
+            &answer_root,
+            std::path::Path::new("answer.md"),
+            &format!("{prefix}OMITTED"),
+        )
+        .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET answer_path=?2,answer_bytes=?3,answer_sha256=?4 WHERE id=?1",
+                params![
+                    child,
+                    proof.path.to_str().unwrap(),
+                    proof.bytes,
+                    proof.sha256
+                ],
+            )
+            .unwrap();
         store.conn.execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
              VALUES('session','fixture','external',?1,?1)", [now()],
@@ -762,7 +869,24 @@ mod tests {
         };
         assert_eq!(notice.agent_id.as_str(), root);
         assert_eq!(notice.run_id.as_ref().unwrap().as_str(), child);
-        let rendered = notice.render().unwrap();
+        let answer = super::verified_notice_answer(home.path(), &notice)
+            .await
+            .unwrap();
+        let rendered = notice.render_with_result(Some(&answer)).unwrap();
+        let excerpt = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("- Untrusted worker output (excerpt): "))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<String>(excerpt).unwrap(), prefix);
+        assert!(rendered.contains(&format!("- full: answer agent_id={root}")));
+        assert!(!rendered.contains("OMITTED") && !rendered.contains("[notification"));
+        assert!(rendered.len() < 4096);
+        std::fs::write(&proof.path, "tampered").unwrap();
+        assert!(
+            super::verified_notice_answer(home.path(), &notice)
+                .await
+                .is_none()
+        );
         let name = agent_run_domain::agent_name(root);
         assert!(rendered.contains(&format!("- Agent: {name} (review) · {root}\n")));
         assert!(!rendered.contains(child));

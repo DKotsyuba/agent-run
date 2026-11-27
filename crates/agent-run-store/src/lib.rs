@@ -1318,10 +1318,14 @@ impl Store<'_> {
         let mut stopped = false;
         if row.status.terminal() {
             let Some((_, child, _)) = restart.as_ref() else {
-                return Err(invalid("agent is already terminal"));
+                return Err(invalid(
+                    "agent is already terminal; use resume with the same agent_id to continue",
+                ));
             };
             if !crate::service_restart::is_restart_stop(&tx, id)? {
-                return Err(invalid("agent is already terminal"));
+                return Err(invalid(
+                    "agent is already terminal; use resume with the same agent_id to continue",
+                ));
             }
             if let Some(child) = child {
                 let state: String =
@@ -1329,7 +1333,9 @@ impl Store<'_> {
                         row.get(0)
                     })?;
                 if !["created", "starting", "running", "cancelling"].contains(&state.as_str()) {
-                    return Err(invalid("agent is already terminal"));
+                    return Err(invalid(
+                        "agent is already terminal; use resume with the same agent_id to continue",
+                    ));
                 }
                 target = child.parse()?;
             } else {
@@ -1353,7 +1359,7 @@ impl Store<'_> {
         }
         if kind != "cancel" && tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_lifecycle l JOIN attempts t ON t.id=l.attempt_id \
             WHERE t.agent_id=? AND t.ownership_active=1 AND l.finish_json IS NOT NULL)",[id.as_str()],|r|r.get::<_,bool>(0))? {
-            return Err(invalid("finish already accepted; no new turn may be admitted"));
+            return Err(invalid("finish already accepted; use resume with the same agent_id after the execution ends"));
         }
         tx.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,?,?,'pending',?)",params![target.as_str(),kind,serde_json::to_string(payload)?,now()])?;
         let cid = tx.last_insert_rowid();
@@ -1389,7 +1395,7 @@ impl Store<'_> {
         limit: usize,
         session: Option<&domain::OrchestratorRef>,
     ) -> Result<(Vec<Record>, i64)> {
-        self.list_selected(active, offset, limit, session, false)
+        self.list_selected(active, offset, limit, session, false, None)
     }
 
     /// Page one latest execution per logical agent; filters apply to that tip.
@@ -1400,19 +1406,20 @@ impl Store<'_> {
         limit: usize,
         session: Option<&domain::OrchestratorRef>,
     ) -> Result<(Vec<Record>, i64)> {
-        self.list_selected(active, offset, limit, session, true)
+        self.list_selected(active, offset, limit, session, true, None)
     }
 
     /// Share bounded pagination between execution history and logical agents.
     /// A session filter includes canonical and known-alias rows for its exact
     /// external id, preserving visibility of historical split session rows.
-    fn list_selected(
+    pub fn list_selected(
         &self,
         active: bool,
         offset: usize,
         limit: usize,
         session: Option<&domain::OrchestratorRef>,
         latest: bool,
+        agent_id: Option<&AgentId>,
     ) -> Result<(Vec<Record>, i64)> {
         if limit == 0 || limit > 1000 {
             return Err(invalid("limit must be 1..1000"));
@@ -1437,7 +1444,8 @@ impl Store<'_> {
              SELECT 1 FROM orchestrator_sessions o WHERE o.id=agents.orchestrator_session_id \
              AND o.external_session_id=? AND o.transport IN (?,?))) \
              AND (?=0 OR NOT EXISTS (SELECT 1 FROM agents newer \
-             WHERE newer.parent_agent_id=agents.id))"
+             WHERE newer.parent_agent_id=agents.id)) AND (?7 IS NULL OR {}=?7)",
+            if latest { "root_agent_id" } else { "id" }
         );
         let total = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM agents {where_sql}"),
@@ -1447,7 +1455,8 @@ impl Store<'_> {
                 external_session_id,
                 canonical,
                 legacy,
-                latest
+                latest,
+                agent_id.map(AgentId::as_str)
             ],
             |r| r.get(0),
         )?;
@@ -1463,6 +1472,7 @@ impl Store<'_> {
                     canonical,
                     legacy,
                     latest,
+                    agent_id.map(AgentId::as_str),
                     limit as i64,
                     offset as i64
                 ],

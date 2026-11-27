@@ -391,7 +391,8 @@ is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
 `start_batch` returns the durable receipt and replay flag in MCP
-`structuredContent`, with a fixed text summary.
+`structuredContent`, with one text line per job showing its stable ID and
+admission-time completion destination relative to the MCP caller.
 When an answer exceeds the MCP text budget, `answer` returns a bounded summary
 with the verified artifact size, SHA-256 and execution sequence, plus a link to
 the existing local answer file where its managed path permits one. Access to
@@ -418,7 +419,7 @@ operator socket, but the orchestrator MCP surface is narrower:
   `"surface":"socket"`): `status`, `batch_receipt`, `capabilities`,
   `transcript_exact`, `initial_task`, `answer_chunk`, `agent_integration`,
   `history_pins_list` and `history_pins_release`. MCP `tools/list` omits them
-  and MCP `tools/call` rejects them as unknown tools.
+  and MCP `tools/call` directs callers to the operator CLI.
 
 The socket `tools` method lists every socket method, including the
 socket-only ones with `"surface":"socket"`, so a socket client keeps detecting
@@ -622,7 +623,9 @@ is operator/service-only and absent from worker capabilities.
 A later PostToolUse notification binding does not change that identity. Clients
 that omit `orchestrator` share the unbound namespace across fresh connections.
 
-`list_agents` accepts optional `after_revision` and `wait_seconds`. When the
+`list_agents` accepts an exact stable `agent_id` filter, and optional
+`after_revision` and `wait_seconds`. For MCP pages, `limit` is 1–20 and defaults
+to 20. The operator socket retains its existing page bounds. When the
 current event revision is not newer, the call waits up to 60 seconds and wakes
 as soon as a committed event advances it. The returned `revision` becomes the
 next cursor, so terminal completion is observable without a notification

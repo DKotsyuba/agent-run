@@ -635,8 +635,7 @@ fn make_due(home: &Path, id: &str) {
 /// Mirrors `tests/test_delivery_base.py::test_configured_identifier_punctuation_renders_verbatim`.
 /// Mirrors `tests/test_delivery_base.py::test_metadata_can_never_add_list_lines_or_commands`.
 /// Mirrors `tests/test_delivery_base.py::test_missing_metadata_renders_unknown_and_unspecified`.
-/// Replays every frozen Python capture, with only the retired timeout recovery advice
-/// projected to the current explicit-resume contract.
+/// Replays the frozen Python captures with the reviewed changes in notice text.
 #[test]
 fn notice_rendering_matches_python_golden_cases() {
     let cases: Vec<Value> = serde_json::from_slice(
@@ -646,10 +645,19 @@ fn notice_rendering_matches_python_golden_cases() {
     for case in cases {
         let input = case.get("input").unwrap();
         let notice: Notice = serde_json::from_value(input.clone()).unwrap();
-        let expected = case["rendered"].as_str().unwrap().replace(
-            "Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID.",
-            "Inspect progress and transcript; resume explicitly after the native-history, authority and cleanup checks pass. Executions have no time limit.",
-        );
+        let expected = case["rendered"].as_str().unwrap().split("\n- Notice:").next().unwrap()
+            .replace(
+                "Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID.",
+                "Inspect progress and transcript; resume explicitly after the native-history, authority and cleanup checks pass. Executions have no time limit.",
+            )
+            .replace(
+                "Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.",
+                "Inspect list_agents, transcript, and supervisor logs for this agent_id before choosing a recovery action.",
+            )
+            .replace(
+                "Inspect status and supervisor logs for process ownership or service failures; do not reuse this failed record.",
+                "Resolve process ownership and cleanup, then use resume with the same agent_id if native history is recoverable.",
+            );
         assert_eq!(notice.render().unwrap(), expected, "{}", case["id"]);
     }
 }
@@ -847,8 +855,8 @@ fn notice_rejects_invalid_metadata_and_contains_only_trusted_facts() {
     invalid.failure_kind = Some("prepare_failed".into());
     assert!(invalid.validate().is_err());
     let rendered = notice().render().unwrap();
-    assert_eq!(rendered.lines().count(), 6);
-    assert!(rendered.contains("- Notice: [notification ntf_test v1]"));
+    assert_eq!(rendered.lines().count(), 5);
+    assert!(!rendered.contains("ntf_test"));
     assert!(!rendered.contains("task"));
     assert!(!rendered.contains("answer"));
 }
@@ -1035,7 +1043,7 @@ async fn notice_projection_tolerates_rows_without_metadata() {
     assert!(
         bare.render()
             .unwrap()
-            .contains("- Runtime/model: unknown/unknown:unspecified\n")
+            .ends_with("- Runtime/model: unknown/unknown:unspecified")
     );
 }
 
