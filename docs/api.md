@@ -161,12 +161,30 @@ connections execute concurrently within independently bounded control and read
 groups. Durable start/resume/cancel/steer admission uses the control group;
 ordinary reads use the read group, so slow reads cannot consume control permits.
 Long polls hold neither group's permit. The server caps
-connections and queued calls, reserves one connection slot for parsed control
-methods, rejects ordinary overload with JSON-RPC code `-32001`, and
-returns `-32002` when its request deadline expires. Input frames remain limited
-to 1 MiB; idle reads and response writes also have finite deadlines. A client
-holding the reserved slot without completing its first frame is disconnected
-within 0.5 seconds.
+connections and queued calls and returns `-32002` when its request deadline
+expires. Input frames remain limited to 1 MiB; idle reads and response writes
+also have finite deadlines.
+
+Connections are admitted in three pools. Ordinary connections (128 by default,
+one of them reserved) serve every method. A long poll (`wait`, or
+`list_agents` with `wait_seconds`) moves its connection to a separate wait pool
+(256 by default) while parked, so many `agent-run start --wait` clients never
+exhaust ordinary capacity; the connection takes an ordinary permit again for
+its next ordinary request. When ordinary permits are exhausted, the reserved
+slot serves one control or worker-report frame and closes; a client holding
+it without completing its first frame is disconnected within 0.5 seconds.
+Further sockets park on the wait pool. Control methods (start, resume, cancel,
+steer and the other admission/lifecycle calls) and worker reports
+(`worker/call`, `worker/notify`, which carry `finish`, `notify_orchestrator`
+and `health_reply`) are admitted on every pool, so a worker can always report
+and finish; the broker still authenticates the per-attempt token and applies
+the request lanes. Any other request without an ordinary permit is refused
+with `-32001` and `broker connection limit reached (N); retry shortly; worker
+calls and control requests are still admitted`. A socket arriving when every
+pool is full receives `-32001` `broker connection limit reached (N); retry
+shortly` and is closed. The wait pool shrinks at startup so that ordinary plus
+wait sockets use at most half of the soft open-file limit; at zero, long polls
+keep their ordinary permit.
 
 The socket path is fenced by a lifetime native file lock. A pre-existing socket
 is reclaimed only after a refused or missing-endpoint connect result and an

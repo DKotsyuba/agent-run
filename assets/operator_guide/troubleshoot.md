@@ -36,6 +36,14 @@ Two checks matter most for a supervisor that cannot even start:
   switch — it may still be running old code; reconnect MCP in that session
   before pruning releases.
 
+## Broker connection limit
+
+`-32001` `broker connection limit reached (N); retry shortly; ...` means every
+ordinary broker connection (128) is held open. Retry the read shortly. Control
+requests and worker `finish`/notify/health replies are still admitted, and
+clients parked in `wait` or `start --wait` use a separate wait pool. If it
+persists, look for clients that keep idle connections open.
+
 ## failure_kind vocabulary
 
 Agent/run failures carry a `failure_kind` plus free-text `failure_text`.
