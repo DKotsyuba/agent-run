@@ -4,6 +4,21 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.36.1
+
+- Keep worker reports and ordinary reads available when many clients wait on
+  the broker. Long polls (`wait`, `start --wait`, `list_agents` with
+  `wait_seconds`) park in a separate wait pool (256 connections by default,
+  fitted to the open-file limit) instead of holding an ordinary connection.
+- Admit worker `finish`, `notify_orchestrator` and health replies
+  (`worker/call`, `worker/notify`) on every connection class, including the
+  reserved control slot, so parallel waiters can no longer block the workers
+  they wait for. Token authentication and request lanes are unchanged.
+- Raise the ordinary broker connection limit from 32 to 128.
+- Name the cause and next step in the `-32001` connection refusal:
+  `broker connection limit reached (N); retry shortly; worker calls and
+  control requests are still admitted`. No state migration.
+
 ## 0.36.0
 
 - Preflight worker directory, Git metadata and Unix socket requirements before
