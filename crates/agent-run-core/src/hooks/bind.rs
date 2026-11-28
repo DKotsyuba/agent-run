@@ -7,7 +7,7 @@ use crate::{
     state::Store,
 };
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// Native host names accepted by the common normalized lifecycle-hook projection.
@@ -235,27 +235,7 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
         .as_object()
         .ok_or_else(|| invalid("hook payload must be a JSON object"))?;
     if object.contains_key("session_id") {
-        let expected = if bind {
-            "PostToolUse"
-        } else {
-            "UserPromptSubmit"
-        };
-        if object
-            .get("hook_event_name")
-            .is_some_and(|event| event.as_str() != Some(expected))
-        {
-            return Err(invalid(format!("raw hook_event_name must be {expected}")));
-        }
-        let session_id = object
-            .get("session_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("raw hook session_id must be nonblank"))?;
-        let reference = OrchestratorRef {
-            transport: transport.into(),
-            external_session_id: session_id.into(),
-            external_turn_id: object.get("turn_id").map(value_string).transpose()?,
-        };
-        reference.validate()?;
+        let reference = raw_reference(object, bind, transport)?;
         let (agent_id, sequence) = if bind {
             let (id, sequence) = raw_selection(object.get("tool_response"))?;
             (Some(id), sequence)
@@ -314,6 +294,169 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
             None
         },
     })
+}
+
+/// Validates the native event and derives its destination from the host session.
+fn raw_reference(
+    object: &serde_json::Map<String, Value>,
+    bind: bool,
+    transport: &str,
+) -> Result<OrchestratorRef> {
+    let expected = if bind {
+        "PostToolUse"
+    } else {
+        "UserPromptSubmit"
+    };
+    if object
+        .get("hook_event_name")
+        .is_some_and(|event| event.as_str() != Some(expected))
+    {
+        return Err(invalid(format!("raw hook_event_name must be {expected}")));
+    }
+    let session_id = object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("raw hook session_id must be nonblank"))?;
+    let reference = OrchestratorRef {
+        transport: transport.into(),
+        external_session_id: session_id.into(),
+        external_turn_id: object.get("turn_id").map(value_string).transpose()?,
+    };
+    reference.validate()?;
+    Ok(reference)
+}
+
+/// Projects a native batch hook to the session identity and safe per-job selectors.
+pub fn batch_hook_payload(payload: &Value, transport: &str) -> Result<Option<Value>> {
+    if !matches!(
+        payload["tool_name"].as_str(),
+        Some("mcp__agent-run__start_batch" | "mcp__agent_run__start_batch")
+    ) {
+        return Ok(None);
+    }
+    if !HOOK_TRANSPORTS.contains(&transport) {
+        return Err(invalid("unknown delivery transport"));
+    }
+    let object = payload
+        .as_object()
+        .ok_or_else(|| invalid("hook payload must be a JSON object"))?;
+    let reference =
+        raw_reference(object, true, transport).map_err(|error| loud("start_batch", &error))?;
+    let jobs = batch_jobs(&payload["tool_response"])
+        .ok_or_else(|| loud("start_batch", "unusable batch binding receipt"))?;
+    if jobs.len() > agent_run_domain::batch::MAX_BATCH_JOBS {
+        return Err(loud(
+            "start_batch",
+            "too many jobs in batch binding receipt",
+        ));
+    }
+    let jobs: Vec<_> = jobs.iter().map(project_batch_job).collect();
+    let mut safe = json!({
+        "hook_event_name":"PostToolUse", "session_id":reference.external_session_id,
+        "tool_name":"mcp__agent_run__start_batch",
+        "tool_response":{"jobs":jobs},
+    });
+    if let Some(turn) = reference.external_turn_id {
+        safe["turn_id"] = json!(turn);
+    }
+    Ok(Some(safe))
+}
+
+/// Retains only validated selectors and a marker for an unusable admitted id.
+fn project_batch_job(job: &Value) -> Value {
+    if let Some(id) = job.get("agent_id").filter(|id| !id.is_null()) {
+        return match id.as_str().and_then(|id| id.parse::<AgentId>().ok()) {
+            Some(id) => json!({"agent_id":id, "sequence":receipt_sequence(&job["sequence"]).ok()}),
+            None => json!({"invalid_agent_id":true}),
+        };
+    }
+    if job["invalid_agent_id"] == true {
+        return json!({"invalid_agent_id":true});
+    }
+    json!({})
+}
+
+/// Reads a batch receipt from structured MCP output or a JSON text content block.
+fn batch_jobs(value: &Value) -> Option<Vec<Value>> {
+    match value {
+        Value::Object(_) if value["accepted"] == false => Some(vec![]),
+        Value::Object(_) => value["jobs"].as_array().cloned().or_else(|| {
+            ["structuredContent", "receipt", "content", "text"]
+                .into_iter()
+                .find_map(|key| batch_jobs(&value[key]))
+        }),
+        Value::Array(items) => items.iter().find_map(batch_jobs),
+        Value::String(text) => batch_jobs(&serde_json::from_str::<Value>(text).ok()?),
+        _ => None,
+    }
+}
+
+/// Binding outcomes for every admitted job, including independent failures.
+pub struct BatchBindResult {
+    pub bound: Vec<BindResult>,
+    pub failures: Vec<String>,
+}
+
+/// Binds each admitted execution once and reports all failures after attempting the batch.
+pub async fn run_batch_hook(
+    home: &std::path::Path,
+    payload: &Value,
+    transport: &str,
+    service: Option<&crate::service::Service>,
+) -> Result<Option<BatchBindResult>> {
+    let Some(safe) = batch_hook_payload(payload, transport)? else {
+        return Ok(None);
+    };
+    let reference = raw_reference(safe.as_object().expect("projected object"), true, transport)?;
+    let jobs = batch_jobs(&safe["tool_response"]).expect("projected jobs");
+    let at = now();
+    let mut bound = Vec::new();
+    let mut failures = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, job) in jobs.into_iter().enumerate() {
+        // The broker may receive the CLI's already-projected receipt.
+        if job["invalid_agent_id"] == true {
+            failures.push(loud(&format!("batch job {index}"), "invalid agent_id").to_string());
+            continue;
+        }
+        let Some(id) = job["agent_id"].as_str() else {
+            continue;
+        };
+        let result = async {
+            let parsed = id.parse::<AgentId>()?;
+            let sequence = receipt_sequence(&job["sequence"])?;
+            if !seen.insert((parsed.to_string(), sequence)) {
+                return Ok(None);
+            }
+            let execution =
+                crate::agent_identity::resolve_sequence(&Store::open(home)?, &parsed, sequence)?.id;
+            bind_with_service(home, execution, reference.clone(), at, service)
+                .await
+                .map(Some)
+        }
+        .await;
+        match result {
+            Ok(Some(result)) => bound.push(result),
+            Ok(None) => {}
+            Err(error) => failures.push(loud(id, &error.public().message).to_string()),
+        }
+    }
+    Ok(Some(BatchBindResult { bound, failures }))
+}
+
+/// Builds the host output and carries per-job diagnostics separately across the broker seam.
+pub fn hook_output(messages: &[String], failures: &[String]) -> Value {
+    let mut output = json!({});
+    if !messages.is_empty() {
+        output["hookSpecificOutput"] = json!({
+            "hookEventName":"PostToolUse", "additionalContext":messages.join("\n"),
+        });
+    }
+    if !failures.is_empty() {
+        output["bindingErrors"] = json!(failures);
+        output["boundCount"] = json!(messages.len());
+    }
+    output
 }
 
 /// Parses the positive bounded counter carried only by machine binding receipts.

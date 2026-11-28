@@ -871,7 +871,17 @@ fn batch_result(
         };
         let _ = writeln!(text, "- agent_id={} — {binding}", job.agent_id);
     }
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    // Some PostToolUse hosts forward only MCP text blocks.
+    let selectors: Vec<_> = batch
+        .receipt
+        .jobs
+        .iter()
+        .map(|job| json!({"agent_id":job.agent_id, "sequence":job.sequence}))
+        .collect();
+    let mut result = CallToolResult::success(vec![
+        ContentBlock::text(text),
+        ContentBlock::text(json!({"jobs":selectors}).to_string()),
+    ]);
     batch.release_token = None;
     result.structured_content = Some(serde_json::to_value(batch)?);
     let mut wire = BoundedWriter {
@@ -2168,6 +2178,51 @@ mod tests {
         .unwrap();
         assert_eq!(payload.agent_id.as_deref(), Some("ag-root"));
         assert_eq!(payload.sequence, Some(2));
+    }
+
+    /// Both full MCP results and text-only hook projections retain the same selectors.
+    #[test]
+    fn posttooluse_batch_binding_extracts_rendered_mcp_receipts() {
+        let id = "ag-20200101-000000-0000000001";
+        let value = json!({"replayed":false,"receipt":{
+            "version":1,"store_id":"store_0123456789abcdef0123456789abcdef",
+            "request_id":"batch-key","jobs":[
+                {"index":0,"agent_id":id,"sequence":1,
+                 "execution_ref":format!("ex1_{}", "a".repeat(64))}
+            ]
+        }});
+        let wire = serde_json::to_value(success_result("start_batch", &value)).unwrap();
+        for (tool, transport, response) in [
+            (
+                "mcp__agent-run__start_batch",
+                "claude_uds",
+                wire["content"].clone(),
+            ),
+            (
+                "mcp__agent_run__start_batch",
+                "codex_queue",
+                json!(wire.to_string()),
+            ),
+            (
+                "mcp__agent_run__start_batch",
+                "codex_queue",
+                wire["structuredContent"].clone(),
+            ),
+        ] {
+            let safe = agent_run_core::hooks::bind::batch_hook_payload(
+                &json!({"hook_event_name":"PostToolUse","session_id":"s-1","turn_id":"t-2",
+                        "tool_name":tool,"tool_response":response}),
+                transport,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(safe["session_id"], "s-1");
+            assert_eq!(safe["turn_id"], "t-2");
+            assert_eq!(
+                safe["tool_response"]["jobs"],
+                json!([{"agent_id":id,"sequence":1}])
+            );
+        }
     }
 
     /// Resume hides internal lineage IDs; other tools cannot bypass templates.

@@ -567,6 +567,82 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
     }
 }
 
+/// A partial failure through the CLI and broker leaves one completion per valid job on replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_hook_binds_admitted_jobs_across_partial_failure_and_replay() {
+    let home = home().await;
+    let first = terminal(home.path());
+    let last = terminal(home.path());
+    let missing = "ag-20200101-000000-0000000001";
+    let server_home = home.path().to_owned();
+    let server =
+        tokio::spawn(async move { agent_run::transport::socket::serve(&server_home).await });
+    let client = agent_run::transport::socket::BrokerClient::new(home.path().join("api.sock"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.call("ping", None).await.is_err() {
+            assert!(!server.is_finished(), "fixture broker exited before ping");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let jobs = json!([
+        {"agent_id":first,"sequence":1},
+        {"agent_id":missing,"sequence":1},
+        {"error":"refused"},
+        {"agent_id":"unvalidated-canary","sequence":1},
+        {"agent_id":last,"sequence":1}
+    ]);
+    let payload = json!({
+        "hook_event_name":"PostToolUse", "session_id":"batch-probe",
+        "tool_name":"mcp__agent-run__start_batch",
+        "tool_response":[{"type":"text","text":json!({"jobs":jobs}).to_string()}]
+    });
+    for _ in 0..2 {
+        let output = hook(home.path(), "bind", "claude_uds", payload.clone()).await;
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("binding confirmed for 2 job(s)"), "{error}");
+        assert!(
+            error.contains(&format!("notification is NOT confirmed for {missing}")),
+            "{error}"
+        );
+        assert!(
+            error.contains("notification is NOT confirmed for batch job 3"),
+            "{error}"
+        );
+        assert!(!error.contains("unvalidated-canary"), "{error}");
+    }
+    let result = client
+        .call(
+            "_hook_bind",
+            Some(json!({
+                "payload":payload, "transport":"claude_uds",
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["boundCount"], 2);
+    assert_eq!(result["bindingErrors"].as_array().unwrap().len(), 2);
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    for id in [first, last] {
+        let (total, bound): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(CASE WHEN s.external_session_id='batch-probe' THEN 1 END)
+             FROM deliveries d LEFT JOIN orchestrator_sessions s ON s.id=d.orchestrator_session_id
+             WHERE d.agent_id=?",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, bound), (1, 1), "{id}");
+    }
+    drop(store);
+    server.abort();
+    let _ = server.await;
+}
+
 /// A real API connection pins the kernel UID even when the raw hook claims another owner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_hook_bind_records_kernel_peer_uid() {
