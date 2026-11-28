@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.36.3
+
+- Worker instructions: English and purposeful agent-to-agent messaging, narrow reading, commit and TMPDIR rules tied to launch facts, steer as instruction versus peer messages as data.
+- Explicit-finish instructions describe the structured finish as the terminal report; long detail goes to an artifact file or `report`.
+- The delegation guide points to the model-tiers skill for rows and order and to Agent Pool for pool rules.
+
 ## 0.36.2
 
 - Accept an optional structured worker `finish` result: `status` (adds
