@@ -24,6 +24,56 @@ flag. Effective launch flags never alter raw request/replay hashes.
 Codex receives `-c service_tier=fast -c features.fast_mode=true`. Fast has higher
 subscription usage or credit rates; see [OpenAI Fast mode documentation](https://learn.chatgpt.com/docs/agent-configuration/speed).
 
+### Worker temporary directories
+
+```toml
+[worker_temp]
+root = "/absolute/path/to/worker-temp"
+harnesses = ["codex"]
+# trusted_owners = ["agent-claude", "pluto"] # Local account names
+# trusted_groups = ["projects", 1005] # Group names or numeric GIDs
+```
+
+Provision the physical root before enabling the setting. Run checks ownership
+and write authority at every parent from the filesystem root through the
+project directory. The worker UID is trusted by default. System ancestors may
+also belong to UID 0. Add other trusted local account names to `trusted_owners`. On Linux, a
+writable group is accepted only if its GID is explicitly listed in
+`trusted_groups`. Listing a group asserts that every principal that can use
+it is trusted, including service credentials granted supplementary groups.
+The default list is empty. Named user ACL writers must be trusted.
+Unlisted writable groups and world-writable paths are refused. On macOS,
+extended ACL allow entries are conservatively refused. Use a root outside the
+workdir and existing native writable roots.
+
+The leaf uses the form `<root>/<project>/<agent_id>`. Its creation mode is
+`0770`, restricted by the inherited ACL or umask. Run checks effective read,
+write and search access without widening the inherited ACL mask. The project
+name comes from the nearest Git checkout, or the working directory if none is
+found. Unsafe filename characters become underscores. Run checks the recorded
+device and inode again before native handoff. Trusted owners can still rename
+entries between that check and when the native sandbox resolves the path.
+
+The setting applies to Codex roles with shell access. A read-only role's native
+sandbox grants writes only to the external leaf. Run sets `TMPDIR`, `TMP` and
+`TEMP` to the leaf and lists it in the launch brief. An explicit launch `tmpdir`
+takes precedence and keeps its usual validation. Omit `[worker_temp]` to keep
+the existing behavior. When an enabled harness or role cannot grant the
+directory, Run warns and uses its ordinary temp behavior.
+
+Retries and resumes reuse the leaf while live configuration allows the
+same root. A withdrawn or changed root falls back to normal temp behavior
+and adds a launch warning. A routed worker that cannot read live configuration
+also falls back without granting the external leaf.
+
+Run records a creation intent in the agent store before creating a leaf.
+It can resume that intent after an interruption and can recreate a missing
+leaf. A pre-existing directory requires a matching intent or verified identity.
+History retention reconciles unfinished intents and completed records after
+the lineage expires. It removes only the leaf, leaving the configured root
+and project directory in place. In split-account installations the account
+worker performs this cleanup during its normal retention pass.
+
 ### Codex worker telemetry
 
 Set `otel` in the existing `[harnesses.codex]` table to export Codex worker

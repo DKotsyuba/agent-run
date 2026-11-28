@@ -46,6 +46,16 @@ pub struct AccessPlan {
     network: bool,
     codex: bool,
     projects: bool,
+    #[serde(skip)]
+    worker_temp_root: Option<PathBuf>,
+    #[serde(skip)]
+    worker_temp_trusted: Vec<String>,
+    #[serde(skip)]
+    worker_temp_groups: Vec<agent_run_platform::fs::TrustedGroup>,
+    #[serde(skip)]
+    worker_temp_changed: bool,
+    #[serde(skip)]
+    worker_temp_unsupported: bool,
 }
 
 /// Observed launch facts. Only advisory messages cross the admission boundary.
@@ -53,6 +63,7 @@ pub(crate) struct Facts {
     pub(crate) warnings: Vec<String>,
     tmpdir: Option<PathBuf>,
     socket_root: Option<PathBuf>,
+    pub(crate) worker_temp: Option<PathBuf>,
     git_blocker: Option<String>,
 }
 
@@ -97,6 +108,10 @@ impl AccessPlan {
                 shell,
             ),
         };
+        let worker_temp = config
+            .worker_temp
+            .as_ref()
+            .filter(|temp| request.tmpdir.is_none() && temp.harnesses.contains(&harness));
         Ok(Self {
             workdir: request.workdir.clone(),
             reads: effective
@@ -115,6 +130,15 @@ impl AccessPlan {
             network,
             codex,
             projects,
+            worker_temp_root: worker_temp
+                .filter(|_| codex && shell)
+                .map(|temp| temp.root.clone()),
+            worker_temp_trusted: worker_temp
+                .map_or_else(Vec::new, |temp| temp.trusted_owners.clone()),
+            worker_temp_groups: worker_temp
+                .map_or_else(Vec::new, |temp| temp.trusted_groups.clone()),
+            worker_temp_changed: false,
+            worker_temp_unsupported: worker_temp.is_some() && !(codex && shell),
         })
     }
 
@@ -138,6 +162,47 @@ impl AccessPlan {
         self
     }
 
+    /// A continuation may reuse its frozen root only while live policy still grants it.
+    pub(crate) fn recheck_worker_temp(&mut self, home: &Path, harness: HarnessId) {
+        if self.worker_temp_root.is_some() {
+            let live = ProviderConfig::load(home)
+                .ok()
+                .and_then(|(config, _)| config.worker_temp);
+            self.apply_worker_temp_policy(harness, live.as_ref());
+        }
+    }
+
+    /// Applies the live ACL allowlist, or selects legacy temp for a withdrawn root.
+    fn apply_worker_temp_policy(
+        &mut self,
+        harness: HarnessId,
+        live: Option<&agent_run_config::provider_config::WorkerTemp>,
+    ) {
+        if let Some(root) = &self.worker_temp_root {
+            if let Some(live) =
+                live.filter(|live| &live.root == root && live.harnesses.contains(&harness))
+            {
+                self.worker_temp_trusted.clone_from(&live.trusted_owners);
+                self.worker_temp_groups.clone_from(&live.trusted_groups);
+            } else {
+                self.worker_temp_root = None;
+                self.worker_temp_changed = true;
+            }
+        }
+    }
+
+    /// Reports a broker-derived fallback without sending operator settings over the launch wire.
+    pub(crate) fn worker_temp_warning(&self) -> Option<&'static str> {
+        if self.worker_temp_changed {
+            return Some(
+                "External worker temp is disabled or its root changed in live configuration. Using the normal temp fallback for this continuation.",
+            );
+        }
+        self.worker_temp_unsupported.then_some(
+            "External worker temp is unavailable for this harness or role. Using the normal temp fallback.",
+        )
+    }
+
     /// Check a plan as the local execution account. Probes never write files.
     pub fn warnings(&self) -> Result<Vec<String>> {
         Ok(self.inspect(false)?.warnings)
@@ -150,9 +215,53 @@ impl AccessPlan {
 
     /// Recheck access and create temp storage. A routed worker can receive
     /// requests from another UID, so never export workspace scratch there.
+    #[cfg(test)]
     pub(crate) fn prepare(&self, system_run: Option<(&Path, &AgentId)>) -> Result<Facts> {
+        self.prepare_for_agent(system_run, None)
+    }
+
+    /// Prepares the actual temp location and records external leaves for retention.
+    pub(crate) fn prepare_for_agent(
+        &self,
+        system_run: Option<(&Path, &AgentId)>,
+        agent: Option<(&Path, &AgentId)>,
+    ) -> Result<Facts> {
         let mut facts = self.inspect(system_run.is_some())?;
-        if let Some((private_home, id)) = system_run {
+        if let Some(root) = &self.worker_temp_root {
+            let (agent_dir, id) = agent.ok_or_else(|| invalid(TEMP_REFUSAL))?;
+            let mut project = self.temp_project();
+            let agent = Dir::open_searchable(agent_dir)?;
+            if let Some(record) = crate::worker_temp::recorded(&agent)?
+                && let Some(name) = record
+                    .path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+            {
+                project = name.to_owned();
+            }
+            let expected = root.join(&project).join(id.as_str());
+            if std::iter::once(&self.workdir)
+                .chain(&self.writable)
+                .any(|root| expected.starts_with(root) || root.starts_with(&expected))
+            {
+                return Err(invalid(
+                    "worker temp directory overlaps the workdir or an existing writable root",
+                ));
+            }
+            let path = crate::worker_temp::prepare(
+                root,
+                Path::new(&project),
+                id,
+                &agent,
+                &self.worker_temp_trusted,
+                &self.worker_temp_groups,
+            )?;
+            facts.socket_root =
+                self.test_socket_root(Some(&path), &mut facts.warnings, system_run.is_some());
+            facts.tmpdir = Some(path.clone());
+            facts.worker_temp = Some(path);
+        } else if let Some((private_home, id)) = system_run {
             let base = self.tmpdir.as_deref().unwrap_or(private_home);
             let parent = open_run_temp_base(base)?;
             facts.tmpdir = Some(create_run_temp(base, &parent, id)?);
@@ -216,6 +325,9 @@ impl AccessPlan {
         }
 
         let mut warnings = Vec::new();
+        if let Some(warning) = self.worker_temp_warning() {
+            warnings.push(warning.into());
+        }
         let scratch = self.workdir.join(".scratch");
         let tmpdir = if let Some(tmpdir) = &self.tmpdir {
             let path = self.inspect_directory(tmpdir, "temporary directory", true, system)?;
@@ -223,7 +335,7 @@ impl AccessPlan {
                 open_run_temp_base(&path)?;
             }
             Some(path)
-        } else if system {
+        } else if system || self.worker_temp_root.is_some() {
             None
         } else if self.scratch_available(&scratch) {
             Some(scratch.clone())
@@ -242,6 +354,7 @@ impl AccessPlan {
         };
         Ok(Facts {
             warnings,
+            worker_temp: None,
             tmpdir,
             socket_root,
             git_blocker,
@@ -459,6 +572,33 @@ impl AccessPlan {
             return refuse("Git HEAD is not a supported symbolic or detached reference");
         }
         None
+    }
+
+    /// Names a single external temp component from the nearest Git worktree or cwd.
+    fn temp_project(&self) -> String {
+        let directory = self
+            .find_dotgit(false)
+            .filter(|(_, kind, _)| matches!(kind, EntryType::File | EntryType::Directory))
+            .map_or(self.workdir.as_path(), |(path, _, _)| path);
+        let name: String = directory
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .take(160)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if matches!(name.as_str(), "" | "." | "..") {
+            "workspace".into()
+        } else {
+            name
+        }
     }
 
     /// Resolve Git's linked-worktree pointers inside authorized, no-follow
@@ -683,9 +823,13 @@ impl AccessPlan {
         } else {
             "Return the final response through the native harness.".into()
         };
+        let mut writable = self.writable.clone();
+        if let Some(path) = &facts.worker_temp {
+            writable.push(path.clone());
+        }
         let mut brief = format!(
             "## Sandbox facts\n- Workdir: {:?}\n- Writable roots: {:?}\n- Git commit: {git}\n- Shell network: {network}\n- Finish: {finish}\n",
-            self.workdir, self.writable,
+            self.workdir, writable,
         );
         for (name, source) in temp_environment {
             brief.push_str(&format!("- {name}: {source}\n"));
@@ -710,6 +854,18 @@ impl Facts {
         })
     }
 
+    /// Pins the scoped temp variables in native shell policy as well as process env.
+    pub(crate) fn codex_environment_overrides(&self) -> Vec<String> {
+        let mut settings: Vec<_> = self.codex_socket_override().into_iter().collect();
+        if let Some(path) = &self.worker_temp {
+            let value = toml::Value::String(path.to_string_lossy().into_owned());
+            settings.extend(
+                TEMP_NAMES.map(|name| format!("shell_environment_policy.set.{name}={value}")),
+            );
+        }
+        settings
+    }
+
     /// Merge temp settings independently and describe the effective entries
     /// without copying arbitrary inherited or harness values into the prompt.
     pub(crate) fn install_environment(
@@ -720,7 +876,9 @@ impl Facts {
     ) -> [(&'static str, String); 3] {
         let temp_environment = TEMP_NAMES.map(|name| {
             let source = if let Some(path) = &self.tmpdir
-                && (plan.tmpdir.is_some() || !configured_tmp.contains(&name))
+                && (self.worker_temp.is_some()
+                    || plan.tmpdir.is_some()
+                    || !configured_tmp.contains(&name))
             {
                 environment.insert(name.into(), path.to_string_lossy().into_owned());
                 format!("{path:?}")
@@ -926,6 +1084,11 @@ mod tests {
             network: true,
             codex: false,
             projects: false,
+            worker_temp_root: None,
+            worker_temp_trusted: Vec::new(),
+            worker_temp_groups: Vec::new(),
+            worker_temp_changed: false,
+            worker_temp_unsupported: false,
         }
     }
 
@@ -1106,6 +1269,71 @@ mod tests {
             .unwrap()
             .install_environment(&check, &mut environment, &TEMP_NAMES);
         assert_eq!(environment["TMPDIR"], custom.to_str().unwrap());
+    }
+
+    /// Read-only Codex workers receive the external leaf and all three temp variables.
+    #[test]
+    fn worker_temp_read_only_launch_facts() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let workdir = home.join("test project").join("src");
+        let root = home.join("temp");
+        let agent = home.join("agent");
+        fs::create_dir_all(workdir.parent().unwrap().join(".git")).unwrap();
+        for dir in [&workdir, &root, &agent] {
+            fs::create_dir(dir).unwrap();
+        }
+        let mut check = plan(&workdir);
+        check.write_workdir = false;
+        check.writable.clear();
+        check.codex = true;
+        check.worker_temp_root = Some(root.clone());
+        let id = AgentId::new();
+        let leaf = root.join("test_project").join(id.as_str());
+        assert_eq!(check.temp_project(), "test_project");
+        let mut facts = check.inspect(false).unwrap();
+        facts.tmpdir = Some(leaf.clone());
+        facts.worker_temp = Some(leaf.clone());
+        assert!(!workdir.join(".scratch").exists());
+        let mut env = BTreeMap::new();
+        let temp = facts.install_environment(&check, &mut env, &TEMP_NAMES);
+        let brief = check.brief(&facts, true, &temp, HarnessId::Codex);
+        assert!(brief.contains(&format!("Writable roots: [{leaf:?}]")));
+        for variable in TEMP_NAMES {
+            assert_eq!(env[variable], leaf.to_str().unwrap());
+            assert!(brief.contains(&format!("{variable}: {leaf:?}")));
+        }
+    }
+
+    /// A changed or withdrawn live root uses ordinary scratch and warns on resume.
+    #[test]
+    fn worker_temp_resume_uses_live_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let mut check = plan(home.path());
+        let root = check.workdir.join("external");
+        let mut live = agent_run_config::provider_config::WorkerTemp {
+            root: root.clone(),
+            harnesses: [HarnessId::Codex].into(),
+            trusted_owners: vec!["trusted-operator".into()],
+            trusted_groups: vec![],
+        };
+        check.worker_temp_root = Some(root.clone());
+        check.apply_worker_temp_policy(HarnessId::Codex, Some(&live));
+        assert_eq!(check.worker_temp_trusted, ["trusted-operator"]);
+        live.root.push("changed");
+        check.apply_worker_temp_policy(HarnessId::Codex, Some(&live));
+        let facts = check.prepare(None).unwrap();
+        assert!(facts.worker_temp.is_none());
+        assert_eq!(facts.tmpdir, Some(check.workdir.join(".scratch")));
+        assert!(
+            facts
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("live configuration"))
+        );
+        check.worker_temp_root = Some(root);
+        check.apply_worker_temp_policy(HarnessId::Codex, None);
+        assert!(check.worker_temp_root.is_none());
     }
 
     /// An unsafe scratch entry yields a warning and its link target stays untouched.

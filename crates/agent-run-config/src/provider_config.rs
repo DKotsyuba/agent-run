@@ -555,6 +555,21 @@ pub struct PoolChatEndpoint {
     pub socket: PathBuf,
 }
 
+/// Operator-provisioned root for retained, per-agent temporary directories.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTemp {
+    pub root: PathBuf,
+    /// Harness names whose launches should request a scoped temp grant.
+    pub harnesses: std::collections::BTreeSet<HarnessId>,
+    /// Additional local accounts trusted to own or modify the temp path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_owners: Vec<String>,
+    /// Group names or GIDs whose entire membership the operator trusts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_groups: Vec<agent_run_platform::fs::TrustedGroup>,
+}
+
 /// Parsed v2 configuration with required legacy harnesses, optional OpenCode and arbitrary providers.
 ///
 /// The v1 `Config` remains the current consumer contract until its launch
@@ -570,6 +585,9 @@ pub struct ProviderConfig {
     /// Enables chat seats and configures the destination of worker relays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_chat: Option<PoolChatEndpoint>,
+    /// Absent configurations preserve the existing temporary-directory behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_temp: Option<WorkerTemp>,
     /// Existing service lifecycle controls.
     #[serde(default)]
     pub core: Core,
@@ -672,6 +690,51 @@ impl ProviderConfig {
     /// A file with neither harnesses nor providers is the explicitly empty
     /// catalog a fresh `init` writes: valid, with nothing to start or collect.
     pub fn validate(&mut self, home: &Path) -> Result<()> {
+        if self.worker_temp.as_ref().is_some_and(|temp| {
+            !temp.root.is_absolute()
+                || temp.root == Path::new("/")
+                || temp
+                    .root
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+                || temp.harnesses.is_empty()
+        }) {
+            return Err(invalid(
+                "worker_temp needs a non-root absolute path without parent traversal and at least one harness",
+            ));
+        }
+        if let Some(temp) = &mut self.worker_temp {
+            if temp.trusted_owners.len() > 64
+                || temp.trusted_owners.iter().any(|name| {
+                    name.is_empty()
+                        || name.len() > 64
+                        || !name
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"_.-$".contains(&c))
+                })
+            {
+                return Err(invalid(
+                    "worker_temp.trusted_owners accepts at most 64 local account names",
+                ));
+            }
+            if temp.trusted_groups.len() > 64
+                || temp.trusted_groups.iter().any(|group| match group {
+                    agent_run_platform::fs::TrustedGroup::Name(name) => {
+                        name.is_empty()
+                            || name.len() > 64
+                            || !name
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || b"_.-$".contains(&c))
+                    }
+                    agent_run_platform::fs::TrustedGroup::Gid(gid) => *gid == u32::MAX,
+                })
+            {
+                return Err(invalid(
+                    "worker_temp.trusted_groups accepts at most 64 valid group names or GIDs",
+                ));
+            }
+            temp.root = temp.root.components().collect();
+        }
         if self.pool_chat.as_ref().is_some_and(|pool| {
             !pool.socket.is_absolute()
                 || pool
@@ -1156,6 +1219,48 @@ impl ProviderConfig {
 #[cfg(test)]
 mod managed_peer_tests {
     use super::*;
+
+    /// The opt-in survives v2 serialization and rejects unsafe root syntax.
+    #[test]
+    fn worker_temp_config_is_optional_and_validated() {
+        let parse = |text: &str| ProviderConfig::parse(text, Path::new("/fixture"));
+        let disabled = parse("schema_version = 2").unwrap();
+        assert!(disabled.worker_temp.is_none());
+        assert!(
+            !serde_json::to_value(disabled)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("worker_temp")
+        );
+        let config =
+            "schema_version = 2\n[worker_temp]\nroot = '/scratch/run'\nharnesses = ['codex']";
+        let enabled = parse(config).unwrap();
+        let temp = enabled.worker_temp.unwrap();
+        assert_eq!(temp.root, Path::new("/scratch/run"));
+        assert!(temp.harnesses.contains(&HarnessId::Codex));
+        assert!(temp.trusted_owners.is_empty());
+        let trusted = format!("{config}\ntrusted_owners = ['pluto', 'agent-claude']");
+        assert_eq!(
+            parse(&trusted).unwrap().worker_temp.unwrap().trusted_owners,
+            ["pluto", "agent-claude"]
+        );
+        assert!(parse(&trusted.replace("agent-claude", "invalid account")).is_err());
+        let groups = format!("{trusted}\ntrusted_groups = ['projects', 1005]");
+        assert_eq!(
+            parse(&groups)
+                .unwrap()
+                .worker_temp
+                .unwrap()
+                .trusted_groups
+                .len(),
+            2
+        );
+        assert!(parse(&groups.replace("1005", "4294967295")).is_err());
+        for root in ["/", "scratch/run", "/scratch/../run"] {
+            assert!(parse(&config.replace("/scratch/run", root)).is_err());
+        }
+    }
 
     #[test]
     fn managed_pins_reject_shared_builds_interpreters_and_ambiguous_custody_scopes() {

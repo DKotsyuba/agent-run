@@ -387,45 +387,58 @@ async fn broker_ready(home: &Path, child: &mut tokio::process::Child) {
 /// broker replacement and native-session resume path without a paid model.
 #[tokio::test]
 async fn service_restart_resumes_a_cooperative_fake_worker() {
-    service_restart_fake_worker(true).await;
+    service_restart_fake_workers(true, false).await;
 }
 
 /// A failed manager request resumes the same worker on the original broker.
 #[tokio::test]
 async fn service_restart_recovers_a_fake_worker_after_manager_failure() {
-    service_restart_fake_worker(false).await;
+    service_restart_fake_workers(false, false).await;
 }
 
-/// Exercise both manager outcomes using only a local fake provider.
-async fn service_restart_fake_worker(replace_broker: bool) {
+/// Eight captured workers exhaust their initial selection budget and then recover.
+#[tokio::test]
+async fn service_restart_retries_busy_selection_without_duplicate_executions() {
+    service_restart_fake_workers(true, true).await;
+}
+
+/// Exercise both manager outcomes using only a local fake provider. The busy
+/// batch also includes a permanent refusal that must finish before the retry budget.
+async fn service_restart_fake_workers(replace_broker: bool, busy_batch: bool) {
     use agent_run::transport::socket;
     let socket_root = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
         .unwrap_or_else(|| std::env::temp_dir().into_os_string());
-    let (_temp, home) = home_in(socket_root, "", &[]);
+    let (_temp, home) = home_in(socket_root, "[core]\nmax_active_agents = 16\n", &[]);
     let mut broker = resident_broker(&home);
     broker_ready(&home, &mut broker).await;
-    let mut input = request(&home);
-    input.task = "fixture:restart-worker".into();
-    input.explicit_finish = true;
-    input.request_id = Some("restart-worker".into());
-    let admitted = socket::client(&home, "start", serde_json::to_value(input).unwrap())
-        .await
-        .unwrap();
-    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..if busy_batch { 9 } else { 1 } {
+        let mut input = request(&home);
+        input.task = "fixture:restart-worker".into();
+        input.explicit_finish = true;
+        input.request_id = Some(format!("restart-worker-{index}"));
+        let admitted = socket::client(&home, "start", serde_json::to_value(input).unwrap())
+            .await
+            .unwrap();
+        ids.push(serde_json::from_value::<AgentId>(admitted["agent_id"].clone()).unwrap());
+    }
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let row = agent_run_store::fixture::open(&home)
-                .unwrap()
-                .get(&id)
-                .unwrap();
-            if row.status == Status::Running && row.runtime_session_id.is_some() {
+            let store = agent_run_store::fixture::open(&home).unwrap();
+            let mut all_running = true;
+            for id in &ids {
+                let row = store.get(id).unwrap();
+                assert!(
+                    !row.status.terminal(),
+                    "worker ended before restart: {:?}",
+                    row.failure_kind
+                );
+                all_running &= row.status == Status::Running && row.runtime_session_id.is_some();
+            }
+            drop(store);
+            if all_running {
                 break;
             }
-            assert!(
-                !row.status.terminal(),
-                "worker ended before restart: {:?}",
-                row.failure_kind
-            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -457,18 +470,35 @@ async fn service_restart_fake_worker(replace_broker: bool) {
     .await
     .unwrap();
     let store = agent_run_store::fixture::open(&home).unwrap();
-    let completion_count: i64 = store
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
-            [id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        completion_count, 0,
-        "temporary finish must not produce a completion notice"
-    );
+    let permanent = busy_batch.then(|| ids.pop().unwrap());
+    for id in &ids {
+        let completion_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            completion_count,
+            0,
+            "temporary finish must not produce a completion notice for {id}: {:?}",
+            store.get(id).unwrap().failure_kind
+        );
+        if busy_batch {
+            fs::write(home.join(format!("restart-stale-{id}")), "").unwrap();
+        }
+    }
+    if let Some(id) = &permanent {
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET runtime_session_id=NULL WHERE id=?",
+                [id.as_str()],
+            )
+            .unwrap();
+    }
     drop(store);
     let claimed = socket::client(
         &home,
@@ -510,6 +540,35 @@ async fn service_restart_fake_worker(replace_broker: bool) {
         .unwrap();
         assert_eq!(result["restart_id"], restart);
     }
+    if let Some(id) = &permanent {
+        let service = Service::new(home.clone());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let store = agent_run_store::fixture::open(&home).unwrap();
+                let failed = service.view(&store, &store.get(id).unwrap()).unwrap();
+                if failed["failure_kind"] == "restart_resume_failed"
+                    && ids
+                        .iter()
+                        .all(|id| home.join(format!("restart-stale-{id}.spent")).is_file())
+                {
+                    assert_eq!(failed["failure_text"], "The native session is unavailable.");
+                    for id in &ids {
+                        let view = service.view(&store, &store.get(id).unwrap()).unwrap();
+                        assert_eq!(view["phase"], "restarting");
+                        assert_eq!(view["failure_kind"], serde_json::Value::Null);
+                    }
+                    break;
+                }
+                drop(store);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for id in &ids {
+            fs::remove_file(home.join(format!("restart-stale-{id}"))).unwrap();
+        }
+    }
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let state = socket::client(
@@ -528,23 +587,30 @@ async fn service_restart_fake_worker(replace_broker: bool) {
     .await
     .unwrap();
     let store = agent_run_store::fixture::open(&home).unwrap();
-    let (result, child, reason): (String, Option<String>, Option<String>) = store.conn.query_row(
-        "SELECT resume_status,resumed_execution_id,resume_error FROM service_restart_agents WHERE restart_id=? AND agent_id=?",
-        rusqlite::params![restart,id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).unwrap();
-    assert_eq!(result, "started", "resume refusal: {reason:?}");
-    let accepted: i64 = store
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_resume_accepted'",
-            [child.unwrap()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        accepted, 1,
-        "a started result requires native resume confirmation"
-    );
+    for id in &ids {
+        if busy_batch {
+            assert!(home.join(format!("restart-stale-{id}.spent")).is_file());
+        }
+        let (result, child, reason): (String, Option<String>, Option<String>) = store.conn.query_row(
+            "SELECT resume_status,resumed_execution_id,resume_error FROM service_restart_agents WHERE restart_id=? AND agent_id=?",
+            rusqlite::params![restart,id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(result, "started", "resume refusal: {reason:?}");
+        let (children, accepted): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM agents WHERE parent_agent_id=?1), \
+             (SELECT COUNT(*) FROM events WHERE agent_id=?2 AND kind='native_resume_accepted')",
+                rusqlite::params![id.as_str(), child.unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(children, 1, "a restart must admit exactly one child");
+        assert_eq!(
+            accepted, 1,
+            "a started result requires native resume confirmation"
+        );
+    }
     drop(store);
     let pid = broker.id().unwrap();
     // SAFETY: the PID belongs to this test's current disposable broker.

@@ -419,6 +419,64 @@ impl Grant {
             permission_profile: profile,
         })
     }
+    /// Adds a verified temp leaf via a named native profile. Existing Projects
+    /// rules are copied verbatim and the built-in policies retain their base.
+    /// The session config selects the same profile when Codex reloads it
+    /// without the typed thread-start/resume overrides.
+    pub(crate) fn with_worker_temp(
+        mut self,
+        runtime: &Runtime,
+        home: &Path,
+        path: &Path,
+    ) -> Result<(Self, Value)> {
+        const PROFILE: &str = "AgentRunWorkerTemp";
+        let path = path
+            .to_str()
+            .ok_or_else(|| invalid("invalid Codex worker temp path"))?;
+        let mut policy = if self.permission_profile.as_deref() == Some("Projects") {
+            if let Some(system) = system_projects()? {
+                serde_json::to_value(system)?
+            } else {
+                let mut config = toml::Table::new();
+                render_permissions(&mut config, runtime, home)?;
+                serde_json::to_value(&config["permissions"]["Projects"])?
+            }
+        } else {
+            let extends = if self.sandbox == "read-only" {
+                ":read-only"
+            } else {
+                // The echo only lists explicit writable roots. Implicit cwd
+                // write access still comes from the built-in workspace policy.
+                self.writable_roots.clear();
+                ":workspace"
+            };
+            json!({"extends":extends,"network":{"enabled":self.network_access}})
+        };
+        let table = policy
+            .as_object_mut()
+            .ok_or_else(|| invalid("invalid Codex worker temp profile"))?;
+        let filesystem = table
+            .entry("filesystem")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| invalid("invalid Codex worker temp filesystem rules"))?;
+        if filesystem.contains_key(path) {
+            return Err(invalid(
+                "Codex worker temp overlaps an explicit filesystem rule",
+            ));
+        }
+        filesystem.insert(path.into(), json!("write"));
+        if !self.writable_roots.iter().any(|root| root == path) {
+            self.writable_roots.push(path.into());
+        }
+        self.sandbox = "workspace-write".into();
+        self.permission_profile = Some(PROFILE.into());
+        Ok((
+            self,
+            json!({"default_permissions":PROFILE,"permissions":{(PROFILE):policy}}),
+        ))
+    }
+
     /// User-addressable writable roots. Generated runtime caches are private
     /// implementation paths and can differ before and after an execution is allocated.
     pub(crate) fn scope_writable_roots(&self, runtime: &Runtime, home: &Path) -> Vec<PathBuf> {
@@ -802,6 +860,33 @@ pub async fn run(
         role,
         home,
         None,
+        None,
+    )
+    .await
+}
+
+/// Executes an unmanaged Codex thread with the Run-owned temp grant.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_worker_temp(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    temp: &crate::worker_temp::LaunchGrant<'_>,
+) -> Result<EngineResult> {
+    run_inner(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        None,
+        Some(temp),
     )
     .await
 }
@@ -878,6 +963,7 @@ pub(crate) async fn run_managed(
         role,
         home,
         Some(managed),
+        None,
     )
     .await
 }
@@ -892,6 +978,7 @@ async fn run_inner(
     role: &Profile,
     home: &Path,
     managed: Option<&ManagedCodexRole<'_>>,
+    worker_temp: Option<&crate::worker_temp::LaunchGrant<'_>>,
 ) -> Result<EngineResult> {
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
@@ -979,7 +1066,22 @@ async fn run_inner(
     if managed.is_some() {
         grant = grant.without_environments();
     }
-    let mut params = grant.request();
+    let projects = grant.permission_profile.as_deref() == Some("Projects");
+    let mut params = if let Some(temp) = worker_temp {
+        let (scoped, config) = grant.with_worker_temp(runtime, home, temp.path)?;
+        grant = scoped;
+        let mut params = grant.request();
+        if projects {
+            params
+                .as_object_mut()
+                .expect("thread start fields")
+                .remove("runtimeWorkspaceRoots");
+        }
+        params["config"] = config;
+        params
+    } else {
+        grant.request()
+    };
     if record.request.explicit_finish {
         // Runtime turn semantics belong above task/user text. Preserve the
         // effective configured developer policy; never override base instructions
@@ -1021,8 +1123,28 @@ async fn run_inner(
     } else {
         "thread/start"
     };
+    if let Some(temp) = worker_temp {
+        temp.verify()?;
+    }
     let thread = process.rpc(method, params, Duration::from_secs(30)).await?;
     grant.verify(&thread)?;
+    // Codex can echo TMPDIR as implicitly writable because it is already the
+    // sole explicit leaf. The process and native shell both use that same path.
+    if worker_temp.is_some()
+        && !role.write
+        && (thread
+            .pointer("/sandbox/excludeSlashTmp")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || thread
+                .pointer("/activePermissionProfile/extends")
+                .and_then(Value::as_str)
+                != Some(":read-only"))
+    {
+        return Err(invalid(
+            "Codex did not honor the read-only worker temp profile",
+        ));
+    }
     if record.resume_of_runtime_session_id.is_some() {
         let status = thread
             .pointer("/thread/status/type")
@@ -3438,6 +3560,48 @@ for status in statuses:
             "workspace_roots": roots,
         }))
         .expect("fixture runtime")
+    }
+
+    /// The read-only leaf is the only explicit writable root, including when
+    /// Codex reloads the session config for MCP inventory without the typed
+    /// thread-start selector. An additional writable root fails verification.
+    #[test]
+    fn worker_temp_codex_read_only_grant() {
+        let runtime = root_runtime(&[]);
+        let base = super::Grant {
+            model: "fixture".into(),
+            cwd: "/work".into(),
+            roots: vec!["/work".into()],
+            writable_roots: vec![],
+            sandbox: "read-only".into(),
+            approval_policy: "never".into(),
+            reviewer: None,
+            network_access: false,
+            permission_profile: Some(":read-only".into()),
+        };
+        let leaf = Path::new("/worker-temp/work/agent");
+        let (grant, config) = base
+            .with_worker_temp(&runtime, Path::new("/home"), leaf)
+            .unwrap();
+        assert_eq!(grant.writable_roots, [leaf.to_str().unwrap()]);
+        assert_eq!(grant.request()["permissions"], "AgentRunWorkerTemp");
+        let selector = config["default_permissions"].as_str().unwrap();
+        assert_eq!(selector, grant.request()["permissions"]);
+        let profile = &config["permissions"][selector];
+        assert_eq!(profile["extends"], ":read-only");
+        assert_eq!(
+            profile["filesystem"],
+            json!({(leaf.to_str().unwrap()): "write"})
+        );
+        let mut reply = json!({
+            "model": "fixture", "cwd": "/work", "approvalPolicy": "never",
+            "runtimeWorkspaceRoots": ["/work"],
+            "activePermissionProfile": {"id":"AgentRunWorkerTemp"},
+            "sandbox": {"type": "workspaceWrite", "writableRoots": [leaf]}
+        });
+        grant.verify(&reply).unwrap();
+        reply["sandbox"]["writableRoots"] = json!([leaf, "/work"]);
+        assert!(grant.verify(&reply).is_err());
     }
 
     /// Managed Projects validation rejects one ungranted configured root and

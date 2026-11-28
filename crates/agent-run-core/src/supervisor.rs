@@ -722,13 +722,24 @@ fn static_reason(message: &str) -> Option<&str> {
     .then_some(message)
 }
 
-/// Returns closed, content-free categories for an execution error. Original
-/// messages, SQL text, paths, JSON contents and credential/environment values
-/// never enter diagnostics; a validation or unsupported error adds only its
-/// [`static_reason`]. Native numeric errno/SQLite codes remain nullable.
+/// Builds execution diagnostics from typed categories and numeric codes.
+/// Validation and unsupported errors contribute only their [`static_reason`].
+/// Correlated engine rejections can also carry bounded, launch-redacted text
+/// prepared by the adapter.
 pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
+        Error::EngineRpcRejected {
+            method,
+            code,
+            message,
+        } => {
+            data["rpc_method"] = json!(method);
+            data["rpc_code"] = json!(code);
+            if let Some(message) = message {
+                data["rpc_message"] = json!(message);
+            }
+        }
         Error::NativeOwnerInputUncertain => {
             data["reason"] = json!("native_owner_input_uncertain");
         }
@@ -833,8 +844,7 @@ async fn failed_execution(
     failed_result(error)
 }
 
-/// The failed engine result for `error`: a closed failure kind, the closed
-/// diagnostic as text and no answer. Pure; persists nothing.
+/// Returns the failed engine result with its typed diagnostic and no answer.
 fn failed_result(error: &Error) -> adapters::EngineResult {
     let metadata = execution_error_metadata(error);
     let mut outcome = Outcome::failure(match error {
@@ -1709,7 +1719,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .clone()
             .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
         let native_role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
-        let scope = crate::launch_scope::AccessPlan::compile(
+        let mut scope = crate::launch_scope::AccessPlan::compile(
             &config,
             identity.authority.harness,
             &identity.provider_request,
@@ -1717,25 +1727,36 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &adapters::provider::profile(&native_role),
             &runtime_home,
         )?;
-        let system_temp = identity
-            .system_route
-            .as_ref()
-            .map(|_| (app_home.to_path_buf(), id.clone()));
-        let (scope, facts) = tokio::task::spawn_blocking(move || {
-            let facts =
-                scope.prepare(system_temp.as_ref().map(|(home, id)| (home.as_path(), id)))?;
-            Ok::<_, Error>((scope, facts))
-        })
-        .await
-        .map_err(|_| Error::Runtime("worker launch access check did not complete".into()))??;
-        let configured_tmp =
-            crate::launch_scope::configured_tmp(&config, identity.authority.harness);
+        if row.parent_agent_id.is_some() || continuing.is_some() {
+            scope.recheck_worker_temp(home, identity.authority.harness);
+        }
         let agent_dir = home.join("agents").join(id.as_str());
         if identity.system_route.is_some() {
             fs::Dir::open(&agent_dir)?;
         } else {
             fs::private_dir(&agent_dir)?;
         }
+        let system_home = identity
+            .system_route
+            .as_ref()
+            .map(|_| app_home.to_path_buf());
+        let temp_agent = (
+            home.join("agents").join(row.root_agent_id.as_str()),
+            row.root_agent_id.clone(),
+        );
+        let verify_temp_agent = temp_agent.clone();
+        let execution = id.clone();
+        let (scope, facts) = tokio::task::spawn_blocking(move || {
+            let facts = scope.prepare_for_agent(
+                system_home.as_deref().map(|home| (home, &execution)),
+                Some((&temp_agent.0, &temp_agent.1)),
+            )?;
+            Ok::<_, Error>((scope, facts))
+        })
+        .await
+        .map_err(|_| Error::Runtime("worker launch access check did not complete".into()))??;
+        let configured_tmp =
+            crate::launch_scope::configured_tmp(&config, identity.authority.harness);
         store
             .event(id, "phase", &json!({"phase":"preparing"}))
             .await?;
@@ -1989,7 +2010,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         match identity.authority.harness {
             HarnessId::Codex => {
                 planned.profile.body.insert_str(0, &format!("{brief}\n"));
-                if let Some(setting) = facts.codex_socket_override() {
+                for setting in facts.codex_environment_overrides() {
                     planned.launch.args.splice(0..0, ["-c".into(), setting]);
                 }
             }
@@ -2382,6 +2403,20 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 home.join("fixture-hide-started-owner").exists(),
             );
         }
+        let temp_grant = facts
+            .worker_temp
+            .as_deref()
+            .map(|path| crate::worker_temp::LaunchGrant {
+                agent: &verify_temp_agent.0,
+                id: &verify_temp_agent.1,
+                path,
+            });
+        if let Some(grant) = &temp_grant
+            && let Err(error) = grant.verify()
+        {
+            store.provider_spawn_failed(id, &attempt_id).await?;
+            return Err(error);
+        }
         let mut process =
             match planned.launch_process(kind, &runtime_home, harness, config_owner_uid) {
                 Ok(process) => process,
@@ -2530,6 +2565,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         &planned.profile,
                         &runtime_home,
                         &managed,
+                    )
+                    .await
+                } else if let Some(temp) = &temp_grant {
+                    crate::codex::run_with_worker_temp(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        &planned.runtime,
+                        &planned.profile,
+                        &runtime_home,
+                        temp,
                     )
                     .await
                 } else {
@@ -3597,6 +3644,57 @@ mod tests {
     }
     use super::error_text;
     use crate::Error;
+
+    /// An app-server rejection survives the adapter boundary and reaches the
+    /// terminal diagnostic after secret redaction and UTF-8 truncation.
+    #[tokio::test]
+    async fn execution_failure_metadata_reports_app_server_rejection() {
+        use serde_json::json;
+        use std::{collections::BTreeMap, time::Duration};
+
+        let secret = "fixture-rpc-secret";
+        let reply = json!({"id":1,"error":{
+            "code":-32603,
+            "message":format!("failed to reload config ({secret}) {}", "☃".repeat(150)),
+            "data":{"detail":"DO_NOT_KEEP_ERROR_DATA"}
+        }});
+        let plan = agent_run_adapters::LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("IFS= read -r line\nprintf '%s\\n' '{reply}'"),
+            ],
+            cwd: std::env::current_dir().unwrap(),
+            environment: BTreeMap::from([("FIXTURE_TOKEN".into(), secret.into())]),
+            initial_input: None,
+        };
+        let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+        let reply = process
+            .rpc(
+                "mcpServerStatus/list",
+                json!({"threadId":"omitted"}),
+                Duration::from_secs(2),
+            )
+            .await;
+        process.input.take();
+        assert_eq!(process.reap().await, Some(0));
+
+        let error = reply.unwrap_err();
+        assert_eq!(error.public().kind, "RuntimeError");
+        assert!(!error.public().message.contains("failed to reload config"));
+        let data = execution_error_metadata(&error);
+        assert_eq!(data["rpc_method"], "mcpServerStatus/list");
+        assert_eq!(data["rpc_code"], "-32603");
+        let message = data["rpc_message"].as_str().unwrap();
+        assert!(message.starts_with("failed to reload config"));
+        assert!(message.len() <= 300 && message.ends_with('☃'));
+        assert!(!message.contains(secret));
+        assert!(!data.to_string().contains("DO_NOT_KEEP_ERROR_DATA"));
+        assert_eq!(
+            failed_result(&error).outcome.failure_kind.as_deref(),
+            Some("runtime_transport_failed")
+        );
+    }
 
     /// Checkpoint causes retain their closed phase and SQLite numeric class;
     /// neither public errors nor durable outcomes expose source diagnostics or
