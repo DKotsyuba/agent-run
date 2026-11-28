@@ -2433,6 +2433,31 @@ fn restart_hook_payload(payload: &Value, transport: &str) -> Result<Option<Value
     )
 }
 
+/// Reports all batch diagnostics to the host on its blocking stderr channel.
+fn emit_bind_output(mut value: Value, output: &CliOutput) -> Result<i32> {
+    if let Some(object) = value.as_object_mut()
+        && let Some(errors) = object.remove("bindingErrors")
+    {
+        let count = object
+            .remove("boundCount")
+            .and_then(|count| count.as_u64())
+            .unwrap_or_default();
+        eprintln!("agent-run: start_batch binding confirmed for {count} job(s).");
+        for error in errors
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            eprintln!("{error}");
+        }
+        output(&value)?;
+        return Ok(2);
+    }
+    output(&value)?;
+    Ok(0)
+}
+
 /// Executes existing broker-only CLI operations with their original payloads and output sinks.
 /// The MCP home is metadata only: operator mode passes an empty path and never resolves a home.
 async fn run_client_command(
@@ -2463,10 +2488,16 @@ async fn run_client_command(
                 let input = read_stdin(1024 * 1024)?;
                 let payload: Value = serde_json::from_str(&input)
                     .map_err(|_| invalid("hook payload must be a JSON object"))?;
-                if bind && let Some(safe) = restart_hook_payload(&payload, &transport)? {
-                    return broker
-                        .call("_hook_bind", json!({"payload":safe,"transport":transport}))
-                        .await;
+                if bind {
+                    let safe = match restart_hook_payload(&payload, &transport)? {
+                        Some(restart) => Some(restart),
+                        None => hooks::bind::batch_hook_payload(&payload, &transport)?,
+                    };
+                    if let Some(safe) = safe {
+                        return broker
+                            .call("_hook_bind", json!({"payload":safe,"transport":transport}))
+                            .await;
+                    }
                 }
                 let normalized = hooks::bind::normalize(&payload, bind, &transport)?;
                 let mut safe = json!({
@@ -2491,6 +2522,7 @@ async fn run_client_command(
             }
             .await;
             match result {
+                Ok(value) if bind => return emit_bind_output(value, &output),
                 Ok(value) => (output)(&value)?,
                 Err(error) if !bind => {
                     hooks::context::log_failure(&error, None);
@@ -3063,6 +3095,20 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                             .await?;
                         (dependencies.output)(&output)?;
                         return Ok(0);
+                    }
+                    if let Some(batch) =
+                        hooks::bind::run_batch_hook(&home, &payload, &transport.transport, None)
+                            .await?
+                    {
+                        let messages = batch
+                            .bound
+                            .iter()
+                            .map(|bound| bound.message())
+                            .collect::<Vec<_>>();
+                        return emit_bind_output(
+                            hooks::bind::hook_output(&messages, &batch.failures),
+                            &dependencies.output,
+                        );
                     }
                     let result =
                         hooks::bind::run_hook(&home, &payload, &transport.transport, None).await?;

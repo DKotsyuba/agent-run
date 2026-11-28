@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.36.5
+
+### Fixed
+
+- The PostToolUse bind hook binds admitted `start_batch` jobs when the host
+  matcher includes `start_batch`. It attempts every admitted job and reports
+  failures individually.
+
 ## 0.36.4
 
 ### Added

@@ -497,37 +497,53 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"agent-run: restart wait recorded; retry after the restart notice."}}),
                 );
             }
-            let bound = crate::hooks::bind::run_hook_with_service(
+            let (bound, failures) = match crate::hooks::bind::run_batch_hook(
                 &service.home,
                 &hook.payload,
                 &hook.transport,
-                None,
                 Some(service),
             )
-            .await?;
+            .await?
+            {
+                Some(batch) => (batch.bound, batch.failures),
+                None => (
+                    vec![
+                        crate::hooks::bind::run_hook_with_service(
+                            &service.home,
+                            &hook.payload,
+                            &hook.transport,
+                            None,
+                            Some(service),
+                        )
+                        .await?,
+                    ],
+                    vec![],
+                ),
+            };
             let configured = agent_run_config::provider_config::ProviderConfig::load(&service.home)
                 .map(|(config, _)| config.delivery.bridge.is_some())
                 .or_else(|_| {
                     crate::config::Config::load(&service.home)
                         .map(|config| config.delivery.bridge.is_some())
                 });
-            let message = match configured {
-                Ok(true) => bound.message(),
-                other => {
-                    let detail = if other.is_ok() {
-                        "Bridge notifications are not configured"
-                    } else {
-                        "Bridge notification configuration could not be verified"
-                    };
-                    format!(
-                        "agent-run: agent {} is bound; {detail}.",
-                        bound.agent_label()
-                    )
-                }
-            };
-            Ok(
-                json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":message}}),
-            )
+            let messages = bound
+                .iter()
+                .map(|bound| match &configured {
+                    Ok(true) => bound.message(),
+                    other => {
+                        let detail = if other.is_ok() {
+                            "Bridge notifications are not configured"
+                        } else {
+                            "Bridge notification configuration could not be verified"
+                        };
+                        format!(
+                            "agent-run: agent {} is bound; {detail}.",
+                            bound.agent_label()
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(crate::hooks::bind::hook_output(&messages, &failures))
         }
         agent_run_domain::pool_chat::CATALOG_METHOD => service.pool_chat_catalog(args(raw)?).await,
         agent_run_domain::worker::CATALOG_METHOD => register_catalog(service, args(raw)?).await,

@@ -93,7 +93,8 @@ receiver evidence; Bridge custody alone is insufficient.
 
 ## Delivery binding
 
-The `PostToolUse` hook on `mcp__agent[-_]run__start` binds a session using
+Configure the `PostToolUse` matcher `^mcp__agent[-_]run__(start|resume|start_batch)$`
+to bind the session to each admitted agent. Set
 `--transport` per client: codex defaults to `codex_queue`, claude to
 `claude_uds`. A missing or wrong `--transport` on that hook is the usual
 cause of "the agent ran but never delivered a result back."
