@@ -421,6 +421,8 @@ impl Grant {
     }
     /// Adds a verified temp leaf via a named native profile. Existing Projects
     /// rules are copied verbatim and the built-in policies retain their base.
+    /// The session config selects the same profile when Codex reloads it
+    /// without the typed thread-start/resume overrides.
     pub(crate) fn with_worker_temp(
         mut self,
         runtime: &Runtime,
@@ -469,7 +471,10 @@ impl Grant {
         }
         self.sandbox = "workspace-write".into();
         self.permission_profile = Some(PROFILE.into());
-        Ok((self, json!({"permissions":{(PROFILE):policy}})))
+        Ok((
+            self,
+            json!({"default_permissions":PROFILE,"permissions":{(PROFILE):policy}}),
+        ))
     }
 
     /// User-addressable writable roots. Generated runtime caches are private
@@ -3557,8 +3562,9 @@ for status in statuses:
         .expect("fixture runtime")
     }
 
-    /// The read-only permission base has one explicit writable root and
-    /// the handshake rejects an additional root in the native echo.
+    /// The read-only leaf is the only explicit writable root, including when
+    /// Codex reloads the session config for MCP inventory without the typed
+    /// thread-start selector. An additional writable root fails verification.
     #[test]
     fn worker_temp_codex_read_only_grant() {
         let runtime = root_runtime(&[]);
@@ -3579,7 +3585,9 @@ for status in statuses:
             .unwrap();
         assert_eq!(grant.writable_roots, [leaf.to_str().unwrap()]);
         assert_eq!(grant.request()["permissions"], "AgentRunWorkerTemp");
-        let profile = &config["permissions"]["AgentRunWorkerTemp"];
+        let selector = config["default_permissions"].as_str().unwrap();
+        assert_eq!(selector, grant.request()["permissions"]);
+        let profile = &config["permissions"][selector];
         assert_eq!(profile["extends"], ":read-only");
         assert_eq!(
             profile["filesystem"],

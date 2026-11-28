@@ -277,6 +277,17 @@ pub enum Error {
     /// A safe runtime error message.
     #[error("{0}")]
     Runtime(String),
+    /// A correlated app-server rejection with bounded, launch-redacted detail
+    /// for execution diagnostics. Display omits the engine text.
+    #[error("app-server rejected {method} ({code})")]
+    EngineRpcRejected {
+        /// Request method supplied by the adapter.
+        method: String,
+        /// Engine reply code, redacted by the adapter.
+        code: String,
+        /// Optional engine detail, redacted and bounded by the adapter.
+        message: Option<String>,
+    },
     /// Closed writer outcome; payload-free diagnostic source, never durability proof.
     #[error("writer operation did not complete")]
     WriterFailure(crate::storage::WriterFailure),
@@ -560,6 +571,7 @@ impl Error {
                 ..
             } => MachineCode::from_wire(code).unwrap_or(MachineCode::RuntimeError),
             Self::Runtime(_)
+            | Self::EngineRpcRejected { .. }
             | Self::NativeOwnerInputUncertain
             | Self::WriterFailure(_)
             | Self::OwnershipCheckpoint { .. }

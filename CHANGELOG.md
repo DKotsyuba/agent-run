@@ -16,6 +16,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 - Graceful service restarts retry transient account-selection refusals with
   bounded backoff before marking a continuation as failed.
+- Codex worker temp directories select their permission profile as the session
+  default, so Codex keeps it when it reloads session config for MCP inventory.
+- Codex RPC rejections record the method, code and a capped, redacted message
+  in the execution failure diagnostic.
 
 ## 0.36.3
 

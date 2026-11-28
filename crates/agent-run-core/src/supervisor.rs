@@ -722,13 +722,24 @@ fn static_reason(message: &str) -> Option<&str> {
     .then_some(message)
 }
 
-/// Returns closed, content-free categories for an execution error. Original
-/// messages, SQL text, paths, JSON contents and credential/environment values
-/// never enter diagnostics; a validation or unsupported error adds only its
-/// [`static_reason`]. Native numeric errno/SQLite codes remain nullable.
+/// Builds execution diagnostics from typed categories and numeric codes.
+/// Validation and unsupported errors contribute only their [`static_reason`].
+/// Correlated engine rejections can also carry bounded, launch-redacted text
+/// prepared by the adapter.
 pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
+        Error::EngineRpcRejected {
+            method,
+            code,
+            message,
+        } => {
+            data["rpc_method"] = json!(method);
+            data["rpc_code"] = json!(code);
+            if let Some(message) = message {
+                data["rpc_message"] = json!(message);
+            }
+        }
         Error::NativeOwnerInputUncertain => {
             data["reason"] = json!("native_owner_input_uncertain");
         }
@@ -833,8 +844,7 @@ async fn failed_execution(
     failed_result(error)
 }
 
-/// The failed engine result for `error`: a closed failure kind, the closed
-/// diagnostic as text and no answer. Pure; persists nothing.
+/// Returns the failed engine result with its typed diagnostic and no answer.
 fn failed_result(error: &Error) -> adapters::EngineResult {
     let metadata = execution_error_metadata(error);
     let mut outcome = Outcome::failure(match error {
@@ -3634,6 +3644,57 @@ mod tests {
     }
     use super::error_text;
     use crate::Error;
+
+    /// An app-server rejection survives the adapter boundary and reaches the
+    /// terminal diagnostic after secret redaction and UTF-8 truncation.
+    #[tokio::test]
+    async fn execution_failure_metadata_reports_app_server_rejection() {
+        use serde_json::json;
+        use std::{collections::BTreeMap, time::Duration};
+
+        let secret = "fixture-rpc-secret";
+        let reply = json!({"id":1,"error":{
+            "code":-32603,
+            "message":format!("failed to reload config ({secret}) {}", "☃".repeat(150)),
+            "data":{"detail":"DO_NOT_KEEP_ERROR_DATA"}
+        }});
+        let plan = agent_run_adapters::LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("IFS= read -r line\nprintf '%s\\n' '{reply}'"),
+            ],
+            cwd: std::env::current_dir().unwrap(),
+            environment: BTreeMap::from([("FIXTURE_TOKEN".into(), secret.into())]),
+            initial_input: None,
+        };
+        let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+        let reply = process
+            .rpc(
+                "mcpServerStatus/list",
+                json!({"threadId":"omitted"}),
+                Duration::from_secs(2),
+            )
+            .await;
+        process.input.take();
+        assert_eq!(process.reap().await, Some(0));
+
+        let error = reply.unwrap_err();
+        assert_eq!(error.public().kind, "RuntimeError");
+        assert!(!error.public().message.contains("failed to reload config"));
+        let data = execution_error_metadata(&error);
+        assert_eq!(data["rpc_method"], "mcpServerStatus/list");
+        assert_eq!(data["rpc_code"], "-32603");
+        let message = data["rpc_message"].as_str().unwrap();
+        assert!(message.starts_with("failed to reload config"));
+        assert!(message.len() <= 300 && message.ends_with('☃'));
+        assert!(!message.contains(secret));
+        assert!(!data.to_string().contains("DO_NOT_KEEP_ERROR_DATA"));
+        assert_eq!(
+            failed_result(&error).outcome.failure_kind.as_deref(),
+            Some("runtime_transport_failed")
+        );
+    }
 
     /// Checkpoint causes retain their closed phase and SQLite numeric class;
     /// neither public errors nor durable outcomes expose source diagnostics or

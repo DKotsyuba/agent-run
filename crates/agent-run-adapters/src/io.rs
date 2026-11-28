@@ -52,8 +52,12 @@ pub enum RpcDisposition {
     /// A correlated native reply carried a result.
     Replied(Value),
     /// A correlated rejection supplied an integer or bounded nonblank string
-    /// code; malformed envelopes never prove rejection.
-    Rejected { code: String },
+    /// code and may carry a redacted, bounded diagnostic message. Malformed
+    /// envelopes never prove rejection.
+    Rejected {
+        code: String,
+        message: Option<String>,
+    },
     /// The backlog was already full before the send, so nothing was written.
     UnsentPressure,
     /// The send may have completed, but no correlated reply was observed
@@ -780,15 +784,17 @@ impl Process {
     }
     /// Sends one request, correlates its reply and retains interleaved events.
     /// Control methods keep their one-second cap. Startup callers retain timeout,
-    /// closed-stream and finite reader/ownership diagnostics. Closed diagnostics
-    /// use only the original remaining budget; no deadline is renewed.
+    /// correlated rejection details, closed-stream and finite reader/ownership
+    /// diagnostics. Closed diagnostics use the original remaining budget.
     pub async fn rpc(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + rpc_timeout(method, timeout)?;
         match self.rpc_exchange_until(method, params, deadline).await? {
             RpcDisposition::Replied(result) => Ok(result),
-            RpcDisposition::Rejected { code } => Err(Error::Runtime(format!(
-                "app-server rejected {method} ({code})"
-            ))),
+            RpcDisposition::Rejected { code, message } => Err(Error::EngineRpcRejected {
+                method: method.into(),
+                code,
+                message,
+            }),
             RpcDisposition::UnsentPressure => Err(Error::Runtime(
                 "app-server control backlog is full; request not sent".into(),
             )),
@@ -887,9 +893,18 @@ impl Process {
                         if v.get("result").is_some() || code.is_none() {
                             return Ok(RpcDisposition::Uncertain(RpcUncertain::MalformedReply));
                         }
-                        let code = code.expect("validated rejection code").to_string();
+                        let code =
+                            self.redact(&code.expect("validated rejection code").to_string());
+                        let message = error.get("message").and_then(Value::as_str).map(|message| {
+                            // Redact before truncating so a secret crossing the
+                            // 300-byte boundary cannot leak as a partial literal.
+                            let mut safe = self.redact(message);
+                            safe.truncate(safe.floor_char_boundary(300));
+                            safe
+                        });
                         return Ok(RpcDisposition::Rejected {
                             code: code.chars().take(64).collect(),
+                            message,
                         });
                     }
                     return Ok(match v.get("result") {

@@ -206,7 +206,8 @@ async fn correlated_replies_are_rejected_or_replied() {
     assert_eq!(
         outcome,
         RpcDisposition::Rejected {
-            code: "\"noTurn\"".into()
+            code: "\"noTurn\"".into(),
+            message: None,
         }
     );
     let outcome = fixture
@@ -295,12 +296,14 @@ async fn correlated_envelope_shape_preserves_truthful_dispositions() {
             json!({"id":1,"error":{"code":-32601}}),
             RpcDisposition::Rejected {
                 code: "-32601".into(),
+                message: None,
             },
         ),
         (
             json!({"id":1,"error":{"code":"noTurn"}}),
             RpcDisposition::Rejected {
                 code: "\"noTurn\"".into(),
+                message: None,
             },
         ),
     ];
