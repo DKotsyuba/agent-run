@@ -12,6 +12,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   roles with shell access. Run reuses each agent's directory on resume and
   reclaims it through history retention.
 
+### Fixed
+
+- Graceful service restarts retry transient account-selection refusals with
+  bounded backoff before marking a continuation as failed.
+
 ## 0.36.3
 
 - Worker instructions: English and purposeful agent-to-agent messaging, narrow reading, commit and TMPDIR rules tied to launch facts, steer as instruction versus peer messages as data.

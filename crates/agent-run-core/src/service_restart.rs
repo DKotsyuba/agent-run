@@ -5,7 +5,7 @@ use rusqlite::OptionalExtension;
 use std::{collections::HashSet, time::Duration};
 use tokio::task::JoinSet;
 
-/// Advance preparation and own one resume attempt per captured agent.
+/// Advance preparation and own one resume task per captured agent.
 pub async fn run(service: Service) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

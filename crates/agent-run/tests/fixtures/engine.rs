@@ -200,6 +200,11 @@ fn wait_marker(name: &str) {
 /// The reader thread owns stdin only until it reads one line; timeout panics
 /// this fixture process, so a missing test driver cannot leave a harness alive.
 fn control_input() -> Value {
+    control_input_with_timeout(Duration::from_secs(5))
+}
+
+/// Reads one control frame within the scenario's specified deadline.
+fn control_input_with_timeout(timeout: Duration) -> Value {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -207,7 +212,7 @@ fn control_input() -> Value {
         let _ = sender.send((read, line));
     });
     let (read, line) = receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(timeout)
         .expect("fixture control deadline");
     read.expect("fixture control input");
     serde_json::from_str(&line).expect("fixture control JSON")
@@ -445,13 +450,7 @@ fn main() {
         emit(replay);
     }
     if task == "fixture:restart-worker" {
-        let (sent, received) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sent.send(control_input());
-        });
-        let mut replay = received
-            .recv_timeout(Duration::from_secs(20))
-            .expect("restart warning");
+        let mut replay = control_input_with_timeout(Duration::from_secs(20));
         let warning = replay.to_string();
         assert!(warning.contains("Agent Run is preparing to restart"));
         let begin = warning
