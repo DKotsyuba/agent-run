@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.36.4
+
+### Fixed
+
+- Graceful service restarts retry transient account-selection refusals with
+  bounded backoff before marking a continuation as failed.
+
 ## 0.36.3
 
 - Worker instructions: English and purposeful agent-to-agent messaging, narrow reading, commit and TMPDIR rules tied to launch facts, steer as instruction versus peer messages as data.

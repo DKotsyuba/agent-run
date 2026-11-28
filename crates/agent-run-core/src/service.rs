@@ -2265,6 +2265,18 @@ impl Service {
                     .candidates)
                 })
                 .await?;
+            #[cfg(feature = "test-fixtures")]
+            if restart_id.is_some()
+                && self
+                    .home
+                    .join(format!("restart-stale-{}", parent.id))
+                    .is_file()
+            {
+                self.lane("admission")?
+                    .handle()
+                    .fixture_advance_quota_revision()
+                    .await?;
+            }
             match self
                 .lane("admission")?
                 .local(
@@ -2304,6 +2316,13 @@ impl Service {
                     decisions.require_fresh();
                 }
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
+                    #[cfg(feature = "test-fixtures")]
+                    if restart_id.is_some() {
+                        let stale = self.home.join(format!("restart-stale-{}", parent.id));
+                        if stale.is_file() {
+                            std::fs::write(stale.with_extension("spent"), "")?;
+                        }
+                    }
                     return Err(QuotaAdmissionError::SelectionBusy {
                         stale_retries: PROVIDER_STALE_RETRIES,
                     }
@@ -2322,25 +2341,59 @@ impl Service {
         Ok(result)
     }
 
-    /// Continue one captured agent after its restart deadline is recorded.
+    /// Continue one captured agent, retrying definite transient admission refusals.
     pub(crate) async fn resume_service_restart(
         &self,
         restart_id: i64,
         id: &AgentId,
     ) -> Result<Value> {
-        let result = self
-            .resume_for(
-                id,
-                "Agent Run has finished its restart procedure. Continue your existing work from where you stopped."
-                    .into(),
-                Some(format!("service-restart:{restart_id}:{id}")),
-                None,
-                None,
-                ResumeScope::default(),
-                Some(restart_id),
-                false,
-            )
-            .await;
+        // Leave time within the store's 60-second confirmation window for
+        // handoff and native confirmation. Never time out an in-flight write:
+        // its outcome may be unknown and the store owns that reconciliation.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        let mut delay = Duration::from_secs(1);
+        // Stagger retries so a batch does not repeatedly contend for the same
+        // capacity revision. The restart request ID stays fixed across attempts.
+        let stagger = Duration::from_millis(
+            BuildHasherDefault::<DefaultHasher>::default().hash_one(id) % 1_000,
+        );
+        let request_id = format!("service-restart:{restart_id}:{id}");
+        let result = loop {
+            let result = self
+                .resume_for(
+                    id,
+                    "Agent Run has finished its restart procedure. Continue your existing work from where you stopped."
+                        .into(),
+                    Some(request_id.clone()),
+                    None,
+                    None,
+                    ResumeScope::default(),
+                    Some(restart_id),
+                    false,
+                )
+                .await;
+            // Quota snapshots can expire, and a binding cooldown can clear.
+            // Capacity exhaustion remains a refusal: old slots are released
+            // when the parents stop, and current limits may have been lowered.
+            let retryable = matches!(
+                result,
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::SelectionBusy { .. }
+                        | QuotaAdmissionError::QuotaDecisionStale
+                        | QuotaAdmissionError::BindingCooldown { .. }
+                ))
+            );
+            let next = tokio::time::Instant::now() + delay + stagger;
+            if !retryable || next >= deadline {
+                break result;
+            }
+            tokio::time::sleep_until(next).await;
+            if tokio::time::Instant::now() >= deadline {
+                break result;
+            }
+            delay = (delay * 2).min(Duration::from_secs(16));
+        };
         if let Err(error) = &result
             && !matches!(
                 error,
