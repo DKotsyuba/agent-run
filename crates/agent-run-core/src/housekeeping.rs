@@ -1614,6 +1614,13 @@ mod tests {
         assert!(worker_temp_mount_ok(&leaf, device));
         leaf.restore_owner_access().unwrap();
         assert_eq!(leaf.entry(None).unwrap().mode & 0o777, 0o750);
+        let nested = Path::new("nested");
+        let expected = leaf.entry(Some(nested)).unwrap();
+        assert!(
+            leaf.open_worker_temp_for_retention(nested, &expected, device ^ 1)
+                .is_err()
+        );
+        assert_eq!(child.entry(None).unwrap().mode & 0o777, 0);
         let mut pass = Pass::new(home.path(), &leaf).unwrap();
         assert!(drain(&leaf, false, 0, &mut pass, false, Some(device)));
         assert_eq!(child.entry(None).unwrap().mode & 0o777, 0o700);

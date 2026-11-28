@@ -745,12 +745,17 @@ impl Dir {
                 return Ok(entry_of(&status));
             }
         };
+        Self::entry_at(parent.as_raw_fd(), &name)
+    }
+
+    /// Captures a final entry's identity without following it through a live parent.
+    fn entry_at(parent: libc::c_int, name: &CStr) -> Result<Entry> {
         // SAFETY: stat is a plain C output buffer; fstatat initializes it before use.
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
         // SAFETY: descriptor/name are live and fstatat retains neither.
         if unsafe {
             libc::fstatat(
-                parent.as_raw_fd(),
+                parent,
                 name.as_ptr(),
                 &mut status,
                 libc::AT_SYMLINK_NOFOLLOW,
@@ -903,14 +908,25 @@ impl Dir {
         if expected.uid != unsafe { libc::geteuid() } {
             return Err(refused());
         }
+        #[cfg(target_os = "linux")]
         let pinned = Self::search_at(parent.as_raw_fd(), &name)?;
+        #[cfg(target_os = "linux")]
         let observed = pinned.entry(None)?;
+        // Darwin's O_SEARCH requires search permission on the child. Stat it
+        // through the pinned parent so mode 000 can be repaired before opening.
+        #[cfg(target_os = "macos")]
+        let observed = Self::entry_at(parent.as_raw_fd(), &name)?;
         if !matches(&observed) {
             return Err(refused());
         }
+        #[cfg(target_os = "linux")]
         pinned.check_worker_temp_mount(device)?;
+        #[cfg(target_os = "macos")]
+        if observed.device != device {
+            return Err(invalid("worker temp retention refused a mount boundary"));
+        }
         if observed.mode & 0o500 != 0o500 {
-            if !matches(&self.entry(Some(path))?) {
+            if !matches(&Self::entry_at(parent.as_raw_fd(), &name)?) {
                 return Err(refused());
             }
             // SAFETY: the parent and name are live; never chmod through a symlink.
