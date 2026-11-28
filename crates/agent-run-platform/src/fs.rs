@@ -1,5 +1,6 @@
 //! Descriptor-anchored local storage. No symlinks are followed inside an owned tree.
 mod cloning;
+mod temp_authority;
 use agent_run_domain::{Error, Result, error::invalid};
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +13,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
 };
+pub use temp_authority::{TempAuthority, TrustedGroup};
 
 /// Hashes arbitrary bytes, including empty input, into 64 lowercase hexadecimal digits.
 pub fn sha256(bytes: &[u8]) -> String {
@@ -355,6 +357,36 @@ impl DirScan {
         Ok((names, false))
     }
 }
+/// Linux POSIX ACL entries use a fixed little-endian on-disk format. Named
+/// users and effective writable groups must be explicitly trusted.
+#[cfg(target_os = "linux")]
+fn trusted_acl_writers(
+    acl: &[u8],
+    trusted_user: impl Fn(u32) -> bool,
+    trusted_group: impl Fn(Option<u32>) -> bool,
+) -> bool {
+    let Some(entries) = acl.strip_prefix(&[2, 0, 0, 0]) else {
+        return false;
+    };
+    let (entries, trailing) = entries.as_chunks::<8>();
+    trailing.is_empty()
+        && !entries.is_empty()
+        && entries.iter().all(|entry| {
+            let tag = u16::from_le_bytes([entry[0], entry[1]]);
+            let perm = u16::from_le_bytes([entry[2], entry[3]]);
+            let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            perm <= 7
+                && match tag {
+                    1 | 16 => true, // Owner is checked separately. Mask is checked via st_mode.
+                    2 => perm & 2 == 0 || trusted_user(id),
+                    4 => perm & 2 == 0 || trusted_group(None),
+                    8 => perm & 2 == 0 || trusted_group(Some(id)),
+                    32 => perm & 2 == 0,
+                    _ => false,
+                }
+        })
+}
+
 impl Dir {
     pub fn open(path: &Path) -> Result<Self> {
         let f = OpenOptions::new()
@@ -447,6 +479,117 @@ impl Dir {
         Err(invalid(
             "directory has an untrusted owner or rename permissions",
         ))
+    }
+
+    /// Opens a no-follow path and verifies who can replace directory entries at
+    /// every level. UID 0 is inherently privileged for system ancestors only.
+    pub fn open_worker_temp_root(path: &Path, authority: &TempAuthority) -> Result<Self> {
+        let parts = relative(
+            path.strip_prefix("/")
+                .map_err(|_| invalid("worker_temp.root must be absolute"))?,
+        )?;
+        let mut dir = Self::search_at(libc::AT_FDCWD, c"/")?;
+        dir.check_worker_temp_access(authority, true)?;
+        for (index, part) in parts.iter().enumerate() {
+            let ancestor = index + 1 < parts.len();
+            dir = if ancestor {
+                Self::search_at(dir.0.as_raw_fd(), part)?
+            } else {
+                Self::directory_at(dir.0.as_raw_fd(), part, libc::O_RDONLY)?
+            };
+            dir.check_worker_temp_access(authority, ancestor)?;
+        }
+        Ok(dir)
+    }
+
+    /// Checks ownership and effective write ACLs on the pinned directory.
+    pub fn check_worker_temp_access(
+        &self,
+        authority: &TempAuthority,
+        system_ancestor: bool,
+    ) -> Result<()> {
+        let entry = self.entry(None)?;
+        let trusted = |id| authority.trusts_uid(id) || (system_ancestor && id == 0);
+        let refused = || {
+            invalid(
+                "worker_temp path has an untrusted owner or writer; set trusted_owners or trusted_groups, or remove untrusted write access",
+            )
+        };
+        if !trusted(entry.uid) || entry.mode & 0o002 != 0 {
+            return Err(refused());
+        }
+        #[cfg(target_os = "linux")]
+        if entry.mode & 0o020 != 0 {
+            let gid = self.0.metadata()?.gid();
+            let mut acl = [0u8; 4096];
+            // fgetxattr cannot use O_PATH. Following this kernel fd link
+            // reads the pinned inode and never resolves the original pathname.
+            let fd =
+                CString::new(format!("/proc/self/fd/{}", self.0.as_raw_fd())).expect("numeric fd");
+            // SAFETY: C names and bounded destination are live for the syscall.
+            let size = unsafe {
+                libc::getxattr(
+                    fd.as_ptr(),
+                    c"system.posix_acl_access".as_ptr(),
+                    acl.as_mut_ptr().cast(),
+                    acl.len(),
+                )
+            };
+            let allowed = if size < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA)
+            {
+                authority.trusts_group(gid)
+            } else if size > 0 {
+                trusted_acl_writers(&acl[..size as usize], trusted, |group| {
+                    authority.trusts_group(group.unwrap_or(gid))
+                })
+            } else {
+                false
+            };
+            if !allowed {
+                return Err(refused());
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if (entry.mode & 0o020 != 0 && !authority.trusts_group(self.0.metadata()?.gid()))
+            || !no_extended_rename_acl(&self.0)
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    /// Refuses crossings onto another device or a Linux bind mount on the same device.
+    pub fn check_worker_temp_mount(&self, device: u64) -> Result<()> {
+        let refused = || invalid("worker temp retention refused a mount boundary");
+        if self.entry(None)?.device != device {
+            return Err(refused());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut stat = std::mem::MaybeUninit::<libc::statx>::uninit();
+            // SAFETY: statx writes to this buffer through a live pinned descriptor.
+            if unsafe {
+                libc::statx(
+                    self.0.as_raw_fd(),
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                    libc::STATX_BASIC_STATS,
+                    stat.as_mut_ptr(),
+                )
+            } != 0
+            {
+                return Err(refused());
+            }
+            // SAFETY: successful statx initialized the output.
+            let stat = unsafe { stat.assume_init() };
+            if stat.stx_attributes_mask & libc::STATX_ATTR_MOUNT_ROOT as u64 == 0
+                || stat.stx_attributes & libc::STATX_ATTR_MOUNT_ROOT as u64 != 0
+            {
+                return Err(refused());
+            }
+        }
+        Ok(())
     }
 
     /// Queries the effective account's access to this pinned directory.
@@ -740,6 +883,72 @@ impl Dir {
             .set_permissions(std::fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
+    /// Opens a retired child for traversal, repairing owner access if needed.
+    /// Checks the no-follow identity and mount before changing mode and again
+    /// after opening for reads. Only owner permission bits may be added.
+    pub fn open_worker_temp_for_retention(
+        &self,
+        path: &Path,
+        expected: &Entry,
+        device: u64,
+    ) -> Result<Self> {
+        let (parent, name) = self.parent(path, false)?;
+        let refused = || invalid("worker temp retention directory identity changed");
+        let matches = |actual: &Entry| {
+            actual.kind == EntryType::Directory
+                && (actual.uid, actual.device, actual.inode)
+                    == (expected.uid, expected.device, expected.inode)
+        };
+        // SAFETY: geteuid only reads process credentials.
+        if expected.uid != unsafe { libc::geteuid() } {
+            return Err(refused());
+        }
+        let pinned = Self::search_at(parent.as_raw_fd(), &name)?;
+        let observed = pinned.entry(None)?;
+        if !matches(&observed) {
+            return Err(refused());
+        }
+        pinned.check_worker_temp_mount(device)?;
+        if observed.mode & 0o500 != 0o500 {
+            if !matches(&self.entry(Some(path))?) {
+                return Err(refused());
+            }
+            // SAFETY: the parent and name are live; never chmod through a symlink.
+            if unsafe {
+                libc::fchmodat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    (observed.mode | 0o700) as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        let child = Self::directory_at(parent.as_raw_fd(), &name, libc::O_RDONLY)?;
+        if !matches(&child.entry(None)?) {
+            return Err(refused());
+        }
+        child.check_worker_temp_mount(device)?;
+        Ok(child)
+    }
+
+    /// Restores only owner rwx on an identity-verified, service-owned directory.
+    pub fn restore_owner_access(&self) -> Result<()> {
+        let entry = self.entry(None)?;
+        // SAFETY: geteuid only reads process credentials.
+        if entry.uid != unsafe { libc::geteuid() } {
+            return Err(invalid(
+                "worker temp retention requires a service-owned directory",
+            ));
+        }
+        if entry.mode & 0o700 != 0o700 {
+            self.0
+                .set_permissions(PermissionsExt::from_mode(entry.mode | 0o700))?;
+        }
+        Ok(())
+    }
     /// Drops owner write permission on this already-open directory descriptor.
     ///
     /// Publishing an immutable shared-store tree leaves every directory it
@@ -881,6 +1090,30 @@ impl Dir {
         let _directory = unsafe { File::from_raw_fd(n) };
         flush(&parent, level)
     }
+    /// Makes a single new directory without adopting any pre-existing entry.
+    /// Leaves the access mode to mkdirat, the umask, and the inherited default ACL.
+    pub fn create_directory_exclusive(&self, name: &Path, mode: u32) -> Result<Self> {
+        let parts = relative(name)?;
+        let [component] = parts.as_slice() else {
+            return Err(invalid("new directory requires a single component"));
+        };
+        // SAFETY: the directory and component are live for mkdirat.
+        if unsafe { libc::mkdirat(self.0.as_raw_fd(), component.as_ptr(), mode as libc::mode_t) }
+            < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let child = self.subdir(name)?;
+        let entry = child.entry(None)?;
+        // SAFETY: geteuid reads the effective process identity.
+        if entry.uid != unsafe { libc::geteuid() } {
+            return Err(invalid("new directory must be owned by the effective user"));
+        }
+        child.push()?;
+        self.sync()?;
+        Ok(child)
+    }
+
     /// Creates the workspace scratch directory with group access, subject to umask.
     /// Refuses links and never changes an existing entry's permissions.
     pub fn scratch_directory(&self, path: &Path) -> Result<()> {
@@ -1477,5 +1710,47 @@ mod scan_tests {
             }
         }
         assert_eq!(seen.len(), 40);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod worker_temp_tests {
+    use super::*;
+
+    /// ACL writers must be identifiable trusted users, never a writable group.
+    #[test]
+    fn trusted_acl_writers_rejects_unnamed_and_foreign_writers() {
+        let mut acl = vec![2, 0, 0, 0];
+        for (tag, permissions, uid) in [
+            (1u16, 7u16, u32::MAX),
+            (2, 7, 123),
+            (4, 5, u32::MAX),
+            (16, 7, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(uid.to_le_bytes());
+        }
+        assert!(trusted_acl_writers(&acl, |uid| uid == 123, |_| false));
+        assert!(!trusted_acl_writers(&acl, |_| false, |_| true));
+        acl[22] = 7; // Group object permissions.
+        assert!(!trusted_acl_writers(&acl, |_| true, |_| false));
+        assert!(trusted_acl_writers(&acl, |_| true, |group| group.is_none()));
+    }
+
+    /// A mount root is refused even when its device matches the reference.
+    #[test]
+    fn worker_temp_mount_root_is_rejected() {
+        let root = Dir::open(Path::new("/")).unwrap();
+        assert!(
+            root.check_worker_temp_mount(root.entry(None).unwrap().device)
+                .is_err()
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let leaf = Dir::open(temp.path()).unwrap();
+        let device = leaf.entry(None).unwrap().device;
+        assert!(leaf.check_worker_temp_mount(device).is_ok());
+        assert!(leaf.check_worker_temp_mount(device ^ 1).is_err());
     }
 }

@@ -646,7 +646,12 @@ fn run_directories(
         if proof.retains(id, &home.join("agents").join(id)) {
             continue;
         }
-        remove_root(&agents, id, false, pass, shared);
+        let Some(agent) = open_owned(&agents, id) else {
+            continue;
+        };
+        if collect_worker_temp(&agent, id, proof, store, pass) {
+            remove_root(&agents, id, false, pass, shared);
+        }
     }
     let Some(runtimes) = open_owned(root, "runtimes") else {
         return;
@@ -706,6 +711,99 @@ fn run_directories(
             }
         }
     }
+}
+
+/// Collects the account-owned external leaves recorded under shared agent
+/// homes. The broker retains those marker files until the owning worker runs.
+pub fn sweep_account_worker_temps(
+    home: &Path,
+    store: &mut Store,
+    configured_paths: &[PathBuf],
+) -> Result<usize> {
+    let root = fs::Dir::open_searchable(home)?;
+    let agents = match root.subdir(Path::new("agents")) {
+        Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(0);
+        }
+        result => result?,
+    };
+    let mut proof = store.storage_protection_snapshot()?;
+    for path in configured_paths {
+        if let Some(text) = path.to_str() {
+            proof.protect_path(text);
+        }
+        protect_existing_ancestor(&mut proof, path);
+    }
+    let mut pass = Pass::new(home, &root)?;
+    if let Some(names) = pass.list(&agents, "account-worker-temp") {
+        for name in names {
+            let Some(id) = name.to_str() else { continue };
+            if let Ok(agent) = agents.subdir(Path::new(id)) {
+                collect_worker_temp(&agent, id, &proof, store, &mut pass);
+            }
+        }
+    }
+    // A scan with more entries needs another pass even if none qualified yet.
+    Ok(pass.removed.max(usize::from(pass.finish()?)))
+}
+
+/// Returns true when the external temp record is absent or reclamation is complete.
+fn collect_worker_temp(
+    agent: &fs::Dir,
+    id: &str,
+    proof: &StorageProtection,
+    store: &Store,
+    pass: &mut Pass,
+) -> bool {
+    let record = match crate::worker_temp::recorded(agent) {
+        Ok(Some(record)) => record,
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    let Ok(agent_id) = id.parse() else {
+        return false;
+    };
+    if pass.roots == 0
+        || pass.unlinks == 0
+        || proof.retains(id, &record.path)
+        || !matches!(store.run_admitted(id), Ok(false))
+    {
+        return false;
+    }
+    let name = Path::new(id);
+    match record.open_leaf(&agent_id, true) {
+        Ok(Some((parent, leaf))) => {
+            let Ok(entry) = leaf.entry(None) else {
+                return false;
+            };
+            pass.roots -= 1;
+            if !worker_temp_mount_ok(
+                &leaf,
+                parent.entry(None).map_or(u64::MAX, |entry| entry.device),
+            ) || leaf.restore_owner_access().is_err()
+                || !drain(&leaf, false, 0, pass, false, Some(entry.device))
+                || !parent.entry(Some(name)).is_ok_and(|current| {
+                    record.matches(&current)
+                        && (current.device, current.inode) == (entry.device, entry.inode)
+                })
+                || parent.remove_directory(name).is_err()
+            {
+                return false;
+            }
+            pass.removed += 1;
+            pass.forget_tree(entry.device, entry.inode);
+        }
+        Ok(None) => {}
+        Err(_) => {
+            warn_worker_temp_mount();
+            return false;
+        }
+    }
+    if agent.remove(Path::new(crate::worker_temp::RECORD)).is_err() {
+        return false;
+    }
+    pass.removed += 1;
+    true
 }
 
 /// Recognizes runtime home bases: `home` and labelled `home@<account>` forms.
@@ -1084,7 +1182,7 @@ fn remove_root(
     if !shared && dir.permit_owner_write().is_err() {
         return;
     }
-    if !drain(&dir, preserve_complete, 0, pass, shared) {
+    if !drain(&dir, preserve_complete, 0, pass, shared, None) {
         return;
     }
     match parent.entry(Some(rel)) {
@@ -1101,13 +1199,34 @@ fn remove_root(
     }
 }
 
+/// Defers mounted or unverified temp directories without descending into them.
+fn worker_temp_mount_ok(dir: &fs::Dir, device: u64) -> bool {
+    if dir.check_worker_temp_mount(device).is_ok() {
+        return true;
+    }
+    warn_worker_temp_mount();
+    false
+}
+
+/// Records the retention refusal without including a worker-controlled path.
+fn warn_worker_temp_mount() {
+    if let Some(logger) = logging::configured() {
+        logger.log(
+            logging::Level::Warning,
+            "worker temp retention refused a mount boundary or could not verify directory identity and access",
+        );
+    }
+}
+
 /// Unlinks every entry of `dir` under the pass budget; true when it became empty.
+/// Worker temp leaves also allow special entries and stay on their original device.
 fn drain(
     dir: &fs::Dir,
     preserve_complete: bool,
     depth: usize,
     pass: &mut Pass,
     shared: bool,
+    worker_temp_device: Option<u64>,
 ) -> bool {
     if depth >= 32 || Instant::now() >= pass.deadline {
         pass.failed = true;
@@ -1129,13 +1248,18 @@ fn drain(
         let Ok(entry) = dir.entry(Some(&rel)) else {
             return false;
         };
+        if worker_temp_device.is_some_and(|device| entry.device != device) {
+            warn_worker_temp_mount();
+            return false;
+        }
         if entry.uid != euid()
             && !(shared && matches!(entry.kind, fs::EntryType::File | fs::EntryType::Symlink))
         {
             return false;
         }
         match entry.kind {
-            fs::EntryType::File | fs::EntryType::Symlink => {
+            fs::EntryType::Special if worker_temp_device.is_none() => empty = false,
+            fs::EntryType::File | fs::EntryType::Symlink | fs::EntryType::Special => {
                 if pass.unlinks == 0 {
                     return false;
                 }
@@ -1156,7 +1280,15 @@ fn drain(
                 if pass.unlinks == 0 {
                     return false;
                 }
-                let Ok(child) = dir.subdir(&rel) else {
+                let child = if let Some(device) = worker_temp_device {
+                    dir.open_worker_temp_for_retention(&rel, &entry, device)
+                } else {
+                    dir.subdir(&rel)
+                };
+                let Ok(child) = child else {
+                    if worker_temp_device.is_some() {
+                        warn_worker_temp_mount();
+                    }
                     return false;
                 };
                 match child.entry(None) {
@@ -1165,10 +1297,17 @@ fn drain(
                     _ => return false,
                 }
                 // Nested owner-read-only directories relax the same narrow way.
-                if !shared && child.permit_owner_write().is_err() {
+                let restored = if worker_temp_device.is_some() {
+                    child.restore_owner_access()
+                } else if !shared {
+                    child.permit_owner_write()
+                } else {
+                    Ok(())
+                };
+                if restored.is_err() {
                     return false;
                 }
-                if !drain(&child, false, depth + 1, pass, shared) {
+                if !drain(&child, false, depth + 1, pass, shared, worker_temp_device) {
                     empty = false;
                     continue;
                 }
@@ -1190,7 +1329,6 @@ fn drain(
                     pass.forget_tree(entry.device, entry.inode);
                 }
             }
-            fs::EntryType::Special => empty = false,
         }
     }
     if pass.pending_for(&key) || !empty {
@@ -1372,6 +1510,114 @@ mod tests {
             tree.join("live").exists(),
             "fresh admission wins over stale protection"
         );
+    }
+
+    /// Retention removes a recorded leaf and refuses an external symlink replacement.
+    #[test]
+    fn worker_temp_gc_checks_recorded_leaf() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+        let root = fs::Dir::open(home.path()).unwrap();
+        let temps = home.path().canonicalize().unwrap().join("temps");
+        std::fs::create_dir(&temps).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if fs::Dir::open_worker_temp_root(&temps, &fs::TempAuthority::new(&[], &[]).unwrap())
+            .is_err()
+        {
+            eprintln!("worker temp GC integration requires trusted TMPDIR ancestors");
+            return;
+        }
+        let agent = root
+            .create_directory_exclusive(Path::new("agent"), 0o700)
+            .unwrap();
+        let project = Path::new("project");
+        let id = agent_run_domain::domain::AgentId::new();
+        let destination =
+            crate::worker_temp::prepare(&temps, project, &id, &agent, &[], &[]).unwrap();
+        let sibling = temps.join(project).join("sibling");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(destination.join("output"), "temp").unwrap();
+        // Simulate a crash after mkdir and before publishing its identity.
+        let record = Path::new(crate::worker_temp::RECORD);
+        let mut intent: serde_json::Value =
+            serde_json::from_slice(&agent.read_private(record, 16 * 1024).unwrap()).unwrap();
+        intent.as_object_mut().unwrap().remove("device");
+        intent.as_object_mut().unwrap().remove("inode");
+        let intent = serde_json::to_vec(&intent).unwrap();
+        agent.write(record, &intent, 0o600).unwrap();
+        let mut pass = Pass::new(home.path(), &root).unwrap();
+        let mut protected = StorageProtection::empty();
+        protected.protect_path(destination.to_str().unwrap());
+        assert!(!collect_worker_temp(
+            &agent,
+            id.as_str(),
+            &protected,
+            &store,
+            &mut pass
+        ));
+        assert!(destination.join("output").is_file());
+        assert!(collect_worker_temp(
+            &agent,
+            id.as_str(),
+            &StorageProtection::empty(),
+            &store,
+            &mut pass
+        ));
+        assert!(!destination.exists());
+        assert!(sibling.is_dir());
+        agent.write(record, &intent, 0o600).unwrap();
+        assert!(collect_worker_temp(
+            &agent,
+            id.as_str(),
+            &StorageProtection::empty(),
+            &store,
+            &mut pass
+        ));
+        assert!(crate::worker_temp::recorded(&agent).unwrap().is_none());
+
+        let destination =
+            crate::worker_temp::prepare(&temps, project, &id, &agent, &[], &[]).unwrap();
+        let original = destination.with_extension("original");
+        std::fs::rename(&destination, &original).unwrap();
+        std::fs::write(original.join("keep"), "temp").unwrap();
+        symlink(&original, &destination).unwrap();
+        assert!(!collect_worker_temp(
+            &agent,
+            id.as_str(),
+            &StorageProtection::empty(),
+            &store,
+            &mut pass
+        ));
+        assert!(destination.is_symlink());
+        assert!(original.join("keep").is_file());
+    }
+
+    /// A verified temp tree drains read-only children without changing group or other bits.
+    #[test]
+    fn worker_temp_retention_restores_owner_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let leaf = fs::Dir::open(home.path()).unwrap();
+        let child = leaf
+            .create_directory_exclusive(Path::new("nested"), 0o700)
+            .unwrap();
+        std::fs::write(home.path().join("nested/output"), "fixture").unwrap();
+        std::fs::set_permissions(
+            home.path().join("nested"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o550)).unwrap();
+        let device = leaf.entry(None).unwrap().device;
+        assert!(worker_temp_mount_ok(&leaf, device));
+        leaf.restore_owner_access().unwrap();
+        assert_eq!(leaf.entry(None).unwrap().mode & 0o777, 0o750);
+        let mut pass = Pass::new(home.path(), &leaf).unwrap();
+        assert!(drain(&leaf, false, 0, &mut pass, false, Some(device)));
+        assert_eq!(child.entry(None).unwrap().mode & 0o777, 0o700);
+        assert!(!home.path().join("nested").exists());
     }
 
     /// Evicting the least recently used stream resets only that traversal and allows progress.

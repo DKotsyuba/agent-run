@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.36.4
+
+### Added
+
+- Opt-in external temporary directories for Codex workers, including read-only
+  roles with shell access. Run reuses each agent's directory on resume and
+  reclaims it through history retention.
+
 ## 0.36.3
 
 - Worker instructions: English and purposeful agent-to-agent messaging, narrow reading, commit and TMPDIR rules tied to launch facts, steer as instruction versus peer messages as data.

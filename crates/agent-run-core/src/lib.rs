@@ -50,6 +50,7 @@ pub mod opencode;
 /// Persistence facade of processes other than the resident broker.
 pub mod persist;
 mod pool_chat;
+mod worker_temp;
 /// Bounded wait for a terminated predecessor broker's kernel locks at startup.
 pub mod predecessor {
     pub use sqlite_access::lease::{PREDECESSOR_SETTLE, SETTLE_POLL};

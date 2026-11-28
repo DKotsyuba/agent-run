@@ -143,6 +143,9 @@ async fn account_retention_pass(
                 &protected,
             )?;
         }
+        removed += agent_run_core::housekeeping::sweep_account_worker_temps(
+            &home, &mut store, &protected,
+        )?;
         Ok(removed)
     })
     .await

@@ -33,6 +33,16 @@ label = "main"
 account = "acct-codex-native"
 ```
 
+Set `[worker_temp]` with `root = "/absolute/path/to/worker-temp"` and
+`harnesses = ["codex"]` to use an external per-agent temporary directory.
+Provision the physical root with worker write access. Use
+`trusted_owners` for additional trusted local accounts. Listing a group in
+`trusted_groups` asserts that every principal able to use it is trusted,
+including services with supplementary group credentials. Run gives shell-capable read-only Codex roles write access to
+their leaf, exports `TMPDIR`, `TMP` and `TEMP`, and keeps the leaf for resumes
+until history retention. A caller's explicit `tmpdir` takes precedence.
+See `docs/provider-config-v2.md` for permissions and fallback behavior.
+
 For a Claude custom Messages provider with `limits_source = "none"`,
 `ordered_accounts = true` orders bindings by descending
 `priority_multiplier` (declaration order breaks ties). A binding may select a

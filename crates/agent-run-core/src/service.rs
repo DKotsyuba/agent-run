@@ -493,7 +493,10 @@ impl Service {
             app_home,
         )?;
         if let (Some(launcher), Some(route)) = (&self.system_launcher, route) {
-            return launcher.preflight_scope(route, plan).await;
+            let temp_warning = plan.worker_temp_warning();
+            let mut warnings = launcher.preflight_scope(route, plan).await?;
+            warnings.extend(temp_warning.map(str::to_owned));
+            return Ok(warnings);
         }
         tokio::task::spawn_blocking(move || plan.warnings())
             .await

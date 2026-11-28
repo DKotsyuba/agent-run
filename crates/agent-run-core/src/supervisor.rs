@@ -1709,7 +1709,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .clone()
             .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
         let native_role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
-        let scope = crate::launch_scope::AccessPlan::compile(
+        let mut scope = crate::launch_scope::AccessPlan::compile(
             &config,
             identity.authority.harness,
             &identity.provider_request,
@@ -1717,25 +1717,36 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &adapters::provider::profile(&native_role),
             &runtime_home,
         )?;
-        let system_temp = identity
-            .system_route
-            .as_ref()
-            .map(|_| (app_home.to_path_buf(), id.clone()));
-        let (scope, facts) = tokio::task::spawn_blocking(move || {
-            let facts =
-                scope.prepare(system_temp.as_ref().map(|(home, id)| (home.as_path(), id)))?;
-            Ok::<_, Error>((scope, facts))
-        })
-        .await
-        .map_err(|_| Error::Runtime("worker launch access check did not complete".into()))??;
-        let configured_tmp =
-            crate::launch_scope::configured_tmp(&config, identity.authority.harness);
+        if row.parent_agent_id.is_some() || continuing.is_some() {
+            scope.recheck_worker_temp(home, identity.authority.harness);
+        }
         let agent_dir = home.join("agents").join(id.as_str());
         if identity.system_route.is_some() {
             fs::Dir::open(&agent_dir)?;
         } else {
             fs::private_dir(&agent_dir)?;
         }
+        let system_home = identity
+            .system_route
+            .as_ref()
+            .map(|_| app_home.to_path_buf());
+        let temp_agent = (
+            home.join("agents").join(row.root_agent_id.as_str()),
+            row.root_agent_id.clone(),
+        );
+        let verify_temp_agent = temp_agent.clone();
+        let execution = id.clone();
+        let (scope, facts) = tokio::task::spawn_blocking(move || {
+            let facts = scope.prepare_for_agent(
+                system_home.as_deref().map(|home| (home, &execution)),
+                Some((&temp_agent.0, &temp_agent.1)),
+            )?;
+            Ok::<_, Error>((scope, facts))
+        })
+        .await
+        .map_err(|_| Error::Runtime("worker launch access check did not complete".into()))??;
+        let configured_tmp =
+            crate::launch_scope::configured_tmp(&config, identity.authority.harness);
         store
             .event(id, "phase", &json!({"phase":"preparing"}))
             .await?;
@@ -1989,7 +2000,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         match identity.authority.harness {
             HarnessId::Codex => {
                 planned.profile.body.insert_str(0, &format!("{brief}\n"));
-                if let Some(setting) = facts.codex_socket_override() {
+                for setting in facts.codex_environment_overrides() {
                     planned.launch.args.splice(0..0, ["-c".into(), setting]);
                 }
             }
@@ -2382,6 +2393,20 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 home.join("fixture-hide-started-owner").exists(),
             );
         }
+        let temp_grant = facts
+            .worker_temp
+            .as_deref()
+            .map(|path| crate::worker_temp::LaunchGrant {
+                agent: &verify_temp_agent.0,
+                id: &verify_temp_agent.1,
+                path,
+            });
+        if let Some(grant) = &temp_grant
+            && let Err(error) = grant.verify()
+        {
+            store.provider_spawn_failed(id, &attempt_id).await?;
+            return Err(error);
+        }
         let mut process =
             match planned.launch_process(kind, &runtime_home, harness, config_owner_uid) {
                 Ok(process) => process,
@@ -2530,6 +2555,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         &planned.profile,
                         &runtime_home,
                         &managed,
+                    )
+                    .await
+                } else if let Some(temp) = &temp_grant {
+                    crate::codex::run_with_worker_temp(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        &planned.runtime,
+                        &planned.profile,
+                        &runtime_home,
+                        temp,
                     )
                     .await
                 } else {
